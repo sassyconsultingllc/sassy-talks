@@ -1,0 +1,104 @@
+[package]
+name = "sassy-talk"
+version = "1.0.0"
+description = "Cross-platform PTT walkie-talkie with retro vibes"
+authors = ["Sassy Consulting LLC"]
+license = "Proprietary"
+repository = "https://github.com/sassyconsulting/sassy-talk"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "sassy_talk_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+sha2 = "0.10"
+
+[dependencies]
+# Tauri framework
+tauri = { version = "2.0", features = [] }
+tauri-plugin-shell = "2.0"
+
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+
+# Audio I/O - Cross-platform
+cpal = "0.15"
+
+# Audio codec - Opus for low latency voice
+audiopus = "0.3.0-rc.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Cryptography - AES-256-GCM + X25519
+aes-gcm = "0.10"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+rand = "0.8"
+sha2 = "0.10"
+
+# Networking - UDP multicast for cross-platform audio
+socket2 = { version = "0.5", features = ["all"] }
+
+# Ring buffer for audio
+ringbuf = "0.4"
+
+# Logging
+tracing = "0.1"
+hostname = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+log = "0.4"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Unique IDs
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+# Base64
+base64 = "0.22"
+
+# Platform-specific: Android
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+android_logger = "0.14"
+ndk = "0.9"
+ndk-context = "0.1"
+
+# Platform-specific: iOS/macOS
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+core-foundation = "0.10"
+
+# Platform-specific: Linux
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# Platform-specific: Windows
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Threading"
+] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+
+[profile.dev]
+opt-level = 0
+debug = true

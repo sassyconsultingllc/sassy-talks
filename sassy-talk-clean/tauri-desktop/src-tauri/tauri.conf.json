@@ -1,0 +1,71 @@
+{
+  "$schema": "https://schema.tauri.app/config/2.0.0",
+  "productName": "Sassy-Talk",
+  "version": "1.0.0",
+  "identifier": "com.sassyconsulting.sassy-talk",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Sassy-Talk",
+        "width": 400,
+        "height": 700,
+        "resizable": true,
+        "fullscreen": false,
+        "minWidth": 320,
+        "minHeight": 500,
+        "center": true,
+        "decorations": true,
+        "transparent": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Utility",
+    "shortDescription": "PTT Walkie-Talkie",
+    "longDescription": "Cross-platform push-to-talk walkie-talkie with retro vibes",
+    "copyright": "© 2025 Sassy Consulting LLC",
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": true
+      },
+      "deb": {
+        "depends": ["libasound2"]
+      }
+    },
+    "macOS": {
+      "entitlements": null,
+      "exceptionDomain": "",
+      "minimumSystemVersion": "11.0"
+    },
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": ""
+    },
+    "iOS": {
+      "developmentTeam": null
+    },
+    "android": {
+      "minSdkVersion": 26
+    }
+  },
+  "plugins": {}
+}

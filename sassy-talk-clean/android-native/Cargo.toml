@@ -1,0 +1,95 @@
+[package]
+name = "sassytalkie"
+version = "1.0.0"
+edition = "2021"
+authors = ["Sassy Consulting LLC"]
+description = "Secure PTT walkie-talkie - Pure Rust"
+
+[lib]
+crate-type = ["cdylib"]
+name = "sassytalkie"
+path = "src/lib.rs"
+
+[dependencies]
+# Android
+android_logger = "0.13"
+android-activity = { version = "0.5", features = ["native-activity"] }
+log = "0.4"
+
+# UI
+eframe = { version = "0.27", default-features = false, features = ["android-native-activity", "glow"] }
+egui = "0.27"
+
+# JNI for Android Bluetooth/Audio
+jni = "0.21"
+
+# Cryptography  
+sha2 = "0.10"
+aes-gcm = "0.10"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+rand = "0.8"
+
+# Networking
+socket2 = { version = "0.5", features = ["all"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utils
+thiserror = "1.0"
+uuid = { version = "1.11", features = ["v4"] }
+base64 = "0.22"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[package.metadata.android]
+package = "com.sassyconsulting.sassytalkie"
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 24
+target_sdk_version = 34
+
+[package.metadata.android.application]
+label = "Sassy-Talk"
+theme = "@android:style/Theme.DeviceDefault.NoActionBar"
+
+[package.metadata.android.application.activity]
+name = "android.app.NativeActivity"
+label = "Sassy-Talk"
+config_changes = "orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize"
+screen_orientation = "portrait"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.BLUETOOTH"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.BLUETOOTH_ADMIN"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.BLUETOOTH_CONNECT"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.BLUETOOTH_SCAN"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.RECORD_AUDIO"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_WIFI_STATE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.CHANGE_WIFI_MULTICAST_STATE"
+
+[package.metadata.android.signing.release]
+path = "sassy-talk.keystore"
+keystore_password = "sassytalk123"

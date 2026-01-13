@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.SassyTalk" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#12121F</item>
+        <item name="android:navigationBarColor">#12121F</item>
+        <item name="android:windowBackground">#1A1A2E</item>
+    </style>
+</resources>

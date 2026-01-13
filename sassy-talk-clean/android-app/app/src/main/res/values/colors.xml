@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark theme colors -->
+    <color name="bg_dark">#0C0C14</color>
+    <color name="bg_mid">#161620</color>
+    <color name="bg_card">#1E1E2E</color>
+    
+    <!-- Accent colors -->
+    <color name="accent">#FF8C00</color>
+    <color name="accent_light">#FFB43C</color>
+    <color name="accent_dark">#C86400</color>
+    
+    <!-- Status colors -->
+    <color name="green">#00FF88</color>
+    <color name="red">#FF4646</color>
+    <color name="yellow">#FFD700</color>
+    
+    <!-- Text colors -->
+    <color name="white">#FFFFFF</color>
+    <color name="gray">#8C8CA0</color>
+    <color name="light_gray">#B0B0C0</color>
+    
+    <!-- Material theme -->
+    <color name="colorPrimary">@color/accent</color>
+    <color name="colorPrimaryDark">@color/bg_dark</color>
+    <color name="colorAccent">@color/accent</color>
+</resources>

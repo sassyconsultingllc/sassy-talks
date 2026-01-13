@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.sassyconsulting.sassytalkie"
+    android:versionCode="1"
+    android:versionName="1.0.0">
+
+    <uses-sdk
+        android:minSdkVersion="24"
+        android:targetSdkVersion="34" />
+
+    <!-- Bluetooth Permissions -->
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    
+    <!-- Android 12+ Bluetooth Permissions -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    
+    <!-- Audio Recording -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    
+    <!-- Optional for future WiFi Direct -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <!-- Bluetooth feature requirement -->
+    <uses-feature android:name="android.hardware.bluetooth" android:required="true" />
+    <uses-feature android:name="android.hardware.microphone" android:required="true" />
+
+    <application
+        android:label="Sassy-Talk"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+        android:allowBackup="false"
+        android:hardwareAccelerated="true"
+        android:supportsRtl="true">
+
+        <activity
+            android:name="android.app.NativeActivity"
+            android:label="Sassy-Talk"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize"
+            android:screenOrientation="portrait"
+            android:exported="true">
+            
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="sassytalkie" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
