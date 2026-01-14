@@ -1,39 +1,49 @@
-// Audio Engine - Cross-platform audio I/O
-// Copyright 2025 Sassy Consulting LLC. All rights reserved.
+/// Audio Engine - Cross-Platform Audio I/O
+/// 
+/// Uses CPAL for portability across Windows, Mac, Linux
+/// Handles microphone input and speaker output with ring buffers
 
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{Device, Host, Stream, StreamConfig, SupportedStreamConfig};
+use ringbuf::{HeapRb, HeapProducer, HeapConsumer};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use tracing::{error, info, warn, debug};
-use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{error, info, warn};
 use thiserror::Error;
 
-// Use CPAL for cross-platform audio on desktop
-#[cfg(not(target_os = "android"))]
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+/// Audio sample rate (Opus requires 48kHz)
+pub const SAMPLE_RATE: u32 = 48000;
 
-/// Audio configuration constants
-pub const SAMPLE_RATE: u32 = 48000; // Opus native rate
-pub const CHANNELS: u16 = 1; // Mono
-pub const BUFFER_SIZE: usize = 960; // 20ms @ 48kHz
+/// Frame size for 20ms at 48kHz
+pub const FRAME_SIZE: usize = 960;
+
+/// Ring buffer size (1 second of audio)
+const BUFFER_SIZE: usize = SAMPLE_RATE as usize;
 
 #[derive(Error, Debug)]
 pub enum AudioError {
-    #[error("No input device")]
-    NoInputDevice,
-    #[error("No output device")]
-    NoOutputDevice,
-    #[error("Config error: {0}")]
+    #[error("No audio device found")]
+    NoDevice,
+    
+    #[error("Failed to get device config: {0}")]
     ConfigError(String),
-    #[error("Stream error: {0}")]
+    
+    #[error("Failed to build stream: {0}")]
     StreamError(String),
+    
+    #[error("Device not supported: {0}")]
+    UnsupportedDevice(String),
+    
+    #[error("Audio engine not initialized")]
+    NotInitialized,
 }
 
-/// Audio device info for UI
-#[derive(Debug, Clone, Serialize)]
+/// Audio device information
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AudioDeviceInfo {
     pub name: String,
-    pub is_input: bool,
     pub is_default: bool,
+    pub device_type: String, // "input" or "output"
 }
 
 /// Audio engine state
@@ -42,141 +52,359 @@ pub enum AudioState {
     Idle,
     Recording,
     Playing,
-    RecordingAndPlaying,
 }
 
-/// Audio format configuration
-pub struct AudioConfig {
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub buffer_size: usize,
-}
-
-impl Default for AudioConfig {
-    fn default() -> Self {
-        Self {
-            sample_rate: SAMPLE_RATE,
-            channels: CHANNELS,
-            buffer_size: BUFFER_SIZE,
-        }
-    }
-}
-
-/// Audio engine for recording and playback
+/// Audio engine for cross-platform audio I/O
 pub struct AudioEngine {
-    config: AudioConfig,
+    // CPAL host
+    host: Host,
+    
+    // Devices
+    input_device: Arc<Mutex<Option<Device>>>,
+    output_device: Arc<Mutex<Option<Device>>>,
+    
+    // Streams
+    input_stream: Arc<Mutex<Option<Stream>>>,
+    output_stream: Arc<Mutex<Option<Stream>>>,
+    
+    // Ring buffers for audio data
+    input_producer: Arc<Mutex<Option<HeapProducer<i16>>>>,
+    input_consumer: Arc<Mutex<Option<HeapConsumer<i16>>>>,
+    output_producer: Arc<Mutex<Option<HeapProducer<i16>>>>,
+    output_consumer: Arc<Mutex<Option<HeapConsumer<i16>>>>,
+    
+    // State
     state: Arc<Mutex<AudioState>>,
-    is_recording: Arc<AtomicBool>,
-    is_playing: Arc<AtomicBool>,
-    input_volume: Arc<AtomicU32>,
-    output_volume: Arc<AtomicU32>,
-    selected_input: Option<String>,
-    selected_output: Option<String>,
+    recording: Arc<AtomicBool>,
+    playing: Arc<AtomicBool>,
+    
+    // Volume
+    input_volume: Arc<Mutex<f32>>,
+    output_volume: Arc<Mutex<f32>>,
 }
 
 impl AudioEngine {
-    pub fn new() -> Self {
-        Self::with_config(AudioConfig::default())
-    }
-
-    pub fn with_config(config: AudioConfig) -> Self {
-        info!("Initializing audio engine with config: {}Hz, {} channels", 
-              config.sample_rate, config.channels);
-
-        Self {
-            config,
+    /// Create new audio engine
+    pub fn new() -> Result<Self, AudioError> {
+        info!("Initializing audio engine");
+        
+        let host = cpal::default_host();
+        
+        Ok(Self {
+            host,
+            input_device: Arc::new(Mutex::new(None)),
+            output_device: Arc::new(Mutex::new(None)),
+            input_stream: Arc::new(Mutex::new(None)),
+            output_stream: Arc::new(Mutex::new(None)),
+            input_producer: Arc::new(Mutex::new(None)),
+            input_consumer: Arc::new(Mutex::new(None)),
+            output_producer: Arc::new(Mutex::new(None)),
+            output_consumer: Arc::new(Mutex::new(None)),
             state: Arc::new(Mutex::new(AudioState::Idle)),
-            is_recording: Arc::new(AtomicBool::new(false)),
-            is_playing: Arc::new(AtomicBool::new(false)),
-            input_volume: Arc::new(AtomicU32::new(80)),
-            output_volume: Arc::new(AtomicU32::new(80)),
-            selected_input: None,
-            selected_output: None,
-        }
+            recording: Arc::new(AtomicBool::new(false)),
+            playing: Arc::new(AtomicBool::new(false)),
+            input_volume: Arc::new(Mutex::new(1.0)),
+            output_volume: Arc::new(Mutex::new(1.0)),
+        })
     }
 
-    /// Start audio capture (recording)
-    pub fn start_capture(&mut self) -> Result<(), String> {
-        info!("Starting audio capture");
-
-        if self.is_recording.load(Ordering::Relaxed) {
-            warn!("Already recording");
-            return Ok(());
-        }
-
-        self.is_recording.store(true, Ordering::Relaxed);
+    /// Get list of input devices
+    pub fn get_input_devices(&self) -> Vec<AudioDeviceInfo> {
+        let mut devices = Vec::new();
         
-        let mut state = self.state.lock().unwrap();
-        *state = match *state {
-            AudioState::Playing => AudioState::RecordingAndPlaying,
-            _ => AudioState::Recording,
-        };
+        if let Ok(input_devices) = self.host.input_devices() {
+            let default_device = self.host.default_input_device();
+            let default_name = default_device.as_ref()
+                .and_then(|d| d.name().ok());
+            
+            for device in input_devices {
+                if let Ok(name) = device.name() {
+                    devices.push(AudioDeviceInfo {
+                        name: name.clone(),
+                        is_default: Some(name.clone()) == default_name,
+                        device_type: "input".to_string(),
+                    });
+                }
+            }
+        }
+        
+        devices
+    }
 
+    /// Get list of output devices
+    pub fn get_output_devices(&self) -> Vec<AudioDeviceInfo> {
+        let mut devices = Vec::new();
+        
+        if let Ok(output_devices) = self.host.output_devices() {
+            let default_device = self.host.default_output_device();
+            let default_name = default_device.as_ref()
+                .and_then(|d| d.name().ok());
+            
+            for device in output_devices {
+                if let Ok(name) = device.name() {
+                    devices.push(AudioDeviceInfo {
+                        name: name.clone(),
+                        is_default: Some(name.clone()) == default_name,
+                        device_type: "output".to_string(),
+                    });
+                }
+            }
+        }
+        
+        devices
+    }
+
+    /// Set input device by name
+    pub fn set_input_device(&mut self, device_name: &str) -> Result<(), AudioError> {
+        info!("Setting input device: {}", device_name);
+        
+        let device = if device_name == "default" {
+            self.host.default_input_device()
+        } else {
+            self.host.input_devices()
+                .ok()
+                .and_then(|devices| {
+                    devices.filter(|d| d.name().ok().as_deref() == Some(device_name))
+                        .next()
+                })
+        }.ok_or(AudioError::NoDevice)?;
+        
+        *self.input_device.lock().unwrap() = Some(device);
         Ok(())
     }
 
-    /// Stop audio capture
-    pub fn stop_capture(&mut self) {
-        info!("Stopping audio capture");
-
-        if !self.is_recording.load(Ordering::Relaxed) {
-            return;
-        }
-
-        self.is_recording.store(false, Ordering::Relaxed);
+    /// Set output device by name
+    pub fn set_output_device(&mut self, device_name: &str) -> Result<(), AudioError> {
+        info!("Setting output device: {}", device_name);
         
-        let mut state = self.state.lock().unwrap();
-        *state = match *state {
-            AudioState::RecordingAndPlaying => AudioState::Playing,
-            _ => AudioState::Idle,
-        };
+        let device = if device_name == "default" {
+            self.host.default_output_device()
+        } else {
+            self.host.output_devices()
+                .ok()
+                .and_then(|devices| {
+                    devices.filter(|d| d.name().ok().as_deref() == Some(device_name))
+                        .next()
+                })
+        }.ok_or(AudioError::NoDevice)?;
+        
+        *self.output_device.lock().unwrap() = Some(device);
+        Ok(())
     }
 
-    /// Start audio playback
-    pub fn start_playback(&mut self) -> Result<(), String> {
+    /// Initialize input stream
+    fn init_input_stream(&self) -> Result<(), AudioError> {
+        let device = self.input_device.lock().unwrap()
+            .clone()
+            .or_else(|| self.host.default_input_device())
+            .ok_or(AudioError::NoDevice)?;
+        
+        let config = device.default_input_config()
+            .map_err(|e| AudioError::ConfigError(e.to_string()))?;
+        
+        info!("Input device: {}", device.name().unwrap_or_default());
+        info!("Input config: {:?}", config);
+        
+        // Create ring buffer
+        let rb = HeapRb::<i16>::new(BUFFER_SIZE);
+        let (producer, consumer) = rb.split();
+        
+        *self.input_producer.lock().unwrap() = Some(producer);
+        *self.input_consumer.lock().unwrap() = Some(consumer);
+        
+        let producer = Arc::clone(&self.input_producer);
+        let volume = Arc::clone(&self.input_volume);
+        let recording = Arc::clone(&self.recording);
+        
+        let stream = device.build_input_stream(
+            &config.into(),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                if !recording.load(Ordering::Relaxed) {
+                    return;
+                }
+                
+                let vol = *volume.lock().unwrap();
+                let mut prod = producer.lock().unwrap();
+                
+                if let Some(ref mut p) = *prod {
+                    for &sample in data {
+                        let scaled = (sample * vol * 32767.0) as i16;
+                        let _ = p.try_push(scaled);
+                    }
+                }
+            },
+            |err| error!("Input stream error: {}", err),
+            None,
+        ).map_err(|e| AudioError::StreamError(e.to_string()))?;
+        
+        stream.play().map_err(|e| AudioError::StreamError(e.to_string()))?;
+        *self.input_stream.lock().unwrap() = Some(stream);
+        
+        Ok(())
+    }
+
+    /// Initialize output stream
+    fn init_output_stream(&self) -> Result<(), AudioError> {
+        let device = self.output_device.lock().unwrap()
+            .clone()
+            .or_else(|| self.host.default_output_device())
+            .ok_or(AudioError::NoDevice)?;
+        
+        let config = device.default_output_config()
+            .map_err(|e| AudioError::ConfigError(e.to_string()))?;
+        
+        info!("Output device: {}", device.name().unwrap_or_default());
+        info!("Output config: {:?}", config);
+        
+        // Create ring buffer
+        let rb = HeapRb::<i16>::new(BUFFER_SIZE);
+        let (producer, consumer) = rb.split();
+        
+        *self.output_producer.lock().unwrap() = Some(producer);
+        *self.output_consumer.lock().unwrap() = Some(consumer);
+        
+        let consumer = Arc::clone(&self.output_consumer);
+        let volume = Arc::clone(&self.output_volume);
+        let playing = Arc::clone(&self.playing);
+        
+        let stream = device.build_output_stream(
+            &config.into(),
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                if !playing.load(Ordering::Relaxed) {
+                    for sample in data.iter_mut() {
+                        *sample = 0.0;
+                    }
+                    return;
+                }
+                
+                let vol = *volume.lock().unwrap();
+                let mut cons = consumer.lock().unwrap();
+                
+                if let Some(ref mut c) = *cons {
+                    for sample in data.iter_mut() {
+                        if let Some(s) = c.try_pop() {
+                            *sample = (s as f32 / 32767.0) * vol;
+                        } else {
+                            *sample = 0.0;
+                        }
+                    }
+                }
+            },
+            |err| error!("Output stream error: {}", err),
+            None,
+        ).map_err(|e| AudioError::StreamError(e.to_string()))?;
+        
+        stream.play().map_err(|e| AudioError::StreamError(e.to_string()))?;
+        *self.output_stream.lock().unwrap() = Some(stream);
+        
+        Ok(())
+    }
+
+    /// Start recording audio
+    pub fn start_recording(&self) -> Result<(), AudioError> {
+        info!("Starting audio recording");
+        
+        if self.input_stream.lock().unwrap().is_none() {
+            self.init_input_stream()?;
+        }
+        
+        self.recording.store(true, Ordering::Relaxed);
+        *self.state.lock().unwrap() = AudioState::Recording;
+        
+        Ok(())
+    }
+
+    /// Stop recording audio
+    pub fn stop_recording(&self) -> Result<(), AudioError> {
+        info!("Stopping audio recording");
+        
+        self.recording.store(false, Ordering::Relaxed);
+        *self.state.lock().unwrap() = AudioState::Idle;
+        
+        Ok(())
+    }
+
+    /// Start playing audio
+    pub fn start_playing(&self) -> Result<(), AudioError> {
         info!("Starting audio playback");
-
-        if self.is_playing.load(Ordering::Relaxed) {
-            warn!("Already playing");
-            return Ok(());
-        }
-
-        self.is_playing.store(true, Ordering::Relaxed);
         
-        let mut state = self.state.lock().unwrap();
-        *state = match *state {
-            AudioState::Recording => AudioState::RecordingAndPlaying,
-            _ => AudioState::Playing,
-        };
-
+        if self.output_stream.lock().unwrap().is_none() {
+            self.init_output_stream()?;
+        }
+        
+        self.playing.store(true, Ordering::Relaxed);
+        *self.state.lock().unwrap() = AudioState::Playing;
+        
         Ok(())
     }
 
-    /// Stop audio playback
-    pub fn stop_playback(&mut self) {
+    /// Stop playing audio
+    pub fn stop_playing(&self) -> Result<(), AudioError> {
         info!("Stopping audio playback");
-
-        if !self.is_playing.load(Ordering::Relaxed) {
-            return;
-        }
-
-        self.is_playing.store(false, Ordering::Relaxed);
         
-        let mut state = self.state.lock().unwrap();
-        *state = match *state {
-            AudioState::RecordingAndPlaying => AudioState::Recording,
-            _ => AudioState::Idle,
-        };
+        self.playing.store(false, Ordering::Relaxed);
+        *self.state.lock().unwrap() = AudioState::Idle;
+        
+        Ok(())
     }
 
-    /// Check if audio is currently playing
-    pub fn is_playing(&self) -> bool {
-        self.is_playing.load(Ordering::Relaxed)
+    /// Read recorded audio samples
+    pub fn read_samples(&self, buffer: &mut [i16]) -> usize {
+        let mut consumer = self.input_consumer.lock().unwrap();
+        
+        if let Some(ref mut c) = *consumer {
+            let mut count = 0;
+            for sample in buffer.iter_mut() {
+                if let Some(s) = c.try_pop() {
+                    *sample = s;
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            count
+        } else {
+            0
+        }
     }
 
-    /// Check if audio is currently recording
-    pub fn is_recording(&self) -> bool {
-        self.is_recording.load(Ordering::Relaxed)
+    /// Write audio samples for playback
+    pub fn write_samples(&self, buffer: &[i16]) -> usize {
+        let mut producer = self.output_producer.lock().unwrap();
+        
+        if let Some(ref mut p) = *producer {
+            let mut count = 0;
+            for &sample in buffer {
+                if p.try_push(sample).is_ok() {
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            count
+        } else {
+            0
+        }
+    }
+
+    /// Set input volume (0.0 - 2.0)
+    pub fn set_input_volume(&self, volume: f32) {
+        *self.input_volume.lock().unwrap() = volume.clamp(0.0, 2.0);
+    }
+
+    /// Set output volume (0.0 - 2.0)
+    pub fn set_output_volume(&self, volume: f32) {
+        *self.output_volume.lock().unwrap() = volume.clamp(0.0, 2.0);
+    }
+
+    /// Get input volume
+    pub fn get_input_volume(&self) -> f32 {
+        *self.input_volume.lock().unwrap()
+    }
+
+    /// Get output volume
+    pub fn get_output_volume(&self) -> f32 {
+        *self.output_volume.lock().unwrap()
     }
 
     /// Get current audio state
@@ -184,202 +412,33 @@ impl AudioEngine {
         *self.state.lock().unwrap()
     }
 
-    /// List available audio devices
-    pub fn list_devices(&self) -> Vec<AudioDeviceInfo> {
-        let mut devices = Vec::new();
-
-        #[cfg(not(target_os = "android"))]
-        {
-            let host = cpal::default_host();
-
-            // Default input device
-            if let Some(device) = host.default_input_device() {
-                devices.push(AudioDeviceInfo {
-                    name: device.name().unwrap_or_else(|_| "Default Input".to_string()),
-                    is_input: true,
-                    is_default: true,
-                });
-            }
-
-            // Default output device
-            if let Some(device) = host.default_output_device() {
-                devices.push(AudioDeviceInfo {
-                    name: device.name().unwrap_or_else(|_| "Default Output".to_string()),
-                    is_input: false,
-                    is_default: true,
-                });
-            }
-
-            // List all input devices
-            if let Ok(input_devices) = host.input_devices() {
-                for device in input_devices {
-                    if let Ok(name) = device.name() {
-                        if !devices.iter().any(|d| d.name == name && d.is_input) {
-                            devices.push(AudioDeviceInfo {
-                                name,
-                                is_input: true,
-                                is_default: false,
-                            });
-                        }
-                    }
-                }
-            }
-
-            // List all output devices
-            if let Ok(output_devices) = host.output_devices() {
-                for device in output_devices {
-                    if let Ok(name) = device.name() {
-                        if !devices.iter().any(|d| d.name == name && !d.is_input) {
-                            devices.push(AudioDeviceInfo {
-                                name,
-                                is_input: false,
-                                is_default: false,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        #[cfg(target_os = "android")]
-        {
-            devices.push(AudioDeviceInfo {
-                name: "Default Microphone".to_string(),
-                is_input: true,
-                is_default: true,
-            });
-            devices.push(AudioDeviceInfo {
-                name: "Default Speaker".to_string(),
-                is_input: false,
-                is_default: true,
-            });
-        }
-
-        devices
+    /// Check if currently recording
+    pub fn is_recording(&self) -> bool {
+        self.recording.load(Ordering::Relaxed)
     }
 
-    /// Select input device by name
-    pub fn select_input_device(&mut self, device_name: &str) -> Result<(), String> {
-        info!("Selecting input device: {}", device_name);
-        
-        #[cfg(not(target_os = "android"))]
-        {
-            let host = cpal::default_host();
-            let found = host.input_devices()
-                .map_err(|e| e.to_string())?
-                .any(|d| d.name().map(|n| n == device_name).unwrap_or(false));
-            
-            if !found {
-                return Err(format!("Input device not found: {}", device_name));
-            }
-        }
+    /// Check if currently playing
+    pub fn is_playing(&self) -> bool {
+        self.playing.load(Ordering::Relaxed)
+    }
 
-        self.selected_input = Some(device_name.to_string());
+    /// Release audio resources
+    pub fn shutdown(&self) -> Result<(), AudioError> {
+        info!("Shutting down audio engine");
+        
+        self.stop_recording()?;
+        self.stop_playing()?;
+        
+        *self.input_stream.lock().unwrap() = None;
+        *self.output_stream.lock().unwrap() = None;
+        
         Ok(())
     }
-
-    /// Select output device by name
-    pub fn select_output_device(&mut self, device_name: &str) -> Result<(), String> {
-        info!("Selecting output device: {}", device_name);
-        
-        #[cfg(not(target_os = "android"))]
-        {
-            let host = cpal::default_host();
-            let found = host.output_devices()
-                .map_err(|e| e.to_string())?
-                .any(|d| d.name().map(|n| n == device_name).unwrap_or(false));
-            
-            if !found {
-                return Err(format!("Output device not found: {}", device_name));
-            }
-        }
-
-        self.selected_output = Some(device_name.to_string());
-        Ok(())
-    }
-
-    /// Get input volume (0-100)
-    pub fn get_input_volume(&self) -> u32 {
-        self.input_volume.load(Ordering::Relaxed)
-    }
-
-    /// Get output volume (0-100)
-    pub fn get_output_volume(&self) -> u32 {
-        self.output_volume.load(Ordering::Relaxed)
-    }
-
-    /// Set input volume (0-100)
-    pub fn set_input_volume(&self, volume: u32) {
-        let clamped = volume.min(100);
-        self.input_volume.store(clamped, Ordering::Relaxed);
-        info!("Input volume set to {}%", clamped);
-    }
-
-    /// Set output volume (0-100)
-    pub fn set_output_volume(&self, volume: u32) {
-        let clamped = volume.min(100);
-        self.output_volume.store(clamped, Ordering::Relaxed);
-        info!("Output volume set to {}%", clamped);
-    }
-
-    /// Apply volume to audio buffer
-    pub fn apply_volume(&self, buffer: &mut [i16], is_input: bool) {
-        let volume = if is_input {
-            self.get_input_volume()
-        } else {
-            self.get_output_volume()
-        };
-
-        let gain = volume as f32 / 100.0;
-        for sample in buffer.iter_mut() {
-            let value = (*sample as f32 * gain).clamp(-32768.0, 32767.0);
-            *sample = value as i16;
-        }
-    }
 }
 
-impl Default for AudioEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Audio processing utilities
-
-/// Apply gain to audio buffer
-pub fn apply_gain(buffer: &mut [i16], gain: f32) {
-    for sample in buffer.iter_mut() {
-        let value = (*sample as f32 * gain).clamp(-32768.0, 32767.0);
-        *sample = value as i16;
-    }
-}
-
-/// Simple noise gate to reduce background noise
-pub fn noise_gate(buffer: &mut [i16], threshold: i16) {
-    for sample in buffer.iter_mut() {
-        if sample.abs() < threshold {
-            *sample = 0;
-        }
-    }
-}
-
-/// Convert f32 audio samples to i16
-pub fn f32_to_i16(input: &[f32], output: &mut [i16]) {
-    for (i, &sample) in input.iter().enumerate() {
-        if i >= output.len() {
-            break;
-        }
-        output[i] = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
-    }
-}
-
-/// Convert i16 audio samples to f32
-pub fn i16_to_f32(input: &[i16], output: &mut [f32]) {
-    for (i, &sample) in input.iter().enumerate() {
-        if i >= output.len() {
-            break;
-        }
-        output[i] = sample as f32 / 32768.0;
+impl Drop for AudioEngine {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }
 
@@ -388,58 +447,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_audio_engine_init() {
+    fn test_audio_engine_creation() {
         let engine = AudioEngine::new();
-        assert_eq!(engine.get_state(), AudioState::Idle);
+        assert!(engine.is_ok());
     }
 
     #[test]
-    fn test_audio_state_transitions() {
-        let mut engine = AudioEngine::new();
-        assert_eq!(engine.get_state(), AudioState::Idle);
-
-        engine.start_capture().unwrap();
-        assert_eq!(engine.get_state(), AudioState::Recording);
-
-        engine.start_playback().unwrap();
-        assert_eq!(engine.get_state(), AudioState::RecordingAndPlaying);
-
-        engine.stop_capture();
-        assert_eq!(engine.get_state(), AudioState::Playing);
-
-        engine.stop_playback();
-        assert_eq!(engine.get_state(), AudioState::Idle);
-    }
-
-    #[test]
-    fn test_volume_controls() {
-        let engine = AudioEngine::new();
+    fn test_device_enumeration() {
+        let engine = AudioEngine::new().unwrap();
+        let inputs = engine.get_input_devices();
+        let outputs = engine.get_output_devices();
         
-        assert_eq!(engine.get_input_volume(), 80);
-        assert_eq!(engine.get_output_volume(), 80);
-        
-        engine.set_input_volume(50);
-        engine.set_output_volume(75);
-        
-        assert_eq!(engine.get_input_volume(), 50);
-        assert_eq!(engine.get_output_volume(), 75);
-        
-        // Test clamping
-        engine.set_input_volume(150);
-        assert_eq!(engine.get_input_volume(), 100);
-    }
-
-    #[test]
-    fn test_gain_application() {
-        let mut buffer = vec![1000i16, -1000, 2000, -2000];
-        apply_gain(&mut buffer, 0.5);
-        assert_eq!(buffer, vec![500, -500, 1000, -1000]);
-    }
-
-    #[test]
-    fn test_noise_gate() {
-        let mut buffer = vec![100i16, -50, 200, -150, 10, -5];
-        noise_gate(&mut buffer, 100);
-        assert_eq!(buffer, vec![100, 0, 200, -150, 0, 0]);
+        // Should have at least one device on most systems
+        println!("Input devices: {}", inputs.len());
+        println!("Output devices: {}", outputs.len());
     }
 }

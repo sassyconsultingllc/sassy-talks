@@ -1,244 +1,193 @@
-// Wire Protocol - Packet structure and serialization
-// Copyright 2025 Sassy Consulting LLC. All rights reserved.
-//
-// Packet Structure (v1):
-// ┌────────────────────────────────────────────────────────────┐
-// │ Byte 0     │ Version (0x01)                                │
-// │ Byte 1     │ Type (Audio/Control/Discovery/Key)           │
-// │ Byte 2-3   │ Sequence Number (u16 BE)                      │
-// │ Byte 4-7   │ Timestamp (u32 BE, ms since epoch % 2^32)    │
-// │ Byte 8-11  │ Sender ID (u32 BE)                            │
-// │ Byte 12    │ Channel (1-16)                                │
-// │ Byte 13-15 │ Reserved                                      │
-// │ Byte 16-27 │ Nonce (12 bytes) - for encrypted packets     │
-// │ Byte 28-29 │ Payload Length (u16 BE)                       │
-// │ Byte 30+   │ Payload (encrypted for audio)                │
-// │ Last 16    │ GCM Auth Tag (encrypted packets only)        │
-// └────────────────────────────────────────────────────────────┘
+/// Protocol - Packet Format and Serialization
+/// 
+/// Defines the wire protocol for SassyTalkie UDP multicast
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
-/// Protocol version
-pub const PROTOCOL_VERSION: u8 = 0x01;
+/// Protocol error types
+#[derive(Error, Debug)]
+pub enum ProtocolError {
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
+    
+    #[error("Deserialization error: {0}")]
+    DeserializationError(String),
+    
+    #[error("Invalid packet type: {0}")]
+    InvalidPacketType(u8),
+    
+    #[error("Checksum mismatch")]
+    ChecksumMismatch,
+}
 
 /// Packet types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u8)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PacketType {
-    Audio = 0x00,
-    Control = 0x01,
-    Discovery = 0x02,
-    KeyExchange = 0x03,
-    Heartbeat = 0x04,
+    /// Discovery beacon (announces presence)
+    Discovery {
+        device_name: String,
+        channel: u8,
+    },
+    
+    /// Audio data
+    Audio {
+        channel: u8,
+        data: Vec<u8>,
+    },
+    
+    /// Keep-alive (maintains connection)
+    KeepAlive,
 }
 
-impl TryFrom<u8> for PacketType {
-    type Error = ();
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0x00 => Ok(PacketType::Audio),
-            0x01 => Ok(PacketType::Control),
-            0x02 => Ok(PacketType::Discovery),
-            0x03 => Ok(PacketType::KeyExchange),
-            0x04 => Ok(PacketType::Heartbeat),
-            _ => Err(()),
-        }
-    }
-}
-
-/// Control message types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum ControlType {
-    PttStart = 0x01,
-    PttEnd = 0x02,
-    ChannelChange = 0x03,
-    RogerBeep = 0x04,
-    Disconnect = 0x05,
-}
-
-/// Network packet
-#[derive(Debug, Clone)]
+/// Network packet structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Packet {
+    /// Protocol version
     pub version: u8,
+    
+    /// Device ID (unique identifier)
+    pub device_id: u32,
+    
+    /// Packet type
     pub packet_type: PacketType,
-    pub sequence: u16,
-    pub timestamp: u32,
-    pub sender_id: u32,
-    pub channel: u8,
-    pub nonce: [u8; 12],
-    pub payload: Vec<u8>,
-    pub auth_tag: Option<[u8; 16]>,
+    
+    /// Timestamp (Unix epoch milliseconds)
+    pub timestamp: u64,
+    
+    /// Checksum (CRC32)
+    pub checksum: u32,
 }
 
 impl Packet {
-    /// Create new audio packet
-    pub fn new_audio(sender_id: u32, channel: u8, audio_data: &[u8]) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            packet_type: PacketType::Audio,
-            sequence: 0, // Will be set by transport
-            timestamp: Self::current_timestamp(),
-            sender_id,
-            channel,
-            nonce: Self::generate_nonce(),
-            payload: audio_data.to_vec(),
-            auth_tag: None, // Set after encryption
-        }
-    }
-
+    /// Protocol version
+    const VERSION: u8 = 1;
+    
     /// Create discovery packet
-    pub fn new_discovery(sender_id: u32, device_name: &str, channel: u8) -> Self {
-        // Discovery payload: device name (null-terminated)
-        let mut payload = device_name.as_bytes().to_vec();
-        payload.push(0);
-
-        Self {
-            version: PROTOCOL_VERSION,
-            packet_type: PacketType::Discovery,
-            sequence: 0,
-            timestamp: Self::current_timestamp(),
-            sender_id,
-            channel,
-            nonce: [0; 12], // Not encrypted
-            payload,
-            auth_tag: None,
-        }
-    }
-
-    /// Create control packet
-    pub fn new_control(sender_id: u32, channel: u8, control_type: ControlType) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            packet_type: PacketType::Control,
-            sequence: 0,
-            timestamp: Self::current_timestamp(),
-            sender_id,
-            channel,
-            nonce: Self::generate_nonce(),
-            payload: vec![control_type as u8],
-            auth_tag: None,
-        }
-    }
-
-    /// Create heartbeat packet
-    pub fn new_heartbeat(sender_id: u32, channel: u8) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            packet_type: PacketType::Heartbeat,
-            sequence: 0,
-            timestamp: Self::current_timestamp(),
-            sender_id,
-            channel,
-            nonce: [0; 12],
-            payload: Vec::new(),
-            auth_tag: None,
-        }
-    }
-
-    /// Serialize packet to bytes
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(30 + self.payload.len() + 16);
-
-        // Header
-        data.push(self.version);
-        data.push(self.packet_type as u8);
-        data.extend_from_slice(&self.sequence.to_be_bytes());
-        data.extend_from_slice(&self.timestamp.to_be_bytes());
-        data.extend_from_slice(&self.sender_id.to_be_bytes());
-        data.push(self.channel);
-        data.extend_from_slice(&[0, 0, 0]); // Reserved
-        data.extend_from_slice(&self.nonce);
-        data.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
-
-        // Payload
-        data.extend_from_slice(&self.payload);
-
-        // Auth tag (if present)
-        if let Some(tag) = &self.auth_tag {
-            data.extend_from_slice(tag);
-        }
-
-        data
-    }
-
-    /// Deserialize packet from bytes
-    pub fn deserialize(data: &[u8]) -> Option<Self> {
-        if data.len() < 30 {
-            return None;
-        }
-
-        let version = data[0];
-        if version != PROTOCOL_VERSION {
-            return None;
-        }
-
-        let packet_type = PacketType::try_from(data[1]).ok()?;
-        let sequence = u16::from_be_bytes([data[2], data[3]]);
-        let timestamp = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-        let sender_id = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-        let channel = data[12];
-        // data[13..16] reserved
-
-        let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&data[16..28]);
-
-        let payload_len = u16::from_be_bytes([data[28], data[29]]) as usize;
-
-        if data.len() < 30 + payload_len {
-            return None;
-        }
-
-        let payload = data[30..30 + payload_len].to_vec();
-
-        // Check for auth tag
-        let auth_tag = if data.len() >= 30 + payload_len + 16 {
-            let mut tag = [0u8; 16];
-            tag.copy_from_slice(&data[30 + payload_len..30 + payload_len + 16]);
-            Some(tag)
-        } else {
-            None
-        };
-
-        Some(Self {
-            version,
-            packet_type,
-            sequence,
-            timestamp,
-            sender_id,
-            channel,
-            nonce,
-            payload,
-            auth_tag,
-        })
-    }
-
-    /// Get current timestamp (ms since epoch, wrapping)
-    fn current_timestamp() -> u32 {
-        let now = std::time::SystemTime::now()
+    pub fn discovery(device_id: u32, device_name: String, channel: u8) -> Self {
+        let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap();
-        (now.as_millis() % (u32::MAX as u128 + 1)) as u32
+            .unwrap()
+            .as_millis() as u64;
+        
+        let packet = Self {
+            version: Self::VERSION,
+            device_id,
+            packet_type: PacketType::Discovery { device_name, channel },
+            timestamp,
+            checksum: 0,
+        };
+        
+        packet.with_checksum()
     }
-
-    /// Generate random nonce
-    fn generate_nonce() -> [u8; 12] {
-        let mut nonce = [0u8; 12];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut nonce);
-        nonce
+    
+    /// Create audio packet
+    pub fn audio(device_id: u32, channel: u8, data: Vec<u8>) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        let packet = Self {
+            version: Self::VERSION,
+            device_id,
+            packet_type: PacketType::Audio { channel, data },
+            timestamp,
+            checksum: 0,
+        };
+        
+        packet.with_checksum()
     }
-
-    /// Extract device name from discovery payload
-    pub fn get_device_name(&self) -> Option<String> {
-        if self.packet_type != PacketType::Discovery {
-            return None;
+    
+    /// Create keep-alive packet
+    pub fn keep_alive(device_id: u32) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        let packet = Self {
+            version: Self::VERSION,
+            device_id,
+            packet_type: PacketType::KeepAlive,
+            timestamp,
+            checksum: 0,
+        };
+        
+        packet.with_checksum()
+    }
+    
+    /// Calculate checksum
+    fn calculate_checksum(&self) -> u32 {
+        let mut hasher = crc32fast::Hasher::new();
+        
+        hasher.update(&self.version.to_le_bytes());
+        hasher.update(&self.device_id.to_le_bytes());
+        hasher.update(&self.timestamp.to_le_bytes());
+        
+        // Hash packet type
+        match &self.packet_type {
+            PacketType::Discovery { device_name, channel } => {
+                hasher.update(&[0u8]); // Type discriminant
+                hasher.update(device_name.as_bytes());
+                hasher.update(&[*channel]);
+            }
+            PacketType::Audio { channel, data } => {
+                hasher.update(&[1u8]); // Type discriminant
+                hasher.update(&[*channel]);
+                hasher.update(data);
+            }
+            PacketType::KeepAlive => {
+                hasher.update(&[2u8]); // Type discriminant
+            }
         }
-
-        // Find null terminator
-        let end = self.payload.iter().position(|&b| b == 0)?;
-        String::from_utf8(self.payload[..end].to_vec()).ok()
+        
+        hasher.finalize()
+    }
+    
+    /// Add checksum to packet
+    fn with_checksum(mut self) -> Self {
+        self.checksum = self.calculate_checksum();
+        self
+    }
+    
+    /// Verify checksum
+    pub fn verify_checksum(&self) -> bool {
+        let calculated = self.calculate_checksum();
+        calculated == self.checksum
+    }
+    
+    /// Serialize packet to bytes
+    pub fn serialize(&self) -> Result<Vec<u8>, String> {
+        bincode::serialize(self)
+            .map_err(|e| format!("Serialization failed: {}", e))
+    }
+    
+    /// Deserialize packet from bytes
+    pub fn deserialize(data: &[u8]) -> Result<Self, String> {
+        let packet: Packet = bincode::deserialize(data)
+            .map_err(|e| format!("Deserialization failed: {}", e))?;
+        
+        // Verify version
+        if packet.version != Self::VERSION {
+            return Err(format!("Invalid protocol version: {}", packet.version));
+        }
+        
+        // Verify checksum
+        if !packet.verify_checksum() {
+            return Err("Checksum verification failed".to_string());
+        }
+        
+        Ok(packet)
+    }
+    
+    /// Get packet size estimate
+    pub fn estimate_size(&self) -> usize {
+        match &self.packet_type {
+            PacketType::Discovery { device_name, .. } => 50 + device_name.len(),
+            PacketType::Audio { data, .. } => 50 + data.len(),
+            PacketType::KeepAlive => 50,
+        }
     }
 }
 
@@ -247,28 +196,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_audio_packet_roundtrip() {
-        let audio_data = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let packet = Packet::new_audio(0x12345678, 5, &audio_data);
-
-        let serialized = packet.serialize();
+    fn test_discovery_packet() {
+        let packet = Packet::discovery(0x12345678, "Test Device".to_string(), 42);
+        
+        assert_eq!(packet.version, 1);
+        assert_eq!(packet.device_id, 0x12345678);
+        assert!(packet.verify_checksum());
+        
+        // Serialize and deserialize
+        let serialized = packet.serialize().unwrap();
         let deserialized = Packet::deserialize(&serialized).unwrap();
-
-        assert_eq!(deserialized.version, PROTOCOL_VERSION);
-        assert_eq!(deserialized.packet_type, PacketType::Audio);
-        assert_eq!(deserialized.sender_id, 0x12345678);
-        assert_eq!(deserialized.channel, 5);
-        assert_eq!(deserialized.payload, audio_data);
+        
+        assert_eq!(deserialized.device_id, packet.device_id);
+        assert!(deserialized.verify_checksum());
     }
 
     #[test]
-    fn test_discovery_packet() {
-        let packet = Packet::new_discovery(0xDEADBEEF, "Test Device", 1);
+    fn test_audio_packet() {
+        let audio_data = vec![1, 2, 3, 4, 5];
+        let packet = Packet::audio(0xABCDEF00, 1, audio_data.clone());
+        
+        assert!(packet.verify_checksum());
+        
+        if let PacketType::Audio { channel, data } = &packet.packet_type {
+            assert_eq!(*channel, 1);
+            assert_eq!(data, &audio_data);
+        } else {
+            panic!("Wrong packet type");
+        }
+    }
 
-        let serialized = packet.serialize();
+    #[test]
+    fn test_checksum_verification() {
+        let mut packet = Packet::discovery(0x11111111, "Device".to_string(), 1);
+        
+        // Tamper with data
+        packet.device_id = 0x22222222;
+        
+        // Checksum should fail
+        assert!(!packet.verify_checksum());
+    }
+
+    #[test]
+    fn test_serialization_roundtrip() {
+        let original = Packet::keep_alive(0xFFFFFFFF);
+        let serialized = original.serialize().unwrap();
         let deserialized = Packet::deserialize(&serialized).unwrap();
-
-        assert_eq!(deserialized.packet_type, PacketType::Discovery);
-        assert_eq!(deserialized.get_device_name(), Some("Test Device".to_string()));
+        
+        assert_eq!(deserialized.device_id, original.device_id);
+        assert_eq!(deserialized.version, original.version);
     }
 }

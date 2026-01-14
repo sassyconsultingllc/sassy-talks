@@ -1,0 +1,80 @@
+.channel-selector {
+  background: var(--card-bg);
+  border: 2px solid var(--border-color);
+  border-radius: 12px;
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  align-items: center;
+}
+
+.channel-label {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.channel-controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.channel-button {
+  background: transparent;
+  border: 2px solid var(--border-color);
+  color: var(--text-primary);
+  width: 45px;
+  height: 45px;
+  border-radius: 8px;
+  font-size: 1.2rem;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.channel-button:hover {
+  background: var(--border-color);
+  border-color: var(--cyan);
+  transform: scale(1.05);
+}
+
+.channel-button:active {
+  transform: scale(0.95);
+}
+
+.channel-input {
+  background: var(--dark-bg);
+  border: 2px solid var(--border-color);
+  color: var(--text-primary);
+  font-size: 2rem;
+  font-weight: 700;
+  width: 100px;
+  height: 60px;
+  text-align: center;
+  border-radius: 12px;
+  font-family: 'Courier New', monospace;
+  transition: all 0.2s;
+}
+
+.channel-input:focus {
+  outline: none;
+  border-color: var(--cyan);
+  box-shadow: 0 0 20px rgba(0, 230, 200, 0.3);
+}
+
+/* Remove spinner */
+.channel-input::-webkit-inner-spin-button,
+.channel-input::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.channel-input[type=number] {
+  -moz-appearance: textfield;
+}
