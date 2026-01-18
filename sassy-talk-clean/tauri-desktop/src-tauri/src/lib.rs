@@ -25,6 +25,7 @@ pub mod codec;
 pub mod commands;
 pub mod protocol;
 pub mod security;
+pub mod tones;
 pub mod transport;
 
 // Re-exports
@@ -32,6 +33,7 @@ pub use audio::{AudioEngine, AudioDeviceInfo, AudioState};
 pub use codec::{OpusEncoder, OpusDecoder, AudioFrame, SAMPLE_RATE, FRAME_SIZE};
 pub use protocol::{Packet, PacketType};
 pub use security::CryptoEngine;
+pub use tones::{TonePlayer, ToneType, ToneError};
 pub use transport::{TransportManager, PeerInfo};
 
 use std::sync::Arc;
@@ -85,6 +87,7 @@ pub struct AppState {
     // Core engines
     audio: Arc<Mutex<AudioEngine>>,
     transport: Arc<Mutex<TransportManager>>,
+    tone_player: Arc<TonePlayer>,
     
     // Channel
     current_channel: Arc<AtomicU8>,
@@ -125,6 +128,7 @@ impl AppState {
             device_name,
             audio,
             transport,
+            tone_player: Arc::new(TonePlayer::new()),
             current_channel: Arc::new(AtomicU8::new(1)),
             connection_status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
             is_transmitting: Arc::new(AtomicBool::new(false)),
@@ -151,6 +155,14 @@ impl AppState {
         self.start_rx_thread().await?;
         
         *self.connection_status.write().await = ConnectionStatus::Connected;
+        
+        // Play connection success tone (3-tone chime)
+        let tone_player = Arc::clone(&self.tone_player);
+        tokio::spawn(async move {
+            if let Err(e) = tone_player.play(ToneType::ConnectionSuccess).await {
+                warn!("Failed to play connection tone: {}", e);
+            }
+        });
         
         Ok(())
     }
@@ -211,9 +223,18 @@ impl AppState {
         audio.stop_recording()?;
         drop(audio);
         
-        // Send roger beep if enabled
+        // Send roger beep if enabled (network + local)
         if self.roger_beep.load(Ordering::Relaxed) {
-            // TODO: Send roger beep tone
+            // Send over network to peers
+            self.send_roger_beep().await;
+            
+            // Play locally
+            let tone_player = Arc::clone(&self.tone_player);
+            tokio::spawn(async move {
+                if let Err(e) = tone_player.play(ToneType::RogerBeep).await {
+                    warn!("Failed to play local roger beep: {}", e);
+                }
+            });
         }
         
         *self.connection_status.write().await = ConnectionStatus::Connected;
@@ -436,8 +457,61 @@ impl AppState {
         *self.vox_threshold.write().await = threshold;
     }
     
+    /// Send roger beep tone
+    async fn send_roger_beep(&self) {
+        // Generate a classic two-tone beep (800Hz + 1000Hz, 100ms total)
+        let mut encoder = match OpusEncoder::new() {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Failed to create encoder for roger beep: {}", e);
+                return;
+            }
+        };
+        
+        // Generate 100ms of dual-tone beep (about 5 frames at 20ms each)
+        let frames_to_send = 5;
+        let mut samples = vec![0i16; FRAME_SIZE];
+        
+        for frame_idx in 0..frames_to_send {
+            // Generate dual-tone samples
+            for (i, sample) in samples.iter_mut().enumerate() {
+                let t = (frame_idx * FRAME_SIZE + i) as f32 / SAMPLE_RATE as f32;
+                // 800Hz + 1000Hz dual tone with envelope
+                let envelope = if frame_idx < 2 { 
+                    (frame_idx as f32 * FRAME_SIZE as f32 + i as f32) / (2.0 * FRAME_SIZE as f32) 
+                } else if frame_idx >= 3 {
+                    1.0 - ((frame_idx as f32 - 3.0) * FRAME_SIZE as f32 + i as f32) / (2.0 * FRAME_SIZE as f32)
+                } else { 
+                    1.0 
+                };
+                let tone = (f32::sin(2.0 * std::f32::consts::PI * 800.0 * t) * 0.5
+                         + f32::sin(2.0 * std::f32::consts::PI * 1000.0 * t) * 0.5)
+                         * envelope * 8000.0;
+                *sample = tone as i16;
+            }
+            
+            // Encode and send
+            if let Ok(opus_data) = encoder.encode(&samples) {
+                let transport = self.transport.lock().await;
+                if let Err(e) = transport.send_audio(&opus_data) {
+                    warn!("Failed to send roger beep frame: {}", e);
+                }
+            }
+            
+            // Small delay between frames
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        
+        info!("Roger beep sent");
+    }
+    
     /// Get device info
     pub fn get_device_info(&self) -> (u32, String) {
         (self.device_id, self.device_name.clone())
+    }
+    
+    /// Get tone player
+    pub fn get_tone_player(&self) -> Arc<TonePlayer> {
+        Arc::clone(&self.tone_player)
     }
 }

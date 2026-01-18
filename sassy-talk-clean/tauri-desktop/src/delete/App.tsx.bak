@@ -1,0 +1,331 @@
+// App.tsx - Sassy-Talk Main UI with Lobby System
+// Copyright 2025 Sassy Consulting LLC. All rights reserved.
+// Merged: Lobby UI (v1.1.0) + Clean Backend (sassy-talk-clean)
+
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import './styles/app.css';
+
+// Types matching Rust structs
+interface PeerInfo {
+  device_id: number;
+  device_name: string;
+  address: string;
+  last_seen: number;
+  channel: number;
+}
+
+interface AppStatus {
+  connection_status: string;
+  channel: number;
+  peer_count: number;
+  is_transmitting: boolean;
+}
+
+interface DeviceInfo {
+  device_id: string;
+  device_name: string;
+  version: string;
+}
+
+interface Volume {
+  input: number;
+  output: number;
+}
+
+type View = 'lobby' | 'walkie' | 'settings';
+
+export default function App() {
+  // View state
+  const [currentView, setCurrentView] = useState<View>('lobby');
+  
+  // Lobby state
+  const [peers, setPeers] = useState<PeerInfo[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+  
+  // Walkie state
+  const [status, setStatus] = useState<AppStatus | null>(null);
+  const [isTransmitting, setIsTransmitting] = useState(false);
+  const [channel, setChannel] = useState(1);
+  const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null);
+  
+  // Settings state
+  const [micVolume, setMicVolume] = useState(80);
+  const [speakerVolume, setSpeakerVolume] = useState(80);
+  const [rogerBeep, setRogerBeep] = useState(true);
+  const [voxEnabled, setVoxEnabled] = useState(false);
+  
+  // Audio visualization
+  const [audioLevel, setAudioLevel] = useState(0);
+  
+  // Refs
+  const pttButtonRef = useRef<HTMLButtonElement>(null);
+
+  // Initialize and setup event listeners
+  useEffect(() => {
+    const setup = async () => {
+      try {
+        const info = await invoke<DeviceInfo>('get_device_info');
+        setDeviceInfo(info);
+        
+        const initialStatus = await invoke<AppStatus>('get_status');
+        setStatus(initialStatus);
+        setChannel(initialStatus.channel);
+        
+        const vol = await invoke<Volume>('get_volume');
+        setMicVolume(Math.round(vol.input * 100));
+        setSpeakerVolume(Math.round(vol.output * 100));
+      } catch (e) {
+        console.error('Failed to get initial status:', e);
+      }
+    };
+    
+    setup();
+    
+    // Listen for audio level events (if backend emits them)
+    const unlistenAudioLevel = listen<number>('audio_level', (event) => {
+      setAudioLevel(event.payload);
+    });
+    
+    // Status polling
+    const statusInterval = setInterval(async () => {
+      try {
+        const s = await invoke<AppStatus>('get_status');
+        setStatus(s);
+        
+        if (isSearching) {
+          const nearbyPeers = await invoke<PeerInfo[]>('get_nearby_devices');
+          setPeers(nearbyPeers);
+        }
+      } catch (e) {
+        // Ignore polling errors
+      }
+    }, 500);
+    
+    return () => {
+      unlistenAudioLevel.then(f => f());
+      clearInterval(statusInterval);
+    };
+  }, [isSearching]);
+
+  // Lobby functions
+  const enterLobby = async () => {
+    setIsSearching(true);
+    try {
+      await invoke('start_discovery');
+    } catch (e) {
+      console.error('Failed to start discovery:', e);
+      setIsSearching(false);
+    }
+  };
+
+  const leaveLobby = async () => {
+    setIsSearching(false);
+    try {
+      await invoke('stop_discovery');
+    } catch (e) {
+      console.error('Failed to stop discovery:', e);
+    }
+    setPeers([]);
+  };
+
+  // Walkie functions
+  const startTransmit = async () => {
+    try {
+      await invoke('start_transmit');
+      setIsTransmitting(true);
+    } catch (e) {
+      console.error('Failed to start transmit:', e);
+    }
+  };
+
+  const stopTransmit = async () => {
+    try {
+      await invoke('stop_transmit');
+      setIsTransmitting(false);
+    } catch (e) {
+      console.error('Failed to stop transmit:', e);
+    }
+  };
+
+  const changeChannel = async (delta: number) => {
+    const newChannel = Math.max(1, Math.min(16, channel + delta));
+    setChannel(newChannel);
+    try {
+      await invoke('set_channel', { channel: newChannel });
+    } catch (e) {
+      console.error('Failed to change channel:', e);
+    }
+  };
+
+  const disconnect = async () => {
+    try {
+      await invoke('disconnect');
+      setCurrentView('lobby');
+    } catch (e) {
+      console.error('Failed to disconnect:', e);
+    }
+  };
+
+  // Settings functions
+  const updateVolume = async (input: number, output: number) => {
+    try {
+      await invoke('set_volume', { input: input / 100, output: output / 100 });
+    } catch (e) {
+      console.error('Failed to set volume:', e);
+    }
+  };
+
+  const handleMicVolumeChange = (value: number) => {
+    setMicVolume(value);
+    updateVolume(value, speakerVolume);
+  };
+
+  const handleSpeakerVolumeChange = (value: number) => {
+    setSpeakerVolume(value);
+    updateVolume(micVolume, value);
+  };
+
+  const handleRogerBeepChange = async (enabled: boolean) => {
+    setRogerBeep(enabled);
+    try {
+      await invoke('set_roger_beep', { enabled });
+    } catch (e) {
+      console.error('Failed to set roger beep:', e);
+    }
+  };
+
+  const handleVoxChange = async (enabled: boolean) => {
+    setVoxEnabled(enabled);
+    try {
+      await invoke('set_vox_enabled', { enabled });
+    } catch (e) {
+      console.error('Failed to set VOX:', e);
+    }
+  };
+
+  // PTT handlers
+  const handlePttDown = useCallback(() => {
+    if (!isTransmitting) startTransmit();
+  }, [isTransmitting]);
+
+  const handlePttUp = useCallback(() => {
+    if (isTransmitting) stopTransmit();
+  }, [isTransmitting]);
+
+  // Render helpers
+  const getPlatformIcon = (address: string) => {
+    // Guess platform from address pattern (can be improved)
+    if (address.includes('android')) return '🤖';
+    if (address.includes('iphone') || address.includes('ipad')) return '🍎';
+    return '📱';
+  };
+
+  const getSignalBars = (lastSeen: number) => {
+    const now = Date.now();
+    const age = now - lastSeen;
+    if (age < 1000) return '▁▃▅▇█';
+    if (age < 3000) return '▁▃▅▇';
+    if (age < 5000) return '▁▃▅';
+    if (age < 10000) return '▁▃';
+    return '▁';
+  };
+
+  // Render Lobby View
+  const renderLobby = () => (
+    <div className="view lobby-view">
+      <header className="lobby-header">
+        <h1>Sassy-Talk</h1>
+        <p className="subtitle">Waiting Room</p>
+      </header>
+
+      {/* Search Toggle */}
+      <div className="search-section">
+        <button 
+          className={`search-btn ${isSearching ? 'active' : ''}`}
+          onClick={isSearching ? leaveLobby : enterLobby}
+        >
+          <span className="search-icon">{isSearching ? '🔍' : '📡'}</span>
+          <span>{isSearching ? 'Searching...' : 'Find Devices'}</span>
+        </button>
+        {isSearching && (
+          <div className="search-pulse">
+            <div className="pulse-ring"></div>
+            <div className="pulse-ring delay-1"></div>
+            <div className="pulse-ring delay-2"></div>
+          </div>
+        )}
+      </div>
+
+      {/* Peer List */}
+      <div className="peers-section">
+        <h3>Nearby Devices {peers.length > 0 && `(${peers.length})`}</h3>
+        
+        {peers.length === 0 && isSearching && (
+          <div className="no-peers">
+            <p>Looking for nearby devices...</p>
+            <p className="hint">Make sure other devices have the app open</p>
+          </div>
+        )}
+        
+        {peers.length === 0 && !isSearching && (
+          <div className="no-peers">
+            <p>No devices found</p>
+            <p className="hint">Tap "Find Devices" to start searching</p>
+          </div>
+        )}
+
+        <div className="peer-list">
+          {peers.map((peer) => (
+            <div 
+              key={peer.device_id} 
+              className={`peer-card ${peer.channel === channel ? 'same-channel' : ''}`}
+            >
+              <div className="peer-main">
+                <span className="status-icon">🟢</span>
+                <span className="platform-icon">{getPlatformIcon(peer.address)}</span>
+                <div className="peer-details">
+                  <span className="peer-name">{peer.device_name}</span>
+                  <span className="peer-meta">
+                    CH{peer.channel.toString().padStart(2, '0')} • 
+                    {peer.address.split(':').slice(0,3).join(':')} • 
+                    {getSignalBars(peer.last_seen)}
+                  </span>
+                </div>
+              </div>
+              
+              <div className="peer-actions">
+                <button 
+                  className="connected-btn"
+                  onClick={() => {
+                    setChannel(peer.channel);
+                    invoke('set_channel', { channel: peer.channel });
+                    setCurrentView('walkie');
+                  }}
+                >
+                  Join CH{peer.channel.toString().padStart(2, '0')}
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Bottom Navigation */}
+      <nav className="bottom-nav">
+        <button className="nav-btn active" onClick={() => setCurrentView('lobby')}>
+          <span className="nav-icon">📡</span>
+          <span>Lobby</span>
+        </button>
+        <button className="nav-btn" onClick={() => setCurrentView('walkie')}>
+          <span className="nav-icon">📻</span>
+          <span>Talk</span>
+        </button>
+        <button className="nav-btn" onClick={() => setCurrentView('settings')}>
+          <span className="nav-icon">⚙️</span>
+          <span>Settings</span>
+        </button>
+      </nav>
+    </div>
+  );

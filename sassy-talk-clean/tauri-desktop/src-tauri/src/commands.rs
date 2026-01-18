@@ -233,3 +233,46 @@ pub async fn set_vox_threshold(
     state.set_vox_threshold(threshold).await;
     Ok(())
 }
+
+
+// ============================================================================
+// Tone Commands - Audio Feedback
+// ============================================================================
+
+use crate::tones::ToneType;
+
+/// Play connection success tone (3-tone chime)
+#[tauri::command]
+pub async fn play_connection_tone(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let tone_player = state.get_tone_player();
+    tone_player.play(ToneType::ConnectionSuccess)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Play message delivered tone (2-tone low→high)
+#[tauri::command]
+pub async fn play_delivered_tone(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let tone_player = state.get_tone_player();
+    tone_player.play(ToneType::MessageDelivered)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Play error/failed tone (2-tone mono)
+#[tauri::command]
+pub async fn play_failed_tone(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let tone_player = state.get_tone_player();
+    tone_player.play(ToneType::Failed)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Play roger beep tone
+#[tauri::command]
+pub async fn play_roger_tone(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let tone_player = state.get_tone_player();
+    tone_player.play(ToneType::RogerBeep)
+        .await
+        .map_err(|e| e.to_string())
+}

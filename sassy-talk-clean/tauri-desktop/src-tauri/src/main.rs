@@ -127,6 +127,11 @@ fn main() {
             commands::set_roger_beep,
             commands::set_vox_enabled,
             commands::set_vox_threshold,
+            // Tones
+            commands::play_connection_tone,
+            commands::play_delivered_tone,
+            commands::play_failed_tone,
+            commands::play_roger_tone,
         ])
         .setup(|_app| {
             info!("Sassy-Talk setup complete");
