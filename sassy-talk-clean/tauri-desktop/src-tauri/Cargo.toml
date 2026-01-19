@@ -27,6 +27,9 @@ tokio = { version = "1.42", features = ["full"] }
 # Audio I/O - Cross-platform
 cpal = "0.15"
 
+# Send wrapper for non-Send types (cpal::Stream on Windows)
+send_wrapper = "0.6"
+
 # Audio codec - Opus for low latency voice
 audiopus = "0.3.0-rc.0"
 
@@ -68,6 +71,9 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 
 # Base64
 base64 = "0.22"
+
+# Hex encoding for public keys
+hex = "0.4"
 
 # Platform-specific: Android
 [target.'cfg(target_os = "android")'.dependencies]

@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Sassy-Talk</string>
+    <string name="nav_talk">Talk</string>
+    <string name="nav_peers">Peers</string>
+    <string name="nav_channels">Channels</string>
+    <string name="nav_settings">Settings</string>
 </resources>

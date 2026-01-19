@@ -2,30 +2,32 @@
 /// 
 /// Uses UDP multicast for automatic peer discovery and audio transmission
 /// Works on WiFi networks (all desktop platforms)
+/// 
+/// Features:
+/// - Random port selection per session for security
+/// - End-to-end encryption with X25519 key exchange
+/// - Configurable multicast address
+/// 
+/// Copyright 2025 Sassy Consulting LLC. All rights reserved.
 
 pub mod discovery;
 pub mod manager;
 
-pub use manager::{TransportManager, PeerInfo};
+pub use manager::{TransportManager, PeerInfo, TransportConfig};
 pub use discovery::DiscoveryService;
 
-use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use crate::constants;
 
-/// Multicast group address (239.255.42.42)
-pub const MULTICAST_ADDR: &str = "239.255.42.42";
-
-/// Multicast port
-pub const MULTICAST_PORT: u16 = 5555;
-
-/// Maximum UDP packet size
-pub const MAX_PACKET_SIZE: usize = 1500;
-
-/// Peer timeout (seconds)
-pub const PEER_TIMEOUT_SECS: u64 = 30;
-
-/// Discovery beacon interval (seconds)
-pub const BEACON_INTERVAL_SECS: u64 = 5;
+// Re-export constants for backwards compatibility
+pub use constants::{
+    DEFAULT_MULTICAST_ADDR as MULTICAST_ADDR,
+    DEFAULT_MULTICAST_PORT as MULTICAST_PORT,
+    MAX_PACKET_SIZE,
+    PEER_TIMEOUT_SECS,
+    BEACON_INTERVAL_SECS,
+    PORT_RANGE_START,
+    PORT_RANGE_END,
+};
 
 /// Transport error types
 #[derive(Debug, thiserror::Error)]
@@ -44,4 +46,13 @@ pub enum TransportError {
     
     #[error("Invalid peer: {0}")]
     InvalidPeer(String),
+    
+    #[error("Encryption error: {0}")]
+    EncryptionError(String),
+    
+    #[error("Key exchange failed: {0}")]
+    KeyExchangeError(String),
+    
+    #[error("No port available in range")]
+    NoPortAvailable,
 }

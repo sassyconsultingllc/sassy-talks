@@ -132,6 +132,12 @@ fn main() {
             commands::play_delivered_tone,
             commands::play_failed_tone,
             commands::play_roger_tone,
+            // Network/Encryption
+            commands::get_transport_config,
+            commands::set_transport_config,
+            commands::get_network_info,
+            commands::set_encryption_enabled,
+            commands::set_random_port_enabled,
         ])
         .setup(|_app| {
             info!("Sassy-Talk setup complete");

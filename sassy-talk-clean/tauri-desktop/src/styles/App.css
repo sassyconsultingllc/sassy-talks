@@ -993,3 +993,28 @@ html, body {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--purple);
 }
+
+/* ============================================
+   SECURITY INDICATORS
+   ============================================ */
+.setting-value.secure {
+  color: var(--green, #10b981);
+  font-weight: 500;
+}
+
+.setting-value.insecure {
+  color: var(--orange, #f59e0b);
+}
+
+.setting-value.key-value {
+  font-family: 'Courier New', monospace;
+  font-size: 0.75rem;
+  background: var(--bg-dark, #1a1a2e);
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.setting-value.key-value:hover {
+  background: var(--bg-light, #2a2a4e);
+}

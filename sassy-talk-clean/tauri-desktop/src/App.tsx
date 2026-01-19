@@ -6,8 +6,9 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import './styles/app.css';
+import './styles/lobby.css';
+import PeerList from './components/lobby/PeerList';
 import Sounds from './sounds';
-import UserAvatar from './components/UserAvatar';
 import {
   IconLobby,
   IconRadio,
@@ -19,9 +20,7 @@ import {
   IconMic,
   IconSpeaker,
   IconRecording,
-  IconSignal,
   IconRefresh,
-  getSignalLevel,
 } from './components/Icons';
 
 // ============================================================================
@@ -65,6 +64,15 @@ interface AudioDeviceInfo {
   device_type: string;
 }
 
+interface NetworkInfo {
+  port: number;
+  multicast_addr: string;
+  use_random_port: boolean;
+  encryption_enabled: boolean;
+  is_encrypted: boolean;
+  public_key: string | null;
+}
+
 type View = 'lobby' | 'walkie' | 'settings';
 
 // ============================================================================
@@ -95,6 +103,11 @@ export default function App() {
   const [audioDevices, setAudioDevices] = useState<AudioDevices>({ inputs: [], outputs: [] });
   const [selectedInput, setSelectedInput] = useState<string>('');
   const [selectedOutput, setSelectedOutput] = useState<string>('');
+  
+  // Network settings state
+  const [networkInfo, setNetworkInfo] = useState<NetworkInfo | null>(null);
+  const [encryptionEnabled, setEncryptionEnabled] = useState(true);
+  const [randomPortEnabled, setRandomPortEnabled] = useState(true);
   
   // Audio visualization
   const [audioLevel, setAudioLevel] = useState(0);
@@ -136,6 +149,16 @@ export default function App() {
         const defaultOutput = devices.outputs.find(d => d.is_default);
         if (defaultInput) setSelectedInput(defaultInput.name);
         if (defaultOutput) setSelectedOutput(defaultOutput.name);
+        
+        // Get network info
+        try {
+          const netInfo = await invoke<NetworkInfo>('get_network_info');
+          setNetworkInfo(netInfo);
+          setEncryptionEnabled(netInfo.encryption_enabled);
+          setRandomPortEnabled(netInfo.use_random_port);
+        } catch (e) {
+          console.warn('Failed to get network info:', e);
+        }
         
       } catch (e) {
         console.error('Failed to initialize:', e);
@@ -182,6 +205,10 @@ export default function App() {
           }
           setPeers(nearbyPeers);
         }
+        
+        // Update network info periodically (encryption status can change)
+        const netInfo = await invoke<NetworkInfo>('get_network_info');
+        setNetworkInfo(netInfo);
       } catch (e) {
         // Ignore polling errors
       }
@@ -368,6 +395,34 @@ export default function App() {
     }
   };
 
+  // ==========================================================================
+  // Network Settings Handlers
+  // ==========================================================================
+
+  const handleEncryptionChange = async (enabled: boolean) => {
+    setEncryptionEnabled(enabled);
+    try {
+      await invoke('set_encryption_enabled', { enabled });
+      // Refresh network info
+      const netInfo = await invoke<NetworkInfo>('get_network_info');
+      setNetworkInfo(netInfo);
+    } catch (e) {
+      console.error('Failed to set encryption:', e);
+      setError(`Failed to set encryption: ${e}`);
+    }
+  };
+
+  const handleRandomPortChange = async (enabled: boolean) => {
+    setRandomPortEnabled(enabled);
+    try {
+      await invoke('set_random_port_enabled', { enabled });
+      // Note: Port change takes effect on next session
+    } catch (e) {
+      console.error('Failed to set random port:', e);
+      setError(`Failed to set random port: ${e}`);
+    }
+  };
+
   // ============================================================================
   // PTT Handlers
   // ============================================================================
@@ -421,15 +476,7 @@ export default function App() {
     return 'Offline';
   };
 
-  const detectPlatform = (deviceName: string): string | undefined => {
-    const name = deviceName.toLowerCase();
-    if (name.includes('android') || name.includes('pixel') || name.includes('galaxy') || name.includes('samsung')) return 'Android';
-    if (name.includes('iphone') || name.includes('ipad')) return 'iOS';
-    if (name.includes('mac') || name.includes('macbook')) return 'MacOS';
-    if (name.includes('windows') || name.includes('surface') || name.includes('pc')) return 'Windows';
-    if (name.includes('linux') || name.includes('ubuntu') || name.includes('fedora') || name.includes('debian')) return 'Linux';
-    return undefined;
-  };
+  
 
   // ============================================================================
   // Render: Lobby View
@@ -488,39 +535,7 @@ export default function App() {
           </div>
         )}
 
-        <div className="peer-list">
-          {peers.map((peer) => (
-            <div key={peer.device_id} className={`peer-card ${peer.channel === channel ? 'same-channel' : ''}`}>
-              <div className="peer-main">
-                <UserAvatar
-                  deviceId={peer.device_id}
-                  deviceName={peer.device_name}
-                  size={44}
-                  showStatus={!detectPlatform(peer.device_name)}
-                  status={peer.channel === channel ? 'online' : 'away'}
-                  platform={detectPlatform(peer.device_name)}
-                />
-                <div className="peer-details">
-                  <span className="peer-name">{peer.device_name}</span>
-                  <span className="peer-meta">
-                    <span>CH{peer.channel.toString().padStart(2, '0')}</span>
-                    <IconSignal size={16} level={getSignalLevel(peer.last_seen)} />
-                  </span>
-                </div>
-              </div>
-              
-              <div className="peer-actions">
-                {peer.channel === channel ? (
-                  <button className="connected-btn" onClick={() => setCurrentView('walkie')}>Talk</button>
-                ) : (
-                  <button className="connect-btn" onClick={() => joinPeerChannel(peer.channel)}>
-                    Join CH{peer.channel.toString().padStart(2, '0')}
-                  </button>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
+        <PeerList peers={peers} channel={channel} onJoin={joinPeerChannel} onTalk={() => setCurrentView('walkie')} />
       </div>
 
       {isSearching && (
@@ -749,8 +764,56 @@ export default function App() {
           </div>
           <div className="setting-row">
             <span className="setting-label">Multicast Group</span>
-            <span className="setting-value">239.255.42.42:5555</span>
+            <span className="setting-value">{networkInfo?.multicast_addr || '239.255.42.42'}</span>
           </div>
+          <div className="setting-row">
+            <span className="setting-label">Port</span>
+            <span className="setting-value">{networkInfo?.port || '---'} {networkInfo?.use_random_port ? '(random)' : '(fixed)'}</span>
+          </div>
+          <div className="setting-row">
+            <span className="setting-label">Random Port Each Session</span>
+            <label className="toggle">
+              <input type="checkbox" checked={randomPortEnabled} onChange={(e) => handleRandomPortChange(e.target.checked)} />
+              <span className="toggle-slider"></span>
+            </label>
+          </div>
+        </section>
+
+        <section className="settings-section">
+          <h3>Security</h3>
+          <div className="setting-row">
+            <span className="setting-label">End-to-End Encryption</span>
+            <label className="toggle">
+              <input type="checkbox" checked={encryptionEnabled} onChange={(e) => handleEncryptionChange(e.target.checked)} />
+              <span className="toggle-slider"></span>
+            </label>
+          </div>
+          <div className="setting-row">
+            <span className="setting-label">Encryption Status</span>
+            <span className={`setting-value ${networkInfo?.is_encrypted ? 'secure' : 'insecure'}`}>
+              {networkInfo?.is_encrypted ? '🔒 Active' : '🔓 Inactive'}
+            </span>
+          </div>
+          {networkInfo?.public_key && (
+            <div className="setting-row">
+              <span className="setting-label">Public Key</span>
+              <span className="setting-value key-value" title={networkInfo.public_key}>
+                {networkInfo.public_key.substring(0, 16)}...
+              </span>
+            </div>
+          )}
+          <div className="setting-row">
+            <span className="setting-label">Key Exchange</span>
+            <span className="setting-value">X25519 ECDH</span>
+          </div>
+          <div className="setting-row">
+            <span className="setting-label">Cipher</span>
+            <span className="setting-value">AES-256-GCM</span>
+          </div>
+        </section>
+
+        <section className="settings-section">
+          <h3>Audio Codec</h3>
           <div className="setting-row">
             <span className="setting-label">Codec</span>
             <span className="setting-value">Opus 32kbps VBR</span>

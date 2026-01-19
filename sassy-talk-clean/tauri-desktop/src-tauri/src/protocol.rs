@@ -1,6 +1,9 @@
 /// Protocol - Packet Format and Serialization
 /// 
 /// Defines the wire protocol for SassyTalkie UDP multicast
+/// Supports encrypted audio and key exchange
+/// 
+/// Copyright 2025 Sassy Consulting LLC. All rights reserved.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -19,6 +22,9 @@ pub enum ProtocolError {
     
     #[error("Checksum mismatch")]
     ChecksumMismatch,
+    
+    #[error("Invalid key length")]
+    InvalidKeyLength,
 }
 
 /// Packet types
@@ -30,14 +36,47 @@ pub enum PacketType {
         channel: u8,
     },
     
-    /// Audio data
+    /// Discovery with public key for encryption
+    DiscoveryWithKey {
+        device_name: String,
+        channel: u8,
+        /// X25519 public key (32 bytes)
+        public_key: Option<[u8; 32]>,
+    },
+    
+    /// Audio data (may be encrypted or plain)
     Audio {
         channel: u8,
         data: Vec<u8>,
     },
     
+    /// Encrypted audio with explicit nonce and tag
+    EncryptedAudio {
+        channel: u8,
+        /// 96-bit nonce
+        nonce: [u8; 12],
+        /// 128-bit auth tag
+        auth_tag: [u8; 16],
+        /// Ciphertext
+        data: Vec<u8>,
+    },
+    
     /// Keep-alive (maintains connection)
     KeepAlive,
+    
+    /// Key exchange request
+    KeyExchange {
+        /// Our public key
+        public_key: [u8; 32],
+    },
+    
+    /// Key exchange response
+    KeyExchangeResponse {
+        /// Their public key
+        public_key: [u8; 32],
+        /// Whether exchange was successful
+        success: bool,
+    },
 }
 
 /// Network packet structure
@@ -61,7 +100,7 @@ pub struct Packet {
 
 impl Packet {
     /// Protocol version
-    const VERSION: u8 = 1;
+    const VERSION: u8 = 2;  // Bumped for encryption support
     
     /// Create discovery packet
     pub fn discovery(device_id: u32, device_name: String, channel: u8) -> Self {
@@ -74,6 +113,24 @@ impl Packet {
             version: Self::VERSION,
             device_id,
             packet_type: PacketType::Discovery { device_name, channel },
+            timestamp,
+            checksum: 0,
+        };
+        
+        packet.with_checksum()
+    }
+    
+    /// Create discovery packet with public key
+    pub fn discovery_with_key(device_id: u32, device_name: String, channel: u8, public_key: Option<[u8; 32]>) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        let packet = Self {
+            version: Self::VERSION,
+            device_id,
+            packet_type: PacketType::DiscoveryWithKey { device_name, channel, public_key },
             timestamp,
             checksum: 0,
         };
@@ -99,6 +156,24 @@ impl Packet {
         packet.with_checksum()
     }
     
+    /// Create encrypted audio packet
+    pub fn encrypted_audio(device_id: u32, channel: u8, nonce: [u8; 12], auth_tag: [u8; 16], data: Vec<u8>) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        let packet = Self {
+            version: Self::VERSION,
+            device_id,
+            packet_type: PacketType::EncryptedAudio { channel, nonce, auth_tag, data },
+            timestamp,
+            checksum: 0,
+        };
+        
+        packet.with_checksum()
+    }
+    
     /// Create keep-alive packet
     pub fn keep_alive(device_id: u32) -> Self {
         let timestamp = std::time::SystemTime::now()
@@ -110,6 +185,24 @@ impl Packet {
             version: Self::VERSION,
             device_id,
             packet_type: PacketType::KeepAlive,
+            timestamp,
+            checksum: 0,
+        };
+        
+        packet.with_checksum()
+    }
+    
+    /// Create key exchange request
+    pub fn key_exchange(device_id: u32, public_key: [u8; 32]) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        let packet = Self {
+            version: Self::VERSION,
+            device_id,
+            packet_type: PacketType::KeyExchange { public_key },
             timestamp,
             checksum: 0,
         };
@@ -132,13 +225,37 @@ impl Packet {
                 hasher.update(device_name.as_bytes());
                 hasher.update(&[*channel]);
             }
-            PacketType::Audio { channel, data } => {
+            PacketType::DiscoveryWithKey { device_name, channel, public_key } => {
                 hasher.update(&[1u8]); // Type discriminant
+                hasher.update(device_name.as_bytes());
+                hasher.update(&[*channel]);
+                if let Some(key) = public_key {
+                    hasher.update(key);
+                }
+            }
+            PacketType::Audio { channel, data } => {
+                hasher.update(&[2u8]); // Type discriminant
                 hasher.update(&[*channel]);
                 hasher.update(data);
             }
+            PacketType::EncryptedAudio { channel, nonce, auth_tag, data } => {
+                hasher.update(&[3u8]); // Type discriminant
+                hasher.update(&[*channel]);
+                hasher.update(nonce);
+                hasher.update(auth_tag);
+                hasher.update(data);
+            }
             PacketType::KeepAlive => {
-                hasher.update(&[2u8]); // Type discriminant
+                hasher.update(&[4u8]); // Type discriminant
+            }
+            PacketType::KeyExchange { public_key } => {
+                hasher.update(&[5u8]); // Type discriminant
+                hasher.update(public_key);
+            }
+            PacketType::KeyExchangeResponse { public_key, success } => {
+                hasher.update(&[6u8]); // Type discriminant
+                hasher.update(public_key);
+                hasher.update(&[*success as u8]);
             }
         }
         
@@ -168,8 +285,8 @@ impl Packet {
         let packet: Packet = bincode::deserialize(data)
             .map_err(|e| format!("Deserialization failed: {}", e))?;
         
-        // Verify version
-        if packet.version != Self::VERSION {
+        // Verify version (allow both v1 and v2 for compatibility)
+        if packet.version < 1 || packet.version > Self::VERSION {
             return Err(format!("Invalid protocol version: {}", packet.version));
         }
         
@@ -185,9 +302,18 @@ impl Packet {
     pub fn estimate_size(&self) -> usize {
         match &self.packet_type {
             PacketType::Discovery { device_name, .. } => 50 + device_name.len(),
+            PacketType::DiscoveryWithKey { device_name, .. } => 82 + device_name.len(),
             PacketType::Audio { data, .. } => 50 + data.len(),
+            PacketType::EncryptedAudio { data, .. } => 78 + data.len(),
             PacketType::KeepAlive => 50,
+            PacketType::KeyExchange { .. } => 82,
+            PacketType::KeyExchangeResponse { .. } => 83,
         }
+    }
+    
+    /// Check if packet is encrypted
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self.packet_type, PacketType::EncryptedAudio { .. })
     }
 }
 
@@ -199,7 +325,7 @@ mod tests {
     fn test_discovery_packet() {
         let packet = Packet::discovery(0x12345678, "Test Device".to_string(), 42);
         
-        assert_eq!(packet.version, 1);
+        assert_eq!(packet.version, 2);
         assert_eq!(packet.device_id, 0x12345678);
         assert!(packet.verify_checksum());
         
@@ -208,6 +334,25 @@ mod tests {
         let deserialized = Packet::deserialize(&serialized).unwrap();
         
         assert_eq!(deserialized.device_id, packet.device_id);
+        assert!(deserialized.verify_checksum());
+    }
+    
+    #[test]
+    fn test_discovery_with_key() {
+        let key = [0x42u8; 32];
+        let packet = Packet::discovery_with_key(0x12345678, "Test".to_string(), 1, Some(key));
+        
+        assert!(packet.verify_checksum());
+        
+        if let PacketType::DiscoveryWithKey { public_key, .. } = &packet.packet_type {
+            assert_eq!(*public_key, Some(key));
+        } else {
+            panic!("Wrong packet type");
+        }
+        
+        // Roundtrip
+        let serialized = packet.serialize().unwrap();
+        let deserialized = Packet::deserialize(&serialized).unwrap();
         assert!(deserialized.verify_checksum());
     }
 
@@ -221,6 +366,27 @@ mod tests {
         if let PacketType::Audio { channel, data } = &packet.packet_type {
             assert_eq!(*channel, 1);
             assert_eq!(data, &audio_data);
+        } else {
+            panic!("Wrong packet type");
+        }
+    }
+    
+    #[test]
+    fn test_encrypted_audio_packet() {
+        let nonce = [0x11u8; 12];
+        let tag = [0x22u8; 16];
+        let data = vec![0x33, 0x44, 0x55];
+        
+        let packet = Packet::encrypted_audio(0x12345678, 5, nonce, tag, data.clone());
+        
+        assert!(packet.verify_checksum());
+        assert!(packet.is_encrypted());
+        
+        if let PacketType::EncryptedAudio { channel, nonce: n, auth_tag, data: d } = &packet.packet_type {
+            assert_eq!(*channel, 5);
+            assert_eq!(*n, nonce);
+            assert_eq!(*auth_tag, tag);
+            assert_eq!(*d, data);
         } else {
             panic!("Wrong packet type");
         }
@@ -245,5 +411,22 @@ mod tests {
         
         assert_eq!(deserialized.device_id, original.device_id);
         assert_eq!(deserialized.version, original.version);
+    }
+    
+    #[test]
+    fn test_key_exchange_packet() {
+        let key = [0xAB; 32];
+        let packet = Packet::key_exchange(0x12345678, key);
+        
+        assert!(packet.verify_checksum());
+        
+        let serialized = packet.serialize().unwrap();
+        let deserialized = Packet::deserialize(&serialized).unwrap();
+        
+        if let PacketType::KeyExchange { public_key } = deserialized.packet_type {
+            assert_eq!(public_key, key);
+        } else {
+            panic!("Wrong packet type");
+        }
     }
 }

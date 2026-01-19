@@ -1,0 +1,12 @@
+/* Lightweight lobby-specific styles (merged from snapshot) */
+.lobby-header h1 { font-size: 2rem; font-weight: 700; }
+.search-section { margin: 16px 0; display:flex; justify-content:center; }
+.peer-list { display:flex; flex-direction:column; gap:8px; }
+.peer-card { padding:12px; border-radius:12px; background: rgba(30,41,59,0.8); border:1px solid rgba(148,163,184,0.12); display:flex; justify-content:space-between; align-items:center; }
+.peer-main { display:flex; align-items:center; gap:12px; }
+.peer-details { display:flex; flex-direction:column; }
+.peer-name { font-weight:600; }
+.peer-actions { display:flex; gap:8px; }
+.connect-btn, .connected-btn { padding:8px 12px; border-radius:8px; border:none; cursor:pointer; }
+.connect-btn { background: linear-gradient(135deg,#2563eb,#7c3aed); color:white; }
+.connected-btn { background:#16a34a; color:white; }

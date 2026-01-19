@@ -10,7 +10,7 @@ use std::f32::consts::PI;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, StreamConfig};
+use cpal::StreamConfig;
 
 /// Sample rate for tone generation
 const SAMPLE_RATE: u32 = 48000;
