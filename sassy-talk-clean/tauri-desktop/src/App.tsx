@@ -7,6 +7,22 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import './styles/app.css';
 import Sounds from './sounds';
+import UserAvatar from './components/UserAvatar';
+import {
+  IconLobby,
+  IconRadio,
+  IconSettings,
+  IconSearch,
+  IconClose,
+  IconChevronLeft,
+  IconChevronRight,
+  IconMic,
+  IconSpeaker,
+  IconRecording,
+  IconSignal,
+  IconRefresh,
+  getSignalLevel,
+} from './components/Icons';
 
 // ============================================================================
 // Types matching Rust backend
@@ -177,15 +193,6 @@ export default function App() {
       if (statusIntervalRef.current) clearInterval(statusIntervalRef.current);
     };
   }, [isSearching]);
-
-  // ==========================================================================
-  // Sound Effects (Web Audio API - frontend)
-  // ==========================================================================
-
-  const playErrorTone = () => Sounds.error();
-  const playDeliveredTone = () => Sounds.messageDelivered();
-  const playConnectionTone = () => Sounds.connectionSuccess();
-  const playChannelTone = () => Sounds.channelChange();
 
   // ==========================================================================
   // Lobby Functions
@@ -406,31 +413,22 @@ export default function App() {
   // Helpers
   // ============================================================================
 
-  const getPlatformIcon = (deviceName: string): string => {
-    const name = deviceName.toLowerCase();
-    if (name.includes('android') || name.includes('pixel') || name.includes('galaxy')) return '🤖';
-    if (name.includes('iphone') || name.includes('ipad') || name.includes('mac')) return '🍎';
-    if (name.includes('windows') || name.includes('surface')) return '🪟';
-    if (name.includes('linux') || name.includes('ubuntu')) return '🐧';
-    return '📱';
-  };
-
-  const getSignalBars = (lastSeen: number): string => {
-    const now = Date.now();
-    const age = now - lastSeen;
-    if (age < 1000) return '▁▃▅▇█';
-    if (age < 3000) return '▁▃▅▇';
-    if (age < 5000) return '▁▃▅';
-    if (age < 10000) return '▁▃';
-    return '▁';
-  };
-
   const getStatusText = (): string => {
     if (!status) return 'Initializing...';
     if (isTransmitting) return 'TRANSMITTING';
     if (isReceiving) return 'Receiving...';
     if (isSearching) return `Online • ${peers.length} nearby`;
     return 'Offline';
+  };
+
+  const detectPlatform = (deviceName: string): string | undefined => {
+    const name = deviceName.toLowerCase();
+    if (name.includes('android') || name.includes('pixel') || name.includes('galaxy') || name.includes('samsung')) return 'Android';
+    if (name.includes('iphone') || name.includes('ipad')) return 'iOS';
+    if (name.includes('mac') || name.includes('macbook')) return 'MacOS';
+    if (name.includes('windows') || name.includes('surface') || name.includes('pc')) return 'Windows';
+    if (name.includes('linux') || name.includes('ubuntu') || name.includes('fedora') || name.includes('debian')) return 'Linux';
+    return undefined;
   };
 
   // ============================================================================
@@ -447,7 +445,7 @@ export default function App() {
       {error && (
         <div className="error-banner">
           <span>{error}</span>
-          <button onClick={() => setError(null)}>✕</button>
+          <button onClick={() => setError(null)}><IconClose size={16} /></button>
         </div>
       )}
 
@@ -456,7 +454,7 @@ export default function App() {
           className={`search-btn ${isSearching ? 'active' : ''}`}
           onClick={isSearching ? leaveLobby : enterLobby}
         >
-          <span className="search-icon">{isSearching ? '🔍' : '📡'}</span>
+          <span className="search-icon">{isSearching ? <IconSearch size={20} /> : <IconLobby size={20} />}</span>
           <span>{isSearching ? 'Searching...' : 'Find Devices'}</span>
         </button>
         {isSearching && (
@@ -494,12 +492,19 @@ export default function App() {
           {peers.map((peer) => (
             <div key={peer.device_id} className={`peer-card ${peer.channel === channel ? 'same-channel' : ''}`}>
               <div className="peer-main">
-                <span className="status-icon">🟢</span>
-                <span className="platform-icon">{getPlatformIcon(peer.device_name)}</span>
+                <UserAvatar
+                  deviceId={peer.device_id}
+                  deviceName={peer.device_name}
+                  size={44}
+                  showStatus={!detectPlatform(peer.device_name)}
+                  status={peer.channel === channel ? 'online' : 'away'}
+                  platform={detectPlatform(peer.device_name)}
+                />
                 <div className="peer-details">
                   <span className="peer-name">{peer.device_name}</span>
                   <span className="peer-meta">
-                    CH{peer.channel.toString().padStart(2, '0')} • {getSignalBars(peer.last_seen)}
+                    <span>CH{peer.channel.toString().padStart(2, '0')}</span>
+                    <IconSignal size={16} level={getSignalLevel(peer.last_seen)} />
                   </span>
                 </div>
               </div>
@@ -521,7 +526,7 @@ export default function App() {
       {isSearching && (
         <div className="quick-talk-section">
           <button className="quick-talk-btn" onClick={() => setCurrentView('walkie')}>
-            <span>📻</span>
+            <IconRadio size={20} />
             <span>Start Talking on CH{channel.toString().padStart(2, '0')}</span>
           </button>
         </div>
@@ -529,15 +534,15 @@ export default function App() {
 
       <nav className="bottom-nav">
         <button className="nav-btn active">
-          <span className="nav-icon">📡</span>
+          <span className="nav-icon"><IconLobby size={20} /></span>
           <span>Lobby</span>
         </button>
         <button className="nav-btn" onClick={() => setCurrentView('walkie')}>
-          <span className="nav-icon">📻</span>
+          <span className="nav-icon"><IconRadio size={20} /></span>
           <span>Talk</span>
         </button>
         <button className="nav-btn" onClick={() => setCurrentView('settings')}>
-          <span className="nav-icon">⚙️</span>
+          <span className="nav-icon"><IconSettings size={20} /></span>
           <span>Settings</span>
         </button>
       </nav>
@@ -553,7 +558,7 @@ export default function App() {
       {error && (
         <div className="error-banner">
           <span>{error}</span>
-          <button onClick={() => setError(null)}>✕</button>
+          <button onClick={() => setError(null)}><IconClose size={16} /></button>
         </div>
       )}
 
@@ -563,16 +568,16 @@ export default function App() {
           <span className="peer-name">Channel {channel.toString().padStart(2, '0')}</span>
           {peers.length > 0 && <span className="transport-badge">UDP Multicast</span>}
         </div>
-        <button className="disconnect-btn" onClick={disconnect} title="Disconnect">✕</button>
+        <button className="disconnect-btn" onClick={disconnect} title="Disconnect"><IconClose size={20} /></button>
       </header>
 
       <div className="channel-display">
-        <button className="channel-btn" onClick={() => changeChannel(-1)} disabled={channel <= 1}>◀</button>
+        <button className="channel-btn" onClick={() => changeChannel(-1)} disabled={channel <= 1}><IconChevronLeft size={24} /></button>
         <div className="channel-lcd">
           <span className="channel-label">CH</span>
           <span className="channel-number">{channel.toString().padStart(2, '0')}</span>
         </div>
-        <button className="channel-btn" onClick={() => changeChannel(1)} disabled={channel >= 16}>▶</button>
+        <button className="channel-btn" onClick={() => changeChannel(1)} disabled={channel >= 16}><IconChevronRight size={24} /></button>
       </div>
 
       <div className="status-display">
@@ -595,7 +600,7 @@ export default function App() {
           onTouchEnd={(e) => { e.preventDefault(); handlePttUp(); }}
           disabled={!isSearching}
         >
-          <span className="ptt-icon">{isTransmitting ? '🔴' : '🎙️'}</span>
+          <span className="ptt-icon">{isTransmitting ? <IconRecording size={48} /> : <IconMic size={48} />}</span>
           <span className="ptt-text">
             {!isSearching ? 'START DISCOVERY FIRST' : isTransmitting ? 'RELEASE TO STOP' : 'PUSH TO TALK'}
           </span>
@@ -605,12 +610,12 @@ export default function App() {
 
       <div className="quick-settings">
         <div className="volume-control">
-          <span className="volume-icon">🔊</span>
+          <span className="volume-icon"><IconSpeaker size={20} /></span>
           <input type="range" min="0" max="100" value={speakerVolume} onChange={(e) => handleSpeakerVolumeChange(Number(e.target.value))} />
           <span className="volume-value">{speakerVolume}%</span>
         </div>
         <div className="volume-control">
-          <span className="volume-icon">🎤</span>
+          <span className="volume-icon"><IconMic size={20} /></span>
           <input type="range" min="0" max="100" value={micVolume} onChange={(e) => handleMicVolumeChange(Number(e.target.value))} />
           <span className="volume-value">{micVolume}%</span>
         </div>
@@ -620,7 +625,7 @@ export default function App() {
         <div className="nearby-mini">
           <span className="nearby-label">Nearby:</span>
           {peers.slice(0, 3).map(p => (
-            <span key={p.device_id} className="nearby-peer">{getPlatformIcon(p.device_name)} {p.device_name.substring(0, 10)}</span>
+            <span key={p.device_id} className="nearby-peer">{p.device_name.substring(0, 10)}</span>
           ))}
           {peers.length > 3 && <span className="nearby-more">+{peers.length - 3} more</span>}
         </div>
@@ -628,15 +633,15 @@ export default function App() {
 
       <nav className="bottom-nav">
         <button className="nav-btn" onClick={() => setCurrentView('lobby')}>
-          <span className="nav-icon">📡</span>
+          <span className="nav-icon"><IconLobby size={20} /></span>
           <span>Lobby</span>
         </button>
         <button className="nav-btn active">
-          <span className="nav-icon">📻</span>
+          <span className="nav-icon"><IconRadio size={20} /></span>
           <span>Talk</span>
         </button>
         <button className="nav-btn" onClick={() => setCurrentView('settings')}>
-          <span className="nav-icon">⚙️</span>
+          <span className="nav-icon"><IconSettings size={20} /></span>
           <span>Settings</span>
         </button>
       </nav>
@@ -656,7 +661,7 @@ export default function App() {
       {error && (
         <div className="error-banner">
           <span>{error}</span>
-          <button onClick={() => setError(null)}>✕</button>
+          <button onClick={() => setError(null)}><IconClose size={16} /></button>
         </div>
       )}
 
@@ -678,7 +683,7 @@ export default function App() {
         </section>
 
         <section className="settings-section">
-          <h3>Audio Devices <button className="refresh-btn" onClick={refreshAudioDevices} title="Refresh">🔄</button></h3>
+          <h3>Audio Devices <button className="refresh-btn" onClick={refreshAudioDevices} title="Refresh"><IconRefresh size={16} /></button></h3>
           <div className="setting-row">
             <span className="setting-label">Microphone</span>
             <select value={selectedInput} onChange={(e) => handleInputDeviceChange(e.target.value)} className="device-select">
@@ -766,15 +771,15 @@ export default function App() {
 
       <nav className="bottom-nav">
         <button className="nav-btn" onClick={() => setCurrentView('lobby')}>
-          <span className="nav-icon">📡</span>
+          <span className="nav-icon"><IconLobby size={20} /></span>
           <span>Lobby</span>
         </button>
         <button className="nav-btn" onClick={() => setCurrentView('walkie')}>
-          <span className="nav-icon">📻</span>
+          <span className="nav-icon"><IconRadio size={20} /></span>
           <span>Talk</span>
         </button>
         <button className="nav-btn active">
-          <span className="nav-icon">⚙️</span>
+          <span className="nav-icon"><IconSettings size={20} /></span>
           <span>Settings</span>
         </button>
       </nav>

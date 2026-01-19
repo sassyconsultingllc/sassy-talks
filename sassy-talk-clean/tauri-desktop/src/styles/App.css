@@ -315,16 +315,17 @@ html, body {
 .peer-main {
   display: flex;
   align-items: center;
-  gap: var(--spacing-sm);
+  gap: var(--spacing-md);
 }
 
-.status-icon, .platform-icon {
-  font-size: 1.2rem;
+.user-avatar {
+  flex-shrink: 0;
 }
 
 .peer-details {
   display: flex;
   flex-direction: column;
+  min-width: 0;
 }
 
 .peer-name {

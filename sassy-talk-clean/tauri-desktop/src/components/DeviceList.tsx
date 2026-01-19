@@ -1,4 +1,5 @@
 import './DeviceList.css';
+import { IconLobby } from './Icons';
 
 interface PeerInfo {
   device_id: number;
@@ -33,7 +34,7 @@ function DeviceList({ peers, currentChannel }: DeviceListProps) {
   return (
     <div className="device-list">
       <div className="device-list-header">
-        <h3>📡 Nearby Devices</h3>
+        <h3><IconLobby size={18} /> Nearby Devices</h3>
         <span className="device-count">
           {peers.length} {peers.length === 1 ? 'device' : 'devices'}
         </span>
