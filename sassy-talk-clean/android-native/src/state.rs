@@ -246,7 +246,7 @@ impl StateMachine {
         Ok(())
     }
 
-    /// TX thread: reads mic audio, encrypts, sends via active transport
+    /// TX thread: reads mic audio, ADPCM-compresses, encrypts, sends via active transport
     fn start_tx_thread(&self) {
         info!("Starting TX thread");
 
@@ -259,6 +259,7 @@ impl StateMachine {
 
         let handle = thread::spawn(move || {
             let mut frame = AudioFrame::new(FRAME_SIZE);
+            let mut encoder = crate::codec::VoiceEncoder::new();
 
             while running.load(Ordering::Relaxed) {
                 // Stamp frame with current time
@@ -295,12 +296,15 @@ impl StateMachine {
                     continue;
                 }
 
-                // Build packet: [channel:1][audio_data:N]
+                // ADPCM-compress the audio (960 samples → 484 bytes)
+                let compressed = encoder.encode(&frame.samples);
+
+                // Build packet: [channel:1][timestamp:8][compressed_audio:N]
                 let channel = current_channel.load(Ordering::Relaxed);
-                let audio_bytes = frame.to_bytes();
-                let mut packet = Vec::with_capacity(1 + audio_bytes.len());
+                let mut packet = Vec::with_capacity(1 + 8 + compressed.len());
                 packet.push(channel);
-                packet.extend_from_slice(&audio_bytes);
+                packet.extend_from_slice(&frame.timestamp.to_le_bytes());
+                packet.extend_from_slice(&compressed);
 
                 // Send via transport (handles encryption internally)
                 let mut tm = transport.lock().unwrap();
@@ -319,7 +323,7 @@ impl StateMachine {
         *self.tx_thread.lock().unwrap() = Some(handle);
     }
 
-    /// RX thread: receives from transport, decrypts, plays audio
+    /// RX thread: receives from transport, decrypts, ADPCM-decompresses, plays audio
     fn start_rx_thread(&self) {
         info!("Starting RX thread");
 
@@ -331,8 +335,9 @@ impl StateMachine {
         let state = Arc::clone(&self.state);
 
         let handle = thread::spawn(move || {
-            // Buffer sized for encrypted packet + overhead
-            let mut buffer = vec![0u8; (FRAME_SIZE * 2) + 128];
+            // Buffer sized for compressed packet after decryption
+            let mut buffer = vec![0u8; 1024];
+            let mut decoder = crate::codec::VoiceDecoder::new();
 
             // Initialize audio player
             if let Some(a) = audio.lock().unwrap().as_ref() {
@@ -361,22 +366,26 @@ impl StateMachine {
                     }
                 };
 
-                if bytes_received < 2 {
+                // Minimum: 1 byte channel + 8 bytes timestamp + 4 bytes ADPCM header
+                if bytes_received < 13 {
                     thread::sleep(Duration::from_millis(5));
                     continue;
                 }
 
-                // Parse: [channel:1][audio_data:N]
+                // Parse: [channel:1][timestamp:8][compressed_audio:N]
                 let _channel = buffer[0];
-                let audio_data = &buffer[1..bytes_received];
+                let _timestamp = u64::from_le_bytes([
+                    buffer[1], buffer[2], buffer[3], buffer[4],
+                    buffer[5], buffer[6], buffer[7], buffer[8],
+                ]);
+                let compressed_audio = &buffer[9..bytes_received];
 
-                let frame = match AudioFrame::from_bytes(audio_data) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        error!("RX: Failed to parse audio frame: {}", e);
-                        continue;
-                    }
-                };
+                // ADPCM-decompress back to PCM-16 samples
+                let samples = decoder.decode(compressed_audio);
+
+                if samples.is_empty() {
+                    continue;
+                }
 
                 *state.lock().unwrap() = AppState::Receiving;
 
@@ -394,9 +403,9 @@ impl StateMachine {
                     }
                 }
 
-                // Play audio
+                // Play decompressed audio
                 if let Some(a) = audio.lock().unwrap().as_ref() {
-                    if let Err(e) = a.write_audio(&frame.samples) {
+                    if let Err(e) = a.write_audio(&samples) {
                         error!("RX: Failed to write audio: {}", e);
                     }
                 }
@@ -533,6 +542,14 @@ impl StateMachine {
     /// Check if PTT is currently active
     pub fn is_ptt_active(&self) -> bool {
         self.ptt_pressed.load(Ordering::Relaxed)
+    }
+
+    /// Check if encryption is active (crypto session set via QR auth)
+    pub fn is_encrypted(&self) -> bool {
+        self.transport.lock().unwrap()
+            .as_ref()
+            .map(|t| t.is_encrypted())
+            .unwrap_or(false)
     }
 
     /// Get audio cache reference (for JNI bridge / UI status)

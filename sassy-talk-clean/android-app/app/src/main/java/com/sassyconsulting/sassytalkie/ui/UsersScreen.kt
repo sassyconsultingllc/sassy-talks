@@ -18,12 +18,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.ui.theme.*
 
 @Composable
 fun UsersScreen(onBack: () -> Unit) {
     var users by remember { mutableStateOf(SassyTalkNative.getUsers()) }
+    var isRefreshing by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     val favorites = users.filter { it.isFavorite }
     val others = users.filter { !it.isFavorite }
@@ -51,8 +55,23 @@ fun UsersScreen(onBack: () -> Unit) {
                 color = Orange
             )
 
-            IconButton(onClick = { users = SassyTalkNative.getUsers() }) {
-                Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = Cyan)
+            Box(
+                modifier = Modifier.size(48.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                RainbowRefreshIndicator(
+                    isRefreshing = isRefreshing,
+                    onRefresh = {
+                        scope.launch {
+                            isRefreshing = true
+                            delay(600)
+                            users = SassyTalkNative.getUsers()
+                            isRefreshing = false
+                        }
+                    },
+                    size = 28.dp,
+                    strokeWidth = 3.dp
+                )
             }
         }
 

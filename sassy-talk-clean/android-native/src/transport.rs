@@ -148,13 +148,19 @@ impl TransportManager {
 
     // ── Unified send/receive ──
 
+    /// Check if encryption is enabled (valid crypto session exists)
+    pub fn is_encrypted(&self) -> bool {
+        self.crypto.is_some()
+    }
+
     /// Send data through the active transport with encryption
+    /// SECURITY: Refuses to send if no encryption session is active.
     pub fn send(&mut self, data: &[u8]) -> Result<usize, String> {
-        // Encrypt if crypto session is active
+        // MANDATORY ENCRYPTION: refuse to transmit cleartext
         let payload = if let Some(ref mut crypto) = self.crypto {
             crypto.encrypt(data)?
         } else {
-            data.to_vec()
+            return Err("Encryption required: authenticate via QR code first".to_string());
         };
 
         match self.active {
@@ -214,7 +220,7 @@ impl TransportManager {
             return Ok(0);
         };
 
-        // Decrypt if crypto session is active
+        // MANDATORY DECRYPTION: drop unencrypted or tampered packets
         if let Some(ref crypto) = self.crypto {
             match crypto.decrypt(&raw_data) {
                 Ok(plaintext) => {
@@ -223,14 +229,14 @@ impl TransportManager {
                     Ok(copy_len)
                 }
                 Err(e) => {
-                    error!("Decryption failed: {}", e);
-                    Err(e)
+                    error!("Decryption failed (dropping packet): {}", e);
+                    Ok(0) // Drop packet silently instead of propagating error
                 }
             }
         } else {
-            let copy_len = raw_data.len().min(buffer.len());
-            buffer[..copy_len].copy_from_slice(&raw_data[..copy_len]);
-            Ok(copy_len)
+            // No crypto session — drop all incoming data
+            warn!("RX: No encryption session, dropping {} bytes", raw_data.len());
+            Ok(0)
         }
     }
 

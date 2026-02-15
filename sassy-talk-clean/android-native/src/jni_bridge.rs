@@ -1887,6 +1887,22 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     }
 }
 
+/// JNI: Check if encryption is active (QR auth completed)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeIsEncrypted(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        if sm.is_encrypted() { JNI_TRUE } else { JNI_FALSE }
+    } else {
+        JNI_FALSE
+    }
+}
+
 /// JNI: Check if WiFi transport has discovered peers
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHasWifiPeers(

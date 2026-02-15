@@ -32,6 +32,7 @@ fun MainScreen(
 ) {
     var isTransmitting by remember { mutableStateOf(false) }
     var currentChannel by remember { mutableIntStateOf(1) }
+    var showEncryptionWarning by remember { mutableStateOf(false) }
 
     // Pulse animation for transmitting
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
@@ -115,16 +116,42 @@ fun MainScreen(
         Spacer(modifier = Modifier.weight(1f))
 
         // PTT Button
+        // Encryption warning snackbar
+        if (showEncryptionWarning) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF442222)),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.Lock, contentDescription = null, tint = Color(0xFFFF6B6B), modifier = Modifier.size(20.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Authenticate via QR first", color = Color(0xFFFF6B6B), fontSize = 13.sp)
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+
         PTTButton(
             isTransmitting = isTransmitting,
             pulseScale = if (isTransmitting) pulseScale else 1f,
             onPressStart = {
-                isTransmitting = true
-                SassyTalkNative.pttStart()
+                if (!SassyTalkNative.isEncrypted()) {
+                    showEncryptionWarning = true
+                } else {
+                    showEncryptionWarning = false
+                    isTransmitting = true
+                    SassyTalkNative.pttStart()
+                }
             },
             onPressEnd = {
-                isTransmitting = false
-                SassyTalkNative.pttStop()
+                if (isTransmitting) {
+                    isTransmitting = false
+                    SassyTalkNative.pttStop()
+                }
             }
         )
 
@@ -136,10 +163,12 @@ fun MainScreen(
         Spacer(modifier = Modifier.height(8.dp))
 
         // Transport + encryption badge
+        val encStatus = if (SassyTalkNative.isEncrypted()) "AES-256-GCM" else "\uD83D\uDD13 UNENCRYPTED"
+        val encColor = if (SassyTalkNative.isEncrypted()) TextMuted else Color(0xFFFF6B6B)
         Text(
-            text = "AES-256-GCM \u2022 ${SassyTalkNative.getTransportName()}",
+            text = "$encStatus \u2022 ADPCM \u2022 ${SassyTalkNative.getTransportName()}",
             fontSize = 11.sp,
-            color = TextMuted,
+            color = encColor,
             textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth()
         )

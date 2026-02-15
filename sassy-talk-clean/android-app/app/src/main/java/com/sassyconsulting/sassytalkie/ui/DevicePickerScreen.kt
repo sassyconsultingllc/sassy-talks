@@ -18,6 +18,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.ui.theme.*
 
@@ -31,6 +33,8 @@ fun DevicePickerScreen(
     var connectingAddress by remember { mutableStateOf("") }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isListening by remember { mutableStateOf(false) }
+    var isRefreshing by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     Column(
         modifier = Modifier
@@ -55,8 +59,23 @@ fun DevicePickerScreen(
                 color = Orange
             )
 
-            IconButton(onClick = { devices = SassyTalkNative.getPairedDevices() }) {
-                Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = Cyan)
+            Box(
+                modifier = Modifier.size(48.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                RainbowRefreshIndicator(
+                    isRefreshing = isRefreshing,
+                    onRefresh = {
+                        scope.launch {
+                            isRefreshing = true
+                            delay(800) // Let the spinner show for a moment
+                            devices = SassyTalkNative.getPairedDevices()
+                            isRefreshing = false
+                        }
+                    },
+                    size = 28.dp,
+                    strokeWidth = 3.dp
+                )
             }
         }
 
@@ -178,10 +197,11 @@ fun DevicePickerScreen(
                             }
 
                             if (isThisConnecting) {
-                                CircularProgressIndicator(
-                                    color = Orange,
-                                    strokeWidth = 2.dp,
-                                    modifier = Modifier.size(24.dp)
+                                RainbowRefreshIndicator(
+                                    isRefreshing = true,
+                                    onRefresh = {},
+                                    size = 24.dp,
+                                    strokeWidth = 2.5.dp
                                 )
                             } else {
                                 Icon(
@@ -219,10 +239,11 @@ fun DevicePickerScreen(
                 .height(56.dp)
         ) {
             if (isListening) {
-                CircularProgressIndicator(
-                    color = Cyan,
-                    strokeWidth = 2.dp,
-                    modifier = Modifier.size(20.dp)
+                RainbowRefreshIndicator(
+                    isRefreshing = true,
+                    onRefresh = {},
+                    size = 20.dp,
+                    strokeWidth = 2.dp
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text("Listening...", fontSize = 16.sp)

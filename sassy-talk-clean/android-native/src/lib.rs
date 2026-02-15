@@ -17,6 +17,7 @@ mod transport;
 mod session;
 mod users;
 mod audio_cache;
+mod codec;
 
 use bluetooth::BluetoothDevice;
 use state::{StateMachine, AppState};

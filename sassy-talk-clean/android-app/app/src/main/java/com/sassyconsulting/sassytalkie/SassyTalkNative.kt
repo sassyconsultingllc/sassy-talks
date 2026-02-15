@@ -500,6 +500,14 @@ object SassyTalkNative {
         } catch (e: Exception) { "" }
     }
 
+    /** Check if encryption is active (QR auth completed). TX is blocked without this. */
+    fun isEncrypted(): Boolean {
+        if (!initialized) return false
+        return try {
+            nativeIsEncrypted()
+        } catch (e: Exception) { false }
+    }
+
     // ── Native method declarations ──
 
     // Lifecycle
@@ -555,6 +563,7 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeInitWifi(): Boolean
     @JvmStatic private external fun nativeGetDeviceName(): String
     @JvmStatic private external fun nativeHasWifiPeers(): Boolean
+    @JvmStatic private external fun nativeIsEncrypted(): Boolean
 
     // Audio Cache (multi-speaker store/replay)
     @JvmStatic private external fun nativeGetCacheStatus(): String
