@@ -18,8 +18,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.ui.theme.*
 
@@ -68,7 +70,7 @@ fun DevicePickerScreen(
                     onRefresh = {
                         scope.launch {
                             isRefreshing = true
-                            delay(800) // Let the spinner show for a moment
+                            delay(800)
                             devices = SassyTalkNative.getPairedDevices()
                             isRefreshing = false
                         }
@@ -149,12 +151,30 @@ fun DevicePickerScreen(
                                 connectingAddress = device.address
                                 errorMessage = null
 
-                                val success = SassyTalkNative.connectDevice(device.address)
-                                if (success) {
-                                    onConnected()
-                                } else {
-                                    errorMessage = "Failed to connect to ${device.name}"
-                                    isConnecting = false
+                                scope.launch {
+                                    val success = withContext(Dispatchers.IO) {
+                                        SassyTalkNative.connectDevice(device.address)
+                                    }
+                                    if (success) {
+                                        // Poll for actual connection since Rust connect is now async
+                                        var connected = false
+                                        for (i in 1..30) {
+                                            delay(500)
+                                            if (SassyTalkNative.isConnected()) {
+                                                connected = true
+                                                break
+                                            }
+                                        }
+                                        if (connected) {
+                                            onConnected()
+                                        } else {
+                                            errorMessage = "Connection to ${device.name} timed out"
+                                            isConnecting = false
+                                        }
+                                    } else {
+                                        errorMessage = "Failed to connect to ${device.name}"
+                                        isConnecting = false
+                                    }
                                 }
                             }
                     ) {
@@ -164,7 +184,6 @@ fun DevicePickerScreen(
                                 .padding(16.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            // BT icon
                             Box(
                                 modifier = Modifier
                                     .size(48.dp)
@@ -223,12 +242,16 @@ fun DevicePickerScreen(
             onClick = {
                 isListening = true
                 errorMessage = null
-                val success = SassyTalkNative.startListening()
-                if (success) {
-                    onConnected()
-                } else {
-                    errorMessage = "Failed to start listening"
-                    isListening = false
+                scope.launch {
+                    val success = withContext(Dispatchers.IO) {
+                        SassyTalkNative.startListening()
+                    }
+                    if (success) {
+                        onConnected()
+                    } else {
+                        errorMessage = "Failed to start listening"
+                        isListening = false
+                    }
                 }
             },
             enabled = !isConnecting && !isListening,
@@ -256,7 +279,8 @@ fun DevicePickerScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Session info — use status to drive display text
+        // Session info
+        @Suppress("UNUSED_VARIABLE")
         val sessionJson = SassyTalkNative.getSessionStatus()
         val isAuth = SassyTalkNative.isAuthenticated()
         Text(
