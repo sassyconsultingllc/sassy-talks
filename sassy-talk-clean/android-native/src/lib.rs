@@ -11,9 +11,13 @@ mod jni_bridge;
 mod audio;
 mod state;
 mod permissions;
+mod crypto;
+mod wifi_transport;
+mod transport;
 
 use bluetooth::BluetoothDevice;
 use state::{StateMachine, AppState};
+use transport::ActiveTransport;
 use permissions::PermissionManager;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -575,9 +579,18 @@ impl SassyTalkApp {
                     
                     ui.add_space(20.0);
                     
-                    // Version
-                    ui.label(egui::RichText::new(format!("v{} • AES-256 Encrypted", VERSION))
-                        .size(11.0).color(TEXT_GRAY));
+                    // Version + transport info
+                    let transport_label = match self.state_machine.lock().unwrap().as_ref() {
+                        Some(sm) => match sm.get_active_transport() {
+                            ActiveTransport::Wifi => "WiFi",
+                            ActiveTransport::Bluetooth => "BT",
+                            ActiveTransport::None => "---",
+                        },
+                        None => "---",
+                    };
+                    ui.label(egui::RichText::new(
+                        format!("v{} • AES-256-GCM • {}", VERSION, transport_label)
+                    ).size(11.0).color(TEXT_GRAY));
                 });
             });
     }

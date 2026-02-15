@@ -85,8 +85,19 @@ fun MainScreen() {
         
         // Status Bar
         StatusBar(isTransmitting = isTransmitting, channel = currentChannel)
-        
-        Spacer(modifier = Modifier.height(16.dp))
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // Transport + encryption badge
+        Text(
+            text = "AES-256-GCM \u2022 ${SassyTalkNative.getTransportName()}",
+            fontSize = 11.sp,
+            color = TextMuted,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
     }
 }
 

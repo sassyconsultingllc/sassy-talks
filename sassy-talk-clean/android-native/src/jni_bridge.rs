@@ -888,9 +888,29 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 ) {
     let ch = channel as u8;
     info!("JNI: Set channel to {}", ch);
-    
+
     let state = get_jni_state();
     let guard = state.lock().unwrap();
-    
+
     guard.current_channel.store(ch, Ordering::Relaxed);
+}
+
+/// JNI: Get active transport type (0=None, 1=Bluetooth, 2=WiFi)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetTransport(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jbyte {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap();
+
+    if let Some(ref sm) = guard.state_machine {
+        match sm.get_active_transport() {
+            crate::transport::ActiveTransport::None => 0,
+            crate::transport::ActiveTransport::Bluetooth => 1,
+            crate::transport::ActiveTransport::Wifi => 2,
+        }
+    } else {
+        0
+    }
 }
