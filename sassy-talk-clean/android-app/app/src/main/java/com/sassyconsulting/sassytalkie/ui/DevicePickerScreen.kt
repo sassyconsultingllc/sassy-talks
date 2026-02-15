@@ -256,12 +256,13 @@ fun DevicePickerScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Session info
-        val sessionStatus = SassyTalkNative.getSessionStatus()
+        // Session info — use status to drive display text
+        val sessionJson = SassyTalkNative.getSessionStatus()
+        val isAuth = SassyTalkNative.isAuthenticated()
         Text(
-            text = "Authenticated session active",
+            text = if (isAuth) "Authenticated session active" else "No active session",
             fontSize = 11.sp,
-            color = Green,
+            color = if (isAuth) Green else TextMuted,
             textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth()
         )

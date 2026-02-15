@@ -1,6 +1,5 @@
 package com.sassyconsulting.sassytalkie
 
-import android.content.Context
 import android.util.Log
 import com.sassyconsulting.sassytalkie.ui.TranscriptionEntry
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -59,7 +58,7 @@ object TranscriptionBridge {
 
     // ── Lifecycle ──
 
-    fun initialize(context: Context) {
+    fun initialize(@Suppress("UNUSED_PARAMETER") context: android.content.Context) {
         if (initialized) return
         initialized = true
         Log.i(TAG, "Initialized")
