@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import './SettingsPanel.css';
+import { IconSettings, IconClose } from './Icons';
 
 interface AudioDeviceInfo {
   name: string;
@@ -114,8 +115,8 @@ function SettingsPanel({ onClose }: SettingsPanelProps) {
     <div className="settings-overlay" onClick={onClose}>
       <div className="settings-panel" onClick={(e) => e.stopPropagation()}>
         <div className="settings-header">
-          <h2>⚙️ Settings</h2>
-          <button className="close-button" onClick={onClose}>✕</button>
+          <h2><IconSettings size={20} /> Settings</h2>
+          <button className="close-button" onClick={onClose}><IconClose size={20} /></button>
         </div>
 
         <div className="settings-content">

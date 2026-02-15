@@ -6,7 +6,22 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import './styles/app.css';
+import './styles/lobby.css';
+import PeerList from './components/lobby/PeerList';
 import Sounds from './sounds';
+import {
+  IconLobby,
+  IconRadio,
+  IconSettings,
+  IconSearch,
+  IconClose,
+  IconChevronLeft,
+  IconChevronRight,
+  IconMic,
+  IconSpeaker,
+  IconRecording,
+  IconRefresh,
+} from './components/Icons';
 
 // ============================================================================
 // Types matching Rust backend
@@ -49,6 +64,15 @@ interface AudioDeviceInfo {
   device_type: string;
 }
 
+interface NetworkInfo {
+  port: number;
+  multicast_addr: string;
+  use_random_port: boolean;
+  encryption_enabled: boolean;
+  is_encrypted: boolean;
+  public_key: string | null;
+}
+
 type View = 'lobby' | 'walkie' | 'settings';
 
 // ============================================================================
@@ -79,6 +103,11 @@ export default function App() {
   const [audioDevices, setAudioDevices] = useState<AudioDevices>({ inputs: [], outputs: [] });
   const [selectedInput, setSelectedInput] = useState<string>('');
   const [selectedOutput, setSelectedOutput] = useState<string>('');
+  
+  // Network settings state
+  const [networkInfo, setNetworkInfo] = useState<NetworkInfo | null>(null);
+  const [encryptionEnabled, setEncryptionEnabled] = useState(true);
+  const [randomPortEnabled, setRandomPortEnabled] = useState(true);
   
   // Audio visualization
   const [audioLevel, setAudioLevel] = useState(0);
@@ -120,6 +149,16 @@ export default function App() {
         const defaultOutput = devices.outputs.find(d => d.is_default);
         if (defaultInput) setSelectedInput(defaultInput.name);
         if (defaultOutput) setSelectedOutput(defaultOutput.name);
+        
+        // Get network info
+        try {
+          const netInfo = await invoke<NetworkInfo>('get_network_info');
+          setNetworkInfo(netInfo);
+          setEncryptionEnabled(netInfo.encryption_enabled);
+          setRandomPortEnabled(netInfo.use_random_port);
+        } catch (e) {
+          console.warn('Failed to get network info:', e);
+        }
         
       } catch (e) {
         console.error('Failed to initialize:', e);
@@ -166,6 +205,10 @@ export default function App() {
           }
           setPeers(nearbyPeers);
         }
+        
+        // Update network info periodically (encryption status can change)
+        const netInfo = await invoke<NetworkInfo>('get_network_info');
+        setNetworkInfo(netInfo);
       } catch (e) {
         // Ignore polling errors
       }
@@ -177,15 +220,6 @@ export default function App() {
       if (statusIntervalRef.current) clearInterval(statusIntervalRef.current);
     };
   }, [isSearching]);
-
-  // ==========================================================================
-  // Sound Effects (Web Audio API - frontend)
-  // ==========================================================================
-
-  const playErrorTone = () => Sounds.error();
-  const playDeliveredTone = () => Sounds.messageDelivered();
-  const playConnectionTone = () => Sounds.connectionSuccess();
-  const playChannelTone = () => Sounds.channelChange();
 
   // ==========================================================================
   // Lobby Functions
@@ -361,6 +395,34 @@ export default function App() {
     }
   };
 
+  // ==========================================================================
+  // Network Settings Handlers
+  // ==========================================================================
+
+  const handleEncryptionChange = async (enabled: boolean) => {
+    setEncryptionEnabled(enabled);
+    try {
+      await invoke('set_encryption_enabled', { enabled });
+      // Refresh network info
+      const netInfo = await invoke<NetworkInfo>('get_network_info');
+      setNetworkInfo(netInfo);
+    } catch (e) {
+      console.error('Failed to set encryption:', e);
+      setError(`Failed to set encryption: ${e}`);
+    }
+  };
+
+  const handleRandomPortChange = async (enabled: boolean) => {
+    setRandomPortEnabled(enabled);
+    try {
+      await invoke('set_random_port_enabled', { enabled });
+      // Note: Port change takes effect on next session
+    } catch (e) {
+      console.error('Failed to set random port:', e);
+      setError(`Failed to set random port: ${e}`);
+    }
+  };
+
   // ============================================================================
   // PTT Handlers
   // ============================================================================
@@ -406,25 +468,6 @@ export default function App() {
   // Helpers
   // ============================================================================
 
-  const getPlatformIcon = (deviceName: string): string => {
-    const name = deviceName.toLowerCase();
-    if (name.includes('android') || name.includes('pixel') || name.includes('galaxy')) return '🤖';
-    if (name.includes('iphone') || name.includes('ipad') || name.includes('mac')) return '🍎';
-    if (name.includes('windows') || name.includes('surface')) return '🪟';
-    if (name.includes('linux') || name.includes('ubuntu')) return '🐧';
-    return '📱';
-  };
-
-  const getSignalBars = (lastSeen: number): string => {
-    const now = Date.now();
-    const age = now - lastSeen;
-    if (age < 1000) return '▁▃▅▇█';
-    if (age < 3000) return '▁▃▅▇';
-    if (age < 5000) return '▁▃▅';
-    if (age < 10000) return '▁▃';
-    return '▁';
-  };
-
   const getStatusText = (): string => {
     if (!status) return 'Initializing...';
     if (isTransmitting) return 'TRANSMITTING';
@@ -432,6 +475,8 @@ export default function App() {
     if (isSearching) return `Online • ${peers.length} nearby`;
     return 'Offline';
   };
+
+  
 
   // ============================================================================
   // Render: Lobby View
@@ -447,7 +492,7 @@ export default function App() {
       {error && (
         <div className="error-banner">
           <span>{error}</span>
-          <button onClick={() => setError(null)}>✕</button>
+          <button onClick={() => setError(null)}><IconClose size={16} /></button>
         </div>
       )}
 
@@ -456,7 +501,7 @@ export default function App() {
           className={`search-btn ${isSearching ? 'active' : ''}`}
           onClick={isSearching ? leaveLobby : enterLobby}
         >
-          <span className="search-icon">{isSearching ? '🔍' : '📡'}</span>
+          <span className="search-icon">{isSearching ? <IconSearch size={20} /> : <IconLobby size={20} />}</span>
           <span>{isSearching ? 'Searching...' : 'Find Devices'}</span>
         </button>
         {isSearching && (
@@ -490,38 +535,13 @@ export default function App() {
           </div>
         )}
 
-        <div className="peer-list">
-          {peers.map((peer) => (
-            <div key={peer.device_id} className={`peer-card ${peer.channel === channel ? 'same-channel' : ''}`}>
-              <div className="peer-main">
-                <span className="status-icon">🟢</span>
-                <span className="platform-icon">{getPlatformIcon(peer.device_name)}</span>
-                <div className="peer-details">
-                  <span className="peer-name">{peer.device_name}</span>
-                  <span className="peer-meta">
-                    CH{peer.channel.toString().padStart(2, '0')} • {getSignalBars(peer.last_seen)}
-                  </span>
-                </div>
-              </div>
-              
-              <div className="peer-actions">
-                {peer.channel === channel ? (
-                  <button className="connected-btn" onClick={() => setCurrentView('walkie')}>Talk</button>
-                ) : (
-                  <button className="connect-btn" onClick={() => joinPeerChannel(peer.channel)}>
-                    Join CH{peer.channel.toString().padStart(2, '0')}
-                  </button>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
+        <PeerList peers={peers} channel={channel} onJoin={joinPeerChannel} onTalk={() => setCurrentView('walkie')} />
       </div>
 
       {isSearching && (
         <div className="quick-talk-section">
           <button className="quick-talk-btn" onClick={() => setCurrentView('walkie')}>
-            <span>📻</span>
+            <IconRadio size={20} />
             <span>Start Talking on CH{channel.toString().padStart(2, '0')}</span>
           </button>
         </div>
@@ -529,15 +549,15 @@ export default function App() {
 
       <nav className="bottom-nav">
         <button className="nav-btn active">
-          <span className="nav-icon">📡</span>
+          <span className="nav-icon"><IconLobby size={20} /></span>
           <span>Lobby</span>
         </button>
         <button className="nav-btn" onClick={() => setCurrentView('walkie')}>
-          <span className="nav-icon">📻</span>
+          <span className="nav-icon"><IconRadio size={20} /></span>
           <span>Talk</span>
         </button>
         <button className="nav-btn" onClick={() => setCurrentView('settings')}>
-          <span className="nav-icon">⚙️</span>
+          <span className="nav-icon"><IconSettings size={20} /></span>
           <span>Settings</span>
         </button>
       </nav>
@@ -553,7 +573,7 @@ export default function App() {
       {error && (
         <div className="error-banner">
           <span>{error}</span>
-          <button onClick={() => setError(null)}>✕</button>
+          <button onClick={() => setError(null)}><IconClose size={16} /></button>
         </div>
       )}
 
@@ -563,16 +583,16 @@ export default function App() {
           <span className="peer-name">Channel {channel.toString().padStart(2, '0')}</span>
           {peers.length > 0 && <span className="transport-badge">UDP Multicast</span>}
         </div>
-        <button className="disconnect-btn" onClick={disconnect} title="Disconnect">✕</button>
+        <button className="disconnect-btn" onClick={disconnect} title="Disconnect"><IconClose size={20} /></button>
       </header>
 
       <div className="channel-display">
-        <button className="channel-btn" onClick={() => changeChannel(-1)} disabled={channel <= 1}>◀</button>
+        <button className="channel-btn" onClick={() => changeChannel(-1)} disabled={channel <= 1}><IconChevronLeft size={24} /></button>
         <div className="channel-lcd">
           <span className="channel-label">CH</span>
           <span className="channel-number">{channel.toString().padStart(2, '0')}</span>
         </div>
-        <button className="channel-btn" onClick={() => changeChannel(1)} disabled={channel >= 16}>▶</button>
+        <button className="channel-btn" onClick={() => changeChannel(1)} disabled={channel >= 16}><IconChevronRight size={24} /></button>
       </div>
 
       <div className="status-display">
@@ -595,7 +615,7 @@ export default function App() {
           onTouchEnd={(e) => { e.preventDefault(); handlePttUp(); }}
           disabled={!isSearching}
         >
-          <span className="ptt-icon">{isTransmitting ? '🔴' : '🎙️'}</span>
+          <span className="ptt-icon">{isTransmitting ? <IconRecording size={48} /> : <IconMic size={48} />}</span>
           <span className="ptt-text">
             {!isSearching ? 'START DISCOVERY FIRST' : isTransmitting ? 'RELEASE TO STOP' : 'PUSH TO TALK'}
           </span>
@@ -605,12 +625,12 @@ export default function App() {
 
       <div className="quick-settings">
         <div className="volume-control">
-          <span className="volume-icon">🔊</span>
+          <span className="volume-icon"><IconSpeaker size={20} /></span>
           <input type="range" min="0" max="100" value={speakerVolume} onChange={(e) => handleSpeakerVolumeChange(Number(e.target.value))} />
           <span className="volume-value">{speakerVolume}%</span>
         </div>
         <div className="volume-control">
-          <span className="volume-icon">🎤</span>
+          <span className="volume-icon"><IconMic size={20} /></span>
           <input type="range" min="0" max="100" value={micVolume} onChange={(e) => handleMicVolumeChange(Number(e.target.value))} />
           <span className="volume-value">{micVolume}%</span>
         </div>
@@ -620,7 +640,7 @@ export default function App() {
         <div className="nearby-mini">
           <span className="nearby-label">Nearby:</span>
           {peers.slice(0, 3).map(p => (
-            <span key={p.device_id} className="nearby-peer">{getPlatformIcon(p.device_name)} {p.device_name.substring(0, 10)}</span>
+            <span key={p.device_id} className="nearby-peer">{p.device_name.substring(0, 10)}</span>
           ))}
           {peers.length > 3 && <span className="nearby-more">+{peers.length - 3} more</span>}
         </div>
@@ -628,15 +648,15 @@ export default function App() {
 
       <nav className="bottom-nav">
         <button className="nav-btn" onClick={() => setCurrentView('lobby')}>
-          <span className="nav-icon">📡</span>
+          <span className="nav-icon"><IconLobby size={20} /></span>
           <span>Lobby</span>
         </button>
         <button className="nav-btn active">
-          <span className="nav-icon">📻</span>
+          <span className="nav-icon"><IconRadio size={20} /></span>
           <span>Talk</span>
         </button>
         <button className="nav-btn" onClick={() => setCurrentView('settings')}>
-          <span className="nav-icon">⚙️</span>
+          <span className="nav-icon"><IconSettings size={20} /></span>
           <span>Settings</span>
         </button>
       </nav>
@@ -656,7 +676,7 @@ export default function App() {
       {error && (
         <div className="error-banner">
           <span>{error}</span>
-          <button onClick={() => setError(null)}>✕</button>
+          <button onClick={() => setError(null)}><IconClose size={16} /></button>
         </div>
       )}
 
@@ -678,7 +698,7 @@ export default function App() {
         </section>
 
         <section className="settings-section">
-          <h3>Audio Devices <button className="refresh-btn" onClick={refreshAudioDevices} title="Refresh">🔄</button></h3>
+          <h3>Audio Devices <button className="refresh-btn" onClick={refreshAudioDevices} title="Refresh"><IconRefresh size={16} /></button></h3>
           <div className="setting-row">
             <span className="setting-label">Microphone</span>
             <select value={selectedInput} onChange={(e) => handleInputDeviceChange(e.target.value)} className="device-select">
@@ -744,8 +764,56 @@ export default function App() {
           </div>
           <div className="setting-row">
             <span className="setting-label">Multicast Group</span>
-            <span className="setting-value">239.255.42.42:5555</span>
+            <span className="setting-value">{networkInfo?.multicast_addr || '239.255.42.42'}</span>
           </div>
+          <div className="setting-row">
+            <span className="setting-label">Port</span>
+            <span className="setting-value">{networkInfo?.port || '---'} {networkInfo?.use_random_port ? '(random)' : '(fixed)'}</span>
+          </div>
+          <div className="setting-row">
+            <span className="setting-label">Random Port Each Session</span>
+            <label className="toggle">
+              <input type="checkbox" checked={randomPortEnabled} onChange={(e) => handleRandomPortChange(e.target.checked)} />
+              <span className="toggle-slider"></span>
+            </label>
+          </div>
+        </section>
+
+        <section className="settings-section">
+          <h3>Security</h3>
+          <div className="setting-row">
+            <span className="setting-label">End-to-End Encryption</span>
+            <label className="toggle">
+              <input type="checkbox" checked={encryptionEnabled} onChange={(e) => handleEncryptionChange(e.target.checked)} />
+              <span className="toggle-slider"></span>
+            </label>
+          </div>
+          <div className="setting-row">
+            <span className="setting-label">Encryption Status</span>
+            <span className={`setting-value ${networkInfo?.is_encrypted ? 'secure' : 'insecure'}`}>
+              {networkInfo?.is_encrypted ? '🔒 Active' : '🔓 Inactive'}
+            </span>
+          </div>
+          {networkInfo?.public_key && (
+            <div className="setting-row">
+              <span className="setting-label">Public Key</span>
+              <span className="setting-value key-value" title={networkInfo.public_key}>
+                {networkInfo.public_key.substring(0, 16)}...
+              </span>
+            </div>
+          )}
+          <div className="setting-row">
+            <span className="setting-label">Key Exchange</span>
+            <span className="setting-value">X25519 ECDH</span>
+          </div>
+          <div className="setting-row">
+            <span className="setting-label">Cipher</span>
+            <span className="setting-value">AES-256-GCM</span>
+          </div>
+        </section>
+
+        <section className="settings-section">
+          <h3>Audio Codec</h3>
           <div className="setting-row">
             <span className="setting-label">Codec</span>
             <span className="setting-value">Opus 32kbps VBR</span>
@@ -766,15 +834,15 @@ export default function App() {
 
       <nav className="bottom-nav">
         <button className="nav-btn" onClick={() => setCurrentView('lobby')}>
-          <span className="nav-icon">📡</span>
+          <span className="nav-icon"><IconLobby size={20} /></span>
           <span>Lobby</span>
         </button>
         <button className="nav-btn" onClick={() => setCurrentView('walkie')}>
-          <span className="nav-icon">📻</span>
+          <span className="nav-icon"><IconRadio size={20} /></span>
           <span>Talk</span>
         </button>
         <button className="nav-btn active">
-          <span className="nav-icon">⚙️</span>
+          <span className="nav-icon"><IconSettings size={20} /></span>
           <span>Settings</span>
         </button>
       </nav>

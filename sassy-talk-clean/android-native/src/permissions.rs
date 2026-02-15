@@ -1,9 +1,13 @@
 /// Permissions Module - Runtime Permission Requests for Android
 /// 
-/// Handles Android 6.0+ runtime permission requests
+/// Handles Android 6.0+ runtime permission requests via JNI
 /// Required for: Bluetooth, Microphone access
+/// 
+/// Copyright 2025 Sassy Consulting LLC. All rights reserved.
 
 use log::{error, info, warn};
+use crate::jni_bridge::get_jvm;
+use jni::objects::{JObject, JString, JValue};
 
 /// Permission state
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -17,6 +21,7 @@ pub enum PermissionState {
 pub struct AppPermissions {
     pub bluetooth_connect: PermissionState,
     pub bluetooth_scan: PermissionState,
+    pub bluetooth_advertise: PermissionState,
     pub record_audio: PermissionState,
 }
 
@@ -26,6 +31,7 @@ impl AppPermissions {
         Self {
             bluetooth_connect: PermissionState::Unknown,
             bluetooth_scan: PermissionState::Unknown,
+            bluetooth_advertise: PermissionState::Unknown,
             record_audio: PermissionState::Unknown,
         }
     }
@@ -47,6 +53,9 @@ impl AppPermissions {
         if self.bluetooth_scan != PermissionState::Granted {
             missing.push("android.permission.BLUETOOTH_SCAN".to_string());
         }
+        if self.bluetooth_advertise != PermissionState::Granted {
+            missing.push("android.permission.BLUETOOTH_ADVERTISE".to_string());
+        }
         if self.record_audio != PermissionState::Granted {
             missing.push("android.permission.RECORD_AUDIO".to_string());
         }
@@ -55,7 +64,11 @@ impl AppPermissions {
     }
 }
 
-/// Permission manager
+/// Permission constants from Android SDK
+const PERMISSION_GRANTED: i32 = 0;  // PackageManager.PERMISSION_GRANTED
+const PERMISSION_DENIED: i32 = -1;  // PackageManager.PERMISSION_DENIED
+
+/// Permission manager with real JNI implementation
 pub struct PermissionManager {
     permissions: AppPermissions,
 }
@@ -70,32 +83,178 @@ impl PermissionManager {
         }
     }
 
-    /// Check if permissions are granted (mock for now)
-    /// 
-    /// NOTE: In a real implementation, this would use JNI to call:
-    /// ActivityCompat.checkSelfPermission(context, permission)
-    /// 
-    /// For now, we'll assume permissions need to be requested
-    pub fn check_permissions(&mut self) -> bool {
-        info!("Checking permissions");
+    /// Check if a specific permission is granted via JNI
+    fn check_permission_jni(&self, permission: &str) -> PermissionState {
+        let vm = match get_jvm() {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to get JVM: {}", e);
+                return PermissionState::Unknown;
+            }
+        };
         
-        // In real implementation, check each permission via JNI
-        // For now, default to needing permissions
+        let mut env = match vm.attach_current_thread() {
+            Ok(e) => e,
+            Err(e) => {
+                error!("Failed to attach thread: {}", e);
+                return PermissionState::Unknown;
+            }
+        };
         
-        self.permissions.bluetooth_connect = PermissionState::Unknown;
-        self.permissions.bluetooth_scan = PermissionState::Unknown;
-        self.permissions.record_audio = PermissionState::Unknown;
+        // Get application context via ActivityThread
+        // ActivityThread.currentApplication().getApplicationContext()
+        let activity_thread_class = match env.find_class("android/app/ActivityThread") {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to find ActivityThread: {}", e);
+                return PermissionState::Unknown;
+            }
+        };
         
-        false
+        let current_app = match env.call_static_method(
+            activity_thread_class,
+            "currentApplication",
+            "()Landroid/app/Application;",
+            &[]
+        ) {
+            Ok(r) => match r.l() {
+                Ok(obj) => obj,
+                Err(e) => {
+                    error!("Failed to get Application object: {}", e);
+                    return PermissionState::Unknown;
+                }
+            },
+            Err(e) => {
+                error!("Failed to call currentApplication: {}", e);
+                return PermissionState::Unknown;
+            }
+        };
+        
+        // Get context
+        let context = match env.call_method(
+            &current_app,
+            "getApplicationContext",
+            "()Landroid/content/Context;",
+            &[]
+        ) {
+            Ok(r) => match r.l() {
+                Ok(obj) => obj,
+                Err(e) => {
+                    error!("Failed to get Context object: {}", e);
+                    return PermissionState::Unknown;
+                }
+            },
+            Err(e) => {
+                error!("Failed to call getApplicationContext: {}", e);
+                return PermissionState::Unknown;
+            }
+        };
+        
+        // Create permission string
+        let permission_jstr = match env.new_string(permission) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to create permission string: {}", e);
+                return PermissionState::Unknown;
+            }
+        };
+        
+        // Call ContextCompat.checkSelfPermission(context, permission)
+        let compat_class = match env.find_class("androidx/core/content/ContextCompat") {
+            Ok(c) => c,
+            Err(_) => {
+                // Fallback to Context.checkSelfPermission for older apps
+                return self.check_permission_legacy(&mut env, &context, &permission_jstr);
+            }
+        };
+        
+        let result = match env.call_static_method(
+            compat_class,
+            "checkSelfPermission",
+            "(Landroid/content/Context;Ljava/lang/String;)I",
+            &[JValue::Object(&context), JValue::Object(&permission_jstr.into())]
+        ) {
+            Ok(r) => match r.i() {
+                Ok(i) => i,
+                Err(e) => {
+                    error!("Failed to get permission result: {}", e);
+                    return PermissionState::Unknown;
+                }
+            },
+            Err(e) => {
+                error!("Failed to call checkSelfPermission: {}", e);
+                return PermissionState::Unknown;
+            }
+        };
+        
+        if result == PERMISSION_GRANTED {
+            PermissionState::Granted
+        } else {
+            PermissionState::Denied
+        }
+    }
+    
+    /// Fallback permission check using Context directly (API 23+)
+    fn check_permission_legacy<'a>(
+        &self,
+        env: &mut jni::JNIEnv<'a>,
+        context: &JObject<'a>,
+        permission: &JString<'a>
+    ) -> PermissionState {
+        let result = match env.call_method(
+            context,
+            "checkSelfPermission",
+            "(Ljava/lang/String;)I",
+            &[JValue::Object(&permission.into())]
+        ) {
+            Ok(r) => match r.i() {
+                Ok(i) => i,
+                Err(e) => {
+                    error!("Legacy permission check failed: {}", e);
+                    return PermissionState::Unknown;
+                }
+            },
+            Err(e) => {
+                error!("Failed to call checkSelfPermission (legacy): {}", e);
+                return PermissionState::Unknown;
+            }
+        };
+        
+        if result == PERMISSION_GRANTED {
+            PermissionState::Granted
+        } else {
+            PermissionState::Denied
+        }
     }
 
-    /// Request permissions (mock for now)
-    /// 
-    /// NOTE: In a real implementation, this would use JNI to call:
-    /// ActivityCompat.requestPermissions(activity, permissions, requestCode)
-    /// 
-    /// The results would come back through onRequestPermissionsResult()
-    /// which would need to be bridged back to Rust
+    /// Check all permissions via JNI
+    pub fn check_permissions(&mut self) -> bool {
+        info!("Checking permissions via JNI");
+        
+        self.permissions.bluetooth_connect = 
+            self.check_permission_jni("android.permission.BLUETOOTH_CONNECT");
+        info!("BLUETOOTH_CONNECT: {:?}", self.permissions.bluetooth_connect);
+        
+        self.permissions.bluetooth_scan = 
+            self.check_permission_jni("android.permission.BLUETOOTH_SCAN");
+        info!("BLUETOOTH_SCAN: {:?}", self.permissions.bluetooth_scan);
+        
+        self.permissions.bluetooth_advertise = 
+            self.check_permission_jni("android.permission.BLUETOOTH_ADVERTISE");
+        info!("BLUETOOTH_ADVERTISE: {:?}", self.permissions.bluetooth_advertise);
+        
+        self.permissions.record_audio = 
+            self.check_permission_jni("android.permission.RECORD_AUDIO");
+        info!("RECORD_AUDIO: {:?}", self.permissions.record_audio);
+        
+        let all_granted = self.permissions.all_granted();
+        info!("All permissions granted: {}", all_granted);
+        
+        all_granted
+    }
+
+    /// Request permissions - returns list of missing permissions
+    /// Note: Actual permission request dialog must be triggered from Activity
     pub fn request_permissions(&self) -> Vec<String> {
         info!("Requesting permissions");
         
@@ -107,20 +266,11 @@ impl PermissionManager {
         }
         
         info!("Permissions to request: {:?}", missing);
-        
-        // In real implementation:
-        // 1. Get Activity context via JNI
-        // 2. Call ActivityCompat.requestPermissions()
-        // 3. Wait for callback in onRequestPermissionsResult()
-        // 4. Update permission states based on results
-        
         missing
     }
 
     /// Handle permission request result
-    /// 
-    /// This would be called from Java/Kotlin onRequestPermissionsResult()
-    /// bridged through JNI
+    /// This is called from Java/Kotlin onRequestPermissionsResult() via JNI
     pub fn on_permission_result(&mut self, permission: &str, granted: bool) {
         info!("Permission result: {} = {}", permission, granted);
         
@@ -136,6 +286,9 @@ impl PermissionManager {
             }
             "android.permission.BLUETOOTH_SCAN" => {
                 self.permissions.bluetooth_scan = state;
+            }
+            "android.permission.BLUETOOTH_ADVERTISE" => {
+                self.permissions.bluetooth_advertise = state;
             }
             "android.permission.RECORD_AUDIO" => {
                 self.permissions.record_audio = state;
@@ -168,6 +321,10 @@ impl PermissionManager {
                 "Bluetooth Scan permission is required to discover and pair with \
                  nearby devices running Sassy-Talk.".to_string()
             }
+            "android.permission.BLUETOOTH_ADVERTISE" => {
+                "Bluetooth Advertise permission is required to make your device \
+                 discoverable to other Sassy-Talk users.".to_string()
+            }
             "android.permission.RECORD_AUDIO" => {
                 "Microphone permission is required to record your voice when you \
                  press the Push-to-Talk button. Without this, you cannot transmit \
@@ -185,9 +342,6 @@ impl Default for PermissionManager {
 }
 
 /// Helper function to show permission rationale dialog
-/// 
-/// NOTE: In a real implementation, this would show a native Android dialog
-/// explaining why the permission is needed before requesting it
 pub fn show_permission_rationale(permission: &str) -> String {
     let manager = PermissionManager::new();
     manager.get_permission_explanation(permission)
@@ -220,7 +374,7 @@ mod tests {
     fn test_missing_permissions() {
         let perms = AppPermissions::new();
         let missing = perms.get_missing_permissions();
-        assert_eq!(missing.len(), 3);
+        assert_eq!(missing.len(), 4); // Now includes BLUETOOTH_ADVERTISE
     }
 
     #[test]

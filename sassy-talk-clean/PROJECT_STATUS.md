@@ -1,3 +1,36 @@
+# Project Status — Sassy Talk (clean)
+
+Last updated: 2026-01-18
+
+Overview
+
+This document records the current integration state and next actions for merging the `v1.1.0-lobby` GUI snapshot into the main tree.
+
+What we have
+
+- `v1.1.0-lobby/` — a self-contained lobby GUI (React + TypeScript) with components, styles, assets, and docs (`LOBBY_DESIGN.md`).
+- Main code: `sassy-talk-clean/` contains desktop/web (Tauri), Android, and iOS projects.
+- A full file inventory was produced and saved at `v:\Projects\sassytalkie\file-inventory.txt`.
+
+Current status
+
+- `v1.1.0-lobby` is NOT merged into `main` (snapshot only).
+- GUI inventory step: completed.
+- Merge staging branch (`merge/lobby-into-main`): not created yet.
+
+Risks & notes
+
+- There are significant build artifacts and generated files under `*-native/target` and `src-tauri/target`. Avoid merging build outputs.
+- Review API and asset paths before copying UI code — some integrations (socket/services) may require small adapter changes.
+
+Next actions (recommended)
+
+1. Create branch `merge/lobby-into-main` from `main`.
+2. Generate diffs limited to `v1.1.0-lobby/src`, `v1.1.0-lobby/src-tauri` (if present), `v1.1.0-lobby/package.json`, and public assets.
+3. Exclude build artifacts and target folders from any copy; prefer copying only source files and assets.
+4. Apply changes to `merge/lobby-into-main`, run the Tauri web/desktop build and mobile builds as relevant, fix integration points, then open PR.
+
+If you confirm, I can create the branch and start producing per-file diffs now.
 # 📊 SassyTalkie - Complete Project Status
 ## Cross-Platform PTT Walkie-Talkie Implementation
 

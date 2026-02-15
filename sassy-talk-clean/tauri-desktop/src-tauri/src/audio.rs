@@ -4,12 +4,23 @@
 /// Handles microphone input and speaker output with ring buffers
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, Host, Stream, StreamConfig, SupportedStreamConfig};
-use ringbuf::{HeapRb, HeapProducer, HeapConsumer};
+use cpal::{Device, Host, Stream};
+use ringbuf::HeapRb;
+use ringbuf::traits::{Producer, Consumer, Split};
+use ringbuf::wrap::caching::{CachingProd, CachingCons};
+use send_wrapper::SendWrapper;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use thiserror::Error;
+
+/// Type aliases for ring buffer producer/consumer (ringbuf 0.4 API)
+type HeapProducer<T> = CachingProd<Arc<HeapRb<T>>>;
+type HeapConsumer<T> = CachingCons<Arc<HeapRb<T>>>;
+
+/// Wrapper for Stream to make it Send+Sync (cpal::Stream is !Send on Windows)
+/// SAFETY: Stream is only accessed from the thread that created it
+type SendableStream = SendWrapper<Stream>;
 
 /// Audio sample rate (Opus requires 48kHz)
 pub const SAMPLE_RATE: u32 = 48000;
@@ -63,9 +74,9 @@ pub struct AudioEngine {
     input_device: Arc<Mutex<Option<Device>>>,
     output_device: Arc<Mutex<Option<Device>>>,
     
-    // Streams
-    input_stream: Arc<Mutex<Option<Stream>>>,
-    output_stream: Arc<Mutex<Option<Stream>>>,
+    // Streams (wrapped for Send+Sync)
+    input_stream: Arc<Mutex<Option<SendableStream>>>,
+    output_stream: Arc<Mutex<Option<SendableStream>>>,
     
     // Ring buffers for audio data
     input_producer: Arc<Mutex<Option<HeapProducer<i16>>>>,
@@ -238,7 +249,7 @@ impl AudioEngine {
         ).map_err(|e| AudioError::StreamError(e.to_string()))?;
         
         stream.play().map_err(|e| AudioError::StreamError(e.to_string()))?;
-        *self.input_stream.lock().unwrap() = Some(stream);
+        *self.input_stream.lock().unwrap() = Some(SendWrapper::new(stream));
         
         Ok(())
     }
@@ -295,7 +306,7 @@ impl AudioEngine {
         ).map_err(|e| AudioError::StreamError(e.to_string()))?;
         
         stream.play().map_err(|e| AudioError::StreamError(e.to_string()))?;
-        *self.output_stream.lock().unwrap() = Some(stream);
+        *self.output_stream.lock().unwrap() = Some(SendWrapper::new(stream));
         
         Ok(())
     }

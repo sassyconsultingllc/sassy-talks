@@ -273,29 +273,36 @@ impl BluetoothManager {
             info!("Accept thread started");
             
             loop {
-                let mut conn = connection.lock().unwrap();
-                
-                // Check if still listening
-                if conn.state != ConnectionState::Listening {
-                    info!("Accept thread exiting (not listening)");
-                    break;
-                }
-                
-                // Get server socket
-                let server_socket = match &conn.server_socket {
-                    Some(s) => s,
-                    None => {
-                        error!("Server socket not available");
-                        break;
+                // Check state and get server socket under lock
+                let should_accept = {
+                    let conn = connection.lock().unwrap();
+                    
+                    // Check if still listening
+                    if conn.state != ConnectionState::Listening {
+                        info!("Accept thread exiting (not listening)");
+                        false
+                    } else {
+                        conn.server_socket.is_some()
                     }
                 };
                 
-                drop(conn); // Release lock before blocking accept
+                if !should_accept {
+                    break;
+                }
                 
-                // Accept incoming connection (blocking)
+                // Accept incoming connection (blocking) - need to hold lock for accept
                 info!("Waiting for incoming connection...");
-                match server_socket.accept() {
-                    Ok(socket) => {
+                let accept_result = {
+                    let conn = connection.lock().unwrap();
+                    if let Some(ref server_socket) = conn.server_socket {
+                        Some(server_socket.accept())
+                    } else {
+                        None
+                    }
+                };
+                
+                match accept_result {
+                    Some(Ok(socket)) => {
                         info!("✓ Incoming connection accepted");
                         
                         // Get I/O streams
@@ -322,10 +329,14 @@ impl BluetoothManager {
                             }
                         }
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         error!("Failed to accept connection: {}", e);
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         continue;
+                    }
+                    None => {
+                        error!("Server socket not available");
+                        break;
                     }
                 }
             }

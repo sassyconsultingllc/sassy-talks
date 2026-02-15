@@ -99,19 +99,25 @@ impl SassyTalkApp {
         }
         
         // Initialize state machine
-        if let Some(sm) = self.state_machine.lock().unwrap().as_ref() {
-            match sm.initialize() {
-                Ok(_) => {
-                    info!("✓ App initialized");
-                    *self.status_message.lock().unwrap() = "Ready".to_string();
-                    self.current_screen = Screen::DeviceList;
-                    self.refresh_device_list();
-                }
-                Err(e) => {
-                    error!("Failed to initialize: {}", e);
-                    *self.last_error.lock().unwrap() = Some(e);
-                    self.show_error = true;
-                }
+        let init_result = {
+            if let Some(sm) = self.state_machine.lock().unwrap().as_ref() {
+                sm.initialize()
+            } else {
+                Err("State machine not available".to_string())
+            }
+        };
+        
+        match init_result {
+            Ok(_) => {
+                info!("✓ App initialized");
+                *self.status_message.lock().unwrap() = "Ready".to_string();
+                self.current_screen = Screen::DeviceList;
+                self.refresh_device_list();
+            }
+            Err(e) => {
+                error!("Failed to initialize: {}", e);
+                *self.last_error.lock().unwrap() = Some(e);
+                self.show_error = true;
             }
         }
     }

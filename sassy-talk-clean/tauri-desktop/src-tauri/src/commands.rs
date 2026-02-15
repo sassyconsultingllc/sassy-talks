@@ -245,34 +245,121 @@ use crate::tones::ToneType;
 #[tauri::command]
 pub async fn play_connection_tone(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let tone_player = state.get_tone_player();
-    tone_player.play(ToneType::ConnectionSuccess)
-        .await
-        .map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(move || {
+        tone_player.play_sync(ToneType::ConnectionSuccess)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
 /// Play message delivered tone (2-tone low→high)
 #[tauri::command]
 pub async fn play_delivered_tone(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let tone_player = state.get_tone_player();
-    tone_player.play(ToneType::MessageDelivered)
-        .await
-        .map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(move || {
+        tone_player.play_sync(ToneType::MessageDelivered)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
 /// Play error/failed tone (2-tone mono)
 #[tauri::command]
 pub async fn play_failed_tone(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let tone_player = state.get_tone_player();
-    tone_player.play(ToneType::Failed)
-        .await
-        .map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(move || {
+        tone_player.play_sync(ToneType::Failed)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
 /// Play roger beep tone
 #[tauri::command]
 pub async fn play_roger_tone(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let tone_player = state.get_tone_player();
-    tone_player.play(ToneType::RogerBeep)
-        .await
-        .map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(move || {
+        tone_player.play_sync(ToneType::RogerBeep)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+// ============================================================================
+// Transport Configuration Commands
+// ============================================================================
+
+use crate::transport::TransportConfig;
+
+/// Get transport configuration
+#[tauri::command]
+pub async fn get_transport_config(state: State<'_, Arc<AppState>>) -> Result<TransportConfig, String> {
+    Ok(state.get_transport_config().await)
+}
+
+/// Set transport configuration
+#[tauri::command]
+pub async fn set_transport_config(
+    state: State<'_, Arc<AppState>>,
+    config: TransportConfig,
+) -> Result<(), String> {
+    state.set_transport_config(config).await;
+    Ok(())
+}
+
+/// Network info response
+#[derive(serde::Serialize)]
+pub struct NetworkInfo {
+    pub port: u16,
+    pub multicast_addr: String,
+    pub use_random_port: bool,
+    pub encryption_enabled: bool,
+    pub is_encrypted: bool,
+    pub public_key: Option<String>,
+}
+
+/// Get network information
+#[tauri::command]
+pub async fn get_network_info(state: State<'_, Arc<AppState>>) -> Result<NetworkInfo, String> {
+    let config = state.get_transport_config().await;
+    let port = state.get_port().await;
+    let is_encrypted = state.is_encrypted().await;
+    let public_key = state.get_public_key().await;
+    
+    Ok(NetworkInfo {
+        port,
+        multicast_addr: config.multicast_addr,
+        use_random_port: config.use_random_port,
+        encryption_enabled: config.encryption_enabled,
+        is_encrypted,
+        public_key,
+    })
+}
+
+/// Set encryption enabled
+#[tauri::command]
+pub async fn set_encryption_enabled(
+    state: State<'_, Arc<AppState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut config = state.get_transport_config().await;
+    config.encryption_enabled = enabled;
+    state.set_transport_config(config).await;
+    Ok(())
+}
+
+/// Set random port enabled
+#[tauri::command]
+pub async fn set_random_port_enabled(
+    state: State<'_, Arc<AppState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut config = state.get_transport_config().await;
+    config.use_random_port = enabled;
+    state.set_transport_config(config).await;
+    Ok(())
 }

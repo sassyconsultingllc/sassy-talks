@@ -5,8 +5,9 @@
 
 use audiopus::{
     coder::{Encoder as OpusEncoderImpl, Decoder as OpusDecoderImpl},
-    Application, Channels, SampleRate, Bitrate, Error as OpusError,
+    Application, Channels, SampleRate, Bitrate, MutSignals, packet::Packet,
 };
+use std::convert::TryInto;
 use thiserror::Error;
 
 /// Codec error types
@@ -126,8 +127,16 @@ impl OpusDecoder {
     pub fn decode(&mut self, opus_data: &[u8]) -> Result<Vec<i16>, CodecError> {
         let mut output = vec![0i16; self.frame_size];
         
+        // Create packet wrapper using TryFrom
+        let packet: Packet<'_> = opus_data.try_into()
+            .map_err(|e| CodecError::DecoderError(format!("Invalid packet: {:?}", e)))?;
+        
+        // Create MutSignals wrapper for output buffer
+        let mut_signals: MutSignals<'_, i16> = (&mut output[..]).try_into()
+            .map_err(|e| CodecError::DecoderError(format!("Signal conversion: {:?}", e)))?;
+        
         let decoded_size = self.decoder
-            .decode(Some(opus_data), &mut output, false)
+            .decode(Some(packet), mut_signals, false)
             .map_err(|e| CodecError::DecoderError(format!("{:?}", e)))?;
         
         if decoded_size != self.frame_size {
@@ -143,8 +152,12 @@ impl OpusDecoder {
     pub fn decode_plc(&mut self) -> Result<Vec<i16>, CodecError> {
         let mut output = vec![0i16; self.frame_size];
         
+        // Create MutSignals wrapper for output buffer
+        let mut_signals: MutSignals<'_, i16> = (&mut output[..]).try_into()
+            .map_err(|e| CodecError::DecoderError(format!("Signal conversion: {:?}", e)))?;
+        
         let decoded_size = self.decoder
-            .decode(None, &mut output, false)
+            .decode(None, mut_signals, false)
             .map_err(|e| CodecError::DecoderError(format!("{:?}", e)))?;
         
         if decoded_size != self.frame_size {

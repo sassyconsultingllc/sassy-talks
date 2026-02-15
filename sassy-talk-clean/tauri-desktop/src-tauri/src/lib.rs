@@ -23,6 +23,7 @@
 pub mod audio;
 pub mod codec;
 pub mod commands;
+pub mod constants;
 pub mod protocol;
 pub mod security;
 pub mod tones;
@@ -34,7 +35,7 @@ pub use codec::{OpusEncoder, OpusDecoder, AudioFrame, SAMPLE_RATE, FRAME_SIZE};
 pub use protocol::{Packet, PacketType};
 pub use security::CryptoEngine;
 pub use tones::{TonePlayer, ToneType, ToneError};
-pub use transport::{TransportManager, PeerInfo};
+pub use transport::{TransportManager, PeerInfo, TransportConfig};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -43,8 +44,8 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use thiserror::Error;
 
-/// Library version
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+// Use centralized version constant
+pub use constants::VERSION;
 
 /// Application error types
 #[derive(Error, Debug)]
@@ -156,10 +157,10 @@ impl AppState {
         
         *self.connection_status.write().await = ConnectionStatus::Connected;
         
-        // Play connection success tone (3-tone chime)
+        // Play connection success tone (3-tone chime) - use spawn_blocking since Stream is !Send
         let tone_player = Arc::clone(&self.tone_player);
-        tokio::spawn(async move {
-            if let Err(e) = tone_player.play(ToneType::ConnectionSuccess).await {
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = tone_player.play_sync(ToneType::ConnectionSuccess) {
                 warn!("Failed to play connection tone: {}", e);
             }
         });
@@ -228,10 +229,10 @@ impl AppState {
             // Send over network to peers
             self.send_roger_beep().await;
             
-            // Play locally
+            // Play locally - use spawn_blocking since Stream is !Send
             let tone_player = Arc::clone(&self.tone_player);
-            tokio::spawn(async move {
-                if let Err(e) = tone_player.play(ToneType::RogerBeep).await {
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = tone_player.play_sync(ToneType::RogerBeep) {
                     warn!("Failed to play local roger beep: {}", e);
                 }
             });
@@ -513,5 +514,35 @@ impl AppState {
     /// Get tone player
     pub fn get_tone_player(&self) -> Arc<TonePlayer> {
         Arc::clone(&self.tone_player)
+    }
+    
+    /// Get transport configuration
+    pub async fn get_transport_config(&self) -> TransportConfig {
+        let transport = self.transport.lock().await;
+        transport.get_config()
+    }
+    
+    /// Update transport configuration
+    pub async fn set_transport_config(&self, config: TransportConfig) {
+        let transport = self.transport.lock().await;
+        transport.update_config(config);
+    }
+    
+    /// Get current bound port
+    pub async fn get_port(&self) -> u16 {
+        let transport = self.transport.lock().await;
+        transport.get_port()
+    }
+    
+    /// Check if encryption is active
+    pub async fn is_encrypted(&self) -> bool {
+        let transport = self.transport.lock().await;
+        transport.is_encrypted()
+    }
+    
+    /// Get our public key (hex encoded)
+    pub async fn get_public_key(&self) -> Option<String> {
+        let transport = self.transport.lock().await;
+        transport.get_public_key()
     }
 }

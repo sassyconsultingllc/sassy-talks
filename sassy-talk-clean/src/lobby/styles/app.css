@@ -1,0 +1,25 @@
+/* Sassy-Talk UI Styles (extracted from staging) */
+:root {
+  --primary-blue: #2563eb;
+  --purple: #7c3aed;
+  --teal: #14b8a6;
+  --coral: #f97316;
+  --bg-dark: #0f172a;
+  --text-primary: #f8fafc;
+  --text-secondary: #94a3b8;
+  --border-radius-md: 12px;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; font-family: 'Inter', sans-serif; background: var(--bg-dark); color: var(--text-primary); }
+.app { height: 100vh; display:flex; flex-direction:column; }
+.view { flex:1; padding:16px; overflow-y:auto; }
+
+.lobby-header { text-align:center; padding:24px 0; }
+.lobby-header h1 { font-size:2rem; font-weight:700; background: linear-gradient(135deg, var(--primary-blue) 0%, var(--purple) 100%); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+
+.search-btn { padding:12px 24px; border-radius:9999px; border:none; cursor:pointer; }
+.peer-list { display:flex; flex-direction:column; gap:8px; }
+.peer-card { padding:12px; border-radius:12px; background: rgba(30,41,59,0.8); border:1px solid rgba(148,163,184,0.2); display:flex; justify-content:space-between; }
+
+/* Truncated: full UI CSS available in staging file */

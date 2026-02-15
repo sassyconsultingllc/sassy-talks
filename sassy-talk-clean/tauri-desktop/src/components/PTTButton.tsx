@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import './PTTButton.css';
+import { IconMic, IconRecording } from './Icons';
 
 interface PTTButtonProps {
   isTransmitting: boolean;
@@ -77,7 +78,7 @@ function PTTButton({ isTransmitting, isConnected, onPress, onRelease }: PTTButto
         disabled={!isConnected}
       >
         <div className="ptt-icon">
-          {isTransmitting ? '🎙️' : '🔇'}
+          {isTransmitting ? <IconRecording size={48} /> : <IconMic size={48} />}
         </div>
         <div className="ptt-label">
           {isTransmitting ? 'TRANSMITTING' : 'PUSH TO TALK'}

@@ -1,6 +1,6 @@
 /// Discovery Service - Peer Discovery and Management
 
-use super::{TransportError, BEACON_INTERVAL_SECS};
+use super::BEACON_INTERVAL_SECS;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};

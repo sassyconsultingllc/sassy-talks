@@ -1,4 +1,5 @@
 import './StatusBar.css';
+import { IconLock } from './Icons';
 
 interface AppStatus {
   connection_status: string;
@@ -55,7 +56,7 @@ function StatusBar({ status, isConnected, peerCount }: StatusBarProps) {
       </div>
       <div className="status-footer">
         <span className="version">v1.0.0</span>
-        <span className="encryption">🔒 AES-256</span>
+        <span className="encryption"><IconLock size={12} /> AES-256</span>
       </div>
     </div>
   );
