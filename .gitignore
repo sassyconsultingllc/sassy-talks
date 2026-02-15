@@ -1,0 +1,48 @@
+# Build outputs
+**/build/
+**/dist/
+**/target/
+**/out/
+
+# Gradle
+**/.gradle/
+**/gradle-wrapper.jar
+**/local.properties
+
+# Node
+**/node_modules/
+**/package-lock.json
+
+# IDE
+**/.idea/
+**/.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Android
+*.apk
+*.aab
+*.dex
+*.class
+*.hprof
+
+# Rust/Tauri
+**/target/
+**/*.rs.bk
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Keystore (sensitive)
+*.jks
+*.keystore
