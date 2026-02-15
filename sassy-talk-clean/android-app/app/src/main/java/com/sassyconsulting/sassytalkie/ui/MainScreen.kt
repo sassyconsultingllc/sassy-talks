@@ -26,12 +26,13 @@ import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.ui.theme.*
 
 @Composable
-fun MainScreen() {
+fun MainScreen(
+    onDisconnect: () -> Unit = {},
+    onShowUsers: () -> Unit = {}
+) {
     var isTransmitting by remember { mutableStateOf(false) }
     var currentChannel by remember { mutableIntStateOf(1) }
-    var isConnected by remember { mutableStateOf(true) }
-    var peerCount by remember { mutableIntStateOf(0) }
-    
+
     // Pulse animation for transmitting
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
     val pulseScale by infiniteTransition.animateFloat(
@@ -43,7 +44,7 @@ fun MainScreen() {
         ),
         label = "pulseScale"
     )
-    
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -51,11 +52,57 @@ fun MainScreen() {
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // Header
-        HeaderSection(isConnected = isConnected, peerCount = peerCount)
-        
+        // Header with back + users buttons
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = {
+                SassyTalkNative.disconnect()
+                onDisconnect()
+            }) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Disconnect", tint = TextGray)
+            }
+
+            Text(
+                text = "Sassy-Talk",
+                fontSize = 28.sp,
+                fontWeight = FontWeight.Bold,
+                color = Orange
+            )
+
+            // Users/people button
+            IconButton(onClick = onShowUsers) {
+                Icon(Icons.Default.People, contentDescription = "Users", tint = Cyan)
+            }
+        }
+
+        // Connection status
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            val isConnected = SassyTalkNative.isConnected()
+            Box(
+                modifier = Modifier
+                    .size(10.dp)
+                    .clip(CircleShape)
+                    .background(if (isConnected) StatusConnected else StatusDisconnected)
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = if (isConnected) "Connected via ${SassyTalkNative.getTransportName()}" else "Offline",
+                fontSize = 13.sp,
+                color = TextGray
+            )
+        }
+
         Spacer(modifier = Modifier.height(24.dp))
-        
+
         // Channel Selector
         ChannelSelector(
             channel = currentChannel,
@@ -64,9 +111,9 @@ fun MainScreen() {
                 SassyTalkNative.setChannel(newChannel)
             }
         )
-        
+
         Spacer(modifier = Modifier.weight(1f))
-        
+
         // PTT Button
         PTTButton(
             isTransmitting = isTransmitting,
@@ -80,9 +127,9 @@ fun MainScreen() {
                 SassyTalkNative.pttStop()
             }
         )
-        
+
         Spacer(modifier = Modifier.weight(1f))
-        
+
         // Status Bar
         StatusBar(isTransmitting = isTransmitting, channel = currentChannel)
 
@@ -98,43 +145,6 @@ fun MainScreen() {
         )
 
         Spacer(modifier = Modifier.height(8.dp))
-    }
-}
-
-@Composable
-private fun HeaderSection(isConnected: Boolean, peerCount: Int) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 8.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        // App title
-        Text(
-            text = "Sassy-Talk",
-            fontSize = 28.sp,
-            fontWeight = FontWeight.Bold,
-            color = Orange
-        )
-        
-        // Connection status
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(12.dp)
-                    .clip(CircleShape)
-                    .background(if (isConnected) StatusConnected else StatusDisconnected)
-            )
-            Text(
-                text = if (isConnected) "Connected" else "Offline",
-                fontSize = 14.sp,
-                color = TextGray
-            )
-        }
     }
 }
 
@@ -155,7 +165,6 @@ private fun ChannelSelector(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Channel down
             IconButton(
                 onClick = { if (channel > 1) onChannelChange(channel - 1) },
                 modifier = Modifier
@@ -170,11 +179,8 @@ private fun ChannelSelector(
                     modifier = Modifier.size(32.dp)
                 )
             }
-            
-            // Channel display
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
+
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(
                     text = "CHANNEL",
                     fontSize = 12.sp,
@@ -188,8 +194,7 @@ private fun ChannelSelector(
                     color = Cyan
                 )
             }
-            
-            // Channel up
+
             IconButton(
                 onClick = { if (channel < 99) onChannelChange(channel + 1) },
                 modifier = Modifier
@@ -218,14 +223,13 @@ private fun PTTButton(
     val buttonColor = if (isTransmitting) Orange else SurfaceBg
     val ringColor = if (isTransmitting) Orange else Cyan
     val innerColor = if (isTransmitting) OrangeLight else CardBg
-    
+
     Box(
         contentAlignment = Alignment.Center,
         modifier = Modifier
             .size(280.dp)
             .scale(pulseScale)
     ) {
-        // Outer glow when transmitting
         if (isTransmitting) {
             Box(
                 modifier = Modifier
@@ -241,8 +245,7 @@ private fun PTTButton(
                     )
             )
         }
-        
-        // Main button
+
         Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier
@@ -260,7 +263,6 @@ private fun PTTButton(
                     )
                 }
         ) {
-            // Inner circle
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
@@ -268,9 +270,7 @@ private fun PTTButton(
                     .clip(CircleShape)
                     .background(innerColor)
             ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Icon(
                         if (isTransmitting) Icons.Default.Mic else Icons.Default.MicNone,
                         contentDescription = null,

@@ -4,9 +4,8 @@
 /// Uses socket2 for multicast group management on Android.
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use log::{error, info, warn};
+use log::info;
 use socket2::{Domain, Protocol, Socket, Type, SockAddr};
 
 /// Multicast group address for SassyTalkie discovery + audio
@@ -67,15 +66,31 @@ impl WifiTransport {
         info!("WiFi transport: initializing multicast sockets");
 
         // Audio socket - join multicast group
-        let audio_sock = Self::create_multicast_socket(MULTICAST_PORT)?;
-        audio_sock.set_read_timeout(Some(Duration::from_millis(10)))
-            .map_err(|e| format!("Failed to set read timeout: {}", e))?;
+        let audio_sock = match Self::create_multicast_socket(MULTICAST_PORT) {
+            Ok(s) => s,
+            Err(e) => {
+                self.state = WifiState::Error;
+                return Err(e);
+            }
+        };
+        if let Err(e) = audio_sock.set_read_timeout(Some(Duration::from_millis(10))) {
+            self.state = WifiState::Error;
+            return Err(format!("Failed to set read timeout: {}", e));
+        }
         self.audio_socket = Some(audio_sock);
 
         // Discovery socket
-        let disc_sock = Self::create_multicast_socket(DISCOVERY_PORT)?;
-        disc_sock.set_read_timeout(Some(Duration::from_millis(100)))
-            .map_err(|e| format!("Failed to set discovery timeout: {}", e))?;
+        let disc_sock = match Self::create_multicast_socket(DISCOVERY_PORT) {
+            Ok(s) => s,
+            Err(e) => {
+                self.state = WifiState::Error;
+                return Err(e);
+            }
+        };
+        if let Err(e) = disc_sock.set_read_timeout(Some(Duration::from_millis(100))) {
+            self.state = WifiState::Error;
+            return Err(format!("Failed to set discovery timeout: {}", e));
+        }
         self.discovery_socket = Some(disc_sock);
 
         self.state = WifiState::Discovering;

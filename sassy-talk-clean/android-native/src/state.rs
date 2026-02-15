@@ -6,13 +6,15 @@
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use log::{error, info, warn};
 
-use crate::transport::{TransportManager, ActiveTransport};
-use crate::bluetooth::{BluetoothDevice, ConnectionState};
+use crate::transport::TransportManager;
+pub use crate::transport::ActiveTransport;
+pub use crate::bluetooth::{BluetoothDevice, ConnectionState};
 use crate::audio::{AudioEngine, AudioFrame, FRAME_SIZE};
-use crate::crypto;
+pub use crate::wifi_transport::{WifiState, WifiPeer};
+use crate::audio_cache::AudioCache;
 
 /// Application state
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -41,6 +43,9 @@ pub struct StateMachine {
     discovery_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 
     running: Arc<AtomicBool>,
+
+    /// Multi-speaker audio cache (Dane.com-style store/replay)
+    audio_cache: Arc<Mutex<AudioCache>>,
 }
 
 impl StateMachine {
@@ -60,6 +65,7 @@ impl StateMachine {
             rx_thread: Arc::new(Mutex::new(None)),
             discovery_thread: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
+            audio_cache: Arc::new(Mutex::new(AudioCache::new())),
         }
     }
 
@@ -69,18 +75,24 @@ impl StateMachine {
 
         *self.state.lock().unwrap() = AppState::Initializing;
 
-        // Initialize transport manager
-        let mut tm = TransportManager::new("SassyTalkie")?;
-
-        // Generate and set a session PSK for encryption
-        // In production, this would come from key exchange during connection
-        let psk = crypto::generate_psk();
-        tm.set_psk(&psk);
-
+        // Initialize transport manager (no encryption yet - set via QR auth)
+        let tm = match TransportManager::new("SassyTalkie") {
+            Ok(tm) => tm,
+            Err(e) => {
+                *self.state.lock().unwrap() = AppState::Error;
+                return Err(e);
+            }
+        };
         *self.transport.lock().unwrap() = Some(tm);
 
         // Initialize audio engine
-        let audio = AudioEngine::new()?;
+        let audio = match AudioEngine::new() {
+            Ok(a) => a,
+            Err(e) => {
+                *self.state.lock().unwrap() = AppState::Error;
+                return Err(e);
+            }
+        };
         *self.audio.lock().unwrap() = Some(audio);
 
         *self.state.lock().unwrap() = AppState::Ready;
@@ -249,6 +261,11 @@ impl StateMachine {
             let mut frame = AudioFrame::new(FRAME_SIZE);
 
             while running.load(Ordering::Relaxed) {
+                // Stamp frame with current time
+                frame.timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
                 let is_recording = audio.lock().unwrap()
                     .as_ref()
                     .map(|a| a.is_recording())
@@ -434,6 +451,17 @@ impl StateMachine {
         *self.discovery_thread.lock().unwrap() = Some(handle);
     }
 
+    // ── Setters ──
+
+    /// Set the encryption session (called after QR auth)
+    pub fn set_crypto_session(&self, crypto: crate::crypto::CryptoSession) {
+        let mut tm = self.transport.lock().unwrap();
+        if let Some(transport) = tm.as_mut() {
+            transport.set_crypto(crypto);
+            info!("Crypto session set via QR auth");
+        }
+    }
+
     // ── Getters ──
 
     pub fn get_state(&self) -> AppState {
@@ -476,6 +504,79 @@ impl StateMachine {
             .as_ref()
             .map(|t| t.active_transport())
             .unwrap_or(ActiveTransport::None)
+    }
+
+    /// Get WiFi transport state
+    pub fn get_wifi_state(&self) -> WifiState {
+        self.transport.lock().unwrap()
+            .as_ref()
+            .map(|t| t.wifi_state())
+            .unwrap_or(WifiState::Inactive)
+    }
+
+    /// Get discovered WiFi peers
+    pub fn get_wifi_peers(&self) -> Vec<WifiPeer> {
+        self.transport.lock().unwrap()
+            .as_ref()
+            .map(|t| t.get_wifi_peers().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Check Bluetooth connection state
+    pub fn get_bt_state(&self) -> ConnectionState {
+        self.transport.lock().unwrap()
+            .as_ref()
+            .map(|t| t.bt_state())
+            .unwrap_or(ConnectionState::Disconnected)
+    }
+
+    /// Check if PTT is currently active
+    pub fn is_ptt_active(&self) -> bool {
+        self.ptt_pressed.load(Ordering::Relaxed)
+    }
+
+    /// Get audio cache reference (for JNI bridge / UI status)
+    pub fn audio_cache(&self) -> &Arc<Mutex<AudioCache>> {
+        &self.audio_cache
+    }
+
+    /// Initialize WiFi transport explicitly
+    pub fn init_wifi(&self) -> Result<(), String> {
+        let mut tm = self.transport.lock().unwrap();
+        if let Some(transport) = tm.as_mut() {
+            transport.init_wifi()?;
+            info!("WiFi transport initialized");
+            Ok(())
+        } else {
+            Err("Transport not initialized".to_string())
+        }
+    }
+
+    /// Get the local device name
+    pub fn get_device_name(&self) -> String {
+        self.transport.lock().unwrap()
+            .as_ref()
+            .map(|t| t.device_name().to_string())
+            .unwrap_or_else(|| "Unknown".to_string())
+    }
+
+    /// Check if WiFi transport has discovered peers
+    pub fn has_wifi_peers(&self) -> bool {
+        self.transport.lock().unwrap()
+            .as_ref()
+            .map(|t| t.has_wifi_peers())
+            .unwrap_or(false)
+    }
+
+    /// Set encryption from a pre-shared key
+    pub fn set_psk(&self, key: &[u8; 32]) {
+        let mut tm = self.transport.lock().unwrap();
+        if let Some(transport) = tm.as_mut() {
+            transport.set_psk(key);
+            info!("PSK encryption set via state machine");
+        } else {
+            warn!("Cannot set PSK: transport not initialized");
+        }
     }
 
     /// Shutdown state machine

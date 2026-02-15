@@ -63,6 +63,20 @@ dependencies {
     
     // Icons
     implementation("androidx.compose.material:material-icons-extended")
+
+    // QR Code generation
+    implementation("com.google.zxing:core:3.5.2")
+
+    // QR Code scanning (ML Kit barcode)
+    implementation("com.google.mlkit:barcode-scanning:17.2.0")
+
+    // CameraX for QR scanner
+    implementation("androidx.camera:camera-camera2:1.3.1")
+    implementation("androidx.camera:camera-lifecycle:1.3.1")
+    implementation("androidx.camera:camera-view:1.3.1")
+
+    // JSON parsing
+    implementation("org.json:json:20231013")
     
     // AppCompat + Material + ConstraintLayout for legacy XML layouts
     implementation("androidx.appcompat:appcompat:1.6.1")

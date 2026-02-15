@@ -189,11 +189,14 @@ impl PermissionManager {
         
         if result == PERMISSION_GRANTED {
             PermissionState::Granted
-        } else {
+        } else if result == PERMISSION_DENIED {
             PermissionState::Denied
+        } else {
+            warn!("Unexpected permission result code: {}", result);
+            PermissionState::Unknown
         }
     }
-    
+
     /// Fallback permission check using Context directly (API 23+)
     fn check_permission_legacy<'a>(
         &self,
@@ -201,11 +204,12 @@ impl PermissionManager {
         context: &JObject<'a>,
         permission: &JString<'a>
     ) -> PermissionState {
+        let permission_obj: JObject<'a> = unsafe { JObject::from_raw(permission.as_raw()) };
         let result = match env.call_method(
             context,
             "checkSelfPermission",
             "(Ljava/lang/String;)I",
-            &[JValue::Object(&permission.into())]
+            &[JValue::Object(&permission_obj)]
         ) {
             Ok(r) => match r.i() {
                 Ok(i) => i,
@@ -219,11 +223,14 @@ impl PermissionManager {
                 return PermissionState::Unknown;
             }
         };
-        
+
         if result == PERMISSION_GRANTED {
             PermissionState::Granted
-        } else {
+        } else if result == PERMISSION_DENIED {
             PermissionState::Denied
+        } else {
+            warn!("Unexpected legacy permission result: {}", result);
+            PermissionState::Unknown
         }
     }
 

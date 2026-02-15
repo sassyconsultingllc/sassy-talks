@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 use log::{error, info, warn};
 use crate::jni_bridge::{
     AndroidBluetoothAdapter,
-    AndroidBluetoothDevice,
     AndroidBluetoothSocket,
     AndroidBluetoothServerSocket,
     AndroidInputStream,

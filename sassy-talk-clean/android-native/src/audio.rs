@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use log::{error, info, warn};
+use log::{info, warn};
 
 use crate::jni_bridge::{AndroidAudioRecord, AndroidAudioTrack};
 
@@ -51,54 +51,78 @@ impl AudioEngine {
     /// Initialize audio recorder
     pub fn init_recorder(&self) -> Result<(), String> {
         info!("Initializing audio recorder");
-        
+
         // Get minimum buffer size
-        let buffer_size = AndroidAudioRecord::get_min_buffer_size(
+        let buffer_size = match AndroidAudioRecord::get_min_buffer_size(
             SAMPLE_RATE,
             CHANNEL_CONFIG_MONO,
             AUDIO_FORMAT_PCM_16
-        )?;
-        
+        ) {
+            Ok(size) => size,
+            Err(e) => {
+                *self.state.lock().unwrap() = AudioState::Error;
+                return Err(e);
+            }
+        };
+
         info!("Recorder buffer size: {} bytes", buffer_size);
-        
+
         // Create recorder
-        let recorder = AndroidAudioRecord::new(
+        let recorder = match AndroidAudioRecord::new(
             SAMPLE_RATE,
             CHANNEL_CONFIG_MONO,
             AUDIO_FORMAT_PCM_16,
             buffer_size * 2  // Double buffer for safety
-        )?;
-        
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                *self.state.lock().unwrap() = AudioState::Error;
+                return Err(e);
+            }
+        };
+
         *self.recorder.lock().unwrap() = Some(recorder);
         info!("✓ Audio recorder initialized");
-        
+
         Ok(())
     }
 
     /// Initialize audio player
     pub fn init_player(&self) -> Result<(), String> {
         info!("Initializing audio player");
-        
+
         // Calculate buffer size (same as recorder for consistency)
-        let buffer_size = AndroidAudioRecord::get_min_buffer_size(
+        let buffer_size = match AndroidAudioRecord::get_min_buffer_size(
             SAMPLE_RATE,
             CHANNEL_CONFIG_MONO,
             AUDIO_FORMAT_PCM_16
-        )?;
-        
+        ) {
+            Ok(size) => size,
+            Err(e) => {
+                *self.state.lock().unwrap() = AudioState::Error;
+                return Err(e);
+            }
+        };
+
         info!("Player buffer size: {} bytes", buffer_size);
-        
+
         // Create player
-        let player = AndroidAudioTrack::new(
+        let player = match AndroidAudioTrack::new(
             SAMPLE_RATE,
             CHANNEL_CONFIG_OUT_MONO,
             AUDIO_FORMAT_PCM_16,
             buffer_size * 2
-        )?;
-        
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                *self.state.lock().unwrap() = AudioState::Error;
+                return Err(e);
+            }
+        };
+
         *self.player.lock().unwrap() = Some(player);
         info!("✓ Audio player initialized");
-        
+
         Ok(())
     }
 
@@ -269,8 +293,10 @@ impl AudioFrame {
     }
 
     /// Convert samples to bytes for Bluetooth transmission
+    /// Format: [timestamp:8][samples:N*2]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.samples.len() * 2);
+        let mut bytes = Vec::with_capacity(8 + self.samples.len() * 2);
+        bytes.extend_from_slice(&self.timestamp.to_le_bytes());
         for sample in &self.samples {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
@@ -278,19 +304,30 @@ impl AudioFrame {
     }
 
     /// Convert bytes from Bluetooth to samples
+    /// Format: [timestamp:8][samples:N*2]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() % 2 != 0 {
-            return Err("Invalid audio data: odd number of bytes".to_string());
+        if bytes.len() < 8 {
+            return Err("Invalid audio data: too short for header".to_string());
         }
-        
-        let mut samples = Vec::with_capacity(bytes.len() / 2);
-        for chunk in bytes.chunks_exact(2) {
+
+        let timestamp = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+
+        let audio_bytes = &bytes[8..];
+        if audio_bytes.len() % 2 != 0 {
+            return Err("Invalid audio data: odd number of sample bytes".to_string());
+        }
+
+        let mut samples = Vec::with_capacity(audio_bytes.len() / 2);
+        for chunk in audio_bytes.chunks_exact(2) {
             samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
         }
-        
+
         Ok(Self {
             samples,
-            timestamp: 0,
+            timestamp,
         })
     }
 }
@@ -303,14 +340,15 @@ mod tests {
     fn test_audio_frame_conversion() {
         let frame = AudioFrame {
             samples: vec![100, -200, 300, -400],
-            timestamp: 0,
+            timestamp: 12345678,
         };
-        
+
         let bytes = frame.to_bytes();
-        assert_eq!(bytes.len(), 8);
-        
+        assert_eq!(bytes.len(), 8 + 8); // 8 byte timestamp + 4 samples * 2 bytes
+
         let recovered = AudioFrame::from_bytes(&bytes).unwrap();
         assert_eq!(recovered.samples, frame.samples);
+        assert_eq!(recovered.timestamp, 12345678);
     }
 
     #[test]

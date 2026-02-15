@@ -10,7 +10,7 @@ use aes_gcm::{
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
 use sha2::{Sha256, Digest};
 use rand::RngCore;
-use log::{error, info};
+use log::info;
 
 /// Nonce size for AES-256-GCM (96 bits / 12 bytes)
 const NONCE_SIZE: usize = 12;

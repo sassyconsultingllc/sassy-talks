@@ -5,7 +5,6 @@
 /// - Preferred: WiFi multicast when both peers report WiFi connectivity
 /// - Automatic fallback: if WiFi fails, falls back to Bluetooth
 
-use std::sync::{Arc, Mutex};
 use log::{error, info, warn};
 
 use crate::bluetooth::{BluetoothManager, BluetoothDevice, ConnectionState};
@@ -143,6 +142,10 @@ impl TransportManager {
         self.wifi.get_peers()
     }
 
+    pub fn has_wifi_peers(&self) -> bool {
+        self.wifi.has_peers()
+    }
+
     // ── Unified send/receive ──
 
     /// Send data through the active transport with encryption
@@ -234,6 +237,11 @@ impl TransportManager {
     /// Get which transport is currently active
     pub fn active_transport(&self) -> ActiveTransport {
         self.active
+    }
+
+    /// Get the local device name
+    pub fn device_name(&self) -> &str {
+        &self.device_name
     }
 
     /// Disconnect all transports

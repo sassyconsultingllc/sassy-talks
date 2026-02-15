@@ -13,22 +13,24 @@ import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import com.sassyconsulting.sassytalkie.ui.theme.SassyTalkTheme
-import com.sassyconsulting.sassytalkie.ui.MainScreen
+import com.sassyconsulting.sassytalkie.ui.AppNavigation
 
 class MainActivity : ComponentActivity() {
 
     private val requiredPermissions: Array<String>
-        get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            arrayOf(
+        get() {
+            val perms = mutableListOf(
                 Manifest.permission.RECORD_AUDIO,
-                Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.BLUETOOTH_SCAN,
-                Manifest.permission.BLUETOOTH_ADVERTISE,
+                Manifest.permission.CAMERA,
             )
-        } else {
-            arrayOf(
-                Manifest.permission.RECORD_AUDIO,
-            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                perms.addAll(listOf(
+                    Manifest.permission.BLUETOOTH_CONNECT,
+                    Manifest.permission.BLUETOOTH_SCAN,
+                    Manifest.permission.BLUETOOTH_ADVERTISE,
+                ))
+            }
+            return perms.toTypedArray()
         }
 
     private val requestPermissionsLauncher = registerForActivityResult(
@@ -59,14 +61,19 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    MainScreen()
+                    AppNavigation()
                 }
             }
         }
     }
 
+    override fun onStop() {
+        super.onStop()
+        SassyTalkNative.pttStop()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
-        SassyTalkNative.pttStop()
+        SassyTalkNative.shutdown()
     }
 }

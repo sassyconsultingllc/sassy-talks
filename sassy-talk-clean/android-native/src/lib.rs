@@ -14,6 +14,9 @@ mod permissions;
 mod crypto;
 mod wifi_transport;
 mod transport;
+mod session;
+mod users;
+mod audio_cache;
 
 use bluetooth::BluetoothDevice;
 use state::{StateMachine, AppState};
@@ -105,7 +108,21 @@ impl SassyTalkApp {
         // Initialize state machine
         let init_result = {
             if let Some(sm) = self.state_machine.lock().unwrap().as_ref() {
-                sm.initialize()
+                let result = sm.initialize();
+                if result.is_ok() {
+                    // Check BT state and warn if not enabled
+                    if !sm.is_bluetooth_enabled() {
+                        warn!("Bluetooth is not enabled - attempting to enable");
+                        if let Err(e) = sm.enable_bluetooth() {
+                            warn!("Could not enable Bluetooth: {}", e);
+                        }
+                    }
+                    // Log connected device if any
+                    if let Some(device) = sm.get_connected_device() {
+                        info!("Already connected to: {} ({})", device.name, device.address);
+                    }
+                }
+                result
             } else {
                 Err("State machine not available".to_string())
             }
@@ -396,7 +413,7 @@ impl SassyTalkApp {
                             });
                     } else {
                         for (idx, device) in devices.iter().enumerate() {
-                            let device_name = device.name.clone();
+                            let device_name = format!("{}. {}", idx + 1, device.name);
                             let device_addr = device.address.clone();
                             
                             egui::Frame::none()
@@ -420,6 +437,7 @@ impl SassyTalkApp {
                                     if ui.add_sized([200.0, 40.0], egui::Button::new(
                                         egui::RichText::new("Connect").size(14.0)
                                     ).fill(GREEN).rounding(8.0)).clicked() {
+                                        self.selected_device = Some(idx);
                                         self.connect_to_device(device_addr);
                                     }
                                 });
@@ -431,6 +449,17 @@ impl SassyTalkApp {
                     ui.add_space(30.0);
                     
                     // Listen mode button
+                    // Show selected device indicator
+                    if let Some(idx) = self.selected_device {
+                        if idx < devices.len() {
+                            ui.label(egui::RichText::new(
+                                format!("Selected: {}", devices[idx].name)
+                            ).color(GREEN).size(12.0));
+                        }
+                    }
+
+                    ui.add_space(10.0);
+
                     if ui.add_sized([220.0, 50.0], egui::Button::new(
                         egui::RichText::new("Listen for Connection").size(16.0).color(egui::Color32::WHITE)
                     ).fill(CYAN).rounding(25.0)).clicked() {
