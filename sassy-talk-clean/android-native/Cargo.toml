@@ -10,20 +10,24 @@ crate-type = ["cdylib"]
 name = "sassytalkie"
 path = "src/lib.rs"
 
+[features]
+default = []
+standalone-ui = ["eframe", "egui", "android-activity"]
+
 [dependencies]
 # Android
 android_logger = "0.13"
-android-activity = { version = "0.5", features = ["native-activity"] }
 log = "0.4"
 
-# UI
-eframe = { version = "0.27", default-features = false, features = ["android-native-activity", "glow"] }
-egui = "0.27"
+# Standalone UI (dev mode only - not used by Kotlin/Compose app)
+android-activity = { version = "0.5", features = ["native-activity"], optional = true }
+eframe = { version = "0.27", default-features = false, features = ["android-native-activity", "glow"], optional = true }
+egui = { version = "0.27", optional = true }
 
 # JNI for Android Bluetooth/Audio
 jni = "0.21"
 
-# Cryptography  
+# Cryptography
 sha2 = "0.10"
 aes-gcm = "0.10"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
@@ -90,6 +94,11 @@ name = "android.permission.ACCESS_WIFI_STATE"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.CHANGE_WIFI_MULTICAST_STATE"
 
-[package.metadata.android.signing.release]
-path = "sassy-talk.keystore"
-keystore_password = "sassytalk123"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_FINE_LOCATION"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.NEARBY_WIFI_DEVICES"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.CHANGE_WIFI_STATE"

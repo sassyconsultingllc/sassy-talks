@@ -1,8 +1,8 @@
 /// Permissions Module - Runtime Permission Requests for Android
-/// 
+///
 /// Handles Android 6.0+ runtime permission requests via JNI
-/// Required for: Bluetooth, Microphone access
-/// 
+/// Required for: Microphone access, WiFi/Network
+///
 /// Copyright 2025 Sassy Consulting LLC. All rights reserved.
 
 use log::{error, info, warn};
@@ -19,9 +19,6 @@ pub enum PermissionState {
 
 /// Required permissions for the app
 pub struct AppPermissions {
-    pub bluetooth_connect: PermissionState,
-    pub bluetooth_scan: PermissionState,
-    pub bluetooth_advertise: PermissionState,
     pub record_audio: PermissionState,
 }
 
@@ -29,37 +26,23 @@ impl AppPermissions {
     /// Create new permissions tracker
     pub fn new() -> Self {
         Self {
-            bluetooth_connect: PermissionState::Unknown,
-            bluetooth_scan: PermissionState::Unknown,
-            bluetooth_advertise: PermissionState::Unknown,
             record_audio: PermissionState::Unknown,
         }
     }
 
     /// Check if all critical permissions are granted
     pub fn all_granted(&self) -> bool {
-        self.bluetooth_connect == PermissionState::Granted &&
-        self.bluetooth_scan == PermissionState::Granted &&
         self.record_audio == PermissionState::Granted
     }
 
     /// Get list of permissions that need to be requested
     pub fn get_missing_permissions(&self) -> Vec<String> {
         let mut missing = Vec::new();
-        
-        if self.bluetooth_connect != PermissionState::Granted {
-            missing.push("android.permission.BLUETOOTH_CONNECT".to_string());
-        }
-        if self.bluetooth_scan != PermissionState::Granted {
-            missing.push("android.permission.BLUETOOTH_SCAN".to_string());
-        }
-        if self.bluetooth_advertise != PermissionState::Granted {
-            missing.push("android.permission.BLUETOOTH_ADVERTISE".to_string());
-        }
+
         if self.record_audio != PermissionState::Granted {
             missing.push("android.permission.RECORD_AUDIO".to_string());
         }
-        
+
         missing
     }
 }
@@ -77,7 +60,7 @@ impl PermissionManager {
     /// Create new permission manager
     pub fn new() -> Self {
         info!("Creating permission manager");
-        
+
         Self {
             permissions: AppPermissions::new(),
         }
@@ -92,7 +75,7 @@ impl PermissionManager {
                 return PermissionState::Unknown;
             }
         };
-        
+
         let mut env = match vm.attach_current_thread() {
             Ok(e) => e,
             Err(e) => {
@@ -100,9 +83,8 @@ impl PermissionManager {
                 return PermissionState::Unknown;
             }
         };
-        
+
         // Get application context via ActivityThread
-        // ActivityThread.currentApplication().getApplicationContext()
         let activity_thread_class = match env.find_class("android/app/ActivityThread") {
             Ok(c) => c,
             Err(e) => {
@@ -110,7 +92,7 @@ impl PermissionManager {
                 return PermissionState::Unknown;
             }
         };
-        
+
         let current_app = match env.call_static_method(
             activity_thread_class,
             "currentApplication",
@@ -129,7 +111,7 @@ impl PermissionManager {
                 return PermissionState::Unknown;
             }
         };
-        
+
         // Get context
         let context = match env.call_method(
             &current_app,
@@ -149,7 +131,7 @@ impl PermissionManager {
                 return PermissionState::Unknown;
             }
         };
-        
+
         // Create permission string
         let permission_jstr = match env.new_string(permission) {
             Ok(s) => s,
@@ -158,7 +140,7 @@ impl PermissionManager {
                 return PermissionState::Unknown;
             }
         };
-        
+
         // Call ContextCompat.checkSelfPermission(context, permission)
         let compat_class = match env.find_class("androidx/core/content/ContextCompat") {
             Ok(c) => c,
@@ -167,7 +149,7 @@ impl PermissionManager {
                 return self.check_permission_legacy(&mut env, &context, &permission_jstr);
             }
         };
-        
+
         let result = match env.call_static_method(
             compat_class,
             "checkSelfPermission",
@@ -186,7 +168,7 @@ impl PermissionManager {
                 return PermissionState::Unknown;
             }
         };
-        
+
         if result == PERMISSION_GRANTED {
             PermissionState::Granted
         } else if result == PERMISSION_DENIED {
@@ -237,66 +219,43 @@ impl PermissionManager {
     /// Check all permissions via JNI
     pub fn check_permissions(&mut self) -> bool {
         info!("Checking permissions via JNI");
-        
-        self.permissions.bluetooth_connect = 
-            self.check_permission_jni("android.permission.BLUETOOTH_CONNECT");
-        info!("BLUETOOTH_CONNECT: {:?}", self.permissions.bluetooth_connect);
-        
-        self.permissions.bluetooth_scan = 
-            self.check_permission_jni("android.permission.BLUETOOTH_SCAN");
-        info!("BLUETOOTH_SCAN: {:?}", self.permissions.bluetooth_scan);
-        
-        self.permissions.bluetooth_advertise = 
-            self.check_permission_jni("android.permission.BLUETOOTH_ADVERTISE");
-        info!("BLUETOOTH_ADVERTISE: {:?}", self.permissions.bluetooth_advertise);
-        
-        self.permissions.record_audio = 
+
+        self.permissions.record_audio =
             self.check_permission_jni("android.permission.RECORD_AUDIO");
         info!("RECORD_AUDIO: {:?}", self.permissions.record_audio);
-        
+
         let all_granted = self.permissions.all_granted();
         info!("All permissions granted: {}", all_granted);
-        
+
         all_granted
     }
 
     /// Request permissions - returns list of missing permissions
-    /// Note: Actual permission request dialog must be triggered from Activity
     pub fn request_permissions(&self) -> Vec<String> {
         info!("Requesting permissions");
-        
+
         let missing = self.permissions.get_missing_permissions();
-        
+
         if missing.is_empty() {
             info!("All permissions already granted");
             return Vec::new();
         }
-        
+
         info!("Permissions to request: {:?}", missing);
         missing
     }
 
     /// Handle permission request result
-    /// This is called from Java/Kotlin onRequestPermissionsResult() via JNI
     pub fn on_permission_result(&mut self, permission: &str, granted: bool) {
         info!("Permission result: {} = {}", permission, granted);
-        
+
         let state = if granted {
             PermissionState::Granted
         } else {
             PermissionState::Denied
         };
-        
+
         match permission {
-            "android.permission.BLUETOOTH_CONNECT" => {
-                self.permissions.bluetooth_connect = state;
-            }
-            "android.permission.BLUETOOTH_SCAN" => {
-                self.permissions.bluetooth_scan = state;
-            }
-            "android.permission.BLUETOOTH_ADVERTISE" => {
-                self.permissions.bluetooth_advertise = state;
-            }
             "android.permission.RECORD_AUDIO" => {
                 self.permissions.record_audio = state;
             }
@@ -319,19 +278,6 @@ impl PermissionManager {
     /// Get user-friendly permission explanation
     pub fn get_permission_explanation(&self, permission: &str) -> String {
         match permission {
-            "android.permission.BLUETOOTH_CONNECT" => {
-                "Bluetooth Connect permission is required to establish peer-to-peer \
-                 connections with other Sassy-Talk users. Without this, you cannot \
-                 communicate with other devices.".to_string()
-            }
-            "android.permission.BLUETOOTH_SCAN" => {
-                "Bluetooth Scan permission is required to discover and pair with \
-                 nearby devices running Sassy-Talk.".to_string()
-            }
-            "android.permission.BLUETOOTH_ADVERTISE" => {
-                "Bluetooth Advertise permission is required to make your device \
-                 discoverable to other Sassy-Talk users.".to_string()
-            }
             "android.permission.RECORD_AUDIO" => {
                 "Microphone permission is required to record your voice when you \
                  press the Push-to-Talk button. Without this, you cannot transmit \
@@ -361,7 +307,7 @@ mod tests {
     #[test]
     fn test_permissions_creation() {
         let perms = AppPermissions::new();
-        assert_eq!(perms.bluetooth_connect, PermissionState::Unknown);
+        assert_eq!(perms.record_audio, PermissionState::Unknown);
         assert!(!perms.all_granted());
     }
 
@@ -369,11 +315,9 @@ mod tests {
     fn test_permission_manager() {
         let mut manager = PermissionManager::new();
         assert!(!manager.has_critical_permissions());
-        
-        manager.on_permission_result("android.permission.BLUETOOTH_CONNECT", true);
-        manager.on_permission_result("android.permission.BLUETOOTH_SCAN", true);
+
         manager.on_permission_result("android.permission.RECORD_AUDIO", true);
-        
+
         assert!(manager.has_critical_permissions());
     }
 
@@ -381,7 +325,7 @@ mod tests {
     fn test_missing_permissions() {
         let perms = AppPermissions::new();
         let missing = perms.get_missing_permissions();
-        assert_eq!(missing.len(), 4); // Now includes BLUETOOTH_ADVERTISE
+        assert_eq!(missing.len(), 1); // Only RECORD_AUDIO
     }
 
     #[test]

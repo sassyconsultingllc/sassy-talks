@@ -8,10 +8,9 @@ import org.json.JSONObject
  * JNI bridge to Rust native library.
  *
  * The native library (libsassytalkie.so) handles:
- * - Bluetooth RFCOMM + WiFi multicast transport
+ * - WiFi multicast + WiFi Direct transport
  * - AES-256-GCM encryption with QR-based key exchange
  * - Audio capture and playback
- * - Smart transport selection (BT default, WiFi preferred)
  * - User registry (mute/favorites)
  */
 object SassyTalkNative {
@@ -21,8 +20,9 @@ object SassyTalkNative {
 
     /** Transport type constants matching Rust enum */
     const val TRANSPORT_NONE = 0
-    const val TRANSPORT_BLUETOOTH = 1
     const val TRANSPORT_WIFI = 2
+    const val TRANSPORT_WIFI_DIRECT = 3
+    const val TRANSPORT_CELLULAR = 4
 
     init {
         try {
@@ -35,6 +35,8 @@ object SassyTalkNative {
 
     // ── Lifecycle ──
 
+    fun isInitialized(): Boolean = initialized
+
     fun init(): Boolean {
         return try {
             initialized = nativeInit()
@@ -43,6 +45,18 @@ object SassyTalkNative {
         } catch (e: Exception) {
             Log.e(TAG, "Init failed: ${e.message}")
             false
+        }
+    }
+
+    /** Set the device display name (sent with audio so peers see who's talking) */
+    fun setDeviceName(name: String) {
+        if (initialized && name.isNotBlank()) {
+            try {
+                nativeSetDeviceName(name)
+                Log.i(TAG, "Device name set to: $name")
+            } catch (e: Exception) {
+                Log.e(TAG, "setDeviceName failed: ${e.message}")
+            }
         }
     }
 
@@ -83,7 +97,7 @@ object SassyTalkNative {
 
     // ── Transport ──
 
-    /** Get active transport: 0=None, 1=Bluetooth, 2=WiFi */
+    /** Get active transport: 0=None, 2=WiFi, 3=WiFi Direct */
     fun getTransport(): Int {
         return if (initialized) {
             try {
@@ -100,53 +114,25 @@ object SassyTalkNative {
 
     fun getTransportName(): String {
         return when (getTransport()) {
-            TRANSPORT_BLUETOOTH -> "BT"
             TRANSPORT_WIFI -> "WiFi"
+            TRANSPORT_WIFI_DIRECT -> "P2P"
+            TRANSPORT_CELLULAR -> "Cell"
             else -> "---"
         }
     }
 
-    // ── Device Management ──
-
-    data class BluetoothDeviceInfo(val name: String, val address: String)
-
-    fun getPairedDevices(): List<BluetoothDeviceInfo> {
-        if (!initialized) return emptyList()
-        return try {
-            val json = nativeGetPairedDevices()
-            val array = JSONArray(json)
-            (0 until array.length()).map { i ->
-                val obj = array.getJSONObject(i)
-                BluetoothDeviceInfo(
-                    name = obj.optString("name", "Unknown"),
-                    address = obj.getString("address")
-                )
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "getPairedDevices failed: ${e.message}")
-            emptyList()
-        }
-    }
-
-    fun connectDevice(address: String): Boolean {
+    /** Connect via WiFi multicast (cross-platform) */
+    fun connectWifiMulticast(): Boolean {
         if (!initialized) return false
         return try {
-            nativeConnectDevice(address)
+            nativeConnectWifiMulticast()
         } catch (e: Exception) {
-            Log.e(TAG, "connectDevice failed: ${e.message}")
+            Log.e(TAG, "connectWifiMulticast failed: ${e.message}")
             false
         }
     }
 
-    fun startListening(): Boolean {
-        if (!initialized) return false
-        return try {
-            nativeStartListening()
-        } catch (e: Exception) {
-            Log.e(TAG, "startListening failed: ${e.message}")
-            false
-        }
-    }
+    // ── Connection Management ──
 
     fun disconnect(): Boolean {
         if (!initialized) return false
@@ -245,30 +231,6 @@ object SassyTalkNative {
                 Log.e(TAG, "setUserFavorite failed: ${e.message}")
             }
         }
-    }
-
-    // ── Bluetooth Status ──
-
-    fun isBluetoothEnabled(): Boolean {
-        if (!initialized) return false
-        return try {
-            nativeIsBluetoothEnabled()
-        } catch (e: Exception) { false }
-    }
-
-    fun enableBluetooth(): Boolean {
-        if (!initialized) return false
-        return try {
-            nativeEnableBluetooth()
-        } catch (e: Exception) { false }
-    }
-
-    fun getConnectedDevice(): JSONObject? {
-        if (!initialized) return null
-        return try {
-            val json = nativeGetConnectedDevice()
-            if (json.isNotEmpty() && json != "{}") JSONObject(json) else null
-        } catch (e: Exception) { null }
     }
 
     /** Get app state: 0=Init, 1=Ready, 2=Connecting, 3=Connected, 4=TX, 5=RX, 6=Disconnecting, 7=Error */
@@ -476,15 +438,102 @@ object SassyTalkNative {
         }
     }
 
-    // ── Status ──
+    // ── Cellular Transport (WebSocket relay) ──
 
-    /** Get BT state: 0=Disconnected, 1=Connecting, 2=Connected, 3=Listening */
-    fun getBtState(): Int {
-        if (!initialized) return 0
-        return try {
-            nativeGetBtState().toInt()
-        } catch (e: Exception) { 0 }
+    /** Set the cellular room ID (from QR session_id) */
+    fun cellularSetRoom(roomId: String) {
+        if (initialized && roomId.isNotBlank()) {
+            try {
+                nativeCellularSetRoom(roomId)
+                Log.i(TAG, "Cellular room set: $roomId")
+            } catch (e: Exception) {
+                Log.e(TAG, "cellularSetRoom failed: ${e.message}")
+            }
+        }
     }
+
+    /** Get the WebSocket URL for the cellular relay */
+    fun cellularGetWsUrl(): String {
+        if (!initialized) return ""
+        return try {
+            nativeCellularGetWsUrl()
+        } catch (e: Exception) {
+            Log.e(TAG, "cellularGetWsUrl failed: ${e.message}")
+            ""
+        }
+    }
+
+    /** Called when WebSocket connects successfully */
+    fun cellularOnConnected(): Boolean {
+        if (!initialized) return false
+        return try {
+            nativeCellularOnConnected()
+        } catch (e: Exception) {
+            Log.e(TAG, "cellularOnConnected failed: ${e.message}")
+            false
+        }
+    }
+
+    /** Called when WebSocket disconnects */
+    fun cellularOnDisconnected(reason: String) {
+        if (initialized) {
+            try {
+                nativeCellularOnDisconnected(reason)
+            } catch (e: Exception) {
+                Log.e(TAG, "cellularOnDisconnected failed: ${e.message}")
+            }
+        }
+    }
+
+    /** Called when WebSocket receives a binary message */
+    fun cellularOnMessage(data: ByteArray) {
+        if (initialized) {
+            try {
+                nativeCellularOnMessage(data)
+            } catch (e: Exception) {
+                Log.e(TAG, "cellularOnMessage failed: ${e.message}")
+            }
+        }
+    }
+
+    /** Called when WebSocket encounters an error */
+    fun cellularOnError(error: String) {
+        if (initialized) {
+            try {
+                nativeCellularOnError(error)
+            } catch (e: Exception) {
+                Log.e(TAG, "cellularOnError failed: ${e.message}")
+            }
+        }
+    }
+
+    /** Poll outbound queue — returns next packet to send via WS, or null */
+    fun cellularPollOutbound(): ByteArray? {
+        if (!initialized) return null
+        return try {
+            nativeCellularPollOutbound()
+        } catch (e: Exception) { null }
+    }
+
+    /** Get cellular transport stats as JSON */
+    fun cellularGetStats(): String {
+        if (!initialized) return "{}"
+        return try {
+            nativeCellularGetStats()
+        } catch (e: Exception) { "{}" }
+    }
+
+    /** Extract session_id from session status (used as room ID for cellular) */
+    fun getSessionId(): String? {
+        if (!initialized) return null
+        return try {
+            val json = JSONObject(nativeGetSessionStatus())
+            val id = json.optString("session_id", "")
+            if (id.isNotEmpty()) id else null
+        } catch (e: Exception) { null }
+    }
+
+    // ── Status ──
 
     fun isPttActive(): Boolean {
         if (!initialized) return false
@@ -522,10 +571,7 @@ object SassyTalkNative {
     // Transport
     @JvmStatic private external fun nativeGetTransport(): Byte
 
-    // Device management
-    @JvmStatic private external fun nativeGetPairedDevices(): String
-    @JvmStatic private external fun nativeConnectDevice(address: String): Boolean
-    @JvmStatic private external fun nativeStartListening(): Boolean
+    // Connection
     @JvmStatic private external fun nativeDisconnect(): Boolean
 
     // QR Auth / Session
@@ -539,10 +585,7 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeSetMuted(userId: String, muted: Boolean)
     @JvmStatic private external fun nativeSetFavorite(userId: String, favorite: Boolean)
 
-    // Extended: BT/WiFi status, session, users, permissions
-    @JvmStatic private external fun nativeIsBluetoothEnabled(): Boolean
-    @JvmStatic private external fun nativeEnableBluetooth(): Boolean
-    @JvmStatic private external fun nativeGetConnectedDevice(): String
+    // WiFi status, session, users, permissions
     @JvmStatic private external fun nativeGetAppState(): Byte
     @JvmStatic private external fun nativeClearSession()
     @JvmStatic private external fun nativeRegisterUser(userId: String, userName: String)
@@ -558,12 +601,13 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeGetPermissionRationale(permission: String): String
     @JvmStatic private external fun nativeGetWifiState(): Byte
     @JvmStatic private external fun nativeGetWifiPeers(): String
-    @JvmStatic private external fun nativeGetBtState(): Byte
     @JvmStatic private external fun nativeIsPttActive(): Boolean
     @JvmStatic private external fun nativeInitWifi(): Boolean
     @JvmStatic private external fun nativeGetDeviceName(): String
+    @JvmStatic private external fun nativeSetDeviceName(name: String)
     @JvmStatic private external fun nativeHasWifiPeers(): Boolean
     @JvmStatic private external fun nativeIsEncrypted(): Boolean
+    @JvmStatic private external fun nativeConnectWifiMulticast(): Boolean
 
     // Audio Cache (multi-speaker store/replay)
     @JvmStatic private external fun nativeGetCacheStatus(): String
@@ -572,4 +616,14 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeClearAudioCache()
     @JvmStatic private external fun nativeReplayUtterance(index: Int): Boolean
     @JvmStatic private external fun nativeSyncCacheUserInfo()
+
+    // Cellular Transport (WebSocket relay)
+    @JvmStatic private external fun nativeCellularSetRoom(roomId: String)
+    @JvmStatic private external fun nativeCellularGetWsUrl(): String
+    @JvmStatic private external fun nativeCellularOnConnected(): Boolean
+    @JvmStatic private external fun nativeCellularOnDisconnected(reason: String)
+    @JvmStatic private external fun nativeCellularOnMessage(data: ByteArray)
+    @JvmStatic private external fun nativeCellularOnError(error: String)
+    @JvmStatic private external fun nativeCellularPollOutbound(): ByteArray?
+    @JvmStatic private external fun nativeCellularGetStats(): String
 }

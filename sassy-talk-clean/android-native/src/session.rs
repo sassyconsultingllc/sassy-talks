@@ -205,7 +205,7 @@ mod tests {
         let qr_json = host.generate_session_qr(24).unwrap();
 
         let mut joiner = SessionManager::new("Joiner");
-        let crypto = joiner.import_session(&qr_json).unwrap();
+        let mut crypto = joiner.import_session(&qr_json).unwrap();
 
         // Both should be authenticated
         assert!(host.is_authenticated());
@@ -234,7 +234,7 @@ mod tests {
 
         let result = mgr.import_session(&expired_json);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expired"));
+        assert!(result.err().unwrap().contains("expired"));
     }
 
     #[test]

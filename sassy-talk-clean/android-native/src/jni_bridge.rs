@@ -1,11 +1,11 @@
 /// JNI Bridge Module - Connects Rust to Android APIs
-/// 
+///
 /// This module provides safe Rust wrappers around Android Java APIs via JNI.
-/// Implements bridges for: Bluetooth, Audio, PackageManager, UI
+/// Implements bridges for: Audio, PackageManager, UI
 
 use jni::{
     JNIEnv,
-    objects::{JClass, JObject, JString, JValue, GlobalRef, JObjectArray},
+    objects::{JClass, JObject, JString, JValue, GlobalRef},
     sys::{jboolean, jbyte, JNI_TRUE, JNI_FALSE},
     JavaVM,
 };
@@ -24,461 +24,6 @@ pub fn init_jvm(vm: JavaVM) {
 /// Get JavaVM instance
 pub fn get_jvm() -> Result<Arc<JavaVM>, String> {
     JAVA_VM.get().cloned().ok_or_else(|| "JavaVM not initialized".to_string())
-}
-
-//==============================================================================
-// BLUETOOTH JNI BRIDGE
-//==============================================================================
-
-/// Android BluetoothAdapter bridge
-pub struct AndroidBluetoothAdapter {
-    adapter: GlobalRef,
-}
-
-impl AndroidBluetoothAdapter {
-    /// Get default Bluetooth adapter
-    pub fn get_default() -> Result<Self, String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let adapter_class = env.find_class("android/bluetooth/BluetoothAdapter")
-            .map_err(|e| format!("Failed to find BluetoothAdapter class: {}", e))?;
-        
-        let adapter = env.call_static_method(
-            adapter_class,
-            "getDefaultAdapter",
-            "()Landroid/bluetooth/BluetoothAdapter;",
-            &[]
-        )
-        .map_err(|e| format!("Failed to get default adapter: {}", e))?
-        .l()
-        .map_err(|e| format!("Failed to convert to object: {}", e))?;
-        
-        let global_ref = env.new_global_ref(&adapter)
-            .map_err(|e| format!("Failed to create global ref: {}", e))?;
-        
-        Ok(Self { adapter: global_ref })
-    }
-    
-    /// Check if Bluetooth is enabled
-    pub fn is_enabled(&self) -> Result<bool, String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let result = env.call_method(
-            self.adapter.as_obj(),
-            "isEnabled",
-            "()Z",
-            &[]
-        )
-        .map_err(|e| format!("Failed to call isEnabled: {}", e))?
-        .z()
-        .map_err(|e| format!("Failed to convert result: {}", e))?;
-        
-        Ok(result)
-    }
-    
-    /// Enable Bluetooth
-    pub fn enable(&self) -> Result<bool, String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let result = env.call_method(
-            self.adapter.as_obj(),
-            "enable",
-            "()Z",
-            &[]
-        )
-        .map_err(|e| format!("Failed to call enable: {}", e))?
-        .z()
-        .map_err(|e| format!("Failed to convert result: {}", e))?;
-        
-        Ok(result)
-    }
-    
-    /// Get bonded (paired) devices
-    pub fn get_bonded_devices(&self) -> Result<Vec<AndroidBluetoothDevice>, String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let devices_set = env.call_method(
-            self.adapter.as_obj(),
-            "getBondedDevices",
-            "()Ljava/util/Set;",
-            &[]
-        )
-        .map_err(|e| format!("Failed to get bonded devices: {}", e))?
-        .l()
-        .map_err(|e| format!("Failed to convert to object: {}", e))?;
-        
-        let devices_array = env.call_method(
-            &devices_set,
-            "toArray",
-            "()[Ljava/lang/Object;",
-            &[]
-        )
-        .map_err(|e| format!("Failed to convert to array: {}", e))?
-        .l()
-        .map_err(|e| format!("Failed to convert to object: {}", e))?;
-        
-        let array: JObjectArray = devices_array.into();
-        let len = env.get_array_length(&array)
-            .map_err(|e| format!("Failed to get array length: {}", e))?;
-        
-        let mut devices = Vec::new();
-        for i in 0..len {
-            let device = env.get_object_array_element(&array, i)
-                .map_err(|e| format!("Failed to get device {}: {}", i, e))?;
-            
-            let global_ref = env.new_global_ref(&device)
-                .map_err(|e| format!("Failed to create global ref: {}", e))?;
-            
-            devices.push(AndroidBluetoothDevice { device: global_ref });
-        }
-        
-        Ok(devices)
-    }
-    
-    /// Create RFCOMM server socket
-    pub fn create_rfcomm_server(&self, name: &str, uuid: &str) -> Result<AndroidBluetoothServerSocket, String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let uuid_class = env.find_class("java/util/UUID")
-            .map_err(|e| format!("Failed to find UUID class: {}", e))?;
-        
-        let uuid_jstr = env.new_string(uuid)
-            .map_err(|e| format!("Failed to create UUID string: {}", e))?;
-        
-        let uuid_obj = env.call_static_method(
-            uuid_class,
-            "fromString",
-            "(Ljava/lang/String;)Ljava/util/UUID;",
-            &[JValue::Object(&uuid_jstr.into())]
-        )
-        .map_err(|e| format!("Failed to parse UUID: {}", e))?
-        .l()
-        .map_err(|e| format!("Failed to convert UUID: {}", e))?;
-        
-        let name_jstr = env.new_string(name)
-            .map_err(|e| format!("Failed to create name string: {}", e))?;
-        
-        let server_socket = env.call_method(
-            self.adapter.as_obj(),
-            "listenUsingRfcommWithServiceRecord",
-            "(Ljava/lang/String;Ljava/util/UUID;)Landroid/bluetooth/BluetoothServerSocket;",
-            &[JValue::Object(&name_jstr.into()), JValue::Object(&uuid_obj)]
-        )
-        .map_err(|e| format!("Failed to create server socket: {}", e))?
-        .l()
-        .map_err(|e| format!("Failed to convert to object: {}", e))?;
-        
-        let global_ref = env.new_global_ref(&server_socket)
-            .map_err(|e| format!("Failed to create global ref: {}", e))?;
-        
-        Ok(AndroidBluetoothServerSocket { socket: global_ref })
-    }
-}
-
-/// Android BluetoothDevice bridge
-pub struct AndroidBluetoothDevice {
-    device: GlobalRef,
-}
-
-impl AndroidBluetoothDevice {
-    /// Get device name
-    pub fn get_name(&self) -> Result<String, String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let name = env.call_method(
-            self.device.as_obj(),
-            "getName",
-            "()Ljava/lang/String;",
-            &[]
-        )
-        .map_err(|e| format!("Failed to get name: {}", e))?
-        .l()
-        .map_err(|e| format!("Failed to convert to object: {}", e))?;
-        
-        let name_jstr = JString::from(name);
-        let name_str: String = env.get_string(&name_jstr)
-            .map_err(|e| format!("Failed to convert to string: {}", e))?
-            .into();
-        
-        Ok(name_str)
-    }
-    
-    /// Get device address (MAC address)
-    pub fn get_address(&self) -> Result<String, String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let address = env.call_method(
-            self.device.as_obj(),
-            "getAddress",
-            "()Ljava/lang/String;",
-            &[]
-        )
-        .map_err(|e| format!("Failed to get address: {}", e))?
-        .l()
-        .map_err(|e| format!("Failed to convert to object: {}", e))?;
-        
-        let addr_jstr = JString::from(address);
-        let address_str: String = env.get_string(&addr_jstr)
-            .map_err(|e| format!("Failed to convert to string: {}", e))?
-            .into();
-        
-        Ok(address_str)
-    }
-    
-    /// Create RFCOMM socket to this device
-    pub fn create_rfcomm_socket(&self, uuid: &str) -> Result<AndroidBluetoothSocket, String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let uuid_class = env.find_class("java/util/UUID")
-            .map_err(|e| format!("Failed to find UUID class: {}", e))?;
-        
-        let uuid_jstr = env.new_string(uuid)
-            .map_err(|e| format!("Failed to create UUID string: {}", e))?;
-        
-        let uuid_obj = env.call_static_method(
-            uuid_class,
-            "fromString",
-            "(Ljava/lang/String;)Ljava/util/UUID;",
-            &[JValue::Object(&uuid_jstr.into())]
-        )
-        .map_err(|e| format!("Failed to parse UUID: {}", e))?
-        .l()
-        .map_err(|e| format!("Failed to convert UUID: {}", e))?;
-        
-        let socket = env.call_method(
-            self.device.as_obj(),
-            "createRfcommSocketToServiceRecord",
-            "(Ljava/util/UUID;)Landroid/bluetooth/BluetoothSocket;",
-            &[JValue::Object(&uuid_obj)]
-        )
-        .map_err(|e| format!("Failed to create socket: {}", e))?
-        .l()
-        .map_err(|e| format!("Failed to convert to object: {}", e))?;
-        
-        let global_ref = env.new_global_ref(&socket)
-            .map_err(|e| format!("Failed to create global ref: {}", e))?;
-        
-        Ok(AndroidBluetoothSocket { socket: global_ref })
-    }
-}
-
-/// Android BluetoothSocket bridge
-pub struct AndroidBluetoothSocket {
-    socket: GlobalRef,
-}
-
-impl AndroidBluetoothSocket {
-    /// Connect to remote device
-    pub fn connect(&self) -> Result<(), String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        env.call_method(self.socket.as_obj(), "connect", "()V", &[])
-            .map_err(|e| format!("Failed to connect: {}", e))?;
-        
-        Ok(())
-    }
-    
-    /// Close socket
-    pub fn close(&self) -> Result<(), String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        env.call_method(self.socket.as_obj(), "close", "()V", &[])
-            .map_err(|e| format!("Failed to close: {}", e))?;
-        
-        Ok(())
-    }
-    
-    /// Get input stream
-    pub fn get_input_stream(&self) -> Result<AndroidInputStream, String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let stream = env.call_method(
-            self.socket.as_obj(),
-            "getInputStream",
-            "()Ljava/io/InputStream;",
-            &[]
-        )
-        .map_err(|e| format!("Failed to get input stream: {}", e))?
-        .l()
-        .map_err(|e| format!("Failed to convert to object: {}", e))?;
-        
-        let global_ref = env.new_global_ref(&stream)
-            .map_err(|e| format!("Failed to create global ref: {}", e))?;
-        
-        Ok(AndroidInputStream { stream: global_ref })
-    }
-    
-    /// Get output stream
-    pub fn get_output_stream(&self) -> Result<AndroidOutputStream, String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let stream = env.call_method(
-            self.socket.as_obj(),
-            "getOutputStream",
-            "()Ljava/io/OutputStream;",
-            &[]
-        )
-        .map_err(|e| format!("Failed to get output stream: {}", e))?
-        .l()
-        .map_err(|e| format!("Failed to convert to object: {}", e))?;
-        
-        let global_ref = env.new_global_ref(&stream)
-            .map_err(|e| format!("Failed to create global ref: {}", e))?;
-        
-        Ok(AndroidOutputStream { stream: global_ref })
-    }
-}
-
-/// Android BluetoothServerSocket bridge
-pub struct AndroidBluetoothServerSocket {
-    socket: GlobalRef,
-}
-
-impl AndroidBluetoothServerSocket {
-    /// Accept incoming connection (blocking)
-    pub fn accept(&self) -> Result<AndroidBluetoothSocket, String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let socket = env.call_method(
-            self.socket.as_obj(),
-            "accept",
-            "()Landroid/bluetooth/BluetoothSocket;",
-            &[]
-        )
-        .map_err(|e| format!("Failed to accept: {}", e))?
-        .l()
-        .map_err(|e| format!("Failed to convert to object: {}", e))?;
-        
-        let global_ref = env.new_global_ref(&socket)
-            .map_err(|e| format!("Failed to create global ref: {}", e))?;
-        
-        Ok(AndroidBluetoothSocket { socket: global_ref })
-    }
-    
-    /// Close server socket
-    pub fn close(&self) -> Result<(), String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        env.call_method(self.socket.as_obj(), "close", "()V", &[])
-            .map_err(|e| format!("Failed to close: {}", e))?;
-        
-        Ok(())
-    }
-}
-
-/// Java InputStream bridge
-pub struct AndroidInputStream {
-    stream: GlobalRef,
-}
-
-impl AndroidInputStream {
-    /// Read bytes from stream
-    pub fn read(&self, buffer: &mut [u8]) -> Result<usize, String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let jarray = env.new_byte_array(buffer.len() as i32)
-            .map_err(|e| format!("Failed to create byte array: {}", e))?;
-        
-        // Create JObject reference without consuming jarray
-        let jarray_obj = unsafe { JObject::from_raw(jarray.as_raw()) };
-        
-        let bytes_read = env.call_method(
-            self.stream.as_obj(),
-            "read",
-            "([B)I",
-            &[JValue::Object(&jarray_obj)]
-        )
-        .map_err(|e| format!("Failed to read: {}", e))?
-        .i()
-        .map_err(|e| format!("Failed to convert result: {}", e))?;
-        
-        if bytes_read <= 0 {
-            return Ok(0);
-        }
-        
-        let mut temp = vec![0i8; bytes_read as usize];
-        env.get_byte_array_region(&jarray, 0, &mut temp)
-            .map_err(|e| format!("Failed to copy bytes: {}", e))?;
-        
-        for (i, &b) in temp.iter().enumerate() {
-            buffer[i] = b as u8;
-        }
-        
-        Ok(bytes_read as usize)
-    }
-}
-
-/// Java OutputStream bridge
-pub struct AndroidOutputStream {
-    stream: GlobalRef,
-}
-
-impl AndroidOutputStream {
-    /// Write bytes to stream
-    pub fn write(&self, buffer: &[u8]) -> Result<(), String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let jarray = env.new_byte_array(buffer.len() as i32)
-            .map_err(|e| format!("Failed to create byte array: {}", e))?;
-        
-        let temp: Vec<i8> = buffer.iter().map(|&b| b as i8).collect();
-        env.set_byte_array_region(&jarray, 0, &temp)
-            .map_err(|e| format!("Failed to copy bytes: {}", e))?;
-        
-        env.call_method(
-            self.stream.as_obj(),
-            "write",
-            "([B)V",
-            &[JValue::Object(&jarray.into())]
-        )
-        .map_err(|e| format!("Failed to write: {}", e))?;
-        
-        Ok(())
-    }
-    
-    /// Flush output stream
-    pub fn flush(&self) -> Result<(), String> {
-        let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        env.call_method(self.stream.as_obj(), "flush", "()V", &[])
-            .map_err(|e| format!("Failed to flush: {}", e))?;
-        
-        Ok(())
-    }
 }
 
 //==============================================================================
@@ -896,7 +441,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     guard.current_channel.store(ch, Ordering::Relaxed);
 }
 
-/// JNI: Get active transport type (0=None, 1=Bluetooth, 2=WiFi)
+/// JNI: Get active transport type (0=None, 2=WiFi, 3=WifiDirect, 4=Cellular)
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetTransport(
     _env: JNIEnv,
@@ -908,8 +453,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     if let Some(ref sm) = guard.state_machine {
         match sm.get_active_transport() {
             crate::transport::ActiveTransport::None => 0,
-            crate::transport::ActiveTransport::Bluetooth => 1,
             crate::transport::ActiveTransport::Wifi => 2,
+            crate::transport::ActiveTransport::WifiDirect => 3,
+            crate::transport::ActiveTransport::Cellular => 4,
         }
     } else {
         0
@@ -931,93 +477,6 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         let _ = sm.shutdown();
     }
     guard.state_machine = None;
-}
-
-/// JNI: Get paired Bluetooth devices as JSON array
-#[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetPairedDevices<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-) -> JObject<'local> {
-    let state = get_jni_state();
-    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-
-    let json = if let Some(ref sm) = guard.state_machine {
-        match sm.get_paired_devices() {
-            Ok(devices) => {
-                let arr: Vec<serde_json::Value> = devices.iter().map(|d| {
-                    serde_json::json!({"name": d.name, "address": d.address, "paired": d.paired})
-                }).collect();
-                serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
-            }
-            Err(e) => {
-                error!("JNI: getPairedDevices failed: {}", e);
-                "[]".to_string()
-            }
-        }
-    } else {
-        "[]".to_string()
-    };
-
-    drop(guard);
-
-    env.new_string(&json)
-        .map(|s| s.into())
-        .unwrap_or_else(|_| JObject::null())
-}
-
-/// JNI: Connect to a Bluetooth device by address
-#[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeConnectDevice<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    address: JString<'local>,
-) -> jboolean {
-    let addr: String = match env.get_string(&address) {
-        Ok(s) => s.into(),
-        Err(_) => return JNI_FALSE,
-    };
-
-    info!("JNI: Connecting to {}", addr);
-
-    let state = get_jni_state();
-    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-
-    if let Some(ref sm) = guard.state_machine {
-        match sm.connect_to_device(&addr) {
-            Ok(()) => JNI_TRUE,
-            Err(e) => {
-                error!("JNI: Connect failed: {}", e);
-                JNI_FALSE
-            }
-        }
-    } else {
-        JNI_FALSE
-    }
-}
-
-/// JNI: Start listening for incoming connections
-#[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeStartListening(
-    _env: JNIEnv,
-    _class: JClass,
-) -> jboolean {
-    info!("JNI: Start listening");
-
-    let state = get_jni_state();
-    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-
-    if let Some(ref sm) = guard.state_machine {
-        match sm.start_listening() {
-            Ok(()) => JNI_TRUE,
-            Err(e) => {
-                error!("JNI: Listen failed: {}", e);
-                JNI_FALSE
-            }
-        }
-    } else {
-        JNI_FALSE
-    }
 }
 
 /// JNI: Disconnect from current device
@@ -1211,72 +670,6 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 // EXTENDED JNI EXPORTS - BT/WiFi status, permissions, user registration
 //==============================================================================
 
-/// JNI: Check if Bluetooth is enabled
-#[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeIsBluetoothEnabled(
-    _env: JNIEnv,
-    _class: JClass,
-) -> jboolean {
-    let state = get_jni_state();
-    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-
-    if let Some(ref sm) = guard.state_machine {
-        if sm.is_bluetooth_enabled() { JNI_TRUE } else { JNI_FALSE }
-    } else {
-        JNI_FALSE
-    }
-}
-
-/// JNI: Enable Bluetooth
-#[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeEnableBluetooth(
-    _env: JNIEnv,
-    _class: JClass,
-) -> jboolean {
-    let state = get_jni_state();
-    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-
-    if let Some(ref sm) = guard.state_machine {
-        match sm.enable_bluetooth() {
-            Ok(()) => JNI_TRUE,
-            Err(e) => {
-                warn!("JNI: Enable BT failed: {}", e);
-                JNI_FALSE
-            }
-        }
-    } else {
-        JNI_FALSE
-    }
-}
-
-/// JNI: Get connected device info as JSON (name + address) or empty string
-#[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetConnectedDevice<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-) -> JObject<'local> {
-    let state = get_jni_state();
-    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-
-    let json = if let Some(ref sm) = guard.state_machine {
-        match sm.get_connected_device() {
-            Some(device) => serde_json::json!({
-                "name": device.name,
-                "address": device.address
-            }).to_string(),
-            None => "{}".to_string(),
-        }
-    } else {
-        "{}".to_string()
-    };
-
-    drop(guard);
-
-    env.new_string(&json)
-        .map(|s| s.into())
-        .unwrap_or_else(|_| JObject::null())
-}
-
 /// JNI: Get app state (0=Init, 1=Ready, 2=Connecting, 3=Connected, 4=TX, 5=RX, 6=Disconnecting, 7=Error)
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetAppState(
@@ -1466,9 +859,6 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let perms = pm.get_permissions();
     let json = serde_json::json!({
         "all_granted": all_granted,
-        "bluetooth_connect": format!("{:?}", perms.bluetooth_connect),
-        "bluetooth_scan": format!("{:?}", perms.bluetooth_scan),
-        "bluetooth_advertise": format!("{:?}", perms.bluetooth_advertise),
         "record_audio": format!("{:?}", perms.record_audio),
         "has_critical": pm.has_critical_permissions(),
     }).to_string();
@@ -1667,27 +1057,6 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         .unwrap_or_else(|_| JObject::null())
 }
 
-/// JNI: Get Bluetooth connection state (0=Disconnected, 1=Connecting, 2=Connected, 3=Listening)
-#[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetBtState(
-    _env: JNIEnv,
-    _class: JClass,
-) -> jbyte {
-    let state = get_jni_state();
-    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-
-    if let Some(ref sm) = guard.state_machine {
-        match sm.get_bt_state() {
-            crate::bluetooth::ConnectionState::Disconnected => 0,
-            crate::bluetooth::ConnectionState::Connecting => 1,
-            crate::bluetooth::ConnectionState::Connected => 2,
-            crate::bluetooth::ConnectionState::Listening => 3,
-        }
-    } else {
-        0
-    }
-}
-
 /// JNI: Check if PTT is currently active
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeIsPttActive(
@@ -1751,6 +1120,28 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         .unwrap_or_else(|_| JObject::null())
 }
 
+/// JNI: Set device display name (called from Kotlin with the actual Android device model)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetDeviceName(
+    mut env: JNIEnv,
+    _class: JClass,
+    name: JString,
+) {
+    let name_str: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+
+    info!("JNI: Set device name to '{}'", name_str);
+
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref mut sm) = guard.state_machine {
+        sm.set_device_name(name_str);
+    }
+}
+
 //==============================================================================
 // AUDIO CACHE JNI EXPORTS (DANE.COM-STYLE MULTI-SPEAKER REPLAY)
 //==============================================================================
@@ -1765,7 +1156,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     let json = if let Some(ref sm) = guard.state_machine {
-        let cache = sm.audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
         cache.status_json()
     } else {
         r#"{"mode":"Live","queued_utterances":0}"#.to_string()
@@ -1790,7 +1181,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let mut cache = sm.audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
         cache.skip_current();
     }
 }
@@ -1813,7 +1204,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let mut cache = sm.audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
         cache.set_mode(cache_mode);
     }
 }
@@ -1830,7 +1221,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let mut cache = sm.audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
         cache.clear();
     }
 }
@@ -1846,7 +1237,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let mut cache = sm.audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
         if cache.replay_from_history(index as usize) {
             info!("JNI: Replaying utterance at index {}", index);
             JNI_TRUE
@@ -1868,7 +1259,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let mut cache = sm.audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
 
         // Parse user registry JSON to sync mute/favorite status into cache
         let users_json = guard.user_registry.to_json();
@@ -1903,6 +1294,155 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     }
 }
 
+//==============================================================================
+// CELLULAR TRANSPORT JNI EXPORTS (WebSocket relay via Cloudflare)
+//==============================================================================
+
+/// JNI: Set the cellular relay room ID (from QR session_id)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCellularSetRoom(
+    mut env: JNIEnv,
+    _class: JClass,
+    room_id: JString,
+) {
+    let room: String = match env.get_string(&room_id) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+    info!("JNI: Cellular room set to '{}'", room);
+
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref mut sm) = guard.state_machine {
+        sm.set_cellular_room(room);
+    }
+}
+
+/// JNI: Get the WebSocket URL for Kotlin to connect to
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCellularGetWsUrl<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    let url = if let Some(ref sm) = guard.state_machine {
+        sm.get_cellular_ws_url()
+    } else {
+        String::new()
+    };
+
+    env.new_string(&url).unwrap_or_else(|_| env.new_string("").unwrap())
+}
+
+/// JNI: Called when Kotlin WebSocket connects successfully
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCellularOnConnected(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    info!("JNI: Cellular WebSocket connected");
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref mut sm) = guard.state_machine {
+        if let Err(e) = sm.on_cellular_connected() {
+            error!("Cellular connect failed: {}", e);
+        }
+    }
+}
+
+/// JNI: Called when Kotlin WebSocket disconnects
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCellularOnDisconnected(
+    mut env: JNIEnv,
+    _class: JClass,
+    reason: JString,
+) {
+    let reason_str: String = env.get_string(&reason).map(|s| s.into()).unwrap_or_default();
+    info!("JNI: Cellular disconnected: {}", reason_str);
+
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref mut sm) = guard.state_machine {
+        sm.on_cellular_disconnected(&reason_str);
+    }
+}
+
+/// JNI: Called when Kotlin receives a binary message from the relay
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCellularOnMessage(
+    env: JNIEnv,
+    _class: JClass,
+    data: jni::objects::JByteArray,
+) {
+    let bytes = match env.convert_byte_array(&data) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref mut sm) = guard.state_machine {
+        sm.on_cellular_message(bytes);
+    }
+}
+
+/// JNI: Called when Kotlin WebSocket has an error
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCellularOnError(
+    mut env: JNIEnv,
+    _class: JClass,
+    error: JString,
+) {
+    let err_str: String = env.get_string(&error).map(|s| s.into()).unwrap_or_default();
+    error!("JNI: Cellular error: {}", err_str);
+
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref mut sm) = guard.state_machine {
+        sm.on_cellular_error(&err_str);
+    }
+}
+
+/// JNI: Poll outbound queue — returns byte array or null if empty
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCellularPollOutbound<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::objects::JByteArray<'local> {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        if let Some(data) = sm.poll_cellular_outbound() {
+            return env.byte_array_from_slice(&data)
+                .unwrap_or_else(|_| jni::objects::JByteArray::default());
+        }
+    }
+
+    // Return null (empty default)
+    jni::objects::JByteArray::default()
+}
+
+/// JNI: Get cellular stats JSON
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCellularGetStats<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    let stats = if let Some(ref sm) = guard.state_machine {
+        sm.get_cellular_stats()
+    } else {
+        "{}".to_string()
+    };
+
+    env.new_string(&stats).unwrap_or_else(|_| env.new_string("{}").unwrap())
+}
+
 /// JNI: Check if WiFi transport has discovered peers
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHasWifiPeers(
@@ -1914,6 +1454,237 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
     if let Some(ref sm) = guard.state_machine {
         if sm.has_wifi_peers() { JNI_TRUE } else { JNI_FALSE }
+    } else {
+        JNI_FALSE
+    }
+}
+
+//==============================================================================
+// WIFI DIRECT JNI EXPORTS
+//==============================================================================
+
+/// JNI: WiFi Direct state changed (called by Kotlin BroadcastReceiver)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeOnWifiDirectStateChanged(
+    _env: JNIEnv,
+    _class: JClass,
+    enabled: jboolean,
+) {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        let transport = sm.get_transport();
+        let mut tm = transport.lock().unwrap_or_else(|e| e.into_inner());
+        tm.wifi_direct_mut().on_state_changed(enabled == JNI_TRUE);
+    }
+}
+
+/// JNI: WiFi Direct peers changed (called by Kotlin after requestPeers)
+/// peers_json: JSON array of objects with device_name, device_address, is_group_owner
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeOnWifiDirectPeersChanged<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    peers_json: JString<'local>,
+) {
+    let json: String = match env.get_string(&peers_json) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+
+    let peers: Vec<crate::wifi_direct::WifiDirectPeer> = match serde_json::from_str::<Vec<serde_json::Value>>(&json) {
+        Ok(arr) => arr.iter().filter_map(|v| {
+            Some(crate::wifi_direct::WifiDirectPeer {
+                device_name: v["device_name"].as_str()?.to_string(),
+                device_address: v["device_address"].as_str()?.to_string(),
+                is_group_owner: v["is_group_owner"].as_bool().unwrap_or(false),
+            })
+        }).collect(),
+        Err(_) => return,
+    };
+
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        let transport = sm.get_transport();
+        let mut tm = transport.lock().unwrap_or_else(|e| e.into_inner());
+        tm.wifi_direct_mut().on_peers_changed(peers);
+    }
+}
+
+/// JNI: WiFi Direct connection changed (called by Kotlin BroadcastReceiver)
+/// This is THE critical callback: when connected=true, we start multicast on the P2P network.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeOnWifiDirectConnectionChanged<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    connected: jboolean,
+    is_owner: jboolean,
+    group_owner_ip: JString<'local>,
+    interface_name: JString<'local>,
+) {
+    let go_ip: Option<std::net::Ipv4Addr> = env.get_string(&group_owner_ip)
+        .ok()
+        .and_then(|s| {
+            let s: String = s.into();
+            s.parse().ok()
+        });
+
+    let iface: Option<String> = env.get_string(&interface_name)
+        .ok()
+        .map(|s| s.into());
+
+    let is_connected = connected == JNI_TRUE;
+    let is_group_owner = is_owner == JNI_TRUE;
+
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        // Update WiFi Direct state in transport manager
+        {
+            let transport = sm.get_transport();
+            let mut tm = transport.lock().unwrap_or_else(|e| e.into_inner());
+            tm.wifi_direct_mut().on_connection_changed(is_connected, is_group_owner, go_ip, iface);
+        }
+
+        // If connected, start multicast transport on the P2P network
+        if is_connected {
+            if let Err(e) = sm.on_wifi_direct_connected() {
+                error!("JNI: Failed to start WiFi Direct transport: {}", e);
+            }
+        } else {
+            sm.on_wifi_direct_disconnected();
+        }
+    }
+}
+
+/// JNI: WiFi Direct discovery started (called by Kotlin after discoverPeers)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeOnWifiDirectDiscoveryStarted(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        let transport = sm.get_transport();
+        let mut tm = transport.lock().unwrap_or_else(|e| e.into_inner());
+        tm.wifi_direct_mut().on_discovery_started();
+    }
+}
+
+/// JNI: Get WiFi Direct state (0=Disabled, 1=Available, 2=Discovering, 3=Connecting, 4=Connected, 5=Error)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetWifiDirectState(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jbyte {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        match sm.get_wifi_direct_state() {
+            crate::wifi_direct::WifiDirectState::Disabled => 0,
+            crate::wifi_direct::WifiDirectState::Available => 1,
+            crate::wifi_direct::WifiDirectState::Discovering => 2,
+            crate::wifi_direct::WifiDirectState::Connecting => 3,
+            crate::wifi_direct::WifiDirectState::Connected => 4,
+            crate::wifi_direct::WifiDirectState::Error => 5,
+        }
+    } else {
+        0
+    }
+}
+
+/// JNI: Get WiFi Direct peers as JSON array
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetWifiDirectPeers<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> JObject<'local> {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    let json = if let Some(ref sm) = guard.state_machine {
+        let peers = sm.get_wifi_direct_peers();
+        let arr: Vec<serde_json::Value> = peers.iter().map(|p| {
+            serde_json::json!({
+                "device_name": p.device_name,
+                "device_address": p.device_address,
+                "is_group_owner": p.is_group_owner,
+            })
+        }).collect();
+        serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
+    } else {
+        "[]".to_string()
+    };
+
+    drop(guard);
+
+    env.new_string(&json)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| JObject::null())
+}
+
+/// JNI: Get WiFi Direct group role (0=None, 1=Owner, 2=Client)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetWifiDirectRole(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jbyte {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        match sm.get_wifi_direct_role() {
+            crate::wifi_direct::GroupRole::None => 0,
+            crate::wifi_direct::GroupRole::Owner => 1,
+            crate::wifi_direct::GroupRole::Client => 2,
+        }
+    } else {
+        0
+    }
+}
+
+/// JNI: Connect via WiFi multicast directly (cross-platform mode, shared WiFi network)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeConnectWifiMulticast(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    info!("JNI: Connect via WiFi multicast (cross-platform)");
+
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        match sm.connect_wifi_multicast() {
+            Ok(()) => JNI_TRUE,
+            Err(e) => {
+                error!("JNI: WiFi multicast connect failed: {}", e);
+                JNI_FALSE
+            }
+        }
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// JNI: Check if WiFi Direct has discovered peers
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHasWifiDirectPeers(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        if sm.has_wifi_direct_peers() { JNI_TRUE } else { JNI_FALSE }
     } else {
         JNI_FALSE
     }

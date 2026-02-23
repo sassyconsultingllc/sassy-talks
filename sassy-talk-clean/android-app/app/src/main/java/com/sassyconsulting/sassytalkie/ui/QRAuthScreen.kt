@@ -4,7 +4,9 @@ import android.graphics.Bitmap
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -21,6 +23,7 @@ import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.ui.theme.*
+import org.json.JSONObject
 
 @Composable
 fun QRAuthScreen(onAuthenticated: () -> Unit) {
@@ -29,13 +32,7 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
     var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var scanResult by remember { mutableStateOf<String?>(null) }
     var showScanner by remember { mutableStateOf(false) }
-
-    // Check if already authenticated
-    LaunchedEffect(Unit) {
-        if (SassyTalkNative.isAuthenticated()) {
-            onAuthenticated()
-        }
-    }
+    val hasExistingSession = remember { mutableStateOf(SassyTalkNative.isAuthenticated()) }
 
     Column(
         modifier = Modifier
@@ -63,7 +60,21 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
             textAlign = TextAlign.Center
         )
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // ── Existing session card ──
+        if (hasExistingSession.value) {
+            ActiveSessionCard(
+                onContinue = onAuthenticated,
+                onNewSession = {
+                    SassyTalkNative.clearSession()
+                    hasExistingSession.value = false
+                    qrBitmap = null
+                    scanResult = null
+                }
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+        }
 
         // Tab row
         TabRow(
@@ -95,7 +106,11 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
                     val qrJson = SassyTalkNative.generateSessionQR(durationHours)
                     if (qrJson.isNotEmpty()) {
                         qrBitmap = generateQRBitmap(qrJson, 600)
+                        hasExistingSession.value = true
                     }
+                },
+                onContinue = {
+                    onAuthenticated()
                 }
             )
             1 -> ScanQRTab(
@@ -107,6 +122,7 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
                     val success = SassyTalkNative.importSessionFromQR(json)
                     scanResult = if (success) "Session established!" else "Invalid QR code"
                     if (success) {
+                        hasExistingSession.value = true
                         onAuthenticated()
                     }
                 }
@@ -116,15 +132,80 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
 }
 
 @Composable
+private fun ActiveSessionCard(
+    onContinue: () -> Unit,
+    onNewSession: () -> Unit
+) {
+    val sessionJson = SassyTalkNative.getSessionStatus()
+    val session = try { JSONObject(sessionJson) } catch (_: Exception) { null }
+    val peerDevice = session?.optString("peer_device", "") ?: ""
+    val remainingSecs = session?.optLong("remaining_seconds", 0) ?: 0
+    val hours = remainingSecs / 3600
+    val mins = (remainingSecs % 3600) / 60
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Green.copy(alpha = 0.15f)),
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Green, modifier = Modifier.size(24.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Active Session", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Green)
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            if (peerDevice.isNotEmpty()) {
+                Text("from $peerDevice", fontSize = 13.sp, color = TextGray)
+            }
+            Text(
+                text = "${hours}h ${mins}m remaining",
+                fontSize = 13.sp, color = TextGray
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Continue with existing session
+                Button(
+                    onClick = onContinue,
+                    colors = ButtonDefaults.buttonColors(containerColor = Green, contentColor = DarkBg),
+                    shape = RoundedCornerShape(25.dp),
+                    modifier = Modifier.weight(1f).height(44.dp)
+                ) {
+                    Text("Continue", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                }
+                // Start new session
+                OutlinedButton(
+                    onClick = onNewSession,
+                    shape = RoundedCornerShape(25.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = TextGray),
+                    modifier = Modifier.weight(1f).height(44.dp)
+                ) {
+                    Text("New Session", fontSize = 14.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun ShowQRTab(
     durationHours: Int,
     onDurationChange: (Int) -> Unit,
     qrBitmap: Bitmap?,
-    onGenerate: () -> Unit
+    onGenerate: () -> Unit,
+    onContinue: () -> Unit
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
     ) {
         // Duration picker
         Card(
@@ -163,7 +244,10 @@ private fun ShowQRTab(
         ) {
             Icon(Icons.Default.QrCode2, contentDescription = null)
             Spacer(modifier = Modifier.width(8.dp))
-            Text("Generate Session QR", fontSize = 16.sp)
+            Text(
+                if (qrBitmap != null) "Regenerate QR" else "Generate Session QR",
+                fontSize = 16.sp
+            )
         }
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -189,6 +273,31 @@ private fun ShowQRTab(
                 text = "Have the other device scan this QR code",
                 color = TextGray,
                 fontSize = 13.sp,
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(modifier = Modifier.height(20.dp))
+
+            // Continue button — crypto is already set when QR was generated
+            Button(
+                onClick = onContinue,
+                colors = ButtonDefaults.buttonColors(containerColor = Green),
+                shape = RoundedCornerShape(25.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp)
+            ) {
+                Icon(Icons.Default.CheckCircle, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Continue", fontSize = 15.sp)
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = "Your session key is active — the other device just needs to scan before connecting.",
+                color = TextMuted,
+                fontSize = 12.sp,
                 textAlign = TextAlign.Center
             )
         }

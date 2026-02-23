@@ -15,7 +15,19 @@ android {
         versionName = "1.0.0"
 
         ndk {
-            abiFilters += listOf("arm64-v8a")
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
+    }
+
+    signingConfigs {
+        create("release") {
+            val ksFile = file("keystore/release.keystore")
+            if (ksFile.exists()) {
+                storeFile = ksFile
+                storePassword = System.getenv("RELEASE_STORE_PASSWORD") ?: ""
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS") ?: ""
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD") ?: ""
+            }
         }
     }
 
@@ -27,7 +39,12 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("debug") // Change for release
+            val releaseKs = file("keystore/release.keystore")
+            signingConfig = if (releaseKs.exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
     
@@ -77,6 +94,9 @@ dependencies {
 
     // JSON parsing
     implementation("org.json:json:20231013")
+
+    // OkHttp for WebSocket (cellular relay transport)
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     
     // AppCompat + Material + ConstraintLayout for legacy XML layouts
     implementation("androidx.appcompat:appcompat:1.6.1")

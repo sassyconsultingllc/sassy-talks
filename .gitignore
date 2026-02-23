@@ -46,6 +46,7 @@ npm-debug.log*
 # Keystore (sensitive)
 *.jks
 *.keystore
+**/keystore/
 
 # Local test suites
 **/tests-local/

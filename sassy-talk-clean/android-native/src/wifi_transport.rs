@@ -9,9 +9,10 @@ use log::info;
 use socket2::{Domain, Protocol, Socket, Type, SockAddr};
 
 /// Multicast group address for SassyTalkie discovery + audio
-const MULTICAST_GROUP: Ipv4Addr = Ipv4Addr::new(239, 77, 83, 84); // 239.MST (Multicast Sassy Talk)
-const MULTICAST_PORT: u16 = 5354;
-const DISCOVERY_PORT: u16 = 5355;
+/// Unified across all platforms (Android, iOS, Desktop)
+const MULTICAST_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 42);
+const MULTICAST_PORT: u16 = 5555;
+const DISCOVERY_PORT: u16 = 5556;
 
 /// Max UDP payload (safe for most networks without fragmentation)
 const MAX_PACKET_SIZE: usize = 1400;

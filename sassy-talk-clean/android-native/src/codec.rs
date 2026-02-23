@@ -21,7 +21,7 @@ pub const CODEC_FRAME_SIZE: usize = 960;
 pub const HEADER_SIZE: usize = 4;
 
 /// Expected compressed frame size: 4-byte header + 480 bytes of nibble data.
-const COMPRESSED_FRAME_SIZE: usize = HEADER_SIZE + CODEC_FRAME_SIZE / 2;
+pub const COMPRESSED_FRAME_SIZE: usize = HEADER_SIZE + CODEC_FRAME_SIZE / 2;
 
 /// Standard IMA ADPCM step size table (89 entries).
 const STEP_TABLE: [i32; 89] = [

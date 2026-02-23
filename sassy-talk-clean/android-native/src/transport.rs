@@ -1,28 +1,35 @@
-/// Transport Module - Unified abstraction over Bluetooth and WiFi
+/// Transport Module - Unified abstraction over WiFi Direct and WiFi Multicast
 ///
-/// Implements smart transport selection:
-/// - Default: Bluetooth RFCOMM
-/// - Preferred: WiFi multicast when both peers report WiFi connectivity
-/// - Automatic fallback: if WiFi fails, falls back to Bluetooth
+/// Transport priority:
+/// 1. WiFi Direct (Android-to-Android, no router needed) + multicast on top
+/// 2. WiFi Multicast (cross-platform: Android + iOS + Desktop, same WiFi network)
+///
+/// WiFi Direct creates an ad-hoc network between devices, then multicast runs
+/// on that network. For cross-platform use, devices on the same WiFi use
+/// multicast directly (no WiFi Direct needed since a router already provides
+/// the shared network).
 
 use log::{error, info, warn};
 
-use crate::bluetooth::{BluetoothManager, BluetoothDevice, ConnectionState};
 use crate::wifi_transport::{WifiTransport, WifiState, WifiPeer};
+use crate::wifi_direct::{WifiDirectManager, WifiDirectState, WifiDirectPeer, GroupRole};
+use crate::cellular_transport::{CellularTransport, CellularState};
 use crate::crypto::CryptoSession;
 
 /// Which transport is currently active for data
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ActiveTransport {
     None,
-    Bluetooth,
     Wifi,
+    WifiDirect,
+    Cellular,
 }
 
 /// Unified transport manager
 pub struct TransportManager {
-    bluetooth: BluetoothManager,
     wifi: WifiTransport,
+    wifi_direct: WifiDirectManager,
+    cellular: CellularTransport,
     crypto: Option<CryptoSession>,
     active: ActiveTransport,
     device_name: String,
@@ -32,19 +39,21 @@ impl TransportManager {
     pub fn new(device_name: &str) -> Result<Self, String> {
         info!("TransportManager: initializing");
 
-        let bluetooth = BluetoothManager::new()?;
         let wifi = WifiTransport::new(device_name);
+        let wifi_direct = WifiDirectManager::new();
+        let cellular = CellularTransport::new(device_name);
 
         Ok(Self {
-            bluetooth,
             wifi,
+            wifi_direct,
+            cellular,
             crypto: None,
             active: ActiveTransport::None,
             device_name: device_name.to_string(),
         })
     }
 
-    /// Initialize WiFi transport (call after permissions granted)
+    /// Initialize WiFi multicast transport (call after permissions granted)
     pub fn init_wifi(&mut self) -> Result<(), String> {
         self.wifi.init()
     }
@@ -61,55 +70,69 @@ impl TransportManager {
         info!("TransportManager: PSK encryption enabled");
     }
 
-    // ── Bluetooth operations ──
+    // ── WiFi Direct operations ──
 
-    pub fn is_bluetooth_enabled(&self) -> bool {
-        self.bluetooth.is_enabled()
+    /// Get WiFi Direct manager (mutable, for JNI callbacks)
+    pub fn wifi_direct_mut(&mut self) -> &mut WifiDirectManager {
+        &mut self.wifi_direct
     }
 
-    pub fn enable_bluetooth(&self) -> Result<(), String> {
-        self.bluetooth.enable()
+    /// Get WiFi Direct state
+    pub fn wifi_direct_state(&self) -> WifiDirectState {
+        self.wifi_direct.get_state()
     }
 
-    pub fn get_paired_devices(&mut self) -> Result<Vec<BluetoothDevice>, String> {
-        self.bluetooth.get_paired_devices()
+    /// Get WiFi Direct peers
+    pub fn get_wifi_direct_peers(&self) -> &[WifiDirectPeer] {
+        self.wifi_direct.get_peers()
     }
 
-    pub fn connect_bluetooth(&mut self, address: &str) -> Result<(), String> {
-        self.bluetooth.connect(address)?;
-        self.active = ActiveTransport::Bluetooth;
-        info!("TransportManager: connected via Bluetooth to {}", address);
+    /// Check if WiFi Direct has discovered peers
+    pub fn has_wifi_direct_peers(&self) -> bool {
+        self.wifi_direct.has_peers()
+    }
 
-        // Try to also init WiFi for potential upgrade
-        if let Err(e) = self.wifi.init() {
-            warn!("TransportManager: WiFi init failed (BT-only mode): {}", e);
-        }
+    /// Get WiFi Direct group role
+    pub fn wifi_direct_role(&self) -> GroupRole {
+        self.wifi_direct.get_role()
+    }
 
+    /// Called when WiFi Direct group is formed — start multicast on the P2P network.
+    /// This is the key integration point: WiFi Direct provides the network,
+    /// multicast provides the audio transport running on that network.
+    pub fn on_wifi_direct_connected(&mut self) -> Result<(), String> {
+        info!("TransportManager: WiFi Direct group formed, starting multicast transport");
+
+        // Initialize multicast on the WiFi Direct network interface
+        self.wifi.init()?;
+        self.wifi.activate();
+        self.active = ActiveTransport::WifiDirect;
+
+        info!("TransportManager: active transport = WifiDirect (multicast on P2P network)");
         Ok(())
     }
 
-    pub fn listen_bluetooth(&mut self) -> Result<(), String> {
-        self.bluetooth.listen()?;
-        self.active = ActiveTransport::Bluetooth;
-        info!("TransportManager: listening via Bluetooth");
+    /// Called when WiFi Direct group is dissolved
+    pub fn on_wifi_direct_disconnected(&mut self) {
+        info!("TransportManager: WiFi Direct group dissolved");
+        self.wifi.shutdown();
 
-        // Try WiFi too
-        if let Err(e) = self.wifi.init() {
-            warn!("TransportManager: WiFi init failed (BT-only mode): {}", e);
+        if self.active == ActiveTransport::WifiDirect {
+            self.active = ActiveTransport::None;
         }
+    }
 
+    // ── WiFi Multicast operations (cross-platform, shared WiFi network) ──
+
+    /// Start multicast transport directly (for cross-platform use on shared WiFi)
+    pub fn connect_wifi_multicast(&mut self) -> Result<(), String> {
+        info!("TransportManager: starting WiFi multicast (cross-platform mode)");
+        self.wifi.init()?;
+        self.wifi.activate();
+        self.active = ActiveTransport::Wifi;
+        info!("TransportManager: active transport = WiFi multicast");
         Ok(())
     }
-
-    pub fn bt_state(&self) -> ConnectionState {
-        self.bluetooth.get_state()
-    }
-
-    pub fn get_connected_device(&self) -> Option<BluetoothDevice> {
-        self.bluetooth.get_connected_device()
-    }
-
-    // ── WiFi operations ──
 
     /// Start WiFi peer discovery (sends periodic announcements)
     pub fn announce_wifi(&self, channel: u8) {
@@ -117,21 +140,6 @@ impl TransportManager {
             // Non-fatal: WiFi may not be available
             warn!("WiFi announce failed: {}", e);
         }
-    }
-
-    /// Check for WiFi peers and potentially upgrade transport
-    pub fn check_wifi_upgrade(&mut self) -> bool {
-        let new_peers = self.wifi.check_discovery();
-
-        if !new_peers.is_empty() && self.active == ActiveTransport::Bluetooth {
-            // Found WiFi peers while on Bluetooth - upgrade
-            self.wifi.activate();
-            self.active = ActiveTransport::Wifi;
-            info!("TransportManager: upgraded to WiFi transport");
-            return true;
-        }
-
-        false
     }
 
     pub fn wifi_state(&self) -> WifiState {
@@ -164,19 +172,11 @@ impl TransportManager {
         };
 
         match self.active {
-            ActiveTransport::Wifi => {
-                match self.wifi.send_audio(&payload) {
-                    Ok(n) => Ok(n),
-                    Err(e) => {
-                        // Fallback to Bluetooth
-                        warn!("WiFi send failed, falling back to BT: {}", e);
-                        self.active = ActiveTransport::Bluetooth;
-                        self.bluetooth.send_audio(&payload)
-                    }
-                }
+            ActiveTransport::WifiDirect | ActiveTransport::Wifi => {
+                self.wifi.send_audio(&payload)
             }
-            ActiveTransport::Bluetooth => {
-                self.bluetooth.send_audio(&payload)
+            ActiveTransport::Cellular => {
+                self.cellular.send_audio(&payload)
             }
             ActiveTransport::None => {
                 Err("No active transport".to_string())
@@ -186,38 +186,34 @@ impl TransportManager {
 
     /// Receive data from active transport with decryption
     pub fn receive(&mut self, buffer: &mut [u8]) -> Result<usize, String> {
-        // Try WiFi first if active (lower latency)
-        let raw_data = if self.active == ActiveTransport::Wifi {
-            let mut wifi_buf = vec![0u8; buffer.len() + 128]; // extra for crypto overhead
-            match self.wifi.receive_audio(&mut wifi_buf) {
-                Ok(n) if n > 0 => Some(wifi_buf[..n].to_vec()),
-                Ok(_) => None, // No data on WiFi, try BT
-                Err(e) => {
-                    warn!("WiFi receive failed: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // Fall back to Bluetooth if no WiFi data
-        let raw_data = if let Some(data) = raw_data {
-            data
-        } else if self.bt_state() == ConnectionState::Connected {
-            let mut bt_buf = vec![0u8; buffer.len() + 128];
-            match self.bluetooth.receive_audio(&mut bt_buf) {
-                Ok(n) if n > 0 => bt_buf[..n].to_vec(),
-                Ok(_) => return Ok(0),
-                Err(e) => {
-                    if !e.contains("would block") {
-                        error!("BT receive failed: {}", e);
+        let raw_data = match self.active {
+            ActiveTransport::Wifi | ActiveTransport::WifiDirect => {
+                let mut wifi_buf = vec![0u8; buffer.len() + 128]; // extra for crypto overhead
+                match self.wifi.receive_audio(&mut wifi_buf) {
+                    Ok(n) if n > 0 => wifi_buf[..n].to_vec(),
+                    Ok(_) => return Ok(0),
+                    Err(e) => {
+                        if !e.contains("would block") && !e.contains("timed out") {
+                            warn!("WiFi receive failed: {}", e);
+                        }
+                        return Ok(0);
                     }
-                    return Ok(0);
                 }
             }
-        } else {
-            return Ok(0);
+            ActiveTransport::Cellular => {
+                let mut cell_buf = vec![0u8; buffer.len() + 128];
+                match self.cellular.receive_audio(&mut cell_buf) {
+                    Ok(n) if n > 0 => cell_buf[..n].to_vec(),
+                    Ok(_) => return Ok(0),
+                    Err(e) => {
+                        warn!("Cellular receive failed: {}", e);
+                        return Ok(0);
+                    }
+                }
+            }
+            ActiveTransport::None => {
+                return Ok(0);
+            }
         };
 
         // MANDATORY DECRYPTION: drop unencrypted or tampered packets
@@ -240,6 +236,67 @@ impl TransportManager {
         }
     }
 
+    // ── Cellular operations (WebSocket relay, works anywhere with internet) ──
+
+    /// Get mutable reference to cellular transport (for JNI callbacks)
+    pub fn cellular_mut(&mut self) -> &mut CellularTransport {
+        &mut self.cellular
+    }
+
+    /// Get cellular state
+    pub fn cellular_state(&self) -> CellularState {
+        self.cellular.get_state()
+    }
+
+    /// Set cellular room ID (from QR session_id)
+    pub fn set_cellular_room(&mut self, room_id: String) {
+        self.cellular.set_room_id(room_id);
+    }
+
+    /// Get WebSocket URL for Kotlin to connect to
+    pub fn get_cellular_ws_url(&self) -> String {
+        self.cellular.get_ws_url()
+    }
+
+    /// Called by Kotlin when WebSocket connects successfully
+    pub fn on_cellular_connected(&mut self) -> Result<(), String> {
+        info!("TransportManager: cellular WebSocket connected");
+        self.cellular.on_connected();
+        self.active = ActiveTransport::Cellular;
+        info!("TransportManager: active transport = Cellular");
+        Ok(())
+    }
+
+    /// Called by Kotlin when WebSocket disconnects
+    pub fn on_cellular_disconnected(&mut self, reason: &str) {
+        info!("TransportManager: cellular disconnected: {}", reason);
+        self.cellular.on_disconnected(reason);
+
+        if self.active == ActiveTransport::Cellular {
+            self.active = ActiveTransport::None;
+        }
+    }
+
+    /// Called by Kotlin when WebSocket receives a binary message
+    pub fn on_cellular_message(&mut self, data: Vec<u8>) {
+        self.cellular.on_message_received(data);
+    }
+
+    /// Called by Kotlin when WebSocket has an error
+    pub fn on_cellular_error(&mut self, error: &str) {
+        self.cellular.on_error(error);
+    }
+
+    /// Poll outbound queue (called by Kotlin to get packets to send via WS)
+    pub fn poll_cellular_outbound(&self) -> Option<Vec<u8>> {
+        self.cellular.poll_outbound()
+    }
+
+    /// Get cellular stats JSON
+    pub fn get_cellular_stats(&self) -> String {
+        self.cellular.get_stats()
+    }
+
     /// Get which transport is currently active
     pub fn active_transport(&self) -> ActiveTransport {
         self.active
@@ -250,12 +307,18 @@ impl TransportManager {
         &self.device_name
     }
 
+    /// Set the local device name
+    pub fn set_device_name(&mut self, name: &str) {
+        self.device_name = name.to_string();
+    }
+
     /// Disconnect all transports
     pub fn disconnect(&mut self) -> Result<(), String> {
         info!("TransportManager: disconnecting all");
 
         self.wifi.shutdown();
-        self.bluetooth.disconnect()?;
+        self.wifi_direct.reset();
+        self.cellular.shutdown();
         self.crypto = None;
         self.active = ActiveTransport::None;
 

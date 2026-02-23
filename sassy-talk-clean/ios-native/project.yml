@@ -1,0 +1,41 @@
+name: SassyTalkie
+options:
+  bundleIdPrefix: com.sassyconsulting
+  deploymentTarget:
+    iOS: "14.0"
+  xcodeVersion: "15.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    INFOPLIST_FILE: Info.plist
+    SWIFT_OBJC_BRIDGING_HEADER: SassyTalkie-Bridging-Header.h
+    LIBRARY_SEARCH_PATHS:
+      - "$(PROJECT_DIR)/target/aarch64-apple-ios/release"
+      - "$(PROJECT_DIR)/target/universal-sim/release"
+    OTHER_LDFLAGS:
+      - "-lsassytalkie_ios"
+      - "-framework Security"
+      - "-framework AVFoundation"
+      - "-framework CoreBluetooth"
+      - "-framework Network"
+
+targets:
+  SassyTalkie:
+    type: application
+    platform: iOS
+    sources:
+      - path: "."
+        includes:
+          - "*.swift"
+      - path: "SassyTalkie-Bridging-Header.h"
+        buildPhase: none
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.sassyconsulting.sassytalkie
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGN_STYLE: Automatic
+    info:
+      path: Info.plist

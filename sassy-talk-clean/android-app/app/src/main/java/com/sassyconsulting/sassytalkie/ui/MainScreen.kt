@@ -22,17 +22,23 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.sassyconsulting.sassytalkie.SassyTalkNative
+import com.sassyconsulting.sassytalkie.WalkieService
 import com.sassyconsulting.sassytalkie.ui.theme.*
 
 @Composable
 fun MainScreen(
     onDisconnect: () -> Unit = {},
-    onShowUsers: () -> Unit = {}
+    onShowUsers: () -> Unit = {},
+    walkieService: WalkieService? = null
 ) {
     var isTransmitting by remember { mutableStateOf(false) }
     var currentChannel by remember { mutableIntStateOf(1) }
     var showEncryptionWarning by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     // Pulse animation for transmitting
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
@@ -62,8 +68,10 @@ fun MainScreen(
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = {
-                SassyTalkNative.disconnect()
-                onDisconnect()
+                scope.launch {
+                    withContext(Dispatchers.IO) { SassyTalkNative.disconnect() }
+                    onDisconnect()
+                }
             }) {
                 Icon(Icons.Default.ArrowBack, contentDescription = "Disconnect", tint = TextGray)
             }
@@ -145,12 +153,14 @@ fun MainScreen(
                     showEncryptionWarning = false
                     isTransmitting = true
                     SassyTalkNative.pttStart()
+                    walkieService?.updateNotification("Transmitting on CH $currentChannel")
                 }
             },
             onPressEnd = {
                 if (isTransmitting) {
                     isTransmitting = false
                     SassyTalkNative.pttStop()
+                    walkieService?.updateNotification("Radio active — ${SassyTalkNative.getTransportName()}")
                 }
             }
         )

@@ -24,8 +24,6 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use log::{info, warn};
 
-use crate::audio::FRAME_SIZE;
-
 /// How long silence before we consider a speaker "done talking"
 const SPEECH_GAP_MS: u64 = 400;
 
@@ -477,6 +475,7 @@ impl AudioCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::FRAME_SIZE;
 
     #[test]
     fn test_cache_live_passthrough() {

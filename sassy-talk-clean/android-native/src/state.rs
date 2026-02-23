@@ -1,22 +1,22 @@
-/// State Machine - Coordinates Transport, Audio, and UI
+/// State Machine - Central coordinator for all subsystems
 ///
-/// Manages the lifecycle of connections, PTT events, and audio streams.
-/// Uses TransportManager for unified Bluetooth + WiFi support with encryption.
+/// Manages audio engine, transport, crypto, users, audio cache, and the
+/// TX/RX audio pipeline threads. Provides the API surface consumed by
+/// both the JNI exports (Kotlin app) and the legacy egui UI.
 
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use log::{error, info, warn};
+use log::{info, warn};
 
-use crate::transport::TransportManager;
-pub use crate::transport::ActiveTransport;
-pub use crate::bluetooth::{BluetoothDevice, ConnectionState};
-use crate::audio::{AudioEngine, AudioFrame, FRAME_SIZE};
-pub use crate::wifi_transport::{WifiState, WifiPeer};
+use crate::audio::AudioEngine;
+use crate::audio_pipeline;
+use crate::transport::{TransportManager, ActiveTransport};
 use crate::audio_cache::AudioCache;
+use crate::users::UserRegistry;
+use crate::crypto::CryptoSession;
+use crate::wifi_direct::{WifiDirectState, WifiDirectPeer, GroupRole};
+use crate::cellular_transport::CellularState;
 
-/// Application state
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppState {
     Initializing,
@@ -29,611 +29,354 @@ pub enum AppState {
     Error,
 }
 
-/// State machine for managing app lifecycle
 pub struct StateMachine {
     state: Arc<Mutex<AppState>>,
-    transport: Arc<Mutex<Option<TransportManager>>>,
-    audio: Arc<Mutex<Option<AudioEngine>>>,
-
+    transport: Arc<Mutex<TransportManager>>,
+    audio: Arc<Mutex<AudioEngine>>,
+    audio_cache: Arc<Mutex<AudioCache>>,
+    user_registry: Arc<Mutex<UserRegistry>>,
     ptt_pressed: Arc<AtomicBool>,
     current_channel: Arc<AtomicU8>,
-
-    tx_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
-    rx_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
-    discovery_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
-
-    running: Arc<AtomicBool>,
-
-    /// Multi-speaker audio cache (Dane.com-style store/replay)
-    audio_cache: Arc<Mutex<AudioCache>>,
+    tx_running: Arc<AtomicBool>,
+    rx_running: Arc<AtomicBool>,
+    device_name: String,
+    local_sender_id: String,
 }
 
 impl StateMachine {
-    pub fn new(
-        ptt_pressed: Arc<AtomicBool>,
-        current_channel: Arc<AtomicU8>,
-    ) -> Self {
-        info!("Creating state machine");
+    pub fn new(ptt: Arc<AtomicBool>, channel: Arc<AtomicU8>) -> Self {
+        let device_name = "SassyTalkie-Android".to_string();
+        let local_sender_id = crate::users::UserRegistry::derive_user_id(device_name.as_bytes());
 
         Self {
             state: Arc::new(Mutex::new(AppState::Initializing)),
-            transport: Arc::new(Mutex::new(None)),
-            audio: Arc::new(Mutex::new(None)),
-            ptt_pressed,
-            current_channel,
-            tx_thread: Arc::new(Mutex::new(None)),
-            rx_thread: Arc::new(Mutex::new(None)),
-            discovery_thread: Arc::new(Mutex::new(None)),
-            running: Arc::new(AtomicBool::new(false)),
+            transport: Arc::new(Mutex::new(TransportManager::new(&device_name).unwrap())),
+            audio: Arc::new(Mutex::new(AudioEngine::new().unwrap())),
             audio_cache: Arc::new(Mutex::new(AudioCache::new())),
+            user_registry: Arc::new(Mutex::new(UserRegistry::new())),
+            ptt_pressed: ptt,
+            current_channel: channel,
+            tx_running: Arc::new(AtomicBool::new(false)),
+            rx_running: Arc::new(AtomicBool::new(false)),
+            device_name,
+            local_sender_id,
         }
     }
 
-    /// Initialize transport and audio subsystems
     pub fn initialize(&self) -> Result<(), String> {
-        info!("Initializing state machine");
-
-        *self.state.lock().unwrap() = AppState::Initializing;
-
-        // Initialize transport manager (no encryption yet - set via QR auth)
-        let tm = match TransportManager::new("SassyTalkie") {
-            Ok(tm) => tm,
-            Err(e) => {
-                *self.state.lock().unwrap() = AppState::Error;
-                return Err(e);
-            }
-        };
-        *self.transport.lock().unwrap() = Some(tm);
-
-        // Initialize audio engine
-        let audio = match AudioEngine::new() {
-            Ok(a) => a,
-            Err(e) => {
-                *self.state.lock().unwrap() = AppState::Error;
-                return Err(e);
-            }
-        };
-        *self.audio.lock().unwrap() = Some(audio);
-
-        *self.state.lock().unwrap() = AppState::Ready;
-        info!("State machine initialized (BT default, WiFi upgrade enabled)");
-
-        Ok(())
-    }
-
-    /// Start listening for incoming Bluetooth connections
-    pub fn start_listening(&self) -> Result<(), String> {
-        info!("Starting server mode");
-
-        *self.state.lock().unwrap() = AppState::Connecting;
-
-        let mut tm = self.transport.lock().unwrap();
-        if let Some(transport) = tm.as_mut() {
-            transport.listen_bluetooth()?;
-            drop(tm);
-
-            // Start WiFi discovery in background
-            self.start_discovery_thread();
-
-            info!("Listening for connections (BT + WiFi discovery)");
-            Ok(())
-        } else {
-            Err("Transport not initialized".to_string())
-        }
-    }
-
-    /// Connect to a specific Bluetooth device
-    pub fn connect_to_device(&self, device_address: &str) -> Result<(), String> {
-        info!("Connecting to device: {}", device_address);
-
-        *self.state.lock().unwrap() = AppState::Connecting;
-
-        let mut tm = self.transport.lock().unwrap();
-        if let Some(transport) = tm.as_mut() {
-            transport.connect_bluetooth(device_address)?;
-            drop(tm);
-
-            *self.state.lock().unwrap() = AppState::Connected;
-
-            // Start RX thread + WiFi discovery
-            self.start_rx_thread();
-            self.start_discovery_thread();
-
-            info!("Connected to {} (WiFi upgrade scanning)", device_address);
-            Ok(())
-        } else {
-            Err("Transport not initialized".to_string())
-        }
-    }
-
-    /// Disconnect current connection
-    pub fn disconnect(&self) -> Result<(), String> {
-        info!("Disconnecting");
-
-        *self.state.lock().unwrap() = AppState::Disconnecting;
-
-        // Stop threads
-        self.running.store(false, Ordering::Relaxed);
-
-        if let Some(handle) = self.tx_thread.lock().unwrap().take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.rx_thread.lock().unwrap().take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.discovery_thread.lock().unwrap().take() {
-            let _ = handle.join();
-        }
-
-        // Stop audio
-        if let Some(audio) = self.audio.lock().unwrap().as_ref() {
-            let _ = audio.stop_recording();
-            let _ = audio.stop_playing();
-        }
-
-        // Disconnect transport
-        let mut tm = self.transport.lock().unwrap();
-        if let Some(transport) = tm.as_mut() {
-            transport.disconnect()?;
-        }
-
-        *self.state.lock().unwrap() = AppState::Ready;
-        info!("Disconnected");
-
-        Ok(())
-    }
-
-    /// Handle PTT press event
-    pub fn on_ptt_press(&self) -> Result<(), String> {
-        let channel = self.current_channel.load(Ordering::Relaxed);
-        info!("PTT pressed - Channel {}", channel);
-
-        // Check if connected via any transport
-        let tm = self.transport.lock().unwrap();
-        if let Some(transport) = tm.as_ref() {
-            if transport.active_transport() == ActiveTransport::None {
-                return Err("Not connected".to_string());
-            }
-        } else {
-            return Err("Transport not initialized".to_string());
-        }
-        drop(tm);
-
-        *self.state.lock().unwrap() = AppState::Transmitting;
-
-        // Initialize audio if needed
+        info!("StateMachine: initializing");
         let audio = self.audio.lock().unwrap();
-        if let Some(audio_engine) = audio.as_ref() {
-            if audio_engine.get_state() != crate::audio::AudioState::Recording {
-                audio_engine.init_recorder()?;
-            }
-        }
-        drop(audio);
-
-        self.start_recording()?;
-        self.start_tx_thread();
-
-        info!("Transmitting via {:?}", self.get_active_transport());
+        audio.init_recorder()?;
+        audio.init_player()?;
+        *self.state.lock().unwrap() = AppState::Ready;
+        info!("StateMachine: ready");
         Ok(())
     }
 
-    /// Handle PTT release event
-    pub fn on_ptt_release(&self) -> Result<(), String> {
-        info!("PTT released");
+    pub fn shutdown(&self) -> Result<(), String> {
+        info!("StateMachine: shutting down");
+        self.stop_audio_threads();
+        self.disconnect()?;
+        let audio = self.audio.lock().unwrap();
+        let _ = audio.release();
+        Ok(())
+    }
+
+    // ── Audio Pipeline Threads ──
+
+    /// Start TX and RX threads. Called when transport is ready.
+    fn start_audio_pipeline(&self) {
+        if self.tx_running.load(Ordering::SeqCst) {
+            return; // Already running
+        }
+
+        self.tx_running.store(true, Ordering::SeqCst);
+        self.rx_running.store(true, Ordering::SeqCst);
+
+        audio_pipeline::spawn_tx_thread(
+            Arc::clone(&self.tx_running),
+            Arc::clone(&self.ptt_pressed),
+            Arc::clone(&self.current_channel),
+            Arc::clone(&self.audio),
+            Arc::clone(&self.transport),
+            self.local_sender_id.clone(),
+            self.device_name.clone(),
+        );
+
+        audio_pipeline::spawn_rx_thread(
+            Arc::clone(&self.rx_running),
+            Arc::clone(&self.current_channel),
+            Arc::clone(&self.audio),
+            Arc::clone(&self.transport),
+            Arc::clone(&self.audio_cache),
+            Arc::clone(&self.user_registry),
+        );
+
+        info!("StateMachine: audio pipeline started");
+    }
+
+    /// Stop TX and RX threads.
+    fn stop_audio_threads(&self) {
+        self.tx_running.store(false, Ordering::SeqCst);
+        self.rx_running.store(false, Ordering::SeqCst);
+        // Threads will exit their loops on next iteration check
+        info!("StateMachine: audio pipeline stop signaled");
+    }
+
+    // ── WiFi Direct Connection (Android-to-Android, no router) ──
+
+    /// Called by Kotlin JNI when WiFi Direct group is formed.
+    /// Starts multicast transport on the P2P network and begins audio pipeline.
+    pub fn on_wifi_direct_connected(&self) -> Result<(), String> {
+        info!("StateMachine: WiFi Direct group formed");
+
+        {
+            let mut transport = self.transport.lock().unwrap();
+            transport.on_wifi_direct_connected()?;
+        }
 
         *self.state.lock().unwrap() = AppState::Connected;
-        self.stop_recording()?;
-
-        info!("Transmission stopped");
+        self.start_audio_pipeline();
         Ok(())
     }
 
-    fn start_recording(&self) -> Result<(), String> {
-        let audio = self.audio.lock().unwrap();
-        if let Some(audio_engine) = audio.as_ref() {
-            audio_engine.start_recording()?;
-            Ok(())
-        } else {
-            Err("Audio not initialized".to_string())
+    /// Called by Kotlin JNI when WiFi Direct group is dissolved.
+    pub fn on_wifi_direct_disconnected(&self) {
+        info!("StateMachine: WiFi Direct group dissolved");
+        self.stop_audio_threads();
+
+        {
+            let mut transport = self.transport.lock().unwrap();
+            transport.on_wifi_direct_disconnected();
+        }
+
+        let current = *self.state.lock().unwrap();
+        if current == AppState::Connected || current == AppState::Transmitting || current == AppState::Receiving {
+            *self.state.lock().unwrap() = AppState::Ready;
         }
     }
 
-    fn stop_recording(&self) -> Result<(), String> {
-        let audio = self.audio.lock().unwrap();
-        if let Some(audio_engine) = audio.as_ref() {
-            audio_engine.stop_recording()?;
+    // ── WiFi Multicast Connection (cross-platform, shared WiFi) ──
+
+    /// Start WiFi multicast transport directly (for cross-platform use).
+    /// Call this when devices are on the same WiFi network (no WiFi Direct needed).
+    pub fn connect_wifi_multicast(&self) -> Result<(), String> {
+        info!("StateMachine: connecting via WiFi multicast (cross-platform)");
+        *self.state.lock().unwrap() = AppState::Connecting;
+
+        {
+            let mut transport = self.transport.lock().unwrap();
+            transport.connect_wifi_multicast().map_err(|e| {
+                *self.state.lock().unwrap() = AppState::Error;
+                e
+            })?;
         }
+
+        *self.state.lock().unwrap() = AppState::Connected;
+        self.start_audio_pipeline();
+        info!("StateMachine: WiFi multicast connected, audio pipeline started");
         Ok(())
     }
 
-    /// TX thread: reads mic audio, ADPCM-compresses, encrypts, sends via active transport
-    fn start_tx_thread(&self) {
-        info!("Starting TX thread");
+    // ── Cellular Connection (WebSocket relay, works anywhere with internet) ──
 
-        self.running.store(true, Ordering::Relaxed);
-
-        let running = Arc::clone(&self.running);
-        let audio = Arc::clone(&self.audio);
-        let transport = Arc::clone(&self.transport);
-        let current_channel = Arc::clone(&self.current_channel);
-
-        let handle = thread::spawn(move || {
-            let mut frame = AudioFrame::new(FRAME_SIZE);
-            let mut encoder = crate::codec::VoiceEncoder::new();
-
-            while running.load(Ordering::Relaxed) {
-                // Stamp frame with current time
-                frame.timestamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                let is_recording = audio.lock().unwrap()
-                    .as_ref()
-                    .map(|a| a.is_recording())
-                    .unwrap_or(false);
-
-                if !is_recording {
-                    break;
-                }
-
-                // Read audio
-                let bytes_read = match audio.lock().unwrap().as_ref() {
-                    Some(a) => match a.read_audio(&mut frame.samples) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            if !e.contains("would block") {
-                                error!("TX: Failed to read audio: {}", e);
-                            }
-                            thread::sleep(Duration::from_millis(5));
-                            continue;
-                        }
-                    },
-                    None => break,
-                };
-
-                if bytes_read == 0 {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-
-                // ADPCM-compress the audio (960 samples → 484 bytes)
-                let compressed = encoder.encode(&frame.samples);
-
-                // Build packet: [channel:1][timestamp:8][compressed_audio:N]
-                let channel = current_channel.load(Ordering::Relaxed);
-                let mut packet = Vec::with_capacity(1 + 8 + compressed.len());
-                packet.push(channel);
-                packet.extend_from_slice(&frame.timestamp.to_le_bytes());
-                packet.extend_from_slice(&compressed);
-
-                // Send via transport (handles encryption internally)
-                let mut tm = transport.lock().unwrap();
-                if let Some(t) = tm.as_mut() {
-                    if let Err(e) = t.send(&packet) {
-                        error!("TX: Failed to send: {}", e);
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            info!("TX thread stopped");
-        });
-
-        *self.tx_thread.lock().unwrap() = Some(handle);
+    /// Set the cellular relay room ID (from QR session_id)
+    pub fn set_cellular_room(&self, room_id: String) {
+        let mut transport = self.transport.lock().unwrap();
+        transport.set_cellular_room(room_id);
     }
 
-    /// RX thread: receives from transport, decrypts, ADPCM-decompresses, plays audio
-    fn start_rx_thread(&self) {
-        info!("Starting RX thread");
-
-        self.running.store(true, Ordering::Relaxed);
-
-        let running = Arc::clone(&self.running);
-        let audio = Arc::clone(&self.audio);
-        let transport = Arc::clone(&self.transport);
-        let state = Arc::clone(&self.state);
-
-        let handle = thread::spawn(move || {
-            // Buffer sized for compressed packet after decryption
-            let mut buffer = vec![0u8; 1024];
-            let mut decoder = crate::codec::VoiceDecoder::new();
-
-            // Initialize audio player
-            if let Some(a) = audio.lock().unwrap().as_ref() {
-                if let Err(e) = a.init_player() {
-                    error!("RX: Failed to init player: {}", e);
-                    return;
-                }
-            }
-
-            while running.load(Ordering::Relaxed) {
-                // Receive via transport (handles decryption internally)
-                let bytes_received = {
-                    let mut tm = transport.lock().unwrap();
-                    match tm.as_mut() {
-                        Some(t) => match t.receive(&mut buffer) {
-                            Ok(n) => n,
-                            Err(e) => {
-                                if !e.contains("would block") {
-                                    error!("RX: receive error: {}", e);
-                                }
-                                thread::sleep(Duration::from_millis(5));
-                                continue;
-                            }
-                        },
-                        None => break,
-                    }
-                };
-
-                // Minimum: 1 byte channel + 8 bytes timestamp + 4 bytes ADPCM header
-                if bytes_received < 13 {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-
-                // Parse: [channel:1][timestamp:8][compressed_audio:N]
-                let _channel = buffer[0];
-                let _timestamp = u64::from_le_bytes([
-                    buffer[1], buffer[2], buffer[3], buffer[4],
-                    buffer[5], buffer[6], buffer[7], buffer[8],
-                ]);
-                let compressed_audio = &buffer[9..bytes_received];
-
-                // ADPCM-decompress back to PCM-16 samples
-                let samples = decoder.decode(compressed_audio);
-
-                if samples.is_empty() {
-                    continue;
-                }
-
-                *state.lock().unwrap() = AppState::Receiving;
-
-                // Start playback if not already playing
-                let should_start = audio.lock().unwrap()
-                    .as_ref()
-                    .map(|a| !a.is_playing())
-                    .unwrap_or(false);
-
-                if should_start {
-                    if let Some(a) = audio.lock().unwrap().as_ref() {
-                        if let Err(e) = a.start_playing() {
-                            error!("RX: Failed to start playback: {}", e);
-                        }
-                    }
-                }
-
-                // Play decompressed audio
-                if let Some(a) = audio.lock().unwrap().as_ref() {
-                    if let Err(e) = a.write_audio(&samples) {
-                        error!("RX: Failed to write audio: {}", e);
-                    }
-                }
-            }
-
-            // Stop playback
-            if let Some(a) = audio.lock().unwrap().as_ref() {
-                let _ = a.stop_playing();
-            }
-
-            info!("RX thread stopped");
-        });
-
-        *self.rx_thread.lock().unwrap() = Some(handle);
+    /// Get the WebSocket URL for Kotlin to connect to
+    pub fn get_cellular_ws_url(&self) -> String {
+        self.transport.lock().unwrap().get_cellular_ws_url()
     }
 
-    /// Discovery thread: periodic WiFi announcements + checks for upgrade
-    fn start_discovery_thread(&self) {
-        info!("Starting WiFi discovery thread");
+    /// Called by Kotlin JNI when the cellular WebSocket connects
+    pub fn on_cellular_connected(&self) -> Result<(), String> {
+        info!("StateMachine: cellular WebSocket connected");
 
-        let running = Arc::clone(&self.running);
-        let transport = Arc::clone(&self.transport);
-        let current_channel = Arc::clone(&self.current_channel);
+        {
+            let mut transport = self.transport.lock().unwrap();
+            transport.on_cellular_connected()?;
+        }
 
-        // Set running if not already
-        self.running.store(true, Ordering::Relaxed);
-
-        let handle = thread::spawn(move || {
-            let mut announce_counter = 0u32;
-
-            while running.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_secs(2));
-
-                let channel = current_channel.load(Ordering::Relaxed);
-
-                let mut tm = transport.lock().unwrap();
-                if let Some(t) = tm.as_mut() {
-                    // Send announcement every ~10 seconds
-                    announce_counter += 1;
-                    if announce_counter % 5 == 0 {
-                        t.announce_wifi(channel);
-                    }
-
-                    // Check for WiFi upgrade
-                    t.check_wifi_upgrade();
-                }
-            }
-
-            info!("Discovery thread stopped");
-        });
-
-        *self.discovery_thread.lock().unwrap() = Some(handle);
+        *self.state.lock().unwrap() = AppState::Connected;
+        self.start_audio_pipeline();
+        info!("StateMachine: cellular connected, audio pipeline started");
+        Ok(())
     }
 
-    // ── Setters ──
+    /// Called by Kotlin JNI when the cellular WebSocket disconnects
+    pub fn on_cellular_disconnected(&self, reason: &str) {
+        info!("StateMachine: cellular disconnected: {}", reason);
+        self.stop_audio_threads();
 
-    /// Set the encryption session (called after QR auth)
-    pub fn set_crypto_session(&self, crypto: crate::crypto::CryptoSession) {
-        let mut tm = self.transport.lock().unwrap();
-        if let Some(transport) = tm.as_mut() {
-            transport.set_crypto(crypto);
-            info!("Crypto session set via QR auth");
+        {
+            let mut transport = self.transport.lock().unwrap();
+            transport.on_cellular_disconnected(reason);
+        }
+
+        let current = *self.state.lock().unwrap();
+        if current == AppState::Connected || current == AppState::Transmitting || current == AppState::Receiving {
+            *self.state.lock().unwrap() = AppState::Ready;
         }
     }
 
-    // ── Getters ──
+    /// Called by Kotlin JNI when a binary message arrives from the relay
+    pub fn on_cellular_message(&self, data: Vec<u8>) {
+        let mut transport = self.transport.lock().unwrap();
+        transport.on_cellular_message(data);
+    }
+
+    /// Called by Kotlin JNI when the WebSocket has an error
+    pub fn on_cellular_error(&self, error: &str) {
+        let mut transport = self.transport.lock().unwrap();
+        transport.on_cellular_error(error);
+    }
+
+    /// Poll outbound cellular queue (called by Kotlin timer)
+    pub fn poll_cellular_outbound(&self) -> Option<Vec<u8>> {
+        self.transport.lock().unwrap().poll_cellular_outbound()
+    }
+
+    /// Get cellular transport state
+    pub fn get_cellular_state(&self) -> CellularState {
+        self.transport.lock().unwrap().cellular_state()
+    }
+
+    /// Get cellular stats JSON
+    pub fn get_cellular_stats(&self) -> String {
+        self.transport.lock().unwrap().get_cellular_stats()
+    }
+
+    // ── Disconnect ──
+
+    pub fn disconnect(&self) -> Result<(), String> {
+        info!("StateMachine: disconnecting");
+        *self.state.lock().unwrap() = AppState::Disconnecting;
+
+        self.stop_audio_threads();
+        self.audio_cache.lock().unwrap().clear();
+
+        let mut transport = self.transport.lock().unwrap();
+        transport.disconnect()?;
+        *self.state.lock().unwrap() = AppState::Ready;
+        Ok(())
+    }
+
+    // ── WiFi ──
+
+    pub fn init_wifi(&self) -> Result<(), String> {
+        self.transport.lock().unwrap().init_wifi()
+    }
+
+    pub fn get_wifi_state(&self) -> crate::wifi_transport::WifiState {
+        self.transport.lock().unwrap().wifi_state()
+    }
+
+    pub fn get_wifi_peers(&self) -> Vec<crate::wifi_transport::WifiPeer> {
+        self.transport.lock().unwrap().get_wifi_peers().to_vec()
+    }
+
+    pub fn has_wifi_peers(&self) -> bool {
+        self.transport.lock().unwrap().has_wifi_peers()
+    }
+
+    // ── WiFi Direct ──
+
+    pub fn get_wifi_direct_state(&self) -> WifiDirectState {
+        self.transport.lock().unwrap().wifi_direct_state()
+    }
+
+    pub fn get_wifi_direct_peers(&self) -> Vec<WifiDirectPeer> {
+        self.transport.lock().unwrap().get_wifi_direct_peers().to_vec()
+    }
+
+    pub fn has_wifi_direct_peers(&self) -> bool {
+        self.transport.lock().unwrap().has_wifi_direct_peers()
+    }
+
+    pub fn get_wifi_direct_role(&self) -> GroupRole {
+        self.transport.lock().unwrap().wifi_direct_role()
+    }
+
+    // ── Transport ──
+
+    pub fn get_active_transport(&self) -> ActiveTransport {
+        self.transport.lock().unwrap().active_transport()
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        self.transport.lock().unwrap().is_encrypted()
+    }
+
+    pub fn set_crypto_session(&self, session: CryptoSession) {
+        self.transport.lock().unwrap().set_crypto(session);
+        info!("StateMachine: crypto session set");
+    }
+
+    pub fn set_psk(&self, key: &[u8; 32]) {
+        self.transport.lock().unwrap().set_psk(key);
+    }
+
+    pub fn get_transport(&self) -> &Arc<Mutex<TransportManager>> {
+        &self.transport
+    }
+
+    pub fn get_device_name(&self) -> String {
+        self.device_name.clone()
+    }
+
+    /// Set the device display name (called from Kotlin with the actual Android device model)
+    pub fn set_device_name(&mut self, name: String) {
+        info!("StateMachine: device name set to '{}'", name);
+        self.device_name = name.clone();
+        self.local_sender_id = crate::users::UserRegistry::derive_user_id(name.as_bytes());
+        // Update transport too
+        let mut transport = self.transport.lock().unwrap();
+        transport.set_device_name(&name);
+    }
+
+    // ── PTT ──
+
+    pub fn on_ptt_press(&self) -> Result<(), String> {
+        self.ptt_pressed.store(true, Ordering::SeqCst);
+        *self.state.lock().unwrap() = AppState::Transmitting;
+        info!("PTT pressed");
+        Ok(())
+    }
+
+    pub fn on_ptt_release(&self) -> Result<(), String> {
+        self.ptt_pressed.store(false, Ordering::SeqCst);
+        *self.state.lock().unwrap() = AppState::Connected;
+        info!("PTT released");
+        Ok(())
+    }
+
+    pub fn is_ptt_active(&self) -> bool {
+        self.ptt_pressed.load(Ordering::SeqCst)
+    }
+
+    // ── State / Accessors ──
 
     pub fn get_state(&self) -> AppState {
         *self.state.lock().unwrap()
     }
 
-    pub fn get_connected_device(&self) -> Option<BluetoothDevice> {
-        self.transport.lock().unwrap()
-            .as_ref()
-            .and_then(|t| t.get_connected_device())
-    }
-
-    pub fn get_paired_devices(&self) -> Result<Vec<BluetoothDevice>, String> {
-        let mut tm = self.transport.lock().unwrap();
-        if let Some(transport) = tm.as_mut() {
-            transport.get_paired_devices()
-        } else {
-            Err("Transport not initialized".to_string())
-        }
-    }
-
-    pub fn is_bluetooth_enabled(&self) -> bool {
-        self.transport.lock().unwrap()
-            .as_ref()
-            .map(|t| t.is_bluetooth_enabled())
-            .unwrap_or(false)
-    }
-
-    pub fn enable_bluetooth(&self) -> Result<(), String> {
-        let tm = self.transport.lock().unwrap();
-        if let Some(transport) = tm.as_ref() {
-            transport.enable_bluetooth()
-        } else {
-            Err("Transport not initialized".to_string())
-        }
-    }
-
-    pub fn get_active_transport(&self) -> ActiveTransport {
-        self.transport.lock().unwrap()
-            .as_ref()
-            .map(|t| t.active_transport())
-            .unwrap_or(ActiveTransport::None)
-    }
-
-    /// Get WiFi transport state
-    pub fn get_wifi_state(&self) -> WifiState {
-        self.transport.lock().unwrap()
-            .as_ref()
-            .map(|t| t.wifi_state())
-            .unwrap_or(WifiState::Inactive)
-    }
-
-    /// Get discovered WiFi peers
-    pub fn get_wifi_peers(&self) -> Vec<WifiPeer> {
-        self.transport.lock().unwrap()
-            .as_ref()
-            .map(|t| t.get_wifi_peers().to_vec())
-            .unwrap_or_default()
-    }
-
-    /// Check Bluetooth connection state
-    pub fn get_bt_state(&self) -> ConnectionState {
-        self.transport.lock().unwrap()
-            .as_ref()
-            .map(|t| t.bt_state())
-            .unwrap_or(ConnectionState::Disconnected)
-    }
-
-    /// Check if PTT is currently active
-    pub fn is_ptt_active(&self) -> bool {
-        self.ptt_pressed.load(Ordering::Relaxed)
-    }
-
-    /// Check if encryption is active (crypto session set via QR auth)
-    pub fn is_encrypted(&self) -> bool {
-        self.transport.lock().unwrap()
-            .as_ref()
-            .map(|t| t.is_encrypted())
-            .unwrap_or(false)
-    }
-
-    /// Get audio cache reference (for JNI bridge / UI status)
-    pub fn audio_cache(&self) -> &Arc<Mutex<AudioCache>> {
+    pub fn get_audio_cache(&self) -> &Arc<Mutex<AudioCache>> {
         &self.audio_cache
     }
 
-    /// Initialize WiFi transport explicitly
-    pub fn init_wifi(&self) -> Result<(), String> {
-        let mut tm = self.transport.lock().unwrap();
-        if let Some(transport) = tm.as_mut() {
-            transport.init_wifi()?;
-            info!("WiFi transport initialized");
-            Ok(())
-        } else {
-            Err("Transport not initialized".to_string())
-        }
-    }
-
-    /// Get the local device name
-    pub fn get_device_name(&self) -> String {
-        self.transport.lock().unwrap()
-            .as_ref()
-            .map(|t| t.device_name().to_string())
-            .unwrap_or_else(|| "Unknown".to_string())
-    }
-
-    /// Check if WiFi transport has discovered peers
-    pub fn has_wifi_peers(&self) -> bool {
-        self.transport.lock().unwrap()
-            .as_ref()
-            .map(|t| t.has_wifi_peers())
-            .unwrap_or(false)
-    }
-
-    /// Set encryption from a pre-shared key
-    pub fn set_psk(&self, key: &[u8; 32]) {
-        let mut tm = self.transport.lock().unwrap();
-        if let Some(transport) = tm.as_mut() {
-            transport.set_psk(key);
-            info!("PSK encryption set via state machine");
-        } else {
-            warn!("Cannot set PSK: transport not initialized");
-        }
-    }
-
-    /// Shutdown state machine
-    pub fn shutdown(&self) -> Result<(), String> {
-        info!("Shutting down state machine");
-
-        let current = self.get_state();
-        if current == AppState::Connected
-            || current == AppState::Transmitting
-            || current == AppState::Receiving
-        {
-            self.disconnect()?;
-        }
-
-        if let Some(audio) = self.audio.lock().unwrap().as_ref() {
-            audio.release()?;
-        }
-
-        *self.state.lock().unwrap() = AppState::Ready;
-        info!("State machine shutdown complete");
-
-        Ok(())
+    pub fn get_user_registry(&self) -> &Arc<Mutex<UserRegistry>> {
+        &self.user_registry
     }
 }
 
 impl Drop for StateMachine {
     fn drop(&mut self) {
-        let _ = self.shutdown();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU8};
-
-    #[test]
-    fn test_state_machine_creation() {
-        let ptt = Arc::new(AtomicBool::new(false));
-        let channel = Arc::new(AtomicU8::new(1));
-        let _sm = StateMachine::new(ptt, channel);
+        self.stop_audio_threads();
+        // disconnect from transport
+        let mut transport = self.transport.lock().unwrap();
+        let _ = transport.disconnect();
     }
 }
