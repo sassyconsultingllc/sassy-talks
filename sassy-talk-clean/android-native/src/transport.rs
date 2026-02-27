@@ -23,6 +23,7 @@ pub enum ActiveTransport {
     Wifi,
     WifiDirect,
     Cellular,
+    Bluetooth,
 }
 
 /// Unified transport manager
@@ -178,6 +179,10 @@ impl TransportManager {
             ActiveTransport::Cellular => {
                 self.cellular.send_audio(&payload)
             }
+            ActiveTransport::Bluetooth => {
+                // BT TX is handled by Kotlin via btEncodeFrame JNI, not here
+                Ok(payload.len())
+            }
             ActiveTransport::None => {
                 Err("No active transport".to_string())
             }
@@ -210,6 +215,10 @@ impl TransportManager {
                         return Ok(0);
                     }
                 }
+            }
+            ActiveTransport::Bluetooth => {
+                // BT RX is handled by Kotlin via btDecodeFrame JNI, not here
+                return Ok(0);
             }
             ActiveTransport::None => {
                 return Ok(0);
@@ -295,6 +304,22 @@ impl TransportManager {
     /// Get cellular stats JSON
     pub fn get_cellular_stats(&self) -> String {
         self.cellular.get_stats()
+    }
+
+    // ── Bluetooth operations (Kotlin-managed RFCOMM, Rust handles codec) ──
+
+    /// Called by Kotlin when BT RFCOMM connects
+    pub fn on_bluetooth_connected(&mut self) {
+        info!("TransportManager: Bluetooth RFCOMM connected");
+        self.active = ActiveTransport::Bluetooth;
+    }
+
+    /// Called by Kotlin when BT RFCOMM disconnects
+    pub fn on_bluetooth_disconnected(&mut self) {
+        info!("TransportManager: Bluetooth disconnected");
+        if self.active == ActiveTransport::Bluetooth {
+            self.active = ActiveTransport::None;
+        }
     }
 
     /// Get which transport is currently active

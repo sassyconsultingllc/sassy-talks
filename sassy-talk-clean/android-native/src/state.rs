@@ -327,6 +327,14 @@ impl StateMachine {
         self.device_name.clone()
     }
 
+    pub fn get_local_sender_id(&self) -> String {
+        self.local_sender_id.clone()
+    }
+
+    pub fn get_audio(&self) -> &Arc<Mutex<AudioEngine>> {
+        &self.audio
+    }
+
     /// Set the device display name (called from Kotlin with the actual Android device model)
     pub fn set_device_name(&mut self, name: String) {
         info!("StateMachine: device name set to '{}'", name);

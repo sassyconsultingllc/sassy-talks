@@ -23,6 +23,7 @@ object SassyTalkNative {
     const val TRANSPORT_WIFI = 2
     const val TRANSPORT_WIFI_DIRECT = 3
     const val TRANSPORT_CELLULAR = 4
+    const val TRANSPORT_BLUETOOTH = 5
 
     init {
         try {
@@ -75,17 +76,35 @@ object SassyTalkNative {
     // ── PTT ──
 
     fun pttStart() {
-        if (initialized) {
-            nativePttStart()
-            Log.d(TAG, "PTT Started")
+        if (!initialized) return
+        val transport = getTransport()
+        val btConnected = transport == TRANSPORT_BLUETOOTH
+        val btPeers = bluetoothTransport?.connectedPeerCount ?: 0
+        Log.i(TAG, "PTT START pressed — BT connected: $btConnected, BT peers: $btPeers, transport: ${getTransportName()}")
+
+        // Connection guard: don't start if no transport is active
+        if (transport == TRANSPORT_NONE && !btConnected && btPeers == 0) {
+            Log.w(TAG, "PTT blocked: no connected peers")
+            return
         }
+
+        nativePttStart()
+
+        // Start BT TX pump if BT transport is active
+        if (btConnected || btPeers > 0) {
+            bluetoothTransport?.startTxPump()
+            Log.i(TAG, "BT TX pump started ($btPeers peers)")
+        }
+        Log.d(TAG, "PTT Started")
     }
 
     fun pttStop() {
-        if (initialized) {
-            nativePttStop()
-            Log.d(TAG, "PTT Stopped")
-        }
+        if (!initialized) return
+        nativePttStop()
+
+        // Stop BT TX pump
+        bluetoothTransport?.stopTxPump()
+        Log.d(TAG, "PTT Stopped")
     }
 
     fun setChannel(channel: Int) {
@@ -117,6 +136,7 @@ object SassyTalkNative {
             TRANSPORT_WIFI -> "WiFi"
             TRANSPORT_WIFI_DIRECT -> "P2P"
             TRANSPORT_CELLULAR -> "Cell"
+            TRANSPORT_BLUETOOTH -> "BT"
             else -> "---"
         }
     }
@@ -533,6 +553,60 @@ object SassyTalkNative {
         } catch (e: Exception) { null }
     }
 
+    // ── Bluetooth Transport ──
+
+    /** Reference to Kotlin-managed BT transport (set by Activity) */
+    @Volatile
+    var bluetoothTransport: com.sassyconsulting.sassytalkie.service.BluetoothTransport? = null
+
+    /** Called by BluetoothTransport when RFCOMM connects */
+    fun btConnected() {
+        if (initialized) {
+            try {
+                nativeBtConnected()
+                Log.i(TAG, "BT: native transport notified (connected)")
+            } catch (e: Exception) {
+                Log.e(TAG, "btConnected failed: ${e.message}")
+            }
+        }
+    }
+
+    /** Called by BluetoothTransport when RFCOMM disconnects */
+    fun btDisconnected() {
+        if (initialized) {
+            try {
+                nativeBtDisconnected()
+                Log.i(TAG, "BT: native transport notified (disconnected)")
+            } catch (e: Exception) {
+                Log.e(TAG, "btDisconnected failed: ${e.message}")
+            }
+        }
+    }
+
+    /** Get current channel for BT channel sync */
+    fun getChannel(): Int {
+        if (!initialized) return 1
+        return try {
+            nativeGetChannel().toInt() and 0xFF
+        } catch (e: Exception) { 1 }
+    }
+
+    /** Encode one audio frame for BT TX (mic → ADPCM → wire frame bytes) */
+    fun btEncodeFrame(): ByteArray? {
+        if (!initialized) return null
+        return try {
+            nativeBtEncodeFrame()
+        } catch (e: Exception) { null }
+    }
+
+    /** Decode a BT-received audio frame (wire frame → ADPCM → play) */
+    fun btDecodeFrame(data: ByteArray): Boolean {
+        if (!initialized) return false
+        return try {
+            nativeBtDecodeFrame(data)
+        } catch (e: Exception) { false }
+    }
+
     // ── Status ──
 
     fun isPttActive(): Boolean {
@@ -626,4 +700,11 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeCellularOnError(error: String)
     @JvmStatic private external fun nativeCellularPollOutbound(): ByteArray?
     @JvmStatic private external fun nativeCellularGetStats(): String
+
+    // Bluetooth Transport (RFCOMM, Kotlin-managed sockets)
+    @JvmStatic private external fun nativeGetChannel(): Byte
+    @JvmStatic private external fun nativeBtConnected()
+    @JvmStatic private external fun nativeBtDisconnected()
+    @JvmStatic private external fun nativeBtEncodeFrame(): ByteArray?
+    @JvmStatic private external fun nativeBtDecodeFrame(data: ByteArray): Boolean
 }

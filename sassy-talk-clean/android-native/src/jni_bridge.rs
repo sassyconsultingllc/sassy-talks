@@ -296,6 +296,8 @@ use std::sync::Mutex;
 use crate::state::StateMachine;
 use crate::session::SessionManager;
 use crate::users::UserRegistry;
+use crate::codec::{VoiceEncoder, VoiceDecoder, CODEC_FRAME_SIZE};
+use crate::audio_pipeline;
 
 /// Global state for JNI mode (when used from Kotlin instead of egui)
 static JNI_STATE: OnceLock<Arc<Mutex<JniAppState>>> = OnceLock::new();
@@ -307,6 +309,13 @@ struct JniAppState {
     ptt_pressed: Arc<AtomicBool>,
     current_channel: Arc<AtomicU8>,
     pending_key_exchange: Option<crate::crypto::KeyExchange>,
+    /// BT TX buffer: Kotlin reads encoded frames from here for RFCOMM transmission
+    bt_tx_buffer: Arc<Mutex<Option<Vec<u8>>>>,
+    /// BT codec instances (stateful ADPCM, persisted across JNI calls)
+    bt_encoder: VoiceEncoder,
+    bt_decoder: VoiceDecoder,
+    /// Track whether BT mic capture is active for btEncodeFrame
+    bt_recording: bool,
 }
 
 impl JniAppState {
@@ -321,6 +330,10 @@ impl JniAppState {
             ptt_pressed,
             current_channel,
             pending_key_exchange: None,
+            bt_tx_buffer: Arc::new(Mutex::new(None)),
+            bt_encoder: VoiceEncoder::new(),
+            bt_decoder: VoiceDecoder::new(),
+            bt_recording: false,
         }
     }
 
@@ -385,24 +398,46 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     }
 }
 
-/// JNI: Start PTT transmission
+/// JNI: Start PTT transmission (with connection guard)
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativePttStart(
     _env: JNIEnv,
     _class: JClass,
 ) {
-    info!("JNI: PTT Start");
-    
     let state = get_jni_state();
-    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Connection guard: check if any transport has connected peers
+    let (bt_connected, transport_active) = if let Some(ref sm) = guard.state_machine {
+        let active = sm.get_active_transport();
+        let bt = active == crate::transport::ActiveTransport::Bluetooth;
+        let has_transport = active != crate::transport::ActiveTransport::None;
+        (bt, has_transport)
+    } else {
+        (false, false)
+    };
+
+    let channel = guard.current_channel.load(Ordering::Relaxed);
+    info!("PTT START pressed — BT connected: {}, transport active: {}, channel: {}",
+          bt_connected, transport_active, channel);
+
+    if !transport_active && !bt_connected {
+        warn!("PTT blocked: no connected peers (transport=None, BT=false)");
+        return;
+    }
+
     guard.ptt_pressed.store(true, Ordering::Relaxed);
-    
+
     if let Some(ref sm) = guard.state_machine {
         if let Err(e) = sm.on_ptt_press() {
             error!("JNI: Failed to start transmit: {}", e);
         }
     }
+
+    // Reset BT encoder state for new transmission
+    guard.bt_encoder.reset();
+    guard.bt_recording = false;
+    info!("Native PTT started");
 }
 
 /// JNI: Stop PTT transmission
@@ -412,20 +447,36 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     _class: JClass,
 ) {
     info!("JNI: PTT Stop");
-    
+
     let state = get_jni_state();
-    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
     guard.ptt_pressed.store(false, Ordering::Relaxed);
-    
+
+    // Stop BT mic capture if active
+    if guard.bt_recording {
+        if let Some(ref sm) = guard.state_machine {
+            let audio = sm.get_audio();
+            if let Ok(eng) = audio.lock() {
+                let _ = eng.stop_recording();
+            }
+        }
+        guard.bt_recording = false;
+    }
+
     if let Some(ref sm) = guard.state_machine {
         if let Err(e) = sm.on_ptt_release() {
             error!("JNI: Failed to stop transmit: {}", e);
         }
     }
+
+    // Clear BT TX buffer
+    if let Ok(mut buf) = guard.bt_tx_buffer.lock() {
+        *buf = None;
+    }
 }
 
-/// JNI: Set channel
+/// JNI: Set channel (syncs to both Rust pipeline and BT transport)
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetChannel(
     _env: JNIEnv,
@@ -439,6 +490,167 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     guard.current_channel.store(ch, Ordering::Relaxed);
+}
+
+/// JNI: Get current channel (for Kotlin BT transport to include in frames)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetChannel(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jbyte {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    guard.current_channel.load(Ordering::Relaxed) as jbyte
+}
+
+/// JNI: Encode one audio frame for BT transmission.
+///
+/// Reads mic → ADPCM encode → pack wire frame → return byte[] for Kotlin to send via RFCOMM.
+/// Returns null if no audio data available.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btEncodeFrame<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jbyteArray {
+    use jni::objects::JByteArray;
+
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    let sm = match guard.state_machine {
+        Some(ref sm) => sm,
+        None => return std::ptr::null_mut(),
+    };
+
+    // Start mic recording if not already
+    if !guard.bt_recording {
+        let audio = sm.get_audio();
+        if let Ok(eng) = audio.lock() {
+            match eng.start_recording() {
+                Ok(()) => {
+                    guard.bt_recording = true;
+                    info!("BT TX: started mic recording");
+                }
+                Err(e) => {
+                    error!("BT TX: failed to start recording: {}", e);
+                    return std::ptr::null_mut();
+                }
+            }
+        }
+    }
+
+    // Read one frame from mic
+    let mut pcm_buffer = vec![0i16; CODEC_FRAME_SIZE];
+    let samples_read = {
+        let audio = sm.get_audio();
+        if let Ok(eng) = audio.lock() {
+            match eng.read_audio(&mut pcm_buffer) {
+                Ok(n) => n,
+                Err(_) => 0,
+            }
+        } else {
+            0
+        }
+    };
+
+    if samples_read < CODEC_FRAME_SIZE {
+        return std::ptr::null_mut(); // Incomplete frame, caller should retry
+    }
+
+    // Encode with ADPCM
+    let compressed = guard.bt_encoder.encode(&pcm_buffer[..CODEC_FRAME_SIZE]);
+
+    // Pack wire frame
+    let channel = guard.current_channel.load(Ordering::Relaxed);
+    let (sender_id, device_name) = if let Some(ref sm) = guard.state_machine {
+        (sm.get_local_sender_id(), sm.get_device_name())
+    } else {
+        ("unknown".to_string(), "unknown".to_string())
+    };
+    let timestamp = audio_pipeline::now_ms();
+    let wire_data = audio_pipeline::pack_wire_frame(channel, &sender_id, &device_name, timestamp, &compressed);
+
+    // Return as byte array
+    match env.byte_array_from_slice(&wire_data) {
+        Ok(arr) => arr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// JNI: Decode a BT-received audio frame and play it.
+///
+/// Kotlin passes raw bytes received from RFCOMM → unpack wire frame → ADPCM decode → play.
+/// Returns true if frame was accepted, false if rejected (wrong channel, malformed, etc.)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btDecodeFrame<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    data: jni::sys::jbyteArray,
+) -> jboolean {
+    use jni::objects::JByteArray;
+
+    // Convert Java byte[] to Rust Vec
+    let j_data = unsafe { JByteArray::from_raw(data) };
+    let raw_bytes = match env.convert_byte_array(&j_data) {
+        Ok(b) => b,
+        Err(_) => return JNI_FALSE,
+    };
+
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Unpack wire frame
+    let (channel, sender_id, device_name, timestamp, compressed) = match audio_pipeline::unpack_wire_frame(&raw_bytes) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            warn!("btDecodeFrame: invalid wire frame: {}", e);
+            return JNI_FALSE;
+        }
+    };
+
+    // Filter by channel
+    let my_channel = guard.current_channel.load(Ordering::Relaxed);
+    if channel != my_channel {
+        return JNI_FALSE;
+    }
+
+    // Validate compressed size
+    if compressed.len() != crate::codec::COMPRESSED_FRAME_SIZE {
+        warn!("btDecodeFrame: unexpected compressed size: {}", compressed.len());
+        return JNI_FALSE;
+    }
+
+    // Auto-register sender in UserRegistry
+    guard.user_registry.register_user(&sender_id, &device_name);
+
+    // Decode ADPCM
+    let pcm_samples = guard.bt_decoder.decode(&compressed);
+
+    // Feed into audio cache and play
+    if let Some(ref sm) = guard.state_machine {
+        // Feed audio cache
+        let cache = sm.get_audio_cache();
+        let mut cache_lock = cache.lock().unwrap();
+        let passthrough = cache_lock.ingest_frame(&sender_id, timestamp, pcm_samples.clone());
+        cache_lock.tick();
+
+        let samples_to_play = if let Some(direct) = passthrough {
+            Some(direct)
+        } else {
+            cache_lock.next_playback_frame().map(|(_, s)| s)
+        };
+        drop(cache_lock);
+
+        if let Some(samples) = samples_to_play {
+            let audio = sm.get_audio();
+            if let Ok(eng) = audio.lock() {
+                let _ = eng.start_playing();
+                let _ = eng.write_audio(&samples);
+            }
+        }
+    }
+
+    JNI_TRUE
 }
 
 /// JNI: Get active transport type (0=None, 2=WiFi, 3=WifiDirect, 4=Cellular)
@@ -456,6 +668,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
             crate::transport::ActiveTransport::Wifi => 2,
             crate::transport::ActiveTransport::WifiDirect => 3,
             crate::transport::ActiveTransport::Cellular => 4,
+            crate::transport::ActiveTransport::Bluetooth => 5,
         }
     } else {
         0
@@ -1687,5 +1900,43 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         if sm.has_wifi_direct_peers() { JNI_TRUE } else { JNI_FALSE }
     } else {
         JNI_FALSE
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BLUETOOTH TRANSPORT JNI EXPORTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// JNI: Called by Kotlin when BT RFCOMM connects to a peer
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeBtConnected(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    info!("JNI: Bluetooth RFCOMM connected");
+
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        let mut transport = sm.get_transport().lock().unwrap();
+        transport.on_bluetooth_connected();
+    }
+}
+
+/// JNI: Called by Kotlin when BT RFCOMM disconnects
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeBtDisconnected(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    info!("JNI: Bluetooth disconnected");
+
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        let mut transport = sm.get_transport().lock().unwrap();
+        transport.on_bluetooth_disconnected();
     }
 }
