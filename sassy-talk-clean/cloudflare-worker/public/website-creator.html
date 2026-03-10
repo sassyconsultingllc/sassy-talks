@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Website Creator | AI-Powered WordPress Builder</title>
+    <meta name="description" content="AI-powered WordPress builder with security hardening, automated backups, and monitoring built in.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0a0a0a;
+            --bg-secondary: #111111;
+            --bg-tertiary: #1a1a1a;
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0a0;
+            --text-tertiary: #606060;
+            --accent-primary: #8b5cf6;
+            --accent-secondary: #7c3aed;
+            --accent-glow: rgba(139, 92, 246, 0.15);
+            --accent-green: #22c55e;
+            --border-subtle: #222222;
+            --border-medium: #333333;
+            --gradient-brand: linear-gradient(90deg, #8b5cf6, #ec4899);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html { scroll-behavior: smooth; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        nav {
+            position: fixed;
+            top: 0; left: 0; right: 0;
+            z-index: 1000;
+            padding: 1rem 2rem;
+            background: rgba(10, 10, 10, 0.8);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        nav .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            font-weight: 700;
+            font-size: 1.25rem;
+            color: var(--text-primary);
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .logo-icon {
+            width: 32px;
+            height: 32px;
+            background: var(--accent-primary);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            font-weight: 700;
+            color: #fff;
+        }
+
+        .nav-links { display: flex; gap: 2rem; align-items: center; }
+        .nav-links a { color: var(--text-secondary); text-decoration: none; font-size: 0.9rem; transition: color 0.2s; }
+        .nav-links a:hover { color: var(--text-primary); }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.625rem 1.25rem;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            text-decoration: none;
+            transition: all 0.2s;
+            cursor: pointer;
+            border: none;
+        }
+
+        .btn-primary { background: var(--accent-primary); color: #fff; }
+        .btn-primary:hover { background: var(--accent-secondary); transform: translateY(-1px); }
+        .btn-secondary { background: transparent; color: var(--text-primary); border: 1px solid var(--border-medium); }
+        .btn-secondary:hover { background: var(--bg-tertiary); }
+        .btn-large { padding: 1rem 2rem; font-size: 1rem; }
+
+        .hero {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            padding: 8rem 2rem 4rem;
+            position: relative;
+        }
+
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 50%;
+            transform: translateX(-50%);
+            width: 800px; height: 800px;
+            background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .hero-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-subtle);
+            border-radius: 100px;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 2rem;
+        }
+
+        .hero-badge .dot {
+            width: 8px; height: 8px;
+            background: var(--accent-primary);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+        .hero h1 {
+            font-size: clamp(2.5rem, 8vw, 5rem);
+            font-weight: 700;
+            line-height: 1.1;
+            margin-bottom: 1.5rem;
+        }
+
+        .hero h1 .gradient {
+            background: var(--gradient-brand);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .hero-sub {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin-bottom: 3rem;
+        }
+
+        .hero-cta { display: flex; gap: 1rem; flex-wrap: wrap; justify-content: center; }
+
+        .price-hero {
+            background: var(--bg-secondary);
+            border: 1px solid var(--accent-primary);
+            border-radius: 16px;
+            padding: 2.5rem 4rem;
+            margin-top: 3rem;
+        }
+
+        .price-hero .price { font-size: 4rem; font-weight: 700; color: var(--accent-primary); }
+        .price-hero .price-sub { color: var(--text-tertiary); }
+
+        .hero-stats {
+            display: flex;
+            gap: 3rem;
+            margin-top: 4rem;
+            padding-top: 3rem;
+            border-top: 1px solid var(--border-subtle);
+        }
+
+        .stat { text-align: center; }
+        .stat-value { font-size: 2rem; font-weight: 700; color: var(--accent-primary); }
+        .stat-label { font-size: 0.85rem; color: var(--text-tertiary); margin-top: 0.25rem; }
+
+        section { padding: 6rem 2rem; max-width: 1200px; margin: 0 auto; }
+
+        .section-label {
+            display: block;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: var(--accent-primary);
+            margin-bottom: 1rem;
+        }
+
+        .section-title { font-size: clamp(1.75rem, 4vw, 2.5rem); font-weight: 700; margin-bottom: 1rem; }
+        .section-desc { font-size: 1.1rem; color: var(--text-secondary); max-width: 600px; margin-bottom: 3rem; }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .feature-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-subtle);
+            border-radius: 12px;
+            padding: 2rem;
+            transition: all 0.3s;
+        }
+
+        .feature-card:hover { border-color: var(--accent-primary); transform: translateY(-2px); }
+
+        .feature-icon {
+            width: 48px; height: 48px;
+            background: var(--bg-tertiary);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+            font-weight: 700;
+            margin-bottom: 1.25rem;
+            color: var(--accent-primary);
+        }
+
+        .feature-card h3 { font-size: 1.125rem; margin-bottom: 0.75rem; }
+        .feature-card p { color: var(--text-secondary); font-size: 0.95rem; }
+
+        .workflow-section {
+            background: var(--bg-secondary);
+            padding: 6rem 2rem;
+        }
+
+        .workflow-container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        .workflow-steps {
+            display: flex;
+            flex-direction: column;
+            gap: 2rem;
+            margin-top: 3rem;
+        }
+
+        .workflow-step {
+            display: flex;
+            gap: 1.5rem;
+            align-items: flex-start;
+        }
+
+        .step-number {
+            width: 48px;
+            height: 48px;
+            background: var(--accent-primary);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 1.25rem;
+            color: #fff;
+            flex-shrink: 0;
+        }
+
+        .step-content h4 { font-size: 1.125rem; margin-bottom: 0.5rem; }
+        .step-content p { color: var(--text-secondary); font-size: 0.95rem; }
+
+        .cta {
+            text-align: center;
+            padding: 8rem 2rem;
+            position: relative;
+        }
+
+        .cta::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 50%;
+            transform: translateX(-50%);
+            width: 600px; height: 600px;
+            background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .cta h2 { font-size: clamp(2rem, 5vw, 3rem); margin-bottom: 1rem; }
+        .cta p { font-size: 1.25rem; color: var(--text-secondary); margin-bottom: 2rem; }
+        .cta-buttons { display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; }
+
+        footer {
+            border-top: 1px solid var(--border-subtle);
+            padding: 3rem 2rem;
+        }
+
+        .footer-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 2rem;
+        }
+
+        .footer-left { color: var(--text-tertiary); font-size: 0.9rem; }
+        .footer-links { display: flex; gap: 2rem; }
+        .footer-links a { color: var(--text-secondary); text-decoration: none; font-size: 0.9rem; }
+        .footer-links a:hover { color: var(--text-primary); }
+
+        @media (max-width: 768px) {
+            .nav-links { display: none; }
+            .hero-stats { flex-direction: column; gap: 1.5rem; }
+            .features-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <nav>
+        <div class="container">
+            <a href="/" class="logo">
+                <span class="logo-icon">WC</span>
+                Website Creator
+            </a>
+            <div class="nav-links">
+                <a href="/">Home</a>
+                <a href="#features">Features</a>
+                <a href="#workflow">Workflow</a>
+                <a href="#download">Download</a>
+                <a href="https://github.com/nicksphone" class="btn btn-primary">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <section class="hero">
+        <div class="hero-badge">
+            <span class="dot"></span>
+            <span>Web Development Tool</span>
+        </div>
+        
+        <h1>
+            AI-powered WordPress.<br>
+            <span class="gradient">Security included.</span>
+        </h1>
+        
+        <p class="hero-sub">
+            Build WordPress sites with AI content generation, automatic security hardening, 
+            backups, and monitoring. Everything configured correctly from the start.
+        </p>
+        
+        <div class="hero-cta">
+            <a href="#download" class="btn btn-primary btn-large">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="7 10 12 15 17 10"></polyline>
+                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                </svg>
+                Download Now - $2
+            </a>
+            <a href="https://github.com/nicksphone" class="btn btn-secondary btn-large">View Source</a>
+        </div>
+        
+        <div class="price-hero">
+            <div class="price">$2</div>
+            <div class="price-sub">One-time purchase. Lifetime license.</div>
+        </div>
+        
+        <div class="hero-stats">
+            <div class="stat">
+                <div class="stat-value">AI</div>
+                <div class="stat-label">Content Generation</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">MCP</div>
+                <div class="stat-label">Integration</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">Auto</div>
+                <div class="stat-label">Security</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">0</div>
+                <div class="stat-label">Config Needed</div>
+            </div>
+        </div>
+    </section>
+
+    <section id="features">
+        <span class="section-label">Features</span>
+        <h2 class="section-title">WordPress done right. Finally.</h2>
+        <p class="section-desc">Stop fighting with configuration. Let AI handle the setup while you focus on content.</p>
+        
+        <div class="features-grid">
+            <div class="feature-card">
+                <div class="feature-icon">AI</div>
+                <h3>AI Content Generation</h3>
+                <p>Generate pages, posts, and product descriptions using Claude. Context-aware content that matches your brand voice.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">SEC</div>
+                <h3>Security Hardening</h3>
+                <p>Automatic .htaccess rules, file permissions, login protection, and security headers. OWASP best practices built in.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">BAK</div>
+                <h3>Automated Backups</h3>
+                <p>Scheduled database and file backups. Store locally or push to S3, Cloudflare R2, or any S3-compatible storage.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">MON</div>
+                <h3>Health Monitoring</h3>
+                <p>Track uptime, performance, and security status. Get alerts before problems become emergencies.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">MCP</div>
+                <h3>MCP Integration</h3>
+                <p>Works with Claude Desktop and other MCP-compatible AI tools. Conversational site management.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">WP</div>
+                <h3>WordPress Native</h3>
+                <p>No lock-in. Standard WordPress installation with proper hooks and filters. Take your site anywhere.</p>
+            </div>
+        </div>
+    </section>
+
+    <section class="workflow-section" id="workflow">
+        <div class="workflow-container">
+            <span class="section-label">Workflow</span>
+            <h2 class="section-title">From zero to deployed in 10 minutes.</h2>
+            
+            <div class="workflow-steps">
+                <div class="workflow-step">
+                    <div class="step-number">1</div>
+                    <div class="step-content">
+                        <h4>Describe Your Site</h4>
+                        <p>Tell the AI what you're building. Business type, target audience, key features. Natural language, no technical jargon required.</p>
+                    </div>
+                </div>
+                <div class="workflow-step">
+                    <div class="step-number">2</div>
+                    <div class="step-content">
+                        <h4>AI Generates Structure</h4>
+                        <p>Pages, menus, categories, and content structure created automatically. Theme selected and configured to match your brand.</p>
+                    </div>
+                </div>
+                <div class="workflow-step">
+                    <div class="step-number">3</div>
+                    <div class="step-content">
+                        <h4>Security Applied</h4>
+                        <p>Firewall rules, hardened permissions, SSL configured, security headers set. All before you even see the site.</p>
+                    </div>
+                </div>
+                <div class="workflow-step">
+                    <div class="step-number">4</div>
+                    <div class="step-content">
+                        <h4>Deploy and Monitor</h4>
+                        <p>Push to your host. Backups scheduled. Monitoring active. Site ready for traffic.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="download">
+        <span class="section-label">Download</span>
+        <h2 class="section-title" style="text-align: center;">Get Website Creator.</h2>
+        <p class="section-desc" style="text-align: center; margin: 0 auto 2rem;">Purchase a license, then download the plugin.</p>
+        
+        <div style="text-align: center;">
+            <button onclick="buyProduct('website-creator')" class="btn btn-primary btn-large" style="margin-bottom: 1rem;">Buy License - $2</button>
+            <br>
+            <a href="/download/website-creator/wordpress/sassy-site-creator.zip" class="btn btn-secondary btn-large">Download WordPress Plugin</a>
+        </div>
+    </section>
+
+    <section class="cta">
+        <h2>WordPress security. $2. Forever.</h2>
+        <p>No subscriptions. No per-site fees. Just results.</p>
+        <div class="cta-buttons">
+            <button onclick="buyProduct('website-creator')" class="btn btn-primary btn-large">Buy Now - $2</button>
+            <a href="https://github.com/nicksphone" class="btn btn-secondary btn-large">View Source Code</a>
+        </div>
+    </section>
+
+    <footer>
+        <div class="footer-content">
+            <div class="footer-left">
+                <strong>Website Creator</strong> by <a href="/" style="color: var(--accent-primary);">Sassy Consulting LLC</a><br>
+                <span style="font-size: 0.8rem;">Veteran-Owned. Wisconsin-Made.</span>
+            </div>
+            <div class="footer-links">
+                <a href="/">Home</a>
+                <a href="/#products">Products</a>
+                <a href="https://github.com/nicksphone">GitHub</a>
+            </div>
+        </div>
+    </footer>
+
+    <script src="checkout.js"></script>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'9d9f46a7bf81982d',t:'MTc3MzExMzc5NQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>

@@ -18,7 +18,7 @@
 import { EmailMessage } from "cloudflare:email";
 
 // Re-export the Durable Object class so the runtime can find it
-export { PttRelay } from "./ptt-relay.js";
+export { PttRoom } from "./ptt-relay.js";
 
 // ── Product catalog ──
 const PRODUCTS = {
@@ -67,53 +67,74 @@ export default {
       "Access-Control-Allow-Headers": "Content-Type, stripe-signature",
     };
 
+    // Security headers applied to all responses via wrapper
+    const securityHeaders = {
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "DENY",
+      "Referrer-Policy": "strict-origin-when-cross-origin",
+      "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+      "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://api.stripe.com",
+      "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+    };
+
     if (method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
+      return new Response(null, { headers: { ...corsHeaders, ...securityHeaders } });
     }
 
     try {
+      let response;
+
       // ── PTT WebSocket relay ──
       if (path === "/api/ptt/ws") {
         return handlePttWebSocket(request, env, url);
       }
 
       if (path === "/api/analyze" && method === "POST") {
-        return await handleAnalyze(request, env, corsHeaders);
-      }
-      if (path === "/api/contact" && method === "POST") {
-        return await handleContact(request, env, corsHeaders);
-      }
-      if (path === "/api/checkout" && method === "POST") {
-        return await handleCheckout(request, env, corsHeaders);
-      }
-      if (path === "/api/verify" && method === "POST") {
-        return await handleVerify(request, env, corsHeaders);
-      }
-      if (path === "/api/webhook" && method === "POST") {
-        return await handleWebhook(request, env, corsHeaders);
-      }
-      if (path === "/api/validate" && method === "POST") {
-        return await handleValidateLicense(request, env, corsHeaders);
-      }
-      if (path === "/api/vpn-recommendations") {
-        return await handleVPNRecommendations(corsHeaders);
-      }
-      if (path === "/api/downloads") {
-        return await handleDownloadsList(env, corsHeaders);
-      }
-      if (path.startsWith("/download/")) {
-        return await handleDownload(path, env, corsHeaders);
+        response = await handleAnalyze(request, env, corsHeaders);
+      } else if (path === "/api/contact" && method === "POST") {
+        response = await handleContact(request, env, corsHeaders);
+      } else if (path === "/api/checkout" && method === "POST") {
+        response = await handleCheckout(request, env, corsHeaders);
+      } else if (path === "/api/verify" && method === "POST") {
+        response = await handleVerify(request, env, corsHeaders);
+      } else if (path === "/api/webhook" && method === "POST") {
+        response = await handleWebhook(request, env, corsHeaders);
+      } else if (path === "/api/validate" && method === "POST") {
+        response = await handleValidateLicense(request, env, corsHeaders);
+      } else if (path === "/api/vpn-recommendations") {
+        response = await handleVPNRecommendations(corsHeaders);
+      } else if (path === "/api/downloads") {
+        response = await handleDownloadsList(env, corsHeaders);
+      } else if (path.startsWith("/download/")) {
+        response = await handleDownload(path, env, corsHeaders);
+      } else if (path === "/privacy-policy.html" || path.startsWith("/legal/")) {
+        response = await handlePrivacyPage(path, env, corsHeaders);
+      } else {
+        response = await env.ASSETS.fetch(request);
       }
 
-      return env.ASSETS.fetch(request);
+      return addSecurityHeaders(response, securityHeaders);
     } catch (error) {
-      return new Response(JSON.stringify({ error: error.message }), {
+      return new Response(JSON.stringify({ error: "Internal server error" }), {
         status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        headers: { ...corsHeaders, ...securityHeaders, "Content-Type": "application/json" },
       });
     }
   },
 };
+
+/**
+ * Clone a response and add security headers.
+ * Skips WebSocket upgrade responses (status 101).
+ */
+function addSecurityHeaders(response, securityHeaders) {
+  if (response.status === 101) return response;
+  const newResponse = new Response(response.body, response);
+  for (const [key, value] of Object.entries(securityHeaders)) {
+    newResponse.headers.set(key, value);
+  }
+  return newResponse;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PTT WebSocket relay — routes to Durable Object by room ID
@@ -126,8 +147,16 @@ function handlePttWebSocket(request, env, url) {
   }
 
   const room = url.searchParams.get("room");
-  if (!room) {
-    return new Response(JSON.stringify({ error: "Missing room parameter" }), {
+  if (!room || room.length < 8 || room.length > 128) {
+    return new Response(JSON.stringify({ error: "Invalid room parameter" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  // Sanitize: only allow alphanumeric, hyphens, underscores
+  if (!/^[a-zA-Z0-9_-]+$/.test(room)) {
+    return new Response(JSON.stringify({ error: "Invalid room format" }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
@@ -147,8 +176,14 @@ function handlePttWebSocket(request, env, url) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function handleAnalyze(request, env, corsHeaders) {
-  const body = await request.json();
-  const zipCode = body.zip_code || "";
+  const body = await safeParseJSON(request, 2048);
+  if (!body) {
+    return new Response(JSON.stringify({ error: "Invalid request" }), {
+      status: 400,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+  const zipCode = (body.zip_code || "").toString().substring(0, 10);
   const ip = request.headers.get("CF-Connecting-IP") || "unknown";
   const country = request.headers.get("CF-IPCountry") || "XX";
   const city = request.headers.get("CF-IPCity") || "Unknown";
@@ -222,12 +257,19 @@ async function handleContact(request, env, corsHeaders) {
   let name, email, message;
 
   if (contentType.includes("application/x-www-form-urlencoded")) {
-    const formData = await request.formData();
+    const text = await request.text();
+    if (text.length > 4096) {
+      return new Response(null, { status: 302, headers: { Location: "/#contact?error=size" } });
+    }
+    const formData = new URLSearchParams(text);
     name = formData.get("name");
     email = formData.get("email");
     message = formData.get("message");
   } else {
-    const body = await request.json();
+    const body = await safeParseJSON(request, 4096);
+    if (!body) {
+      return new Response(null, { status: 302, headers: { Location: "/#contact?error=invalid" } });
+    }
     name = body.name;
     email = body.email;
     message = body.message;
@@ -293,7 +335,13 @@ async function handleContact(request, env, corsHeaders) {
 }
 
 async function handleCheckout(request, env, corsHeaders) {
-  const body = await request.json();
+  const body = await safeParseJSON(request, 4096);
+  if (!body) {
+    return new Response(JSON.stringify({ error: "Invalid request" }), {
+      status: 400,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
   const { product, email, success_url, cancel_url } = body;
 
   if (!product || !PRODUCTS[product]) {
@@ -302,11 +350,46 @@ async function handleCheckout(request, env, corsHeaders) {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }
-  if (!email) {
-    return new Response(JSON.stringify({ error: "Email required" }), {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!email || typeof email !== "string" || !emailRegex.test(email) || email.length > 254) {
+    return new Response(JSON.stringify({ error: "Valid email required" }), {
       status: 400,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
+  }
+
+  // Validate URLs if provided — only allow same-origin
+  if (success_url && typeof success_url === "string") {
+    try {
+      const u = new URL(success_url);
+      if (u.origin !== new URL(request.url).origin) {
+        return new Response(JSON.stringify({ error: "Invalid success_url" }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+    } catch {
+      return new Response(JSON.stringify({ error: "Invalid success_url" }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+  }
+  if (cancel_url && typeof cancel_url === "string") {
+    try {
+      const u = new URL(cancel_url);
+      if (u.origin !== new URL(request.url).origin) {
+        return new Response(JSON.stringify({ error: "Invalid cancel_url" }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+    } catch {
+      return new Response(JSON.stringify({ error: "Invalid cancel_url" }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
   }
 
   const productInfo = PRODUCTS[product];
@@ -346,18 +429,24 @@ async function handleCheckout(request, env, corsHeaders) {
 }
 
 async function handleVerify(request, env, corsHeaders) {
-  const body = await request.json();
+  const body = await safeParseJSON(request);
+  if (!body) {
+    return new Response(JSON.stringify({ error: "Invalid request" }), {
+      status: 400,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
   const { session_id } = body;
 
-  if (!session_id) {
-    return new Response(JSON.stringify({ error: "Session ID required" }), {
+  if (!session_id || !isValidStripeSessionId(session_id)) {
+    return new Response(JSON.stringify({ error: "Invalid session ID" }), {
       status: 400,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }
 
   const stripeResponse = await fetch(
-    `https://api.stripe.com/v1/checkout/sessions/${session_id}`,
+    `https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(session_id)}`,
     { headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` } }
   );
   const session = await stripeResponse.json();
@@ -403,8 +492,39 @@ async function handleVerify(request, env, corsHeaders) {
 }
 
 async function handleWebhook(request, env, corsHeaders) {
+  // Stripe webhooks can be up to ~64KB; limit to 128KB for safety
+  const contentLength = parseInt(request.headers.get("Content-Length") || "0");
+  if (contentLength > 131072) {
+    return new Response(JSON.stringify({ error: "Payload too large" }), {
+      status: 413,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+
   const payload = await request.text();
-  const event = JSON.parse(payload);
+  if (payload.length > 131072) {
+    return new Response(JSON.stringify({ error: "Payload too large" }), {
+      status: 413,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+
+  let event;
+  try {
+    event = JSON.parse(payload);
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+      status: 400,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+
+  if (!event || typeof event.type !== "string") {
+    return new Response(JSON.stringify({ error: "Invalid event" }), {
+      status: 400,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
 
   if (event.type === "checkout.session.completed") {
     const session = event.data.object;
@@ -430,16 +550,23 @@ async function handleWebhook(request, env, corsHeaders) {
 }
 
 async function handleValidateLicense(request, env, corsHeaders) {
-  const body = await request.json();
+  const body = await safeParseJSON(request);
+  if (!body) {
+    return new Response(JSON.stringify({ valid: false, error: "Invalid request" }), {
+      status: 400,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
   const { license_key } = body;
 
-  if (!license_key) {
+  // Validate format: SASSY-XXXX-XXXX-XXXX-XXXX (alphanumeric + hyphens, max 30 chars)
+  if (!license_key || typeof license_key !== "string" || license_key.length > 30) {
     return new Response(JSON.stringify({ valid: false, error: "License key required" }), {
       status: 400,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }
-  if (!license_key.startsWith("SASSY-")) {
+  if (!/^SASSY-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(license_key)) {
     return new Response(JSON.stringify({ valid: false, error: "Invalid license format" }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
@@ -504,6 +631,16 @@ async function handleDownload(path, env, corsHeaders) {
     return new Response("Not found", { status: 404 });
   }
   const [product, platform, filename] = parts;
+
+  // Prevent path traversal — no dots-dots, no slashes in segments
+  const safeSegment = /^[a-zA-Z0-9._-]+$/;
+  if (!safeSegment.test(product) || !safeSegment.test(platform) || !safeSegment.test(filename)) {
+    return new Response("Invalid path", { status: 400 });
+  }
+  if (product.includes("..") || platform.includes("..") || filename.includes("..")) {
+    return new Response("Invalid path", { status: 400 });
+  }
+
   const r2Key = `${product}/${platform}/${filename}`;
 
   const object = await env.DOWNLOADS.get(r2Key);
@@ -525,6 +662,56 @@ async function handleDownload(path, env, corsHeaders) {
   headers.set("Content-Type", object.httpMetadata?.contentType || "application/octet-stream");
   headers.set("Content-Disposition", `attachment; filename="${filename}"`);
   return new Response(object.body, { headers });
+}
+
+async function handlePrivacyPage(path, env, corsHeaders) {
+  // Map URL path to R2 key — prevent traversal
+  if (path.includes("..") || path.includes("//")) {
+    return new Response("Not found", { status: 404 });
+  }
+
+  let r2Key;
+  if (path === "/privacy-policy.html") {
+    r2Key = "privacy-policy.html";
+  } else {
+    // /legal/foo.html → legal/foo.html (only allow simple paths)
+    r2Key = path.replace(/^\//, "");
+    if (!/^legal\/[a-zA-Z0-9._-]+$/.test(r2Key)) {
+      return new Response("Not found", { status: 404 });
+    }
+  }
+
+  const object = await env.PRIVACY.get(r2Key);
+  if (!object) {
+    return new Response("Not found", { status: 404 });
+  }
+
+  const headers = new Headers(corsHeaders);
+  headers.set("Content-Type", object.httpMetadata?.contentType || "text/html; charset=utf-8");
+  headers.set("Cache-Control", "public, max-age=3600");
+  return new Response(object.body, { headers });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Security & validation helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Parse JSON body with size limit (default 10KB). Returns null if too large or invalid. */
+async function safeParseJSON(request, maxBytes = 10240) {
+  const contentLength = parseInt(request.headers.get("Content-Length") || "0");
+  if (contentLength > maxBytes) return null;
+  try {
+    const text = await request.text();
+    if (text.length > maxBytes) return null;
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+/** Validate a Stripe session ID format (cs_test_... or cs_live_...) */
+function isValidStripeSessionId(id) {
+  return typeof id === "string" && /^cs_(test|live)_[a-zA-Z0-9]{10,200}$/.test(id);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

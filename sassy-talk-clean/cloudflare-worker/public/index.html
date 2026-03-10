@@ -1,0 +1,1144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sassy Consulting LLC | Veteran-Owned Security Software</title>
+    <meta name="description" content="U.S. Army veteran-led company building privacy-focused tools. No tracking. No telemetry. Just protection.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0a0a0a;
+            --bg-secondary: #111111;
+            --bg-tertiary: #1a1a1a;
+            --bg-card: #141414;
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0a0;
+            --text-tertiary: #606060;
+            --accent-primary: #22c55e;
+            --accent-secondary: #16a34a;
+            --accent-glow: rgba(34, 197, 94, 0.15);
+            --accent-red: #ef4444;
+            --accent-orange: #f97316;
+            --accent-yellow: #eab308;
+            --accent-blue: #3b82f6;
+            --accent-cyan: #06b6d4;
+            --border-subtle: #222222;
+            --border-medium: #333333;
+            --gradient-brand: linear-gradient(90deg, #22c55e, #06b6d4);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html {
+            scroll-behavior: smooth;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        .mono {
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* Navigation */
+        nav {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 1000;
+            padding: 1rem 2rem;
+            background: rgba(10, 10, 10, 0.8);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        nav .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            font-weight: 700;
+            font-size: 1.25rem;
+            color: var(--text-primary);
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .logo-icon {
+            width: 32px;
+            height: 32px;
+            background: var(--accent-primary);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            font-weight: 700;
+            color: #000;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 2rem;
+            align-items: center;
+        }
+
+        .nav-links a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: color 0.2s;
+        }
+
+        .nav-links a:hover {
+            color: var(--text-primary);
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.625rem 1.25rem;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            text-decoration: none;
+            transition: all 0.2s;
+            cursor: pointer;
+            border: none;
+        }
+
+        .btn-primary {
+            background: var(--accent-primary);
+            color: #000;
+        }
+
+        .btn-primary:hover {
+            background: var(--accent-secondary);
+            transform: translateY(-1px);
+        }
+
+        .btn-secondary {
+            background: transparent;
+            color: var(--text-primary);
+            border: 1px solid var(--border-medium);
+        }
+
+        .btn-secondary:hover {
+            background: var(--bg-tertiary);
+            border-color: var(--text-tertiary);
+        }
+
+        .btn-large {
+            padding: 1rem 2rem;
+            font-size: 1rem;
+        }
+
+        /* Hero Section */
+        .hero {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            padding: 8rem 2rem 4rem;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 800px;
+            height: 800px;
+            background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .hero-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-subtle);
+            border-radius: 100px;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 2rem;
+        }
+
+        .hero-badge .dot {
+            width: 8px;
+            height: 8px;
+            background: var(--accent-primary);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .hero h1 {
+            font-size: clamp(2.5rem, 8vw, 5rem);
+            font-weight: 700;
+            line-height: 1.1;
+            margin-bottom: 1.5rem;
+            max-width: 900px;
+        }
+
+        .hero h1 .gradient {
+            background: var(--gradient-brand);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .hero-sub {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin-bottom: 3rem;
+        }
+
+        .hero-cta {
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .hero-stats {
+            display: flex;
+            gap: 3rem;
+            margin-top: 4rem;
+            padding-top: 3rem;
+            border-top: 1px solid var(--border-subtle);
+        }
+
+        .stat {
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--accent-primary);
+        }
+
+        .stat-label {
+            font-size: 0.85rem;
+            color: var(--text-tertiary);
+            margin-top: 0.25rem;
+        }
+
+        /* Sections */
+        section {
+            padding: 6rem 2rem;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .section-label {
+            display: block;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: var(--accent-primary);
+            margin-bottom: 1rem;
+        }
+
+        .section-title {
+            font-size: clamp(1.75rem, 4vw, 2.5rem);
+            font-weight: 700;
+            margin-bottom: 1rem;
+            max-width: 700px;
+        }
+
+        .section-desc {
+            font-size: 1.1rem;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin-bottom: 3rem;
+        }
+
+        /* Products Grid */
+        .products-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .product-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-subtle);
+            border-radius: 16px;
+            padding: 2rem;
+            text-decoration: none;
+            color: inherit;
+            transition: all 0.3s;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .product-card:hover {
+            border-color: var(--accent-primary);
+            transform: translateY(-4px);
+            box-shadow: 0 20px 40px -12px rgba(34, 197, 94, 0.15);
+        }
+
+        .product-badge {
+            position: absolute;
+            top: 1rem;
+            right: 1rem;
+            padding: 0.25rem 0.75rem;
+            background: var(--accent-primary);
+            color: #000;
+            font-size: 0.7rem;
+            font-weight: 600;
+            border-radius: 100px;
+            text-transform: uppercase;
+        }
+
+        .product-badge.featured {
+            background: var(--accent-orange);
+        }
+
+        .product-badge.new {
+            background: var(--accent-cyan);
+        }
+
+        .product-badge.free {
+            background: var(--accent-blue);
+            color: #fff;
+        }
+
+        .product-icon {
+            width: 56px;
+            height: 56px;
+            background: var(--bg-tertiary);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.25rem;
+            font-weight: 700;
+            margin-bottom: 1.5rem;
+            color: var(--accent-primary);
+        }
+
+        .product-card h3 {
+            font-size: 1.25rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .product-card p {
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+            margin-bottom: 1.5rem;
+            line-height: 1.6;
+        }
+
+        .product-card .price {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--accent-primary);
+            margin-bottom: 1rem;
+        }
+
+        .product-tags {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .product-tag {
+            padding: 0.25rem 0.75rem;
+            background: var(--bg-tertiary);
+            border-radius: 100px;
+            font-size: 0.75rem;
+            color: var(--text-tertiary);
+        }
+
+        /* Dashboard Section */
+        .dashboard-section {
+            background: var(--bg-secondary);
+            padding: 6rem 2rem;
+        }
+
+        .dashboard-container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .search-form {
+            display: flex;
+            gap: 1rem;
+            max-width: 500px;
+            margin: 0 auto 3rem;
+        }
+
+        .search-form input {
+            flex: 1;
+            padding: 1rem 1.5rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-subtle);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 1rem;
+            font-family: inherit;
+        }
+
+        .search-form input:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+        }
+
+        .results-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+
+        .result-card {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-subtle);
+            border-radius: 12px;
+            padding: 1.5rem;
+        }
+
+        .result-card .label {
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: var(--text-tertiary);
+            margin-bottom: 0.5rem;
+        }
+
+        .result-card .value {
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+
+        .result-card .sub {
+            font-size: 0.85rem;
+            color: var(--text-tertiary);
+            margin-top: 0.25rem;
+        }
+
+        .status-banner {
+            padding: 1.5rem;
+            border-radius: 12px;
+            margin-bottom: 2rem;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-subtle);
+        }
+
+        .status-banner.safe {
+            background: rgba(34, 197, 94, 0.1);
+            border-color: var(--accent-primary);
+        }
+
+        .status-banner.warning {
+            background: rgba(249, 115, 22, 0.1);
+            border-color: var(--accent-orange);
+        }
+
+        .status-banner.protected {
+            background: rgba(59, 130, 246, 0.1);
+            border-color: var(--accent-blue);
+        }
+
+        /* About Section */
+        .about-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4rem;
+            align-items: center;
+        }
+
+        .values-list {
+            margin-top: 2rem;
+        }
+
+        .value-item {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .value-icon {
+            width: 40px;
+            height: 40px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--accent-primary);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            color: var(--accent-primary);
+            font-size: 0.9rem;
+            font-weight: 600;
+        }
+
+        .value-text h4 {
+            font-size: 1rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .value-text p {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        .code-window {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-subtle);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .code-header {
+            display: flex;
+            gap: 8px;
+            padding: 1rem;
+            background: var(--bg-tertiary);
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .code-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        .code-dot.red { background: #ff5f56; }
+        .code-dot.yellow { background: #ffbd2e; }
+        .code-dot.green { background: #27ca40; }
+
+        .code-window pre {
+            padding: 1.5rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            line-height: 1.7;
+            overflow-x: auto;
+            color: var(--text-secondary);
+        }
+
+        .code-window .kw { color: var(--accent-blue); }
+        .code-window .ty { color: var(--accent-cyan); }
+        .code-window .lit { color: var(--accent-primary); }
+        .code-window .str { color: var(--accent-yellow); }
+
+        /* CTA Section */
+        .cta {
+            text-align: center;
+            padding: 8rem 2rem;
+            position: relative;
+        }
+
+        .cta::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .cta h2 {
+            font-size: clamp(2rem, 5vw, 3rem);
+            margin-bottom: 1rem;
+        }
+
+        .cta p {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            margin-bottom: 2rem;
+        }
+
+        .cta-buttons {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        /* Footer */
+        footer {
+            border-top: 1px solid var(--border-subtle);
+            padding: 3rem 2rem;
+        }
+
+        .footer-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 2rem;
+        }
+
+        .footer-left {
+            color: var(--text-tertiary);
+            font-size: 0.9rem;
+        }
+
+        .footer-links {
+            display: flex;
+            gap: 2rem;
+        }
+
+        .footer-links a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.9rem;
+        }
+
+        .footer-links a:hover {
+            color: var(--text-primary);
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .nav-links {
+                display: none;
+            }
+
+            .hero-stats {
+                flex-direction: column;
+                gap: 1.5rem;
+            }
+
+            .products-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .results-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .about-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Animations */
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .animate {
+            animation: fadeInUp 0.6s ease-out forwards;
+        }
+
+        .delay-1 { animation-delay: 0.1s; }
+        .delay-2 { animation-delay: 0.2s; }
+        .delay-3 { animation-delay: 0.3s; }
+    </style>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav>
+        <div class="container">
+            <a href="/" class="logo">
+                <span class="logo-icon">SC</span>
+                Sassy Consulting
+            </a>
+            <div class="nav-links">
+                <a href="#products">Products</a>
+                <a href="#tools">Tools</a>
+                <a href="/aboutme">About</a>
+                <a href="https://github.com/sassyconsultingllc" target="_blank">GitHub</a>
+                <a href="#products" class="btn btn-primary">Get Started</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Hero -->
+    <section class="hero">
+        <div class="hero-badge">
+            <span class="dot"></span>
+            <span>U.S. Veteran-Owned Business</span>
+        </div>
+        
+        <h1>
+            Building tools for<br>
+            <span class="gradient">safety and ownership</span>
+        </h1>
+        
+        <p class="hero-sub">
+            U.S. Army veteran-led company creating secure software that puts control 
+            back in your hands. No tracking. No telemetry. Just protection.
+        </p>
+        
+        <div class="hero-cta">
+            <a href="#tools" class="btn btn-primary btn-large">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <path d="M12 6v6l4 2"></path>
+                </svg>
+                Check Your Privacy
+            </a>
+            <a href="#products" class="btn btn-secondary btn-large">View Products</a>
+        </div>
+        
+        <div class="hero-stats">
+            <div class="stat">
+                <div class="stat-value">5+</div>
+                <div class="stat-label">Products</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">$2</div>
+                <div class="stat-label">Per License</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">0</div>
+                <div class="stat-label">Data Collected</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">11yr</div>
+                <div class="stat-label">Military Service</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Products -->
+    <section id="products">
+        <span class="section-label">Our Products</span>
+        <h2 class="section-title">Privacy-focused tools built with Rust and security-first principles.</h2>
+        <p class="section-desc">Every product is $2 one-time purchase. No subscriptions. No hidden fees. Own it forever.</p>
+        
+        <div class="products-grid">
+            <a href="/sassy-talk.html" class="product-card">
+                <span class="product-badge">Popular</span>
+                <div class="product-icon">ST</div>
+                <h3>Sassy-Talk</h3>
+                <p>Encrypted walkie-talkie app. AES-256-GCM over local WiFi. No servers, no accounts, no data collection.</p>
+                <div class="price">$2</div>
+                <div class="product-tags">
+                    <span class="product-tag">Rust</span>
+                    <span class="product-tag">Android</span>
+                    <span class="product-tag">Windows</span>
+                </div>
+            </a>
+            
+            <a href="https://mybestsites.online" class="product-card" target="_blank">
+                <span class="product-badge new">New</span>
+                <div class="product-icon" style="color: var(--accent-cyan);">MBS</div>
+                <h3>My Best Sites</h3>
+                <p>Create professional websites in 5 minutes. AI-powered content, free hosting, own everything forever.</p>
+                <div class="price" style="color: var(--accent-cyan);">Free / $79 / $279</div>
+                <div class="product-tags">
+                    <span class="product-tag">AI</span>
+                    <span class="product-tag">Cloudflare</span>
+                    <span class="product-tag">Templates</span>
+                </div>
+            </a>
+            
+            <a href="/winforensics.html" class="product-card">
+                <div class="product-icon" style="color: var(--accent-orange);">WF</div>
+                <h3>WinForensics</h3>
+                <p>Digital forensics toolkit. Registry analysis, file recovery, timeline generation, evidence preservation.</p>
+                <div class="price">$2</div>
+                <div class="product-tags">
+                    <span class="product-tag">Rust</span>
+                    <span class="product-tag">Windows</span>
+                    <span class="product-tag">CLI</span>
+                </div>
+            </a>
+            
+            <a href="/website-creator.html" class="product-card">
+                <div class="product-icon" style="color: var(--accent-blue);">WC</div>
+                <h3>Website Creator</h3>
+                <p>AI-powered WordPress builder with security hardening, automated backups, and monitoring built in.</p>
+                <div class="price">$2</div>
+                <div class="product-tags">
+                    <span class="product-tag">WordPress</span>
+                    <span class="product-tag">MCP</span>
+                    <span class="product-tag">AI</span>
+                </div>
+            </a>
+            
+            <a href="/browser-info.html" class="product-card" aria-labelledby="sassy-browser-title" role="article">
+                <span class="product-badge featured">Featured</span>
+                <div class="product-icon">SB</div>
+                <h3 id="sassy-browser-title">Sassy Browser (v2 Tease)</h3>
+                <p>Privacy-first universal file viewer & secure browser — now v2.0.0. Click for details and to support development.</p>
+                <div class="price">Free</div>
+                <div class="product-tags">
+                    <span class="product-tag">Rust</span>
+                    <span class="product-tag">Windows</span>
+                    <span class="product-tag">50K+ Lines</span>
+                </div>
+            </a>
+            
+            <a href="#tools" class="product-card">
+                <span class="product-badge free">Free Tool</span>
+                <div class="product-icon" style="color: var(--accent-yellow);">NA</div>
+                <h3>Network Analysis</h3>
+                <p>Check your connection security, detect VPNs, and get privacy recommendations. Instant results.</p>
+                <div class="price" style="color: var(--accent-yellow);">Free</div>
+                <div class="product-tags">
+                    <span class="product-tag">Free</span>
+                    <span class="product-tag">Instant</span>
+                    <span class="product-tag">No Signup</span>
+                </div>
+            </a>
+        </div>
+    </section>
+
+    <!-- Network Analysis Dashboard -->
+    <section class="dashboard-section" id="tools">
+        <div class="dashboard-container">
+            <span class="section-label">Free Tool</span>
+            <h2 class="section-title" style="text-align: center; max-width: none;">Network Analysis Dashboard</h2>
+            <p class="section-desc" style="text-align: center; margin: 0 auto 3rem;">Enter your ZIP code to analyze your connection and check your privacy status.</p>
+            
+            <div class="search-form">
+                <input type="text" id="zip-input" placeholder="Enter ZIP code (e.g., 53575)" maxlength="5">
+                <button id="analyze-btn" class="btn btn-primary">Analyze</button>
+            </div>
+            
+            <div id="results-container" style="display: none;">
+                <div id="status-banner" class="status-banner">
+                    <span id="status-icon" style="font-size: 1.5rem;"></span>
+                    <div>
+                        <strong id="status-title"></strong>
+                        <p id="status-message" style="color: var(--text-secondary); margin: 0;"></p>
+                    </div>
+                </div>
+
+                <div class="results-grid">
+                    <div class="result-card">
+                        <div class="label">IP Address</div>
+                        <div class="value" id="ip-address">--</div>
+                        <div class="sub">Partially masked</div>
+                    </div>
+                    <div class="result-card">
+                        <div class="label">Location</div>
+                        <div class="value" id="location">--</div>
+                        <div class="sub" id="location-sub">--</div>
+                    </div>
+                    <div class="result-card">
+                        <div class="label">ISP</div>
+                        <div class="value" id="isp">--</div>
+                        <div class="sub" id="asn">--</div>
+                    </div>
+                    <div class="result-card">
+                        <div class="label">Latency</div>
+                        <div class="value" id="ping">--</div>
+                        <div class="sub">ms to Cloudflare edge</div>
+                    </div>
+                </div>
+
+                <div id="verify-banner" class="status-banner" style="margin-top: 1rem;">
+                    <span style="font-size: 1.5rem;" id="verify-icon"></span>
+                    <div>
+                        <strong id="verify-title">ZIP Verification</strong>
+                        <p id="verify-message" style="color: var(--text-secondary); margin: 0;"></p>
+                    </div>
+                </div>
+
+                <div id="vpn-status" class="status-banner" style="margin-top: 0.5rem;">
+                    <span style="font-size: 1.5rem;" id="vpn-icon"></span>
+                    <div>
+                        <strong id="vpn-title">VPN Detection</strong>
+                        <p id="vpn-message" style="color: var(--text-secondary); margin: 0;"></p>
+                    </div>
+                </div>
+
+                <div id="cf-details" style="margin-top: 1rem; display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem;">
+                    <div class="result-card" style="padding: 0.75rem;">
+                        <div class="label" style="font-size: 0.7rem;">CF Edge</div>
+                        <div class="value" style="font-size: 0.9rem;" id="cf-colo">--</div>
+                    </div>
+                    <div class="result-card" style="padding: 0.75rem;">
+                        <div class="label" style="font-size: 0.7rem;">TLS</div>
+                        <div class="value" style="font-size: 0.9rem;" id="cf-tls">--</div>
+                    </div>
+                    <div class="result-card" style="padding: 0.75rem;">
+                        <div class="label" style="font-size: 0.7rem;">Protocol</div>
+                        <div class="value" style="font-size: 0.9rem;" id="cf-http">--</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div id="loading-state" style="display: none; text-align: center; padding: 3rem;">
+                <div style="width: 40px; height: 40px; border: 3px solid var(--border-subtle); border-top-color: var(--accent-primary); border-radius: 50%; margin: 0 auto 1rem; animation: spin 1s linear infinite;"></div>
+                <p style="color: var(--text-secondary);">Analyzing your connection...</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- About -->
+    <section id="about">
+        <div class="about-grid">
+            <div>
+                <span class="section-label">About Us</span>
+                <h2 class="section-title">Built by a veteran. For everyone who deserves protection.</h2>
+                <p class="section-desc">Sassy Consulting LLC is a veteran-owned software company based in Wisconsin. Founded by a U.S. Army veteran with 11 years of service, we build tools that prioritize user privacy, security, and ownership.</p>
+                
+                <div class="values-list">
+                    <div class="value-item">
+                        <div class="value-icon">P</div>
+                        <div class="value-text">
+                            <h4>Privacy First</h4>
+                            <p>No tracking, no telemetry, no data collection</p>
+                        </div>
+                    </div>
+                    <div class="value-item">
+                        <div class="value-icon">S</div>
+                        <div class="value-text">
+                            <h4>Source Available</h4>
+                            <p>Audit our code on GitHub</p>
+                        </div>
+                    </div>
+                    <div class="value-item">
+                        <div class="value-icon">H</div>
+                        <div class="value-text">
+                            <h4>Security Hardened</h4>
+                            <p>Built in Rust with memory safety</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="code-window">
+                <div class="code-header">
+                    <span class="code-dot red"></span>
+                    <span class="code-dot yellow"></span>
+                    <span class="code-dot green"></span>
+                </div>
+                <pre><code><span class="kw">pub struct</span> <span class="ty">SassyConsulting</span> {
+    privacy: <span class="ty">Priority</span>::Maximum,
+    data_collection: <span class="ty">Option</span>&lt;<span class="ty">Never</span>&gt;,
+    source_code: <span class="ty">Visibility</span>::Auditable,
+    telemetry: <span class="lit">false</span>,
+    veteran_owned: <span class="lit">true</span>,
+    years_service: <span class="lit">11</span>,
+    location: <span class="str">"Wisconsin"</span>,
+}</code></pre>
+            </div>
+        </div>
+    </section>
+
+    <!-- CTA -->
+    <section class="cta">
+        <h2>Your data. Your control. Your choice.</h2>
+        <p>Start with our free tools, or grab a $2 license.</p>
+        <div class="cta-buttons">
+            <a href="#tools" class="btn btn-primary btn-large">Try Free Tools</a>
+            <a href="#products" class="btn btn-secondary btn-large">View Products</a>
+            <a href="https://github.com/sassyconsultingllc" class="btn btn-secondary btn-large">GitHub</a>
+        </div>
+    </section>
+
+    <!-- Contact Form -->
+    <section id="contact" style="padding: 6rem 2rem; max-width: 600px; margin: 0 auto;">
+        <span class="section-label">Contact Us</span>
+        <h2 class="section-title">Get in Touch</h2>
+        <p class="section-desc">Have questions? We'd love to hear from you.</p>
+        
+        <form action="/api/contact" method="POST" style="background: var(--bg-secondary); border: 1px solid var(--border-subtle); border-radius: 16px; padding: 2rem;">
+            <div style="margin-bottom: 1.5rem;">
+                <label for="name" style="display: block; margin-bottom: 0.5rem; color: var(--text-secondary); font-size: 0.9rem;">Name</label>
+                <input type="text" id="name" name="name" required minlength="2" maxlength="100"
+                    style="width: 100%; padding: 0.75rem 1rem; background: var(--bg-tertiary); border: 1px solid var(--border-subtle); border-radius: 8px; color: var(--text-primary); font-size: 1rem;"
+                    placeholder="Your name">
+            </div>
+            <div style="margin-bottom: 1.5rem;">
+                <label for="email" style="display: block; margin-bottom: 0.5rem; color: var(--text-secondary); font-size: 0.9rem;">Email</label>
+                <input type="email" id="email" name="email" required
+                    style="width: 100%; padding: 0.75rem 1rem; background: var(--bg-tertiary); border: 1px solid var(--border-subtle); border-radius: 8px; color: var(--text-primary); font-size: 1rem;"
+                    placeholder="you@example.com">
+            </div>
+            <div style="margin-bottom: 1.5rem;">
+                <label for="message" style="display: block; margin-bottom: 0.5rem; color: var(--text-secondary); font-size: 0.9rem;">Message</label>
+                <textarea id="message" name="message" required minlength="10" maxlength="1000" rows="5"
+                    style="width: 100%; padding: 0.75rem 1rem; background: var(--bg-tertiary); border: 1px solid var(--border-subtle); border-radius: 8px; color: var(--text-primary); font-size: 1rem; resize: vertical;"
+                    placeholder="How can we help?"></textarea>
+            </div>
+            <button type="submit" class="btn btn-primary btn-large" style="width: 100%;">
+                Send Message →
+            </button>
+        </form>
+    </section>
+
+    <!-- Footer -->
+    <footer>
+        <div class="footer-content">
+            <div class="footer-left">
+                <strong>Sassy Consulting LLC</strong> - Veteran-Owned, Wisconsin-Made<br>
+                <span style="font-size: 0.8rem;">Still serving. Different uniform.</span>
+            </div>
+            <div class="footer-links">
+                <a href="/browser.html">Browser</a>
+                <a href="/sassy-talk.html">Sassy-Talk</a>
+                <a href="https://mybestsites.online">My Best Sites</a>
+                <a href="https://github.com/sassyconsultingllc">GitHub</a>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        document.getElementById('analyze-btn').addEventListener('click', analyze);
+        document.getElementById('zip-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') analyze();
+        });
+
+        async function analyze() {
+            const zip = document.getElementById('zip-input').value.trim();
+            if (!zip || !/^\d{5}$/.test(zip)) {
+                alert('Please enter a valid 5-digit ZIP code');
+                return;
+            }
+
+            document.getElementById('loading-state').style.display = 'block';
+            document.getElementById('results-container').style.display = 'none';
+
+            try {
+                const response = await fetch('/api/analyze', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ zip_code: zip })
+                });
+
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+
+                // ── Status Banner ──
+                const banner = document.getElementById('status-banner');
+                const statusIcon = document.getElementById('status-icon');
+                banner.className = 'status-banner';
+
+                if (data.connection_status === 'safe') {
+                    banner.classList.add('safe');
+                    statusIcon.textContent = '\u2705';
+                } else if (data.connection_status === 'protected') {
+                    banner.classList.add('protected');
+                    statusIcon.textContent = '\uD83D\uDEE1\uFE0F';
+                } else {
+                    banner.classList.add('warning');
+                    statusIcon.textContent = '\u26A0\uFE0F';
+                }
+                document.getElementById('status-title').textContent = data.status_message;
+
+                // ── Connection Details ──
+                document.getElementById('ip-address').textContent = data.ip || '--';
+                const loc = data.location || {};
+                document.getElementById('location').textContent =
+                    (loc.city && loc.city !== 'Unknown' ? loc.city + ', ' : '') + (loc.region || loc.country || '--');
+                document.getElementById('location-sub').textContent =
+                    loc.country + (loc.postal && loc.postal !== 'N/A' ? ' \u2022 CF postal: ' + loc.postal : '');
+                document.getElementById('isp').textContent = (data.isp?.name || '--').substring(0, 25);
+                document.getElementById('asn').textContent = data.isp?.asn || '--';
+                document.getElementById('ping').textContent = data.ping_ms || '--';
+
+                // ── ZIP Verification Banner ──
+                const v = data.verification || {};
+                const verifyBanner = document.getElementById('verify-banner');
+                const verifyIcon = document.getElementById('verify-icon');
+                const verifyTitle = document.getElementById('verify-title');
+                const verifyMsg = document.getElementById('verify-message');
+                verifyBanner.className = 'status-banner';
+
+                if (v.zip_match === 'exact') {
+                    verifyBanner.classList.add('safe');
+                    verifyIcon.textContent = '\u2705';
+                    verifyTitle.textContent = 'ZIP Verified \u2014 Exact Match';
+                    verifyMsg.textContent = `Your ZIP (${zip}) matches Cloudflare geolocation (${v.cf_postal}).`;
+                } else if (v.zip_match === 'region') {
+                    verifyBanner.classList.add('safe');
+                    verifyIcon.textContent = '\u2705';
+                    verifyTitle.textContent = 'ZIP Verified \u2014 Same Region';
+                    verifyMsg.textContent = `Your ZIP (${zip}) is in the same region as Cloudflare detected (${v.cf_postal}).`;
+                } else if (v.zip_match === 'mismatch') {
+                    verifyBanner.classList.add('warning');
+                    verifyIcon.textContent = '\u26A0\uFE0F';
+                    verifyTitle.textContent = 'ZIP Mismatch';
+                    verifyMsg.textContent = `Your ZIP (${zip}) doesn\u2019t match Cloudflare detected postal (${v.cf_postal}). Possible VPN or proxy.`;
+                } else {
+                    verifyBanner.classList.add('protected');
+                    verifyIcon.textContent = '\uD83D\uDD0D';
+                    verifyTitle.textContent = 'ZIP Unverifiable';
+                    verifyMsg.textContent = 'Cloudflare did not return a postal code for your IP \u2014 cannot verify ZIP.';
+                }
+
+                // ── VPN Detection Banner ──
+                const vpnStatus = document.getElementById('vpn-status');
+                vpnStatus.className = 'status-banner';
+                if (data.vpn?.isVPN) {
+                    vpnStatus.classList.add('protected');
+                    document.getElementById('vpn-icon').textContent = '\uD83D\uDEE1\uFE0F';
+                    document.getElementById('vpn-title').textContent = 'VPN / Proxy Detected';
+                    document.getElementById('vpn-message').textContent = data.vpn.reason;
+                } else {
+                    vpnStatus.classList.add('warning');
+                    document.getElementById('vpn-icon').textContent = '\u26A0\uFE0F';
+                    document.getElementById('vpn-title').textContent = 'No VPN Detected';
+                    document.getElementById('vpn-message').textContent = 'Consider using a VPN for better privacy.';
+                }
+
+                // ── Cloudflare Edge Details ──
+                document.getElementById('cf-colo').textContent = v.cf_colo || '--';
+                document.getElementById('cf-tls').textContent = v.tls || '--';
+                document.getElementById('cf-http').textContent = v.http || '--';
+
+                document.getElementById('loading-state').style.display = 'none';
+                document.getElementById('results-container').style.display = 'block';
+
+            } catch (err) {
+                document.getElementById('loading-state').style.display = 'none';
+                alert('Analysis failed: ' + err.message);
+            }
+        }
+    </script>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'9d9f38477c3c6b56',t:'MTc3MzExMzIwNg=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>

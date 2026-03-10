@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WinForensics | Digital Forensics Toolkit</title>
+    <meta name="description" content="Registry analysis, file recovery, timeline generation, evidence preservation. Built in Rust for Windows.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0a0a0a;
+            --bg-secondary: #111111;
+            --bg-tertiary: #1a1a1a;
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0a0;
+            --text-tertiary: #606060;
+            --accent-primary: #f97316;
+            --accent-secondary: #ea580c;
+            --accent-glow: rgba(249, 115, 22, 0.15);
+            --accent-green: #22c55e;
+            --border-subtle: #222222;
+            --border-medium: #333333;
+            --gradient-brand: linear-gradient(90deg, #f97316, #eab308);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html { scroll-behavior: smooth; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        .mono { font-family: 'JetBrains Mono', monospace; }
+
+        nav {
+            position: fixed;
+            top: 0; left: 0; right: 0;
+            z-index: 1000;
+            padding: 1rem 2rem;
+            background: rgba(10, 10, 10, 0.8);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        nav .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            font-weight: 700;
+            font-size: 1.25rem;
+            color: var(--text-primary);
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .logo-icon {
+            width: 32px;
+            height: 32px;
+            background: var(--accent-primary);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            font-weight: 700;
+            color: #000;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 2rem;
+            align-items: center;
+        }
+
+        .nav-links a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: color 0.2s;
+        }
+
+        .nav-links a:hover { color: var(--text-primary); }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.625rem 1.25rem;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            text-decoration: none;
+            transition: all 0.2s;
+            cursor: pointer;
+            border: none;
+        }
+
+        .btn-primary { background: var(--accent-primary); color: #000; }
+        .btn-primary:hover { background: var(--accent-secondary); transform: translateY(-1px); }
+        .btn-secondary { background: transparent; color: var(--text-primary); border: 1px solid var(--border-medium); }
+        .btn-secondary:hover { background: var(--bg-tertiary); }
+        .btn-large { padding: 1rem 2rem; font-size: 1rem; }
+
+        .hero {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            padding: 8rem 2rem 4rem;
+            position: relative;
+        }
+
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 50%;
+            transform: translateX(-50%);
+            width: 800px; height: 800px;
+            background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .hero-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-subtle);
+            border-radius: 100px;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 2rem;
+        }
+
+        .hero-badge .dot {
+            width: 8px; height: 8px;
+            background: var(--accent-primary);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+        .hero h1 {
+            font-size: clamp(2.5rem, 8vw, 5rem);
+            font-weight: 700;
+            line-height: 1.1;
+            margin-bottom: 1.5rem;
+        }
+
+        .hero h1 .gradient {
+            background: var(--gradient-brand);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .hero-sub {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin-bottom: 3rem;
+        }
+
+        .hero-cta { display: flex; gap: 1rem; flex-wrap: wrap; justify-content: center; }
+
+        .price-hero {
+            background: var(--bg-secondary);
+            border: 1px solid var(--accent-primary);
+            border-radius: 16px;
+            padding: 2.5rem 4rem;
+            margin-top: 3rem;
+        }
+
+        .price-hero .price { font-size: 4rem; font-weight: 700; color: var(--accent-primary); }
+        .price-hero .price-sub { color: var(--text-tertiary); }
+
+        .hero-stats {
+            display: flex;
+            gap: 3rem;
+            margin-top: 4rem;
+            padding-top: 3rem;
+            border-top: 1px solid var(--border-subtle);
+        }
+
+        .stat { text-align: center; }
+        .stat-value { font-size: 2rem; font-weight: 700; color: var(--accent-primary); }
+        .stat-label { font-size: 0.85rem; color: var(--text-tertiary); margin-top: 0.25rem; }
+
+        section { padding: 6rem 2rem; max-width: 1200px; margin: 0 auto; }
+
+        .section-label {
+            display: block;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: var(--accent-primary);
+            margin-bottom: 1rem;
+        }
+
+        .section-title { font-size: clamp(1.75rem, 4vw, 2.5rem); font-weight: 700; margin-bottom: 1rem; }
+        .section-desc { font-size: 1.1rem; color: var(--text-secondary); max-width: 600px; margin-bottom: 3rem; }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .feature-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-subtle);
+            border-radius: 12px;
+            padding: 2rem;
+            transition: all 0.3s;
+        }
+
+        .feature-card:hover { border-color: var(--accent-primary); transform: translateY(-2px); }
+
+        .feature-icon {
+            width: 48px; height: 48px;
+            background: var(--bg-tertiary);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+            font-weight: 700;
+            margin-bottom: 1.25rem;
+            color: var(--accent-primary);
+        }
+
+        .feature-card h3 { font-size: 1.125rem; margin-bottom: 0.75rem; }
+        .feature-card p { color: var(--text-secondary); font-size: 0.95rem; }
+
+        .code-demo {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-subtle);
+            border-radius: 12px;
+            overflow: hidden;
+            margin-top: 3rem;
+        }
+
+        .code-header {
+            display: flex;
+            gap: 8px;
+            padding: 1rem;
+            background: var(--bg-tertiary);
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .code-dot { width: 12px; height: 12px; border-radius: 50%; }
+        .code-dot.red { background: #ff5f56; }
+        .code-dot.yellow { background: #ffbd2e; }
+        .code-dot.green { background: #27ca40; }
+
+        .code-demo pre {
+            padding: 1.5rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            line-height: 1.7;
+            overflow-x: auto;
+            color: var(--text-secondary);
+        }
+
+        .code-demo .cmd { color: var(--accent-primary); }
+        .code-demo .flag { color: var(--accent-green); }
+        .code-demo .output { color: var(--text-tertiary); }
+
+        .cta {
+            text-align: center;
+            padding: 8rem 2rem;
+            position: relative;
+        }
+
+        .cta::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 50%;
+            transform: translateX(-50%);
+            width: 600px; height: 600px;
+            background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .cta h2 { font-size: clamp(2rem, 5vw, 3rem); margin-bottom: 1rem; }
+        .cta p { font-size: 1.25rem; color: var(--text-secondary); margin-bottom: 2rem; }
+        .cta-buttons { display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; }
+
+        footer {
+            border-top: 1px solid var(--border-subtle);
+            padding: 3rem 2rem;
+        }
+
+        .footer-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 2rem;
+        }
+
+        .footer-left { color: var(--text-tertiary); font-size: 0.9rem; }
+        .footer-links { display: flex; gap: 2rem; }
+        .footer-links a { color: var(--text-secondary); text-decoration: none; font-size: 0.9rem; }
+        .footer-links a:hover { color: var(--text-primary); }
+
+        @media (max-width: 768px) {
+            .nav-links { display: none; }
+            .hero-stats { flex-direction: column; gap: 1.5rem; }
+            .features-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <nav>
+        <div class="container">
+            <a href="/" class="logo">
+                <span class="logo-icon">WF</span>
+                WinForensics
+            </a>
+            <div class="nav-links">
+                <a href="/">Home</a>
+                <a href="#features">Features</a>
+                <a href="#usage">Usage</a>
+                <a href="#download">Download</a>
+                <a href="https://github.com/sassyconsultingllc" class="btn btn-primary">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <section class="hero">
+        <div class="hero-badge">
+            <span class="dot"></span>
+            <span>Security Tool</span>
+        </div>
+        
+        <h1>
+            Digital forensics.<br>
+            <span class="gradient">Memory-safe precision.</span>
+        </h1>
+        
+        <p class="hero-sub">
+            Registry analysis, file recovery, timeline generation, evidence preservation. 
+            Built in Rust for Windows incident response.
+        </p>
+        
+        <div class="hero-cta">
+            <a href="#download" class="btn btn-primary btn-large">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="7 10 12 15 17 10"></polyline>
+                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                </svg>
+                Download Now - $2
+            </a>
+            <a href="https://github.com/sassyconsultingllc" class="btn btn-secondary btn-large">View Source</a>
+        </div>
+        
+        <div class="price-hero">
+            <div class="price">$2</div>
+            <div class="price-sub">One-time purchase. Lifetime license.</div>
+        </div>
+        
+        <div class="hero-stats">
+            <div class="stat">
+                <div class="stat-value">Rust</div>
+                <div class="stat-label">Memory Safe</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">CLI</div>
+                <div class="stat-label">Interface</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">0</div>
+                <div class="stat-label">Dependencies</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">Fast</div>
+                <div class="stat-label">Execution</div>
+            </div>
+        </div>
+    </section>
+
+    <section id="features">
+        <span class="section-label">Features</span>
+        <h2 class="section-title">Professional forensics tools. No bloat.</h2>
+        <p class="section-desc">Everything you need for Windows incident response in a single binary.</p>
+        
+        <div class="features-grid">
+            <div class="feature-card">
+                <div class="feature-icon">REG</div>
+                <h3>Registry Analysis</h3>
+                <p>Parse and analyze Windows registry hives. Extract user activity, installed programs, network connections, and persistence mechanisms.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">REC</div>
+                <h3>File Recovery</h3>
+                <p>Recover deleted files from NTFS volumes. Carve files from unallocated space using signature-based detection.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">TL</div>
+                <h3>Timeline Generation</h3>
+                <p>Build comprehensive timelines from multiple sources. Correlate events across registry, file system, and logs.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">EV</div>
+                <h3>Evidence Preservation</h3>
+                <p>Create forensically sound copies with hash verification. Chain of custody documentation built in.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">MFT</div>
+                <h3>MFT Parser</h3>
+                <p>Parse NTFS Master File Table for complete file system analysis. Extract timestamps, paths, and metadata.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">LOG</div>
+                <h3>Event Log Analysis</h3>
+                <p>Parse Windows Event Logs (EVTX). Filter, search, and export security-relevant events.</p>
+            </div>
+        </div>
+    </section>
+
+    <section id="usage" style="background: var(--bg-secondary); padding: 6rem 2rem;">
+        <div style="max-width: 1000px; margin: 0 auto;">
+            <span class="section-label">Usage</span>
+            <h2 class="section-title">Simple CLI. Powerful results.</h2>
+            
+            <div class="code-demo">
+                <div class="code-header">
+                    <span class="code-dot red"></span>
+                    <span class="code-dot yellow"></span>
+                    <span class="code-dot green"></span>
+                </div>
+                <pre><code><span class="output"># Analyze registry for persistence mechanisms</span>
+<span class="cmd">winforensics</span> <span class="flag">registry</span> --hive C:\Windows\System32\config\SOFTWARE --persistence
+
+<span class="output"># Generate timeline from multiple sources</span>
+<span class="cmd">winforensics</span> <span class="flag">timeline</span> --mft C:\$MFT --evtx C:\Windows\System32\winevt\Logs\ --output timeline.csv
+
+<span class="output"># Recover deleted files</span>
+<span class="cmd">winforensics</span> <span class="flag">recover</span> --volume C: --output recovered/ --signatures jpg,png,pdf,docx
+
+<span class="output"># Parse MFT for file system analysis</span>
+<span class="cmd">winforensics</span> <span class="flag">mft</span> --input C:\$MFT --output mft_analysis.json
+
+<span class="output"># Create forensic image with verification</span>
+<span class="cmd">winforensics</span> <span class="flag">image</span> --source \\.\PhysicalDrive0 --output evidence.dd --verify</code></pre>
+            </div>
+        </div>
+    </section>
+
+    <section id="download">
+        <span class="section-label">Download</span>
+        <h2 class="section-title" style="text-align: center;">Get WinForensics for Windows.</h2>
+        <p class="section-desc" style="text-align: center; margin: 0 auto 2rem;">Purchase a license, then download the CLI tool.</p>
+        
+        <div style="text-align: center;">
+            <button onclick="buyProduct('winforensics')" class="btn btn-primary btn-large" style="margin-bottom: 1rem;">Buy License - $2</button>
+            <br>
+            <a href="/download/winforensics/windows/winforensics.exe" class="btn btn-secondary btn-large">Download CLI (Windows)</a>
+        </div>
+    </section>
+
+    <section class="cta">
+        <h2>Professional forensics. $2. Forever.</h2>
+        <p>No subscriptions. No cloud dependencies. Just tools.</p>
+        <div class="cta-buttons">
+            <button onclick="buyProduct('winforensics')" class="btn btn-primary btn-large">Buy Now - $2</button>
+            <a href="https://github.com/sassyconsultingllc" class="btn btn-secondary btn-large">View Source Code</a>
+        </div>
+    </section>
+
+    <footer>
+        <div class="footer-content">
+            <div class="footer-left">
+                <strong>WinForensics</strong> by <a href="/" style="color: var(--accent-primary);">Sassy Consulting LLC</a><br>
+                <span style="font-size: 0.8rem;">Veteran-Owned. Wisconsin-Made.</span>
+            </div>
+            <div class="footer-links">
+                <a href="/">Home</a>
+                <a href="/#products">Products</a>
+                <a href="https://github.com/sassyconsultingllc">GitHub</a>
+            </div>
+        </div>
+    </footer>
+
+    <script src="checkout.js"></script>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'9d9f46a43dc586c1',t:'MTc3MzExMzc5NQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>

@@ -14,7 +14,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 
-export class PttRelay extends DurableObject {
+export class PttRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     // Map<WebSocket, { id: string, device: string, joinedAt: number }>

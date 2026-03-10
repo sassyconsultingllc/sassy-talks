@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sassy-Talk | Encrypted Walkie-Talkie</title>
+    <meta name="description" content="AES-256-GCM encrypted voice chat over local WiFi. No servers, no accounts, no data collection.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0a0a0a;
+            --bg-secondary: #111111;
+            --bg-tertiary: #1a1a1a;
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0a0;
+            --text-tertiary: #606060;
+            --accent-primary: #06b6d4;
+            --accent-secondary: #0891b2;
+            --accent-glow: rgba(6, 182, 212, 0.15);
+            --accent-green: #22c55e;
+            --border-subtle: #222222;
+            --border-medium: #333333;
+            --gradient-brand: linear-gradient(90deg, #06b6d4, #22c55e);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html { scroll-behavior: smooth; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        nav {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 1000;
+            padding: 1rem 2rem;
+            background: rgba(10, 10, 10, 0.8);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        nav .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            font-weight: 700;
+            font-size: 1.25rem;
+            color: var(--text-primary);
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .logo-icon {
+            width: 32px;
+            height: 32px;
+            background: var(--accent-primary);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            font-weight: 700;
+            color: #000;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 2rem;
+            align-items: center;
+        }
+
+        .nav-links a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: color 0.2s;
+        }
+
+        .nav-links a:hover { color: var(--text-primary); }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.625rem 1.25rem;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            text-decoration: none;
+            transition: all 0.2s;
+            cursor: pointer;
+            border: none;
+        }
+
+        .btn-primary {
+            background: var(--accent-primary);
+            color: #000;
+        }
+
+        .btn-primary:hover {
+            background: var(--accent-secondary);
+            transform: translateY(-1px);
+        }
+
+        .btn-secondary {
+            background: transparent;
+            color: var(--text-primary);
+            border: 1px solid var(--border-medium);
+        }
+
+        .btn-secondary:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .btn-large {
+            padding: 1rem 2rem;
+            font-size: 1rem;
+        }
+
+        .hero {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            padding: 8rem 2rem 4rem;
+            position: relative;
+        }
+
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 800px;
+            height: 800px;
+            background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .hero-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-subtle);
+            border-radius: 100px;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 2rem;
+        }
+
+        .hero-badge .dot {
+            width: 8px;
+            height: 8px;
+            background: var(--accent-primary);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .hero h1 {
+            font-size: clamp(2.5rem, 8vw, 5rem);
+            font-weight: 700;
+            line-height: 1.1;
+            margin-bottom: 1.5rem;
+        }
+
+        .hero h1 .gradient {
+            background: var(--gradient-brand);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .hero-sub {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin-bottom: 3rem;
+        }
+
+        .hero-cta {
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .price-hero {
+            background: var(--bg-secondary);
+            border: 1px solid var(--accent-primary);
+            border-radius: 16px;
+            padding: 2.5rem 4rem;
+            margin-top: 3rem;
+        }
+
+        .price-hero .price {
+            font-size: 4rem;
+            font-weight: 700;
+            color: var(--accent-primary);
+        }
+
+        .price-hero .price-sub {
+            color: var(--text-tertiary);
+        }
+
+        .hero-stats {
+            display: flex;
+            gap: 3rem;
+            margin-top: 4rem;
+            padding-top: 3rem;
+            border-top: 1px solid var(--border-subtle);
+        }
+
+        .stat { text-align: center; }
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--accent-primary);
+        }
+        .stat-label {
+            font-size: 0.85rem;
+            color: var(--text-tertiary);
+            margin-top: 0.25rem;
+        }
+
+        section {
+            padding: 6rem 2rem;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .section-label {
+            display: block;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: var(--accent-primary);
+            margin-bottom: 1rem;
+        }
+
+        .section-title {
+            font-size: clamp(1.75rem, 4vw, 2.5rem);
+            font-weight: 700;
+            margin-bottom: 1rem;
+        }
+
+        .section-desc {
+            font-size: 1.1rem;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin-bottom: 3rem;
+        }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .feature-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-subtle);
+            border-radius: 12px;
+            padding: 2rem;
+            transition: all 0.3s;
+        }
+
+        .feature-card:hover {
+            border-color: var(--accent-primary);
+            transform: translateY(-2px);
+        }
+
+        .feature-icon {
+            width: 48px;
+            height: 48px;
+            background: var(--bg-tertiary);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+            font-weight: 700;
+            margin-bottom: 1.25rem;
+            color: var(--accent-primary);
+        }
+
+        .feature-card h3 {
+            font-size: 1.125rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .feature-card p {
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+        }
+
+        .specs-section {
+            background: var(--bg-secondary);
+            padding: 6rem 2rem;
+        }
+
+        .specs-container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        .table-wrapper {
+            border: 1px solid var(--border-subtle);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            padding: 1rem 1.25rem;
+            text-align: left;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        th {
+            background: var(--bg-tertiary);
+            font-weight: 600;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-secondary);
+        }
+
+        td { color: var(--text-secondary); }
+        td:first-child { font-weight: 600; color: var(--text-primary); }
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background: var(--bg-tertiary); }
+
+        .download-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 2rem;
+            max-width: 700px;
+            margin: 3rem auto 0;
+        }
+
+        .download-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-subtle);
+            border-radius: 16px;
+            padding: 2.5rem;
+            text-align: center;
+            transition: all 0.3s;
+        }
+
+        .download-card:hover {
+            border-color: var(--accent-primary);
+            transform: translateY(-4px);
+        }
+
+        .platform-icon {
+            width: 64px;
+            height: 64px;
+            background: var(--bg-tertiary);
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            margin: 0 auto 1.5rem;
+            color: var(--accent-primary);
+            font-weight: 700;
+        }
+
+        .download-card h3 {
+            font-size: 1.25rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .download-card p {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .cta {
+            text-align: center;
+            padding: 8rem 2rem;
+            position: relative;
+        }
+
+        .cta::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .cta h2 {
+            font-size: clamp(2rem, 5vw, 3rem);
+            margin-bottom: 1rem;
+        }
+
+        .cta p {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            margin-bottom: 2rem;
+        }
+
+        .cta-buttons {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        footer {
+            border-top: 1px solid var(--border-subtle);
+            padding: 3rem 2rem;
+        }
+
+        .footer-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 2rem;
+        }
+
+        .footer-left {
+            color: var(--text-tertiary);
+            font-size: 0.9rem;
+        }
+
+        .footer-links {
+            display: flex;
+            gap: 2rem;
+        }
+
+        .footer-links a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.9rem;
+        }
+
+        .footer-links a:hover { color: var(--text-primary); }
+
+        @media (max-width: 768px) {
+            .nav-links { display: none; }
+            .hero-stats { flex-direction: column; gap: 1.5rem; }
+            .features-grid { grid-template-columns: 1fr; }
+            .download-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <nav>
+        <div class="container">
+            <a href="/" class="logo">
+                <span class="logo-icon">ST</span>
+                Sassy-Talk
+            </a>
+            <div class="nav-links">
+                <a href="/">Home</a>
+                <a href="#features">Features</a>
+                <a href="#specs">Specs</a>
+                <a href="#download">Download</a>
+                <a href="https://github.com/sassyconsultingllc" class="btn btn-primary">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <section class="hero">
+        <div class="hero-badge">
+            <span class="dot"></span>
+            <span>Communication Tool</span>
+        </div>
+        
+        <h1>
+            Encrypted voice chat.<br>
+            <span class="gradient">No strings attached.</span>
+        </h1>
+        
+        <p class="hero-sub">
+            Military-grade AES-256-GCM encryption over local WiFi. No servers, 
+            no accounts, no data collection. Just secure communication.
+        </p>
+        
+        <div class="hero-cta">
+            <a href="#download" class="btn btn-primary btn-large">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="7 10 12 15 17 10"></polyline>
+                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                </svg>
+                Download Now - $2
+            </a>
+            <a href="https://github.com/sassyconsultingllc" class="btn btn-secondary btn-large">View Source</a>
+        </div>
+        
+        <div class="price-hero">
+            <div class="price">$2</div>
+            <div class="price-sub">One-time purchase. Lifetime license.</div>
+        </div>
+        
+        <div class="hero-stats">
+            <div class="stat">
+                <div class="stat-value">AES-256</div>
+                <div class="stat-label">Encryption</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">99</div>
+                <div class="stat-label">Channels</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">0</div>
+                <div class="stat-label">Servers</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">0</div>
+                <div class="stat-label">Data Collected</div>
+            </div>
+        </div>
+    </section>
+
+    <section id="features">
+        <span class="section-label">Features</span>
+        <h2 class="section-title">Everything you need. Nothing you don't.</h2>
+        <p class="section-desc">Built for teams that need secure, local communication without the complexity.</p>
+        
+        <div class="features-grid">
+            <div class="feature-card">
+                <div class="feature-icon">ENC</div>
+                <h3>AES-256-GCM Encryption</h3>
+                <p>Military-grade encryption for all voice transmissions. Your conversations stay private, even on shared networks.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">LAN</div>
+                <h3>No Internet Required</h3>
+                <p>Perfect for offline environments, the encrypted communication is between the two (or more) devices, no servers or outside listeners.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">CH</div>
+                <h3>99 Encrypted Channels</h3>
+                <p>Create separate encrypted channels for different teams. Each channel has its own encryption key.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">0</div>
+                <h3>Zero Data Collection</h3>
+                <p>No accounts, no tracking, no analytics. We never see your data because it never leaves your network.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">KEY</div>
+                <h3>ECDH Key Exchange</h3>
+                <p>Secure key exchange using X25519 elliptic curve. Same algorithm used by Signal, WhatsApp, and WireGuard.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">PTT</div>
+                <h3>Push-to-Talk</h3>
+                <p>Simple, familiar interface. Hold to talk, release to listen. Works exactly like a traditional walkie-talkie.</p>
+            </div>
+        </div>
+    </section>
+
+    <section class="specs-section" id="specs">
+        <div class="specs-container">
+            <span class="section-label">Technical Specifications</span>
+            <h2 class="section-title">Built with security-first engineering.</h2>
+            
+            <div class="table-wrapper" style="margin-top: 2rem;">
+                <table>
+                    <tbody>
+                        <tr><td>Encryption</td><td>AES-256-GCM (Galois/Counter Mode)</td></tr>
+                        <tr><td>Key Exchange</td><td>QR-based pre-shared key + ECDH X25519</td></tr>
+                        <tr><td>Audio Codec</td><td>IMA ADPCM (4:1 compression, low latency)</td></tr>
+                        <tr><td>Network</td><td>WiFi Direct · WiFi multicast · Cellular relay</td></tr>
+                        <tr><td>Language</td><td>Rust (memory-safe)</td></tr>
+                        <tr><td>Platforms</td><td>Android 8.0+, Windows 10/11</td></tr>
+                        <tr><td>Install Size</td><td>~15 MB (Android), ~25 MB (Windows)</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </section>
+
+    <section id="download">
+        <span class="section-label">Download</span>
+        <h2 class="section-title" style="text-align: center;">Get Sassy-Talk for your platform.</h2>
+        <p class="section-desc" style="text-align: center; margin: 0 auto 1rem;">Purchase a license, then download for Android or Windows.</p>
+        
+        <div style="text-align: center; margin-bottom: 2rem;">
+            <button onclick="buyProduct('sassy-talk')" class="btn btn-primary btn-large">Buy License - $2</button>
+        </div>
+        
+        <div class="download-grid">
+            <div class="download-card">
+                <div class="platform-icon"><svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor"><path d="M6 18c0 .55.45 1 1 1h1v3.5c0 .83.67 1.5 1.5 1.5s1.5-.67 1.5-1.5V19h2v3.5c0 .83.67 1.5 1.5 1.5s1.5-.67 1.5-1.5V19h1c.55 0 1-.45 1-1V8H6v10zM3.5 8C2.67 8 2 8.67 2 9.5v7c0 .83.67 1.5 1.5 1.5S5 17.33 5 16.5v-7C5 8.67 4.33 8 3.5 8zm17 0c-.83 0-1.5.67-1.5 1.5v7c0 .83.67 1.5 1.5 1.5s1.5-.67 1.5-1.5v-7c0-.83-.67-1.5-1.5-1.5zm-4.97-5.84l1.3-1.3c.2-.2.2-.51 0-.71-.2-.2-.51-.2-.71 0l-1.48 1.48A5.84 5.84 0 0012 1c-.96 0-1.86.23-2.66.63L7.85.15c-.2-.2-.51-.2-.71 0-.2.2-.2.51 0 .71l1.31 1.31A5.983 5.983 0 006 7h12c0-2.12-1.1-3.98-2.77-5.04h.3zM10 5H9V4h1v1zm5 0h-1V4h1v1z"/></svg></div>
+                <h3>Android</h3>
+                <p>APK for Android 8.0+</p>
+                <a href="/download/sassy-talk/android/sassytalkie.apk" class="btn btn-primary">Download APK</a>
+            </div>
+            <div class="download-card">
+                <div class="platform-icon"><svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor"><rect x="1" y="1" width="10" height="10" rx="1.5"/><rect x="13" y="1" width="10" height="10" rx="1.5"/><rect x="1" y="13" width="10" height="10" rx="1.5"/><rect x="13" y="13" width="10" height="10" rx="1.5"/></svg></div>
+                <h3>Windows</h3>
+                <p>MSI for Windows 10/11</p>
+                <a href="/download/sassy-talk/windows/sassy-talk-setup.msi" class="btn btn-primary">Download MSI</a>
+            </div>
+        </div>
+    </section>
+
+    <section class="cta">
+        <h2>Secure communication. $2. Forever.</h2>
+        <p>No subscriptions. No hidden fees. Just privacy.</p>
+        <div class="cta-buttons">
+            <button onclick="buyProduct('sassy-talk')" class="btn btn-primary btn-large">Buy Now - $2</button>
+            <a href="https://github.com/sassyconsultingllc" class="btn btn-secondary btn-large">View Source Code</a>
+        </div>
+    </section>
+
+    <footer>
+        <div class="footer-content">
+            <div class="footer-left">
+                <strong>Sassy-Talk</strong> by <a href="/" style="color: var(--accent-primary);">Sassy Consulting LLC</a><br>
+                <span style="font-size: 0.8rem;">Veteran-Owned. Wisconsin-Made.</span>
+            </div>
+            <div class="footer-links">
+                <a href="/">Home</a>
+                <a href="/#products">Products</a>
+                <a href="https://github.com/sassyconsultingllc">GitHub</a>
+            </div>
+        </div>
+    </footer>
+
+    <script src="checkout.js"></script>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'9d9f4625fb7068e0',t:'MTc3MzExMzc3NQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>
