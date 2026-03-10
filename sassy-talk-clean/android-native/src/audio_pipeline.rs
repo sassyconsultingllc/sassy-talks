@@ -347,11 +347,7 @@ fn call_transcription_bridge(
     use jni::sys::{JNI_TRUE, JNI_FALSE};
 
     // Use the cached class ref (resolved on the main thread during nativeInit)
-<<<<<<< HEAD
     let bridge_ref: &GlobalRef = match crate::jni_bridge::get_transcription_bridge_class() {
-=======
-    let bridge_ref = match crate::jni_bridge::get_transcription_bridge_class() {
->>>>>>> a2f85e424db1ffaac3647b50ff7dc3fc9d934ea5
         Some(r) => r,
         None => return, // TranscriptionBridge not available (class not found at init)
     };
@@ -388,18 +384,11 @@ fn call_transcription_bridge(
     let j_fav = if is_favorite { JNI_TRUE } else { JNI_FALSE };
     let j_muted = if is_muted { JNI_TRUE } else { JNI_FALSE };
 
-<<<<<<< HEAD
     // Call static method using cached GlobalRef (carries app classloader context)
     // Safety: GlobalRef -> JObject -> JClass cast is valid for class references
     let bridge_class = unsafe { JClass::from_raw(bridge_ref.as_obj().as_raw()) };
     let result = env.call_static_method(
         &bridge_class,
-=======
-    // Call static method: TranscriptionBridge.onAudioReceived(...)
-    // Using the cached GlobalRef which carries the app classloader context
-    let result = env.call_static_method(
-        <&jni::objects::JClass>::from(bridge_ref.as_obj()),
->>>>>>> a2f85e424db1ffaac3647b50ff7dc3fc9d934ea5
         "onAudioReceived",
         "(Ljava/lang/String;Ljava/lang/String;[SZZ)V",
         &[
@@ -416,11 +405,8 @@ fn call_transcription_bridge(
         let _ = env.exception_describe();
         let _ = env.exception_clear();
     }
-<<<<<<< HEAD
     // Don't drop bridge_class - it's borrowed from the global ref, not owned
     std::mem::forget(bridge_class);
-=======
->>>>>>> a2f85e424db1ffaac3647b50ff7dc3fc9d934ea5
 }
 
 #[cfg(test)]

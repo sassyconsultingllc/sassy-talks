@@ -1,0 +1,33 @@
+name = "sassyconsultingllc"
+account_id = "d5ccd0d80780f2d0ab72ab12b15244e2"
+main = "src/worker.js"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ── Durable Objects ──
+[[durable_objects.bindings]]
+name = "PTT_RELAY"
+class_name = "PttRelay"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["PttRelay"]
+
+# ── D1 Database ──
+[[d1_databases]]
+binding = "DB"
+database_name = "sassy-db"
+database_id = "ed5f3cc4-fa38-4eaa-b9ac-8480eb24e2be"
+
+# ── R2 Bucket ──
+[[r2_buckets]]
+binding = "DOWNLOADS"
+bucket_name = "sassy-downloads"
+
+# ── Email ──
+[[send_email]]
+name = "CONTACT_EMAIL"
+
+# ── Assets (static site) ──
+[assets]
+binding = "ASSETS"

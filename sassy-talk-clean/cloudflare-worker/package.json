@@ -1,0 +1,14 @@
+{
+  "name": "sassyconsultingllc",
+  "version": "2.0.0",
+  "private": true,
+  "description": "SassyConsultingLLC Worker with PTT WebSocket relay",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
