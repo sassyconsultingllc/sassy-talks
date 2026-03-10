@@ -49,6 +49,7 @@ fun AppNavigation(
     var currentScreen by remember { mutableStateOf(Screen.Auth) }
     var nativeReady by remember { mutableStateOf(false) }
     var initFailed by remember { mutableStateOf(false) }
+    var bleReady by remember { mutableStateOf(false) }
 
     // ── Phase 1: Wait for permissions ──
     if (!permissionsGranted) {
@@ -108,6 +109,17 @@ fun AppNavigation(
             } else {
                 initFailed = true
             }
+        }
+    }
+
+    // Wait for both native init and the service binding before starting BLE/RFCOMM
+    LaunchedEffect(nativeReady, walkieService) {
+        val service = walkieService
+        if (nativeReady && service != null && !bleReady) {
+            withContext(Dispatchers.IO) {
+                service.initBleTransport()
+            }
+            bleReady = true
         }
     }
 

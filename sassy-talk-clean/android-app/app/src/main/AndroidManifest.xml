@@ -19,6 +19,17 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Bluetooth (Classic + BLE) -->
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
+    <!-- Foreground service for BLE connected device -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
     <!-- Android 13+ notification permission -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
@@ -41,11 +52,11 @@
             </intent-filter>
         </activity>
 
-        <!-- Foreground service for multicast lock + wake lock -->
+        <!-- Foreground service for multicast lock + wake lock + BLE -->
         <service
             android:name=".WalkieService"
             android:exported="false"
-            android:foregroundServiceType="mediaPlayback" />
+            android:foregroundServiceType="mediaPlayback|connectedDevice" />
 
     </application>
 

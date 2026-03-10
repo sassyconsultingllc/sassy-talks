@@ -332,8 +332,10 @@ pub fn spawn_rx_thread(
 
 /// Call the Kotlin TranscriptionBridge.onAudioReceived callback via JNI.
 ///
-/// This forwards decoded PCM audio to the Kotlin layer for voice activity
-/// detection and transcription display.
+/// Uses the cached GlobalRef from nativeInit (resolved on the main thread with
+/// the app classloader) so that native RX threads can find the class.
+/// This avoids ClassNotFoundException on attached native threads which only
+/// have the system classloader.
 fn call_transcription_bridge(
     sender_id: &str,
     sender_name: &str,
@@ -341,8 +343,14 @@ fn call_transcription_bridge(
     is_favorite: bool,
     is_muted: bool,
 ) {
-    use jni::objects::JValue;
+    use jni::objects::{JValue, JClass, GlobalRef};
     use jni::sys::{JNI_TRUE, JNI_FALSE};
+
+    // Use the cached class ref (resolved on the main thread during nativeInit)
+    let bridge_ref: &GlobalRef = match crate::jni_bridge::get_transcription_bridge_class() {
+        Some(r) => r,
+        None => return, // TranscriptionBridge not available (class not found at init)
+    };
 
     let vm = match crate::jni_bridge::get_jvm() {
         Ok(v) => v,
@@ -352,12 +360,6 @@ fn call_transcription_bridge(
     let mut env = match vm.attach_current_thread() {
         Ok(e) => e,
         Err(_) => return,
-    };
-
-    // Find TranscriptionBridge class
-    let bridge_class = match env.find_class("com/sassyconsulting/sassytalkie/TranscriptionBridge") {
-        Ok(c) => c,
-        Err(_) => return, // Class not available (standalone mode)
     };
 
     // Create JNI arguments
@@ -382,9 +384,11 @@ fn call_transcription_bridge(
     let j_fav = if is_favorite { JNI_TRUE } else { JNI_FALSE };
     let j_muted = if is_muted { JNI_TRUE } else { JNI_FALSE };
 
-    // Call static method: TranscriptionBridge.onAudioReceived(...)
-    let _ = env.call_static_method(
-        bridge_class,
+    // Call static method using cached GlobalRef (carries app classloader context)
+    // Safety: GlobalRef -> JObject -> JClass cast is valid for class references
+    let bridge_class = unsafe { JClass::from_raw(bridge_ref.as_obj().as_raw()) };
+    let result = env.call_static_method(
+        &bridge_class,
         "onAudioReceived",
         "(Ljava/lang/String;Ljava/lang/String;[SZZ)V",
         &[
@@ -395,6 +399,14 @@ fn call_transcription_bridge(
             JValue::Bool(j_muted),
         ],
     );
+
+    // Clear any pending exception so it doesn't crash the RX thread
+    if result.is_err() {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+    // Don't drop bridge_class - it's borrowed from the global ref, not owned
+    std::mem::forget(bridge_class);
 }
 
 #[cfg(test)]

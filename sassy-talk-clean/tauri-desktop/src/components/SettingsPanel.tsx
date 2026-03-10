@@ -2,17 +2,7 @@ import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import './SettingsPanel.css';
 import { IconSettings, IconClose } from './Icons';
-
-interface AudioDeviceInfo {
-  name: string;
-  is_default: boolean;
-  device_type: string;
-}
-
-interface AudioDevices {
-  inputs: AudioDeviceInfo[];
-  outputs: AudioDeviceInfo[];
-}
+import type { AudioDevices } from '../types';
 
 interface SettingsPanelProps {
   onClose: () => void;
@@ -47,7 +37,7 @@ function SettingsPanel({ onClose }: SettingsPanelProps) {
 
   const handleInputDeviceChange = async (deviceName: string) => {
     try {
-      await invoke('set_input_device', { deviceName });
+      await invoke('set_input_device', { device_name: deviceName });
       setSelectedInput(deviceName);
     } catch (err) {
       console.error('Failed to set input device:', err);
@@ -56,7 +46,7 @@ function SettingsPanel({ onClose }: SettingsPanelProps) {
 
   const handleOutputDeviceChange = async (deviceName: string) => {
     try {
-      await invoke('set_output_device', { deviceName });
+      await invoke('set_output_device', { device_name: deviceName });
       setSelectedOutput(deviceName);
     } catch (err) {
       console.error('Failed to set output device:', err);
@@ -165,7 +155,7 @@ function SettingsPanel({ onClose }: SettingsPanelProps) {
                 <input 
                   type="range" 
                   min="0" 
-                  max="200"
+                  max="100"
                   value={inputVolume}
                   onChange={(e) => handleInputVolumeChange(parseInt(e.target.value))}
                 />
@@ -179,7 +169,7 @@ function SettingsPanel({ onClose }: SettingsPanelProps) {
                 <input 
                   type="range" 
                   min="0" 
-                  max="200"
+                  max="100"
                   value={outputVolume}
                   onChange={(e) => handleOutputVolumeChange(parseInt(e.target.value))}
                 />

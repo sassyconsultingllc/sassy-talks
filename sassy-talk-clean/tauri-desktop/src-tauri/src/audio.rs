@@ -11,8 +11,24 @@ use ringbuf::wrap::caching::{CachingProd, CachingCons};
 use send_wrapper::SendWrapper;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use thiserror::Error;
+
+/// Ensure COM is initialized as MTA on the current thread (Windows only).
+/// WASAPI requires COM on the thread that calls IAudioClient::Initialize.
+/// Safe to call multiple times - returns S_FALSE if already initialized.
+#[cfg(target_os = "windows")]
+fn ensure_com_mta() {
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+        // S_OK (0) = success, S_FALSE (1) = already initialized as MTA
+        // 0x80010106 = RPC_E_CHANGED_MODE = already initialized as STA
+        if hr.is_err() {
+            warn!("COM MTA init returned 0x{:08X} (may already be STA on this thread)", hr.0);
+        }
+    }
+}
 
 /// Type aliases for ring buffer producer/consumer (ringbuf 0.4 API)
 type HeapProducer<T> = CachingProd<Arc<HeapRb<T>>>;
@@ -205,6 +221,10 @@ impl AudioEngine {
 
     /// Initialize input stream
     fn init_input_stream(&self) -> Result<(), AudioError> {
+        // Ensure COM is initialized as MTA on this thread for WASAPI
+        #[cfg(target_os = "windows")]
+        ensure_com_mta();
+
         let device = self.input_device.lock().unwrap()
             .clone()
             .or_else(|| self.host.default_input_device())
@@ -256,6 +276,10 @@ impl AudioEngine {
 
     /// Initialize output stream
     fn init_output_stream(&self) -> Result<(), AudioError> {
+        // Ensure COM is initialized as MTA on this thread for WASAPI
+        #[cfg(target_os = "windows")]
+        ensure_com_mta();
+
         let device = self.output_device.lock().unwrap()
             .clone()
             .or_else(|| self.host.default_output_device())

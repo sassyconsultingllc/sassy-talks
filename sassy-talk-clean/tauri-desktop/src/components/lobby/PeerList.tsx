@@ -1,12 +1,6 @@
 import UserAvatar from '../../components/UserAvatar';
-import { IconSignal } from '../../components/Icons';
-
-interface PeerInfo {
-  device_id: number;
-  device_name: string;
-  last_seen?: number;
-  channel: number;
-}
+import { IconSignal, getSignalLevel } from '../../components/Icons';
+import type { PeerInfo } from '../../types';
 
 export default function PeerList({ peers, channel, onJoin, onTalk }: { peers: PeerInfo[]; channel: number; onJoin: (ch:number)=>void; onTalk: ()=>void }) {
   return (
@@ -26,7 +20,7 @@ export default function PeerList({ peers, channel, onJoin, onTalk }: { peers: Pe
               <span className="peer-name">{peer.device_name}</span>
               <span className="peer-meta">
                 <span>CH{peer.channel.toString().padStart(2, '0')}</span>
-                <IconSignal size={16} level={peer.last_seen ? Math.min(4, Math.floor((Date.now() - peer.last_seen)/1000)) : 0} />
+                <IconSignal size={16} level={peer.last_seen ? getSignalLevel(peer.last_seen * 1000) : 0} />
               </span>
             </div>
           </div>

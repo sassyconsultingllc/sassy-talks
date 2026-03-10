@@ -1,13 +1,6 @@
 import './DeviceList.css';
 import { IconLobby } from './Icons';
-
-interface PeerInfo {
-  device_id: number;
-  device_name: string;
-  address: string;
-  last_seen: number;
-  channel: number;
-}
+import type { PeerInfo } from '../types';
 
 interface DeviceListProps {
   peers: PeerInfo[];

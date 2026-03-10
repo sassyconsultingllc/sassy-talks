@@ -90,6 +90,17 @@ class BluetoothTransport(private val context: Context) {
     val connectedPeerCount: Int get() = peerCount.get()
     val peerNames: List<String> get() = connectedPeers.values.map { it.device.name ?: it.device.address }
 
+    /** Check if we have an active RFCOMM connection to a specific device */
+    fun isConnectedTo(address: String): Boolean = connectedPeers.containsKey(address)
+
+    /** Connect RFCOMM to a device (auto-connect from BLE peer discovery) */
+    fun connectDevice(device: BluetoothDevice) {
+        Thread {
+            Thread.currentThread().name = "bt-connect-${device.address.takeLast(5)}"
+            connectTo(device)
+        }.start()
+    }
+
     /**
      * Connect to a remote device using RFCOMM triple fallback.
      * Returns true if connection succeeded.

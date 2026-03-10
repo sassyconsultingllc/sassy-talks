@@ -50,6 +50,12 @@ class MainActivity : ComponentActivity() {
                 Manifest.permission.RECORD_AUDIO,
                 Manifest.permission.CAMERA,
             )
+            // Android 12+ requires runtime Bluetooth permissions
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                perms.add(Manifest.permission.BLUETOOTH_CONNECT)
+                perms.add(Manifest.permission.BLUETOOTH_SCAN)
+                perms.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            }
             // Android 13+ requires POST_NOTIFICATIONS for foreground service notification
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 perms.add(Manifest.permission.POST_NOTIFICATIONS)

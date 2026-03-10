@@ -400,10 +400,11 @@ impl AppState {
         self.current_channel.load(Ordering::Relaxed)
     }
     
-    /// Set channel
+    /// Set channel (clamped to valid range 1-16)
     pub async fn set_channel(&self, channel: u8) {
+        let channel = channel.clamp(1, 16);
         self.current_channel.store(channel, Ordering::Relaxed);
-        
+
         let transport = self.transport.lock().await;
         transport.set_channel(channel);
     }

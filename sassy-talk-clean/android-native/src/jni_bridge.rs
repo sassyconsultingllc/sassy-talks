@@ -15,6 +15,20 @@ use log::{error, info, warn};
 /// Global JavaVM instance (initialized once, thread-safe)
 static JAVA_VM: std::sync::OnceLock<Arc<JavaVM>> = std::sync::OnceLock::new();
 
+/// Cached TranscriptionBridge class GlobalRef (resolved during nativeInit)
+static TRANSCRIPTION_BRIDGE_CLASS: std::sync::OnceLock<GlobalRef> = std::sync::OnceLock::new();
+
+/// Store the TranscriptionBridge class reference
+pub fn init_transcription_bridge_class(global_ref: GlobalRef) {
+    let _ = TRANSCRIPTION_BRIDGE_CLASS.set(global_ref);
+    info!("JNI: TranscriptionBridge class cached");
+}
+
+/// Get the cached TranscriptionBridge class reference
+pub fn get_transcription_bridge_class() -> Option<&'static GlobalRef> {
+    TRANSCRIPTION_BRIDGE_CLASS.get()
+}
+
 /// Initialize global JavaVM reference
 pub fn init_jvm(vm: JavaVM) {
     let _ = JAVA_VM.set(Arc::new(vm));
@@ -473,7 +487,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     // Clear BT TX buffer
     if let Ok(mut buf) = guard.bt_tx_buffer.lock() {
         *buf = None;
-    }
+    };
 }
 
 /// JNI: Set channel (syncs to both Rust pipeline and BT transport)
@@ -517,27 +531,29 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btEn
     let state = get_jni_state();
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    let sm = match guard.state_machine {
-        Some(ref sm) => sm,
-        None => return std::ptr::null_mut(),
-    };
+    if guard.state_machine.is_none() {
+        return std::ptr::null_mut();
+    }
 
     // Start mic recording if not already
     if !guard.bt_recording {
-        let audio = sm.get_audio();
-        if let Ok(eng) = audio.lock() {
-            match eng.start_recording() {
-                Ok(()) => {
-                    guard.bt_recording = true;
-                    info!("BT TX: started mic recording");
-                }
-                Err(e) => {
-                    error!("BT TX: failed to start recording: {}", e);
-                    return std::ptr::null_mut();
+        if let Some(ref sm) = guard.state_machine {
+            let audio = sm.get_audio();
+            if let Ok(eng) = audio.lock() {
+                match eng.start_recording() {
+                    Ok(()) => {}
+                    Err(e) => {
+                        error!("BT TX: failed to start recording: {}", e);
+                        return std::ptr::null_mut();
+                    }
                 }
             }
         }
+        guard.bt_recording = true;
+        info!("BT TX: started mic recording");
     }
+
+    let sm = guard.state_machine.as_ref().unwrap();
 
     // Read one frame from mic
     let mut pcm_buffer = vec![0i16; CODEC_FRAME_SIZE];

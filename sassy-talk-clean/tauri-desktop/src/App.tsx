@@ -8,6 +8,10 @@ import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import './styles/app.css';
 import './styles/lobby.css';
 import PeerList from './components/lobby/PeerList';
+import DeviceList from './components/DeviceList';
+import ChannelSelector from './components/ChannelSelector';
+import StatusBar from './components/StatusBar';
+import SettingsPanel from './components/SettingsPanel';
 import Sounds from './sounds';
 import {
   IconLobby,
@@ -15,65 +19,20 @@ import {
   IconSettings,
   IconSearch,
   IconClose,
-  IconChevronLeft,
-  IconChevronRight,
   IconMic,
   IconSpeaker,
   IconRecording,
   IconRefresh,
 } from './components/Icons';
-
-// ============================================================================
-// Types matching Rust backend
-// ============================================================================
-
-interface PeerInfo {
-  device_id: number;
-  device_name: string;
-  address: string;
-  last_seen: number;
-  channel: number;
-}
-
-interface AppStatus {
-  connection_status: string;
-  channel: number;
-  peer_count: number;
-  is_transmitting: boolean;
-}
-
-interface DeviceInfo {
-  device_id: string;
-  device_name: string;
-  version: string;
-}
-
-interface Volume {
-  input: number;
-  output: number;
-}
-
-interface AudioDevices {
-  inputs: AudioDeviceInfo[];
-  outputs: AudioDeviceInfo[];
-}
-
-interface AudioDeviceInfo {
-  name: string;
-  is_default: boolean;
-  device_type: string;
-}
-
-interface NetworkInfo {
-  port: number;
-  multicast_addr: string;
-  use_random_port: boolean;
-  encryption_enabled: boolean;
-  is_encrypted: boolean;
-  public_key: string | null;
-}
-
-type View = 'lobby' | 'walkie' | 'settings';
+import type {
+  PeerInfo,
+  AppStatus,
+  DeviceInfo,
+  Volume,
+  AudioDevices,
+  NetworkInfo,
+  View,
+} from './types';
 
 // ============================================================================
 // Main App Component
@@ -82,18 +41,18 @@ type View = 'lobby' | 'walkie' | 'settings';
 export default function App() {
   // View state
   const [currentView, setCurrentView] = useState<View>('lobby');
-  
+
   // Lobby state
   const [peers, setPeers] = useState<PeerInfo[]>([]);
   const [isSearching, setIsSearching] = useState(false);
-  
+
   // Walkie state
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [isTransmitting, setIsTransmitting] = useState(false);
   const [isReceiving, setIsReceiving] = useState(false);
   const [channel, setChannel] = useState(1);
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null);
-  
+
   // Settings state
   const [micVolume, setMicVolume] = useState(80);
   const [speakerVolume, setSpeakerVolume] = useState(80);
@@ -103,18 +62,21 @@ export default function App() {
   const [audioDevices, setAudioDevices] = useState<AudioDevices>({ inputs: [], outputs: [] });
   const [selectedInput, setSelectedInput] = useState<string>('');
   const [selectedOutput, setSelectedOutput] = useState<string>('');
-  
+
   // Network settings state
   const [networkInfo, setNetworkInfo] = useState<NetworkInfo | null>(null);
   const [encryptionEnabled, setEncryptionEnabled] = useState(true);
   const [randomPortEnabled, setRandomPortEnabled] = useState(true);
-  
+
   // Audio visualization
   const [audioLevel, setAudioLevel] = useState(0);
-  
+
   // Error handling
   const [error, setError] = useState<string | null>(null);
-  
+
+  // Settings modal
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+
   // Refs
   const pttButtonRef = useRef<HTMLButtonElement>(null);
   const statusIntervalRef = useRef<number | null>(null);
@@ -129,27 +91,27 @@ export default function App() {
         // Get device info
         const info = await invoke<DeviceInfo>('get_device_info');
         setDeviceInfo(info);
-        
+
         // Get initial status
         const initialStatus = await invoke<AppStatus>('get_status');
         setStatus(initialStatus);
         setChannel(initialStatus.channel);
-        
+
         // Get volume
         const vol = await invoke<Volume>('get_volume');
         setMicVolume(Math.round(vol.input * 100));
         setSpeakerVolume(Math.round(vol.output * 100));
-        
+
         // Get audio devices
         const devices = await invoke<AudioDevices>('get_audio_devices');
         setAudioDevices(devices);
-        
+
         // Set defaults
         const defaultInput = devices.inputs.find(d => d.is_default);
         const defaultOutput = devices.outputs.find(d => d.is_default);
         if (defaultInput) setSelectedInput(defaultInput.name);
         if (defaultOutput) setSelectedOutput(defaultOutput.name);
-        
+
         // Get network info
         try {
           const netInfo = await invoke<NetworkInfo>('get_network_info');
@@ -159,25 +121,25 @@ export default function App() {
         } catch (e) {
           console.warn('Failed to get network info:', e);
         }
-        
+
       } catch (e) {
         console.error('Failed to initialize:', e);
         setError(`Initialization failed: ${e}`);
       }
     };
-    
+
     setup();
-    
+
     // Listen for audio level events
     let unlistenAudio: UnlistenFn | null = null;
     let unlistenReceiving: UnlistenFn | null = null;
     let hadPeers = false;
     let wasReceiving = false;
-    
+
     listen<number>('audio_level', (event) => {
       setAudioLevel(event.payload);
     }).then(fn => { unlistenAudio = fn; });
-    
+
     listen<boolean>('receiving', (event) => {
       setIsReceiving(event.payload);
       // Play incoming transmission sound when we start receiving
@@ -186,14 +148,14 @@ export default function App() {
       }
       wasReceiving = event.payload;
     }).then(fn => { unlistenReceiving = fn; });
-    
-    // Status polling
+
+    // Status polling (250ms for status + peers, no network info here)
     statusIntervalRef.current = window.setInterval(async () => {
       try {
         const s = await invoke<AppStatus>('get_status');
         setStatus(s);
         setIsTransmitting(s.is_transmitting);
-        
+
         if (isSearching) {
           const nearbyPeers = await invoke<PeerInfo[]>('get_nearby_devices');
           // Play connection success when first peer discovered
@@ -205,15 +167,11 @@ export default function App() {
           }
           setPeers(nearbyPeers);
         }
-        
-        // Update network info periodically (encryption status can change)
-        const netInfo = await invoke<NetworkInfo>('get_network_info');
-        setNetworkInfo(netInfo);
       } catch (e) {
         // Ignore polling errors
       }
     }, 250);
-    
+
     return () => {
       if (unlistenAudio) unlistenAudio();
       if (unlistenReceiving) unlistenReceiving();
@@ -285,18 +243,15 @@ export default function App() {
     try {
       await invoke('stop_transmit');
       setIsTransmitting(false);
-      if (rogerBeep) {
-        Sounds.rogerBeep();
-      }
+      // Roger beep is handled by the backend (plays locally via CPAL + sends to peers)
     } catch (e) {
       console.error('Failed to stop transmit:', e);
     }
   };
 
-  const changeChannel = async (delta: number) => {
-    const newChannel = Math.max(1, Math.min(16, channel + delta));
+  const handleChannelChange = async (newChannel: number) => {
     if (newChannel === channel) return;
-    
+
     setChannel(newChannel);
     try {
       await invoke('set_channel', { channel: newChannel });
@@ -447,36 +402,22 @@ export default function App() {
         handlePttDown();
       }
     };
-    
+
     const handleKeyUp = (e: KeyboardEvent) => {
       if (e.code === 'Space' && currentView === 'walkie') {
         e.preventDefault();
         handlePttUp();
       }
     };
-    
+
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
-    
+
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
   }, [currentView, handlePttDown, handlePttUp]);
-
-  // ============================================================================
-  // Helpers
-  // ============================================================================
-
-  const getStatusText = (): string => {
-    if (!status) return 'Initializing...';
-    if (isTransmitting) return 'TRANSMITTING';
-    if (isReceiving) return 'Receiving...';
-    if (isSearching) return `Online • ${peers.length} nearby`;
-    return 'Offline';
-  };
-
-  
 
   // ============================================================================
   // Render: Lobby View
@@ -486,7 +427,12 @@ export default function App() {
     <div className="view lobby-view">
       <header className="lobby-header">
         <h1>Sassy-Talk</h1>
-        <p className="subtitle">Bluetooth Walkie-Talkie</p>
+        <div className="lobby-header-actions">
+          <p className="subtitle">Bluetooth Walkie-Talkie</p>
+          <button className="settings-gear-btn" onClick={() => setShowSettingsModal(true)} title="Quick Settings">
+            <IconSettings size={20} />
+          </button>
+        </div>
       </header>
 
       {error && (
@@ -497,7 +443,7 @@ export default function App() {
       )}
 
       <div className="search-section">
-        <button 
+        <button
           className={`search-btn ${isSearching ? 'active' : ''}`}
           onClick={isSearching ? leaveLobby : enterLobby}
         >
@@ -520,14 +466,14 @@ export default function App() {
 
       <div className="peers-section">
         <h3>Nearby Devices {peers.length > 0 && `(${peers.length})`}</h3>
-        
+
         {peers.length === 0 && isSearching && (
           <div className="no-peers">
             <p>Looking for nearby devices...</p>
             <p className="hint">Make sure other devices have the app open</p>
           </div>
         )}
-        
+
         {peers.length === 0 && !isSearching && (
           <div className="no-peers">
             <p>No devices found</p>
@@ -536,6 +482,10 @@ export default function App() {
         )}
 
         <PeerList peers={peers} channel={channel} onJoin={joinPeerChannel} onTalk={() => setCurrentView('walkie')} />
+
+        {peers.length > 0 && (
+          <DeviceList peers={peers} currentChannel={channel} />
+        )}
       </div>
 
       {isSearching && (
@@ -579,21 +529,17 @@ export default function App() {
 
       <header className="walkie-header">
         <div className="connection-info">
-          <span className="connected-to">{getStatusText()}</span>
-          <span className="peer-name">Channel {channel.toString().padStart(2, '0')}</span>
-          {peers.length > 0 && <span className="transport-badge">UDP Multicast</span>}
+          <StatusBar status={status} isConnected={isSearching} peerCount={peers.length} />
         </div>
-        <button className="disconnect-btn" onClick={disconnect} title="Disconnect"><IconClose size={20} /></button>
+        <div className="walkie-header-actions">
+          <button className="settings-gear-btn" onClick={() => setShowSettingsModal(true)} title="Quick Settings">
+            <IconSettings size={20} />
+          </button>
+          <button className="disconnect-btn" onClick={disconnect} title="Disconnect"><IconClose size={20} /></button>
+        </div>
       </header>
 
-      <div className="channel-display">
-        <button className="channel-btn" onClick={() => changeChannel(-1)} disabled={channel <= 1}><IconChevronLeft size={24} /></button>
-        <div className="channel-lcd">
-          <span className="channel-label">CH</span>
-          <span className="channel-number">{channel.toString().padStart(2, '0')}</span>
-        </div>
-        <button className="channel-btn" onClick={() => changeChannel(1)} disabled={channel >= 16}><IconChevronRight size={24} /></button>
-      </div>
+      <ChannelSelector channel={channel} onChange={handleChannelChange} />
 
       <div className="status-display">
         <div className={`status-indicator ${isTransmitting ? 'tx' : isReceiving ? 'rx-active' : 'rx'}`}>
@@ -791,7 +737,7 @@ export default function App() {
           <div className="setting-row">
             <span className="setting-label">Encryption Status</span>
             <span className={`setting-value ${networkInfo?.is_encrypted ? 'secure' : 'insecure'}`}>
-              {networkInfo?.is_encrypted ? '🔒 Active' : '🔓 Inactive'}
+              {networkInfo?.is_encrypted ? 'Active' : 'Inactive'}
             </span>
           </div>
           {networkInfo?.public_key && (
@@ -827,7 +773,7 @@ export default function App() {
         <section className="settings-section">
           <h3>About</h3>
           <div className="setting-row">
-            <span className="setting-label">© 2025 Sassy Consulting LLC</span>
+            <span className="setting-label">&copy; 2025 Sassy Consulting LLC</span>
           </div>
         </section>
       </div>
@@ -858,6 +804,10 @@ export default function App() {
       {currentView === 'lobby' && renderLobby()}
       {currentView === 'walkie' && renderWalkie()}
       {currentView === 'settings' && renderSettings()}
+
+      {showSettingsModal && (
+        <SettingsPanel onClose={() => setShowSettingsModal(false)} />
+      )}
     </div>
   );
 }

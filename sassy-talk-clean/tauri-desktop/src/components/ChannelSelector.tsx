@@ -7,18 +7,18 @@ interface ChannelSelectorProps {
 
 function ChannelSelector({ channel, onChange }: ChannelSelectorProps) {
   const handlePrevious = () => {
-    const newChannel = channel > 1 ? channel - 1 : 99;
+    const newChannel = channel > 1 ? channel - 1 : 16;
     onChange(newChannel);
   };
 
   const handleNext = () => {
-    const newChannel = channel < 99 ? channel + 1 : 1;
+    const newChannel = channel < 16 ? channel + 1 : 1;
     onChange(newChannel);
   };
 
   const handleInput = (e: React.ChangeEvent<HTMLInputElement>) => {
     const value = parseInt(e.target.value);
-    if (value >= 1 && value <= 99) {
+    if (value >= 1 && value <= 16) {
       onChange(value);
     }
   };
@@ -40,7 +40,7 @@ function ChannelSelector({ channel, onChange }: ChannelSelectorProps) {
           value={channel}
           onChange={handleInput}
           min="1"
-          max="99"
+          max="16"
         />
         <button 
           className="channel-button"

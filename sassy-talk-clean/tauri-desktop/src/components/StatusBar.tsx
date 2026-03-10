@@ -1,12 +1,6 @@
 import './StatusBar.css';
 import { IconLock } from './Icons';
-
-interface AppStatus {
-  connection_status: string;
-  channel: number;
-  peer_count: number;
-  is_transmitting: boolean;
-}
+import type { AppStatus } from '../types';
 
 interface StatusBarProps {
   status: AppStatus | null;

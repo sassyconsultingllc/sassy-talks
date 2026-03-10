@@ -5,6 +5,8 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
 import android.net.wifi.WifiManager
@@ -14,6 +16,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.sassyconsulting.sassytalkie.service.BluetoothTransport
 
 /**
  * Foreground service that keeps SassyTalkie alive while in use.
@@ -49,6 +52,15 @@ class WalkieService : Service() {
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
+    // BLE + RFCOMM
+    var bleSignaling: BleSignalingService? = null
+        private set
+    var btTransport: BluetoothTransport? = null
+        private set
+    var pttCoordinator: PttCoordinator? = null
+        private set
+    private var bleInitialized = false
+
     // ── Service lifecycle ──
 
     override fun onCreate() {
@@ -67,9 +79,66 @@ class WalkieService : Service() {
 
     override fun onDestroy() {
         Log.i(TAG, "Service destroyed")
+        shutdownBleTransport()
         releaseMulticastLock()
         releaseWakeLock()
         super.onDestroy()
+    }
+
+    // ── BLE + RFCOMM init ──
+
+    /**
+     * Initialize BLE signaling + RFCOMM transport.
+     * Call after SassyTalkNative.init() succeeds and BT permissions are granted.
+     */
+    @android.annotation.SuppressLint("MissingPermission")
+    fun initBleTransport() {
+        if (bleInitialized) {
+            Log.i(TAG, "BLE transport already initialized; skipping")
+            return
+        }
+
+        val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+        if (adapter == null || !adapter.isEnabled) {
+            Log.w(TAG, "Bluetooth not available or not enabled")
+            return
+        }
+
+        val ble = BleSignalingService(this, adapter)
+        val bt = BluetoothTransport(this)
+        val coord = PttCoordinator(ble, bt)
+
+        // Start BLE
+        ble.startServer()
+        ble.startAdvertising()
+        ble.startScanning()
+
+        // Start RFCOMM listener
+        bt.startAcceptThread()
+
+        bleSignaling = ble
+        btTransport = bt
+        pttCoordinator = coord
+
+        // Wire BT transport reference so SassyTalkNative.pttStart() can start TX pump
+        SassyTalkNative.bluetoothTransport = bt
+
+        Log.i(TAG, "BLE + RFCOMM transport initialized")
+        bleInitialized = true
+    }
+
+    private fun shutdownBleTransport() {
+        pttCoordinator?.shutdown()
+        btTransport?.shutdown()
+        bleSignaling?.shutdown()
+
+        SassyTalkNative.bluetoothTransport = null
+        pttCoordinator = null
+        btTransport = null
+        bleSignaling = null
+        bleInitialized = false
+
+        Log.i(TAG, "BLE + RFCOMM transport shut down")
     }
 
     // ── Multicast lock ──
