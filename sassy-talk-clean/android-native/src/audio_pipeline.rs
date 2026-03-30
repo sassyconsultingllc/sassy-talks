@@ -100,6 +100,20 @@ pub fn now_ms() -> u64 {
 ///
 /// The thread runs in a loop while `tx_running` is true. It only captures+sends when
 /// `ptt_pressed` is true.
+/// Whether PTT should buffer audio and burst-send on release (true)
+/// or stream live frame-by-frame (false). Default: true (buffer mode).
+static PTT_BUFFER_MODE: AtomicBool = AtomicBool::new(true);
+
+/// Set PTT buffer mode. true = buffer and burst on release. false = live stream.
+pub fn set_ptt_buffer_mode(buffer: bool) {
+    PTT_BUFFER_MODE.store(buffer, Ordering::Relaxed);
+    info!("TX: PTT buffer mode = {}", buffer);
+}
+
+pub fn get_ptt_buffer_mode() -> bool {
+    PTT_BUFFER_MODE.load(Ordering::Relaxed)
+}
+
 pub fn spawn_tx_thread(
     tx_running: Arc<AtomicBool>,
     ptt_pressed: Arc<AtomicBool>,
@@ -119,6 +133,9 @@ pub fn spawn_tx_thread(
             let mut pcm_buffer = vec![0i16; CODEC_FRAME_SIZE];
             let mut was_transmitting = false;
             let mut idle_ticks = 0u32;
+
+            // Buffer for burst-send mode: accumulates wire frames during PTT
+            let mut tx_frame_buffer: Vec<Vec<u8>> = Vec::new();
 
             // Send initial presence beacon so peers register us immediately on connect
             {
@@ -144,6 +161,23 @@ pub fn spawn_tx_thread(
                         let _ = eng.stop_recording();
                         was_transmitting = false;
                         encoder.reset();
+
+                        // In buffer mode: flush all accumulated frames with pacing
+                        // so the receiver can play them back without drops
+                        if PTT_BUFFER_MODE.load(Ordering::Relaxed) && !tx_frame_buffer.is_empty() {
+                            let frame_count = tx_frame_buffer.len();
+                            info!("TX: burst-sending {} buffered frames", frame_count);
+                            for frame in tx_frame_buffer.drain(..) {
+                                let mut tm = transport.lock().unwrap();
+                                let _ = tm.send(&frame);
+                                drop(tm);
+                                // Pace at real-time (20ms per frame = 1x playback speed)
+                                // so receiver plays back naturally without buffer overrun
+                                thread::sleep(Duration::from_millis(20));
+                            }
+                            info!("TX: burst-send complete ({} frames)", frame_count);
+                        }
+
                         info!("TX: stopped recording (PTT released)");
                     }
                     // Periodic presence heartbeat every ~10 seconds so peers keep seeing us
@@ -209,10 +243,15 @@ pub fn spawn_tx_thread(
                 let timestamp = now_ms();
                 let wire_data = pack_wire_frame(channel, subch, &local_sender_id, &local_device_name, timestamp, &compressed);
 
-                // Send through transport (encrypted inside TransportManager::send)
-                let mut tm = transport.lock().unwrap();
-                if let Err(e) = tm.send(&wire_data) {
-                    warn!("TX: send failed: {}", e);
+                if PTT_BUFFER_MODE.load(Ordering::Relaxed) {
+                    // Buffer mode: accumulate frames, burst-send on PTT release
+                    tx_frame_buffer.push(wire_data);
+                } else {
+                    // Live mode: send immediately frame-by-frame
+                    let mut tm = transport.lock().unwrap();
+                    if let Err(e) = tm.send(&wire_data) {
+                        warn!("TX: send failed: {}", e);
+                    }
                 }
             }
 

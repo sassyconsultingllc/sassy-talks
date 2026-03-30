@@ -108,6 +108,18 @@ object SassyTalkNative {
         Log.d(TAG, "PTT Stopped")
     }
 
+    /** Set PTT buffer mode. true = buffer audio and burst-send on release. false = live stream. */
+    fun setPttBufferMode(buffer: Boolean) {
+        if (initialized) {
+            try { nativeSetPttBufferMode(buffer) } catch (_: Exception) {}
+        }
+    }
+
+    fun getPttBufferMode(): Boolean {
+        if (!initialized) return true
+        return try { nativeGetPttBufferMode() } catch (_: Exception) { true }
+    }
+
     fun setChannel(channel: Int) {
         if (initialized && channel in 1..99) {
             nativeSetChannel(channel.toByte())
@@ -493,9 +505,11 @@ object SassyTalkNative {
                 Log.e(TAG, "clearAudioCache failed: ${e.message}")
             }
         }
+        // Clear transcription entries in sync with audio cache
+        try { com.sassyconsulting.sassytalkie.TranscriptionBridge.clearEntries() } catch (_: Exception) {}
     }
 
-    /** Replay a previous utterance from history by index */
+    /** Replay a previous utterance from history by index (legacy) */
     fun replayUtterance(index: Int): Boolean {
         if (!initialized) return false
         return try {
@@ -504,6 +518,23 @@ object SassyTalkNative {
             Log.e(TAG, "replayUtterance failed: ${e.message}")
             false
         }
+    }
+
+    /** Replay a previous utterance from history by unique ID */
+    fun replayById(utteranceId: Long): Boolean {
+        if (!initialized) return false
+        return try {
+            nativeReplayById(utteranceId)
+        } catch (e: Exception) {
+            Log.e(TAG, "replayById failed: ${e.message}")
+            false
+        }
+    }
+
+    /** Get the unique ID of the most recently added history utterance */
+    fun lastHistoryId(): Long {
+        if (!initialized) return -1
+        return try { nativeLastHistoryId() } catch (_: Exception) { -1 }
     }
 
     /** Sync user info (mute/favorite status) from UserRegistry into the audio cache */
@@ -709,6 +740,10 @@ object SassyTalkNative {
     // PTT
     @JvmStatic private external fun nativePttStart()
     @JvmStatic private external fun nativePttStop()
+    @JvmStatic private external fun nativeSetPttBufferMode(bufferMode: Boolean)
+    @JvmStatic private external fun nativeGetPttBufferMode(): Boolean
+    @JvmStatic private external fun nativeReplayById(utteranceId: Long): Boolean
+    @JvmStatic private external fun nativeLastHistoryId(): Long
     @JvmStatic private external fun nativeSetChannel(channel: Byte)
 
     // Transport

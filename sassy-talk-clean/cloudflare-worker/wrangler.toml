@@ -1,8 +1,12 @@
-name = "sassyconsultingllc"
+name = "sassytalk-relay"
 account_id = "d5ccd0d80780f2d0ab72ab12b15244e2"
-main = "src/worker.js"
+main = "src/ptt-relay-worker.js"
 compatibility_date = "2024-12-01"
-compatibility_flags = ["nodejs_compat"]
+
+# Custom domain
+routes = [
+  { pattern = "relay.sassy-consults.com/*", zone_name = "sassy-consults.com" }
+]
 
 # ── Durable Objects ──
 [[durable_objects.bindings]]
@@ -12,27 +16,3 @@ class_name = "PttRoom"
 [[migrations]]
 tag = "v1_pttroom"
 new_sqlite_classes = ["PttRoom"]
-
-# ── D1 Database ──
-[[d1_databases]]
-binding = "DB"
-database_name = "sassy-db"
-database_id = "ed5f3cc4-fa38-4eaa-b9ac-8480eb24e2be"
-
-# ── R2 Buckets ──
-[[r2_buckets]]
-binding = "DOWNLOADS"
-bucket_name = "sassy-downloads"
-
-[[r2_buckets]]
-binding = "PRIVACY"
-bucket_name = "sassy-privacy"
-
-# ── Email ──
-[[send_email]]
-name = "CONTACT_EMAIL"
-
-# ── Assets (static site) ──
-[assets]
-binding = "ASSETS"
-directory = "./public"

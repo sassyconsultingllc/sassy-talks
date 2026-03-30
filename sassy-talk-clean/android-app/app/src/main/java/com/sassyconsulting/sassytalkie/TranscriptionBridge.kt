@@ -1,6 +1,15 @@
 package com.sassyconsulting.sassytalkie
 
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.os.Build
 import android.util.Log
+import androidx.core.app.NotificationCompat
+import androidx.lifecycle.ProcessLifecycleOwner
+import androidx.lifecycle.Lifecycle
 import com.sassyconsulting.sassytalkie.ui.TranscriptionEntry
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -20,6 +29,11 @@ import kotlin.math.sqrt
 object TranscriptionBridge {
 
     private const val TAG = "TranscriptionBridge"
+    private const val TRANSCRIPTION_CHANNEL_ID = "sassytalkie_transcription"
+    private const val TRANSCRIPTION_NOTIFICATION_BASE_ID = 5000
+
+    private var appContext: Context? = null
+    private var notificationIdCounter = TRANSCRIPTION_NOTIFICATION_BASE_ID
 
     /** RMS amplitude below which a frame is considered silence. */
     private const val SILENCE_THRESHOLD = 500
@@ -51,7 +65,6 @@ object TranscriptionBridge {
 
     @Volatile
     var whisperReady = false
-        private set
 
     // Background scope for whisper inference (doesn't block RX thread)
     private val transcriptionScope = CoroutineScope(
@@ -74,10 +87,70 @@ object TranscriptionBridge {
 
     // ── Lifecycle ──
 
-    fun initialize(@Suppress("UNUSED_PARAMETER") context: android.content.Context) {
+    fun initialize(context: Context) {
         if (initialized) return
+        appContext = context.applicationContext
+        createNotificationChannel(context.applicationContext)
         initialized = true
         Log.i(TAG, "Initialized")
+    }
+
+    private fun createNotificationChannel(context: Context) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                TRANSCRIPTION_CHANNEL_ID,
+                "Transcription Alerts",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Notifications when someone speaks while the app is in the background"
+            }
+            val nm = context.getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(channel)
+        }
+    }
+
+    private fun isAppInForeground(): Boolean {
+        return try {
+            ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+        } catch (e: Exception) {
+            true // default to foreground (don't notify) if we can't tell
+        }
+    }
+
+    private fun showTranscriptionNotification(entry: TranscriptionEntry) {
+        val ctx = appContext ?: return
+        if (isAppInForeground()) return
+        if (entry.isMuted) return
+
+        val launchIntent = Intent(ctx, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("open_transcription", true)
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            ctx, 0, launchIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(ctx, TRANSCRIPTION_CHANNEL_ID)
+            .setContentTitle(entry.senderName)
+            .setContentText(entry.text)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+
+        try {
+            val nm = ctx.getSystemService(NotificationManager::class.java)
+            nm.notify(notificationIdCounter++, notification)
+            // Keep IDs from growing unbounded
+            if (notificationIdCounter > TRANSCRIPTION_NOTIFICATION_BASE_ID + 50) {
+                notificationIdCounter = TRANSCRIPTION_NOTIFICATION_BASE_ID
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to show transcription notification: ${e.message}")
+        }
     }
 
     /** Call after model download completes. */
@@ -142,9 +215,16 @@ object TranscriptionBridge {
         _entries.value = updated
     }
 
+    @Volatile
+    private var clearing = false
+
     fun clearEntries() {
+        if (clearing) return
+        clearing = true
         _entries.value = emptyList()
         synchronized(lock) { resetSpeechState() }
+        try { SassyTalkNative.clearAudioCache() } catch (_: Exception) {}
+        clearing = false
         Log.d(TAG, "Entries cleared")
     }
 
@@ -216,6 +296,14 @@ object TranscriptionBridge {
 
         if (totalSamples < 960) return // skip sub-20ms utterances
 
+        // Wait briefly for Rust audio cache to finalize the utterance into history,
+        // then grab its unique ID for replay linkage
+        val utteranceId = run {
+            // Give tick() a moment to finalize the live accumulator
+            Thread.sleep(50)
+            SassyTalkNative.lastHistoryId()
+        }
+
         if (whisperReady) {
             // Run whisper inference on background thread (1-3s on weak phones)
             transcriptionScope.launch {
@@ -237,6 +325,7 @@ object TranscriptionBridge {
                     timestamp = ts,
                     isFavorite = isFav,
                     isMuted = isMuted,
+                    utteranceId = utteranceId,
                 )
                 addEntry(entry)
             }
@@ -249,6 +338,7 @@ object TranscriptionBridge {
                 timestamp = ts,
                 isFavorite = isFav,
                 isMuted = isMuted,
+                utteranceId = utteranceId,
             )
             addEntry(entry)
         }
@@ -262,6 +352,9 @@ object TranscriptionBridge {
             current + entry
         }
         _entries.value = updated
+
+        // Fire notification if app is backgrounded
+        showTranscriptionNotification(entry)
     }
 
     private fun resetSpeechState() {

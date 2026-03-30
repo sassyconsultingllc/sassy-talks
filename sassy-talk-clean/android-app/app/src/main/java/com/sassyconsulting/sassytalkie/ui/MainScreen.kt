@@ -1,6 +1,7 @@
 package com.sassyconsulting.sassytalkie.ui
 
 import androidx.compose.animation.core.*
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
@@ -14,6 +15,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -40,14 +42,17 @@ fun MainScreen(
     onDisconnect: () -> Unit = {},
     onShowUsers: () -> Unit = {},
     onShowTranscription: () -> Unit = {},
+    onShowAbout: () -> Unit = {},
     walkieService: WalkieService? = null,
     autoConnect: AutoConnectManager,
 ) {
     var isTransmitting by remember { mutableStateOf(false) }
+    var showMenu by remember { mutableStateOf(false) }
     var currentChannel by remember { mutableIntStateOf(1) }
     var currentSubchannel by remember { mutableIntStateOf(0) } // 0=Main, 1=A, 2=B
     var pttHoldMode by remember { mutableStateOf(false) } // toggle PTT vs hold-to-talk
     var showEncryptionWarning by remember { mutableStateOf(false) }
+    var showQrDialog by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     val connectState by autoConnect.state.collectAsState()
@@ -59,6 +64,11 @@ fun MainScreen(
         if (connectState != ConnectState.CONNECTED) {
             autoConnect.reset()
             autoConnect.autoConnect(walkieService)
+        }
+        // Re-apply persisted session crypto after transport is connected.
+        // restoreSession() sets crypto before transport init, so it can get lost.
+        withContext(Dispatchers.IO) {
+            SassyTalkNative.restoreSession()
         }
     }
 
@@ -111,14 +121,49 @@ fun MainScreen(
                 maxLines = 1
             )
 
-            // Transcription log button
-            IconButton(onClick = onShowTranscription) {
-                Icon(Icons.Default.Chat, contentDescription = "Transcription", tint = Cyan)
-            }
+            Row {
+                // Show QR for current session
+                IconButton(onClick = { showQrDialog = true }) {
+                    Icon(Icons.Default.QrCode2, contentDescription = "Show QR", tint = Cyan, modifier = Modifier.size(22.dp))
+                }
 
-            // Users/people button
-            IconButton(onClick = onShowUsers) {
-                Icon(Icons.Default.People, contentDescription = "Users", tint = Cyan)
+                // Reconnect button
+                IconButton(onClick = {
+                    scope.launch {
+                        autoConnect.reset()
+                        autoConnect.autoConnect(walkieService)
+                    }
+                }) {
+                    Icon(Icons.Default.Refresh, contentDescription = "Reconnect", tint = if (connectState != ConnectState.CONNECTED) Orange else Cyan, modifier = Modifier.size(22.dp))
+                }
+
+                // Hamburger menu for remaining options
+                Box {
+                    IconButton(onClick = { showMenu = true }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "Menu", tint = Cyan, modifier = Modifier.size(22.dp))
+                    }
+                    DropdownMenu(
+                        expanded = showMenu,
+                        onDismissRequest = { showMenu = false },
+                        modifier = Modifier.background(CardBg)
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Transcription", color = TextWhite) },
+                            onClick = { showMenu = false; onShowTranscription() },
+                            leadingIcon = { Icon(Icons.Default.Chat, contentDescription = null, tint = Cyan, modifier = Modifier.size(20.dp)) }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Users", color = TextWhite) },
+                            onClick = { showMenu = false; onShowUsers() },
+                            leadingIcon = { Icon(Icons.Default.People, contentDescription = null, tint = Cyan, modifier = Modifier.size(20.dp)) }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("About", color = TextWhite) },
+                            onClick = { showMenu = false; onShowAbout() },
+                            leadingIcon = { Icon(Icons.Default.Info, contentDescription = null, tint = Cyan, modifier = Modifier.size(20.dp)) }
+                        )
+                    }
+                }
             }
         }
 
@@ -318,6 +363,67 @@ fun MainScreen(
         )
 
         Spacer(modifier = Modifier.height(8.dp))
+    }
+
+    // Show QR dialog for current session
+    if (showQrDialog) {
+        val sessionStatus = remember { SassyTalkNative.getSessionStatus() }
+        val sessionId = remember { SassyTalkNative.getSessionId() ?: "" }
+        val channelInfo = remember { SassyTalkNative.getChannelInfo() }
+
+        // Find the current channel's session JSON from SharedPreferences
+        val context = LocalContext.current
+        val sessionJson = remember {
+            context.getSharedPreferences("sassy_session", android.content.Context.MODE_PRIVATE)
+                .getString("session_ch_$currentChannel", null) ?: ""
+        }
+
+        AlertDialog(
+            onDismissRequest = { showQrDialog = false },
+            confirmButton = {
+                TextButton(onClick = { showQrDialog = false }) {
+                    Text("Close", color = Cyan)
+                }
+            },
+            title = { Text("Session QR", color = Orange) },
+            text = {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    if (sessionJson.isNotEmpty()) {
+                        // Generate QR bitmap
+                        val qrBitmap = remember(sessionJson) {
+                            try {
+                                val writer = com.google.zxing.qrcode.QRCodeWriter()
+                                val matrix = writer.encode(sessionJson, com.google.zxing.BarcodeFormat.QR_CODE, 400, 400)
+                                val bmp = android.graphics.Bitmap.createBitmap(400, 400, android.graphics.Bitmap.Config.RGB_565)
+                                for (x in 0 until 400) for (y in 0 until 400)
+                                    bmp.setPixel(x, y, if (matrix[x, y]) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
+                                bmp
+                            } catch (_: Exception) { null }
+                        }
+                        if (qrBitmap != null) {
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = Color.White),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Image(
+                                    bitmap = qrBitmap.asImageBitmap(),
+                                    contentDescription = "Session QR",
+                                    modifier = Modifier.size(180.dp).padding(8.dp)
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text("Scan to join CH $currentChannel", color = TextGray, fontSize = 13.sp)
+                        if (sessionId.isNotEmpty()) {
+                            Text("Session: ${sessionId.take(8)}", color = TextMuted, fontSize = 11.sp)
+                        }
+                    } else {
+                        Text("No active session for this channel", color = TextMuted)
+                    }
+                }
+            },
+            containerColor = CardBg
+        )
     }
 }
 

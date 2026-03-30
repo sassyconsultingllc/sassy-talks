@@ -33,6 +33,7 @@ enum class Screen {
     Main,
     Users,
     Transcription,
+    About,
 }
 
 /**
@@ -139,10 +140,11 @@ fun AppNavigation(
                 }
                 nativeReady = true
 
-                // Initialize transcription + whisper model (downloads ~75MB on first run)
+                // Initialize transcription but don't enable by default
+                // User can enable via About screen after model downloads
                 TranscriptionBridge.initialize(context)
-                TranscriptionBridge.setEnabled(true)
-                WhisperModelManager.ensureReady(context)
+                TranscriptionBridge.setEnabled(false)
+                // Don't auto-download whisper model — let user choose in About screen
             } else {
                 initFailed = true
             }
@@ -207,6 +209,7 @@ fun AppNavigation(
             }
             Screen.Users -> currentScreen = Screen.Main
             Screen.Transcription -> currentScreen = Screen.Main
+            Screen.About -> currentScreen = Screen.Main
             else -> {}
         }
     }
@@ -227,6 +230,7 @@ fun AppNavigation(
             },
             onShowUsers = { currentScreen = Screen.Users },
             onShowTranscription = { currentScreen = Screen.Transcription },
+            onShowAbout = { currentScreen = Screen.About },
             walkieService = walkieService,
             autoConnect = autoConnect
         )
@@ -236,6 +240,9 @@ fun AppNavigation(
         )
         Screen.Transcription -> TranscriptionFeedScreen(
             entries = TranscriptionBridge.entries.collectAsState().value,
+            onBack = { currentScreen = Screen.Main }
+        )
+        Screen.About -> AboutScreen(
             onBack = { currentScreen = Screen.Main }
         )
     }

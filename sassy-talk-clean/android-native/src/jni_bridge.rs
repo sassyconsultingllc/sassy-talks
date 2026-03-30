@@ -384,7 +384,7 @@ fn get_jni_state() -> &'static Arc<Mutex<JniAppState>> {
 /// JNI: Initialize native backend
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeInit(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
 ) -> jboolean {
     // Initialize logging
@@ -404,7 +404,30 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         error!("JNI: Failed to get JavaVM");
         return JNI_FALSE;
     }
-    
+
+    // Cache TranscriptionBridge class reference so RX thread can call it via JNI.
+    // Must be done on the main thread (which has the app classloader) because
+    // native threads only have the system classloader and can't find app classes.
+    {
+        let class_name = "com/sassyconsulting/sassytalkie/TranscriptionBridge";
+        match env.find_class(class_name) {
+            Ok(cls) => {
+                match env.new_global_ref(cls) {
+                    Ok(global) => {
+                        init_transcription_bridge_class(global);
+                    }
+                    Err(e) => {
+                        warn!("JNI: Failed to create GlobalRef for TranscriptionBridge: {:?}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("JNI: TranscriptionBridge class not found (transcription disabled): {:?}", e);
+                let _ = env.exception_clear();
+            }
+        }
+    }
+
     // Initialize app state
     let state = get_jni_state();
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -492,6 +515,65 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     if let Ok(mut buf) = guard.bt_tx_buffer.lock() {
         *buf = None;
     };
+}
+
+/// JNI: Set PTT buffer mode (true = buffer and burst on release, false = live stream)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetPttBufferMode(
+    _env: JNIEnv,
+    _class: JClass,
+    buffer_mode: jni::sys::jboolean,
+) {
+    crate::audio_pipeline::set_ptt_buffer_mode(buffer_mode != 0);
+}
+
+/// JNI: Get PTT buffer mode
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetPttBufferMode(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jboolean {
+    if crate::audio_pipeline::get_ptt_buffer_mode() { 1 } else { 0 }
+}
+
+/// JNI: Replay utterance by unique ID (preferred over index-based replay)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeReplayById(
+    _env: JNIEnv,
+    _class: JClass,
+    utterance_id: jni::sys::jlong,
+) -> jboolean {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if cache.replay_by_id(utterance_id as u64) {
+            info!("JNI: Replaying utterance id={}", utterance_id);
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// JNI: Get the ID of the most recently added history utterance
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeLastHistoryId(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jlong {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        let cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        cache.last_history_id().map(|id| id as i64).unwrap_or(-1)
+    } else {
+        -1
+    }
 }
 
 /// JNI: Set channel (syncs to both Rust pipeline and BT transport)
@@ -969,9 +1051,17 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     };
 
     let state = get_jni_state();
-    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    guard.user_registry.set_muted(&id, muted == JNI_TRUE);
+    // Write to StateMachine's registry (where RX thread reads), not JniState's copy
+    if let Some(ref sm) = guard.state_machine {
+        let mut reg = sm.get_user_registry().lock().unwrap();
+        reg.set_muted(&id, muted == JNI_TRUE);
+    } else {
+        drop(guard);
+        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.user_registry.set_muted(&id, muted == JNI_TRUE);
+    }
 }
 
 /// JNI: Set user favorite status
@@ -988,9 +1078,17 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     };
 
     let state = get_jni_state();
-    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    guard.user_registry.set_favorite(&id, favorite == JNI_TRUE);
+    // Write to StateMachine's registry (where RX thread reads), not JniState's copy
+    if let Some(ref sm) = guard.state_machine {
+        let mut reg = sm.get_user_registry().lock().unwrap();
+        reg.set_favorite(&id, favorite == JNI_TRUE);
+    } else {
+        drop(guard);
+        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.user_registry.set_favorite(&id, favorite == JNI_TRUE);
+    }
 }
 
 //==============================================================================

@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SassyTalk Privacy Policy</title>
+<style>
+  :root {
+    --bg: #0a0a0a;
+    --fg: #e0e0e0;
+    --accent: #00e5ff;
+    --muted: #888;
+    --card-bg: #141414;
+    --border: #222;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.7;
+    padding: 2rem 1rem;
+    max-width: 800px;
+    margin: 0 auto;
+  }
+  h1 { color: var(--accent); font-size: 1.8rem; margin-bottom: 0.5rem; }
+  h2 { color: var(--accent); font-size: 1.3rem; margin-top: 2rem; margin-bottom: 0.75rem; border-bottom: 1px solid var(--border); padding-bottom: 0.25rem; }
+  h3 { color: var(--fg); font-size: 1.1rem; margin-top: 1.25rem; margin-bottom: 0.5rem; }
+  p, li { margin-bottom: 0.75rem; }
+  ul { padding-left: 1.5rem; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .meta { color: var(--muted); font-size: 0.9rem; margin-bottom: 2rem; }
+  .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0; }
+  .highlight { color: var(--accent); font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+  th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border); font-size: 0.95rem; }
+  th { color: var(--accent); font-weight: 600; }
+  .jurisdiction { background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem 1rem; margin: 0.5rem 0; }
+  .jurisdiction strong { color: var(--accent); }
+  @media (max-width: 600px) {
+    body { padding: 1rem 0.75rem; }
+    h1 { font-size: 1.4rem; }
+    table { font-size: 0.85rem; }
+  }
+</style>
+</head>
+<body>
+
+<h1>SassyTalk Privacy Policy</h1>
+<div class="meta">
+  Version 2.0.0 &bull; Effective Date: March 30, 2026 &bull; Last Updated: March 30, 2026<br>
+  Sassy Consulting LLC &bull; <a href="mailto:support@sassyconsulting.com">support@sassyconsulting.com</a>
+</div>
+
+<div class="card">
+  <strong>Summary:</strong> SassyTalk is an encrypted push-to-talk walkie-talkie app. We do not create user accounts, do not store your voice, and do not sell any data. Audio is encrypted end-to-end on your device and the relay server cannot decrypt it. This policy explains exactly what data exists and where.
+</div>
+
+<h2>1. Who We Are</h2>
+<p>SassyTalk is developed and operated by <strong>Sassy Consulting LLC</strong> ("we", "us", "our"). We are the data controller for any personal data processed through the SassyTalk application.</p>
+<p>Contact: <a href="mailto:support@sassyconsulting.com">support@sassyconsulting.com</a></p>
+
+<h2>2. What SassyTalk Does</h2>
+<p>SassyTalk is a push-to-talk voice communication app that works like a digital walkie-talkie. Users press a button to transmit voice to other devices on the same encrypted channel. Audio is encrypted with AES-256-GCM on your device before transmission and can only be decrypted by devices that share your session key.</p>
+<p>The app supports two communication paths:</p>
+<ul>
+  <li><strong>WiFi Multicast</strong> &mdash; direct device-to-device on the same local network. No server involved.</li>
+  <li><strong>Cellular Relay</strong> &mdash; encrypted audio forwarded through a Cloudflare relay server at <code>relay.sassy-consults.com</code>. The relay is a blind binary forwarder and <span class="highlight">cannot decrypt your audio</span>.</li>
+</ul>
+
+<h2>3. Data We Collect</h2>
+
+<h3>3.1 Data We Do NOT Collect</h3>
+<ul>
+  <li>Voice recordings (audio is never stored on any server)</li>
+  <li>Transcription text (Whisper speech-to-text runs entirely on your device and never leaves it)</li>
+  <li>Email addresses, phone numbers, or any account information (no accounts exist)</li>
+  <li>Contacts, photos, or files from your device</li>
+  <li>Location data</li>
+  <li>Advertising identifiers</li>
+  <li>Analytics or behavioral tracking data</li>
+</ul>
+
+<h3>3.2 Data That Exists When Using the Cellular Relay</h3>
+<p>When you use the cellular relay (internet-based communication), the following data is processed by our infrastructure provider, Cloudflare:</p>
+
+<table>
+  <tr><th>Data</th><th>Purpose</th><th>Retention</th></tr>
+  <tr><td>IP address</td><td>WebSocket connection routing</td><td>Cloudflare infrastructure logs; we do not access or control retention</td></tr>
+  <tr><td>Connection timestamps</td><td>Standard server logging</td><td>Cloudflare infrastructure logs</td></tr>
+  <tr><td>Relay room ID</td><td>Routing encrypted packets to the correct room</td><td>In-memory only; cleared when room closes</td></tr>
+  <tr><td>Peer count per room</td><td>Enforcing 16-peer room limit</td><td>In-memory only</td></tr>
+  <tr><td>Encrypted audio packets</td><td>Forwarding to room peers</td><td>Not stored; forwarded immediately and discarded</td></tr>
+</table>
+
+<h3>3.3 Data Shared With Other Users in Your Session</h3>
+<p>The following is transmitted to other devices in your session as part of the audio wire frame:</p>
+<ul>
+  <li><strong>Display name</strong> and <strong>emoji avatar</strong> &mdash; set by you in the Profile screen. Transmitted in the wire frame header (unencrypted) so peers can identify who is speaking.</li>
+  <li><strong>Device sender ID</strong> &mdash; a random identifier generated per session. Transmitted in the wire frame header (unencrypted).</li>
+  <li><strong>Encrypted audio</strong> &mdash; AES-256-GCM ciphertext. Only devices with the session key can decrypt this.</li>
+  <li><strong>Channel and subchannel numbers</strong> &mdash; transmitted unencrypted for routing. Does not reveal audio content.</li>
+</ul>
+
+<h3>3.4 Data Stored On Your Device</h3>
+<ul>
+  <li><strong>Session keys</strong> &mdash; stored in Android SharedPreferences. These are the AES-256-GCM encryption keys for your active channels. Clearing app data removes them.</li>
+  <li><strong>Profile</strong> &mdash; your chosen display name, emoji, and color. Stored in SharedPreferences.</li>
+  <li><strong>Whisper model</strong> &mdash; a 75MB speech recognition model file (<code>ggml-tiny.en.bin</code>) downloaded from HuggingFace and stored on device for on-device transcription.</li>
+  <li><strong>Temporary audio cache</strong> &mdash; recent audio is held in memory for replay. Cleared when the app closes. Never written to disk.</li>
+</ul>
+
+<h2>4. Permissions We Request</h2>
+<table>
+  <tr><th>Permission</th><th>Why</th></tr>
+  <tr><td>RECORD_AUDIO</td><td>Capture your voice when you press the push-to-talk button</td></tr>
+  <tr><td>CAMERA</td><td>Scan QR codes to join encrypted sessions</td></tr>
+  <tr><td>BLUETOOTH, BLUETOOTH_CONNECT, BLUETOOTH_SCAN</td><td>Discover and connect to nearby peers via Bluetooth</td></tr>
+  <tr><td>INTERNET</td><td>Connect to the cellular relay server for cross-network communication</td></tr>
+  <tr><td>ACCESS_WIFI_STATE, CHANGE_WIFI_MULTICAST_STATE</td><td>Enable WiFi multicast for same-network communication</td></tr>
+  <tr><td>FOREGROUND_SERVICE</td><td>Keep the walkie-talkie active when the screen is off</td></tr>
+  <tr><td>POST_NOTIFICATIONS (Android 13+)</td><td>Show transcription notifications when the app is in the background</td></tr>
+</table>
+
+<h2>5. Third-Party Services</h2>
+
+<h3>Cloudflare (Infrastructure)</h3>
+<p>Our relay server runs on Cloudflare Workers and Durable Objects. Cloudflare processes connection metadata (IP addresses, timestamps, request counts) as part of their infrastructure. We do not have access to Cloudflare's infrastructure logs. Cloudflare's privacy policy: <a href="https://www.cloudflare.com/privacypolicy/" rel="noopener">cloudflare.com/privacypolicy</a></p>
+
+<h3>HuggingFace (Model Download)</h3>
+<p>The Whisper speech recognition model is downloaded from HuggingFace's public model repository. This is a one-time download. HuggingFace may log the download request (IP, timestamp). No audio or personal data is sent to HuggingFace. HuggingFace's privacy policy: <a href="https://huggingface.co/privacy" rel="noopener">huggingface.co/privacy</a></p>
+
+<h3>No Other Third Parties</h3>
+<p>SassyTalk does not include any analytics SDKs, advertising networks, crash reporting services, or social media integrations.</p>
+
+<h2>6. Data Security</h2>
+<ul>
+  <li><strong>End-to-end encryption:</strong> All voice audio is encrypted with AES-256-GCM before leaving your device. The encryption key is generated locally and shared only via QR code or manual code entry.</li>
+  <li><strong>Blind relay:</strong> The relay server forwards encrypted binary packets. It does not have the encryption key and cannot decrypt audio content.</li>
+  <li><strong>No server storage:</strong> Audio packets are forwarded in real-time and immediately discarded. There is no database, no recording, no replay capability on any server.</li>
+  <li><strong>Screen protection:</strong> The app blocks screenshots, screen recording, and app preview in the recent apps list.</li>
+  <li><strong>Local transcription:</strong> Speech-to-text runs entirely on your device using the Whisper model. No audio is sent to any external transcription service.</li>
+</ul>
+
+<h2>7. Children's Privacy</h2>
+<p>SassyTalk does not knowingly collect personal data from children under 13 (or the applicable age in your jurisdiction). Since SassyTalk does not create accounts or collect personal information, there is no mechanism for us to identify the age of users. If you believe a child is using SassyTalk in a way that concerns you, contact us at <a href="mailto:support@sassyconsulting.com">support@sassyconsulting.com</a>.</p>
+
+<h2>8. Your Rights by Jurisdiction</h2>
+
+<div class="jurisdiction">
+  <strong>European Union / European Economic Area / United Kingdom (GDPR)</strong>
+  <p>Legal basis for processing: Legitimate interest (providing the relay service you chose to use). You have the right to access, rectify, erase, restrict processing, data portability, and object to processing. Since we do not store personal data beyond Cloudflare infrastructure logs (which we do not control), most of these rights are satisfied by default. To exercise any rights or lodge a complaint, contact us or your local Data Protection Authority.</p>
+</div>
+
+<div class="jurisdiction">
+  <strong>California, USA (CCPA/CPRA)</strong>
+  <p>We do not sell or share personal information. We do not use personal information for cross-context behavioral advertising. Categories of personal information collected: Internet activity information (IP address, connection timestamps) via Cloudflare infrastructure only. You have the right to know, delete, correct, and opt-out of sale/sharing. Since we do not sell data, there is nothing to opt out of. Contact: <a href="mailto:support@sassyconsulting.com">support@sassyconsulting.com</a></p>
+</div>
+
+<div class="jurisdiction">
+  <strong>Canada (PIPEDA)</strong>
+  <p>We collect the minimum data necessary to provide the relay service. You may request access to your personal information or challenge our compliance by contacting us. Since we do not maintain user accounts or store personal data, access requests will confirm that no personal data is held.</p>
+</div>
+
+<div class="jurisdiction">
+  <strong>Brazil (LGPD)</strong>
+  <p>Legal basis: Legitimate interest. You have the right to confirmation of processing, access, correction, anonymization, portability, deletion, information about sharing, and the right to revoke consent. As we do not store personal data, these rights are satisfied by default. Contact our data protection officer at <a href="mailto:support@sassyconsulting.com">support@sassyconsulting.com</a>.</p>
+</div>
+
+<div class="jurisdiction">
+  <strong>South Africa (POPIA)</strong>
+  <p>We process personal information only for the purpose of providing the relay communication service. Processing is limited to what is necessary for this purpose. You have the right to access, correct, and delete your personal information. Contact us to exercise these rights.</p>
+</div>
+
+<div class="jurisdiction">
+  <strong>All Other Jurisdictions</strong>
+  <p>Regardless of your location, we apply the same privacy standards globally: minimal data collection, end-to-end encryption, no data sales, and transparency about what data exists. If your jurisdiction grants privacy rights not listed above, contact us and we will comply to the extent applicable.</p>
+</div>
+
+<h2>9. Data Retention</h2>
+<ul>
+  <li><strong>Audio:</strong> Never stored. Forwarded in real-time and discarded.</li>
+  <li><strong>Transcription:</strong> Exists only in device memory while the app is running. Not written to disk.</li>
+  <li><strong>Session keys:</strong> Stored on your device until you clear app data or the session expires.</li>
+  <li><strong>Cloudflare logs:</strong> Retained per Cloudflare's data retention policies. We do not access or control these logs.</li>
+  <li><strong>On-device profile:</strong> Stored until you clear app data or uninstall the app.</li>
+</ul>
+
+<h2>10. Future Changes</h2>
+<p>We may introduce paid features in the future. If any paid feature requires additional data collection or processing, this privacy policy will be updated before that feature is released. We will not retroactively change the privacy practices for the free version of SassyTalk.</p>
+
+<h2>11. Changes to This Policy</h2>
+<p>We will update this policy if our data practices change. The "Last Updated" date at the top will reflect the most recent revision. Continued use of SassyTalk after changes constitutes acceptance of the updated policy. For material changes, we will provide notice through the app or on our website.</p>
+
+<h2>12. Contact Us</h2>
+<p>If you have questions about this privacy policy or want to exercise your privacy rights:</p>
+<ul>
+  <li>Email: <a href="mailto:support@sassyconsulting.com">support@sassyconsulting.com</a></li>
+  <li>Website: <a href="https://sassyconsultingllc.com">sassyconsultingllc.com</a></li>
+  <li>Entity: Sassy Consulting LLC</li>
+</ul>
+
+<div class="card" style="margin-top: 2rem;">
+  <strong>Google Play Data Safety Summary:</strong><br>
+  Data collected: Connection metadata (IP, timestamps) via Cloudflare infrastructure.<br>
+  Data shared with peers: Encrypted audio, display name, device ID.<br>
+  Encryption: Yes (AES-256-GCM end-to-end).<br>
+  Data deletion: No user data stored to delete. Clear app data to remove local keys and profile.
+</div>
+
+</body>
+</html>

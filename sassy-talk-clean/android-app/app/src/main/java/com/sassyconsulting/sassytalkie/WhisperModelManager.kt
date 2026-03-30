@@ -19,15 +19,38 @@ object WhisperModelManager {
 
     private const val TAG = "WhisperModel"
 
-    /** Model file name stored in app's filesDir/whisper/ */
-    private const val MODEL_FILENAME = "ggml-tiny.en.bin"
+    /** Available Whisper model configurations */
+    enum class ModelSize(val filename: String, val url: String, val expectedBytes: Long, val label: String) {
+        BASE_EN(
+            "ggml-base.en.bin",
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+            147_964_211L,
+            "Base (142 MB)"
+        ),
+        SMALL_EN(
+            "ggml-small.en.bin",
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
+            487_601_967L,
+            "Small (466 MB)"
+        ),
+        MEDIUM_EN(
+            "ggml-medium.en.bin",
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin",
+            1_533_774_781L,
+            "Medium (1.5 GB)"
+        ),
+        LARGE_V3(
+            "ggml-large-v3.bin",
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
+            3_095_033_483L,
+            "Large (3.1 GB)"
+        );
+    }
 
-    /** CDN URL for the model. Hosted on Hugging Face (public, fast). */
-    private const val MODEL_URL =
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
-
-    /** Model size in bytes (~75 MB) for progress calculation. */
-    private const val EXPECTED_SIZE_BYTES = 77_704_448L
+    /** Current model selection — persisted in SharedPreferences */
+    @Volatile
+    var currentModel: ModelSize = ModelSize.BASE_EN
+        private set
 
     // ── State ──
 
@@ -46,13 +69,30 @@ object WhisperModelManager {
     /** Get the model file path (whether it exists or not). */
     fun modelPath(context: Context): String {
         val dir = File(context.filesDir, "whisper")
-        return File(dir, MODEL_FILENAME).absolutePath
+        return File(dir, currentModel.filename).absolutePath
     }
 
     /** Check if model is already downloaded and valid. */
     fun isModelReady(context: Context): Boolean {
         val file = File(modelPath(context))
         return file.exists() && file.length() > 1_000_000 // basic sanity check
+    }
+
+    /** Load persisted model preference */
+    private fun loadModelPreference(context: Context) {
+        val prefs = context.getSharedPreferences("sassy_whisper", Context.MODE_PRIVATE)
+        val saved = prefs.getString("model_size", "BASE_EN") ?: "BASE_EN"
+        currentModel = try { ModelSize.valueOf(saved) } catch (_: Exception) { ModelSize.BASE_EN }
+    }
+
+    /** Switch to a different model size. Triggers re-download if needed. */
+    fun switchModel(context: Context, model: ModelSize) {
+        currentModel = model
+        context.getSharedPreferences("sassy_whisper", Context.MODE_PRIVATE)
+            .edit().putString("model_size", model.name).apply()
+        _state.value = ModelState.NotDownloaded
+        TranscriptionBridge.whisperReady = false
+        ensureReady(context)
     }
 
     /**
@@ -62,11 +102,21 @@ object WhisperModelManager {
     fun ensureReady(context: Context) {
         if (_state.value is ModelState.Ready) return
 
+        loadModelPreference(context)
         val path = modelPath(context)
         if (isModelReady(context)) {
             // Model exists — just init whisper
             initWhisper(path)
             return
+        }
+
+        // Delete old model files to save space
+        val dir = File(context.filesDir, "whisper")
+        dir.listFiles()?.forEach { f ->
+            if (f.name != currentModel.filename) {
+                f.delete()
+                Log.i(TAG, "Deleted old model: ${f.name}")
+            }
         }
 
         // Need to download
@@ -91,12 +141,13 @@ object WhisperModelManager {
         val dir = File(context.filesDir, "whisper")
         if (!dir.exists()) dir.mkdirs()
 
-        val outFile = File(dir, MODEL_FILENAME)
-        val tmpFile = File(dir, "$MODEL_FILENAME.tmp")
+        val model = currentModel
+        val outFile = File(dir, model.filename)
+        val tmpFile = File(dir, "${model.filename}.tmp")
 
-        Log.i(TAG, "Downloading model from $MODEL_URL")
+        Log.i(TAG, "Downloading ${model.label} from ${model.url}")
 
-        val conn = URL(MODEL_URL).openConnection() as HttpURLConnection
+        val conn = URL(model.url).openConnection() as HttpURLConnection
         conn.connectTimeout = 30_000
         conn.readTimeout = 60_000
         conn.instanceFollowRedirects = true
@@ -107,7 +158,7 @@ object WhisperModelManager {
             if (code != 200) throw Exception("HTTP $code")
 
             val totalBytes = conn.contentLengthLong.let {
-                if (it > 0) it else EXPECTED_SIZE_BYTES
+                if (it > 0) it else model.expectedBytes
             }
 
             conn.inputStream.buffered().use { input ->

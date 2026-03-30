@@ -18,6 +18,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.ui.theme.*
 import java.text.SimpleDateFormat
 import java.util.*
@@ -30,6 +31,8 @@ data class TranscriptionEntry(
     val timestamp: Long,
     val isFavorite: Boolean = false,
     val isMuted: Boolean = false,
+    /** Unique utterance ID from Rust audio cache history. -1 if not cached. */
+    val utteranceId: Long = -1L,
 )
 
 /** Color palette for user avatars — deterministic from user ID */
@@ -227,6 +230,21 @@ private fun TranscriptionBubble(
                 fontSize = 14.sp,
                 color = TextWhite
             )
+        }
+
+        // Replay button — only shown if audio is still in cache
+        if (entry.utteranceId >= 0) {
+            IconButton(
+                onClick = { SassyTalkNative.replayById(entry.utteranceId) },
+                modifier = Modifier.size(32.dp)
+            ) {
+                Icon(
+                    Icons.Default.PlayArrow,
+                    contentDescription = "Replay",
+                    tint = Cyan,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
         }
     }
 }

@@ -21,8 +21,16 @@
 /// The sender_id comes from UserRegistry::derive_user_id()
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use log::{info, warn};
+
+/// Global monotonic utterance ID counter
+static NEXT_UTTERANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_utterance_id() -> u64 {
+    NEXT_UTTERANCE_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// How long silence before we consider a speaker "done talking"
 const SPEECH_GAP_MS: u64 = 400;
@@ -48,6 +56,7 @@ pub struct CachedFrame {
 
 /// A complete utterance (contiguous speech) from one speaker
 pub struct Utterance {
+    pub id: u64,               // unique monotonic ID
     pub sender_id: String,
     pub sender_name: String,
     pub is_favorite: bool,
@@ -120,6 +129,7 @@ impl SpeakerBuffer {
         self.last_timestamp = 0;
 
         Utterance {
+            id: next_utterance_id(),
             sender_id: self.sender_id.clone(),
             sender_name: sender_name.to_string(),
             is_favorite,
@@ -181,6 +191,10 @@ pub struct AudioCache {
     history: VecDeque<Utterance>,
     /// Max history entries
     max_history: usize,
+
+    /// Shadow accumulator for Live mode — captures frames for history even
+    /// though they're passed through immediately for playback
+    live_accumulator: HashMap<String, SpeakerBuffer>,
 }
 
 impl AudioCache {
@@ -194,6 +208,7 @@ impl AudioCache {
             user_info: HashMap::new(),
             history: VecDeque::new(),
             max_history: 50,
+            live_accumulator: HashMap::new(),
         }
     }
 
@@ -251,6 +266,19 @@ impl AudioCache {
             if let Some(buf) = self.active_buffers.get_mut(sender_id) {
                 buf.frames.pop();
             }
+
+            // Shadow-accumulate for replay history even in Live mode
+            let live_frame = CachedFrame {
+                sender_id: sender_id.to_string(),
+                timestamp,
+                samples: samples.clone(),
+                received_at: Instant::now(),
+            };
+            if !self.live_accumulator.contains_key(sender_id) {
+                self.live_accumulator.insert(sender_id.to_string(), SpeakerBuffer::new(sender_id));
+            }
+            self.live_accumulator.get_mut(sender_id).unwrap().push_frame(live_frame);
+
             return Some(samples);
         }
 
@@ -261,6 +289,29 @@ impl AudioCache {
     /// Called periodically by the RX/playback thread to check for completed utterances
     /// and move them to the playback queue
     pub fn tick(&mut self) {
+        // Finalize live-mode shadow accumulators into history for replay
+        let live_completed: Vec<String> = self.live_accumulator.iter()
+            .filter(|(_, buf)| buf.is_speech_complete())
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in live_completed {
+            if let Some(mut buffer) = self.live_accumulator.remove(&id) {
+                let (name, is_fav, _) = self.user_info.get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| (id.clone(), false, false));
+
+                let mut utterance = buffer.drain_to_utterance(&name, is_fav);
+                if !utterance.frames.is_empty() {
+                    utterance.fully_played = true;
+                    if self.history.len() >= self.max_history {
+                        self.history.pop_front();
+                    }
+                    self.history.push_back(utterance);
+                }
+            }
+        }
+
         // Check each active buffer for speech completion
         let completed_ids: Vec<String> = self.active_buffers.iter()
             .filter(|(_, buf)| buf.is_speech_complete())
@@ -402,15 +453,15 @@ impl AudioCache {
         &self.history
     }
 
-    /// Replay a specific utterance from history by index
+    /// Replay a specific utterance from history by index (legacy)
     pub fn replay_from_history(&mut self, index: usize) -> bool {
         if index >= self.history.len() {
             return false;
         }
 
-        // Clone the utterance frames for replay
         let original = &self.history[index];
         let replay = Utterance {
+            id: original.id,
             sender_id: original.sender_id.clone(),
             sender_name: original.sender_name.clone(),
             is_favorite: original.is_favorite,
@@ -426,9 +477,41 @@ impl AudioCache {
         true
     }
 
+    /// Replay a specific utterance from history by unique ID
+    pub fn replay_by_id(&mut self, utterance_id: u64) -> bool {
+        let original = match self.history.iter().find(|u| u.id == utterance_id) {
+            Some(u) => u,
+            None => return false,
+        };
+
+        let replay = Utterance {
+            id: original.id,
+            sender_id: original.sender_id.clone(),
+            sender_name: original.sender_name.clone(),
+            is_favorite: original.is_favorite,
+            started_at: original.started_at,
+            ended_at: original.ended_at,
+            frames: original.frames.clone(),
+            fully_played: false,
+        };
+
+        let name = replay.sender_name.clone();
+        self.mode = CacheMode::Replay;
+        self.now_playing = Some(replay);
+        self.play_cursor = 0;
+        info!("AudioCache: replaying utterance id={} from {}", utterance_id, name);
+        true
+    }
+
+    /// Get the ID of the most recently added history entry
+    pub fn last_history_id(&self) -> Option<u64> {
+        self.history.back().map(|u| u.id)
+    }
+
     /// Clear all cached audio
     pub fn clear(&mut self) {
         self.active_buffers.clear();
+        self.live_accumulator.clear();
         self.playback_queue.clear();
         self.now_playing = None;
         self.play_cursor = 0;
@@ -525,6 +608,7 @@ mod tests {
 
         // Create utterances manually
         let u_alice = Utterance {
+            id: next_utterance_id(),
             sender_id: "alice".into(),
             sender_name: "Alice".into(),
             is_favorite: false,
@@ -540,6 +624,7 @@ mod tests {
         };
 
         let u_bob = Utterance {
+            id: next_utterance_id(),
             sender_id: "bob".into(),
             sender_name: "Bob".into(),
             is_favorite: true,
@@ -583,6 +668,7 @@ mod tests {
         }).collect();
 
         cache.playback_queue.push_back(Utterance {
+            id: next_utterance_id(),
             sender_id: "alice".into(),
             sender_name: "Alice".into(),
             is_favorite: false,
@@ -593,6 +679,7 @@ mod tests {
         });
 
         cache.playback_queue.push_back(Utterance {
+            id: next_utterance_id(),
             sender_id: "bob".into(),
             sender_name: "Bob".into(),
             is_favorite: false,
@@ -638,6 +725,7 @@ mod tests {
         }).collect();
 
         cache.playback_queue.push_back(Utterance {
+            id: next_utterance_id(),
             sender_id: "alice".into(),
             sender_name: "Alice".into(),
             is_favorite: false,
