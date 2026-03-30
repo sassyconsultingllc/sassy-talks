@@ -10,9 +10,18 @@
  *   Text messages   → JSON control (ping/pong, peer_joined, peer_left)
  *
  * Uses WebSocket Hibernation so idle rooms don't consume memory.
+ *
+ * Security:
+ *   - Room capacity capped at MAX_PEERS_PER_ROOM (prevents abuse)
+ *   - Dead sockets pruned on send failure
+ *   - Device name length capped
+ *   - All audio is end-to-end encrypted (AES-256-GCM) — relay never sees plaintext
  */
 
 import { DurableObject } from "cloudflare:workers";
+
+const MAX_PEERS_PER_ROOM = 16;
+const MAX_DEVICE_NAME_LEN = 100;
 
 export class PttRoom extends DurableObject {
   constructor(ctx, env) {
@@ -34,6 +43,12 @@ export class PttRoom extends DurableObject {
       return new Response("Expected WebSocket upgrade", { status: 426 });
     }
 
+    // Enforce room capacity
+    const currentPeers = this.ctx.getWebSockets().length;
+    if (currentPeers >= MAX_PEERS_PER_ROOM) {
+      return new Response("Room full", { status: 429 });
+    }
+
     // Create the WebSocket pair
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -42,11 +57,12 @@ export class PttRoom extends DurableObject {
     this.ctx.acceptWebSocket(server);
 
     const clientId = url.searchParams.get("client_id") || crypto.randomUUID();
-    const device = url.searchParams.get("device") || "Unknown";
+    const rawDevice = url.searchParams.get("device") || "Unknown";
+    const device = decodeURIComponent(rawDevice).substring(0, MAX_DEVICE_NAME_LEN);
 
     const session = {
       id: clientId,
-      device: decodeURIComponent(device),
+      device,
       joinedAt: Date.now(),
     };
 
@@ -61,7 +77,7 @@ export class PttRoom extends DurableObject {
       device: session.device,
       peers: this.sessions.size,
     });
-    this.broadcast(server, joinMsg, /* textOnly */ true);
+    this.broadcast(server, joinMsg);
 
     // Send welcome to the new client
     server.send(JSON.stringify({
@@ -108,7 +124,9 @@ export class PttRoom extends DurableObject {
         try {
           peer.send(message);
         } catch {
-          // Peer disconnected; webSocketClose will clean up
+          // Send failed — peer is dead. Force-close so it gets cleaned up.
+          try { peer.close(1011, "Send failed"); } catch { /* already closed */ }
+          this.sessions.delete(peer);
         }
       }
     }
@@ -120,14 +138,14 @@ export class PttRoom extends DurableObject {
   async webSocketClose(ws, code, reason, wasClean) {
     const session = this.sessions.get(ws) || ws.deserializeAttachment() || {};
     this.sessions.delete(ws);
-    ws.close(code, reason);
+    try { ws.close(code, reason); } catch { /* already closed */ }
 
     // Notify remaining peers
     const leaveMsg = JSON.stringify({
       type: "peer_left",
       client_id: session.id || "unknown",
       device: session.device || "Unknown",
-      peers: this.sessions.size,
+      peers: this.ctx.getWebSockets().length,
     });
 
     const sockets = this.ctx.getWebSockets();
@@ -135,7 +153,8 @@ export class PttRoom extends DurableObject {
       try {
         peer.send(leaveMsg);
       } catch {
-        // ignore
+        // Dead socket — will be cleaned up on next message or close
+        this.sessions.delete(peer);
       }
     }
   }
@@ -147,22 +166,22 @@ export class PttRoom extends DurableObject {
     const session = this.sessions.get(ws) || {};
     console.error(`WebSocket error for ${session.id || "unknown"}: ${error}`);
     this.sessions.delete(ws);
+    try { ws.close(1011, "Error"); } catch { /* ignore */ }
   }
 
   /**
    * Broadcast a message to all peers except the sender.
-   * @param {WebSocket} sender - The WebSocket that sent the message (excluded)
-   * @param {string|ArrayBuffer} message - The message to broadcast
-   * @param {boolean} textOnly - If true, only send to sockets (skip binary check)
    */
-  broadcast(sender, message, textOnly = false) {
+  broadcast(sender, message) {
     const sockets = this.ctx.getWebSockets();
     for (const peer of sockets) {
       if (peer !== sender) {
         try {
           peer.send(message);
         } catch {
-          // ignore dead sockets
+          // Dead socket — force-close
+          try { peer.close(1011, "Broadcast failed"); } catch { /* ignore */ }
+          this.sessions.delete(peer);
         }
       }
     }

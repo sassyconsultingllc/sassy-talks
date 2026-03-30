@@ -159,22 +159,21 @@
         </p>
 
         <div class="highlight">
-            <h2>📱 Sassy-Talk: True Privacy by Design</h2>
-            <p><strong>We don't collect your data because we can't see it.</strong></p>
-            <p>Sassy-Talk is a <strong>100% peer-to-peer</strong> encrypted walkie-talkie app. Your conversations go directly from your device to your friend's device via Bluetooth. No servers. No cloud. No data collection. Period.</p>
+            <h2>📱 Sassy-Talk: Privacy by Design</h2>
+            <p><strong>We minimize data collection and protect your communications.</strong></p>
+            <p>Sassy-Talk is designed to work peer-to-peer (Bluetooth, WiFi multicast, or WiFi Direct) so audio is kept local whenever possible. The app also supports an optional encrypted "cellular relay" transport to let devices communicate over the internet when peers are not on the same local network. When the cellular relay is used audio frames are encrypted on-device (AES-256-GCM) and forwarded through a relay service (Cloudflare Durable Objects). The relay forwards encrypted audio but does not decrypt it. By default the relay is a transient forwarder and audio is not stored; some ancillary endpoints (contact form, downloads, or optional analytics) may collect minimal metadata — see sections below for details.
+            </p>
         </div>
 
-        <h2>🚫 What We DON'T Collect</h2>
-        <p>Unlike most apps, we genuinely collect <strong>ZERO personal data</strong>:</p>
+        <h2>🚫 What We DON'T Collect (Unless You Use Optional Features)</h2>
+        <p>By default Sassy-Talk does not collect identifiable conversation content. However, depending on the transport and optional features you use, the app may send minimal data to our backend endpoints:</p>
         <ul>
-            <li>❌ No names or email addresses</li>
-            <li>❌ No conversation recordings</li>
-            <li>❌ No location tracking</li>
-            <li>❌ No contact list access</li>
-            <li>❌ No analytics or usage statistics</li>
-            <li>❌ No advertising IDs</li>
-            <li>❌ No user accounts</li>
-            <li>❌ No third-party data sharing</li>
+            <li>❌ We do not collect saved conversation recordings by default.</li>
+            <li>⚠️ <strong>Cellular relay:</strong> Encrypted audio frames are forwarded via a relay service when you choose the "Cellular Relay" transport; the relay does not decrypt audio and does not persist audio by default.</li>
+            <li>✅ <strong>Contact form:</strong> If you submit the contact form we will receive the name, email, and message you provide so we can respond.</li>
+            <li>⚠️ <strong>Connection analysis / diagnostics:</strong> Some server endpoints may collect limited connection metadata (e.g., masked or hashed IP, country) to help diagnose connectivity issues; any stored logs are minimized and/or hashed where practical.</li>
+            <li>❌ No contact list access unless you explicitly grant and use a feature that requires it.</li>
+            <li>❌ No advertising IDs or third‑party advertising networks.</li>
         </ul>
 
         <h2>🔐 How It Works</h2>
@@ -206,10 +205,10 @@
         </div>
 
         <div class="feature">
-            <h3>🌐 INTERNET (Declared but Unused)</h3>
-            <p><strong>Why it's declared:</strong> Reserved for potential future WiFi Direct features</p>
-            <p><strong>Current usage:</strong> NONE - the app works 100% offline</p>
-            <p><strong>Your privacy:</strong> No internet connection is made</p>
+            <h3>🌐 INTERNET</h3>
+            <p><strong>Why it's declared:</strong> Used for optional features: the cellular relay (encrypted forwarding), contact form, download catalog, and payments (Stripe) if enabled.</p>
+            <p><strong>Current usage:</strong> Internet is only used when you choose a feature that requires it — e.g., "Cellular Relay", submitting the contact form, or purchasing a product. Encrypted audio frames sent via the relay are forwarded but not decrypted by the relay.</p>
+            <p><strong>Your privacy:</strong> When internet features are used we document what is transmitted and who receives it in the sections below.</p>
         </div>
 
         <h2>🔒 Security & Encryption</h2>
@@ -238,8 +237,14 @@
 
         <h2>🎯 Third-Party Services</h2>
         <div class="warning">
-            <strong>We use ZERO third-party services.</strong>
-            <p>No analytics. No ads. No tracking SDKs. Just you, your friend, and Bluetooth.</p>
+            <strong>Minimal third-party services are used for optional features.</strong>
+            <p>When the cellular relay or server-backed features are used we rely on a small set of third-party services:</p>
+            <ul>
+                <li>Cloudflare — Durable Objects & R2 for relay and optional downloads.</li>
+                <li>Stripe — payment processing for purchases (we do not directly handle card numbers in the app).</li>
+                <li>Email delivery provider — used to deliver contact form messages.</li>
+            </ul>
+            <p>We do not include analytics SDKs or advertising networks by default.</p>
         </div>
 
         <h2>✋ Your Rights</h2>
@@ -282,12 +287,12 @@
         <div class="highlight" style="margin-top: 40px;">
             <h2>📊 Google Play Store Data Safety Summary</h2>
             <ul>
-                <li>✅ <strong>Data Collected:</strong> None</li>
-                <li>✅ <strong>Data Shared:</strong> None</li>
-                <li>✅ <strong>Data Transmitted:</strong> Encrypted voice (peer-to-peer only)</li>
-                <li>✅ <strong>Data Stored:</strong> None</li>
-                <li>✅ <strong>Encryption:</strong> Yes (AES-256-GCM)</li>
-                <li>✅ <strong>Third-Party Sharing:</strong> None</li>
+                <li>✅ <strong>Data Collected:</strong> Minimal and opt-in: contact form (name, email, message); diagnostic metadata (masked/hashed IP) only when enabled; encrypted audio frames may be forwarded when using the cellular relay.</li>
+                <li>⚠️ <strong>Data Shared:</strong> Encrypted audio frames are forwarded through Cloudflare relay; contact form data is sent to our configured email/storage provider; Stripe handles payment data.</li>
+                <li>✅ <strong>Data Transmitted:</strong> Encrypted audio (AES-256-GCM) when using relay; contact form and minimal metadata when you submit them.</li>
+                <li>⚠️ <strong>Data Stored:</strong> By default audio is not stored; contact form and diagnostic logs may be stored for support purposes (retention limited).</li>
+                <li>✅ <strong>Encryption:</strong> Audio is encrypted on-device (AES-256-GCM) in transit; server-side forwarding does not decrypt audio.</li>
+                <li>⚠️ <strong>Third-Party Sharing:</strong> Cloudflare (relay/R2), Stripe (payments), and email provider are used for specific features.</li>
             </ul>
         </div>
 

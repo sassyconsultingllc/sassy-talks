@@ -1,0 +1,35 @@
+Play Console Data Safety suggested entries:
+
+1) Data types collected
+- Audio (voice): Transmitted (encrypted) when user selects "Cellular Relay". Purpose: App functionality (real-time communication). Storage: No (relay forwards encrypted frames only). Encryption: AES-256-GCM on-device; TLS to server.
+- User-provided contact info: Name, email, message (if user submits contact form). Purpose: Customer support. Storage: Yes (email provider/DB). Shared with: Email delivery provider.
+- Diagnostics/Connection metadata: Masked/hashed IP, country, connectivity metrics (only when diagnostic endpoint used). Purpose: Debugging/analytics. Storage: Possibly (hashed), retention limited.
+- Financial info: Payments handled by Stripe (third-party). The app does NOT collect raw card numbers.
+
+2) Data usage purposes
+- App functionality: Encrypted voice forwarding for relay.
+- Analytics/Diagnostics: Connection analysis (optional/minimal).
+- Contact: Responding to user messages.
+- Payments: Stripe checkout.
+
+3) Data retention
+- Encrypted audio frames: Not stored by default; transient.
+- Contact form & diagnostics: May be stored for support; retention policy should be documented on backend.
+- Payments: Managed by Stripe per their policy.
+
+4) Third parties
+- Cloudflare (Durable Objects, R2) — relay and optional downloads.
+- Stripe — payment processing.
+- Email delivery provider — contact messages.
+
+5) Security
+- Audio encryption: AES-256-GCM on-device.
+- Transport: HTTPS/TLS for server endpoints.
+
+6) Answers for Play Console fields (copy/paste guidance)
+- "Is data collected?" — Yes (audio when using Cellular Relay; contact form when submitted; diagnostics optional).
+- "Is data shared?" — Yes (Cloudflare for relay, Stripe for payments, email provider for contact messages).
+- "Is data encrypted in transit?" — Yes (AES-256-GCM for audio; TLS for server comms).
+- "Does the app allow users to request deletion?" — Contact form data and diagnostics: contact support@ (or provide backend deletion flow). Encrypted audio: not stored, uninstall removes local data.
+
+Notes: If you want to present the app as strictly P2P, build with `ENABLE_CELLULAR_RELAY=false` and remove/disable any server-backed features; otherwise disclose the relay and third parties as above.

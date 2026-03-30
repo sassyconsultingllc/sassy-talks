@@ -19,9 +19,12 @@ pub mod transport;
 pub mod session;
 pub mod users;
 pub mod audio_cache;
+pub mod opus_ffi;
 pub mod codec;
 pub mod audio_pipeline;
 pub mod cellular_transport;
+pub mod whisper_ffi;
+pub mod transcription;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

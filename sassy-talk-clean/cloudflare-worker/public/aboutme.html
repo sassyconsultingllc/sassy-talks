@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>About Shane | Sassy Consulting LLC</title>
+    <meta name="description" content="The story behind Sassy Consulting LLC — from building custom homes and cleaning alongside mom, to 11 years of military service, to building privacy-focused software in Wisconsin.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-deep: #0a1628;
+            --bg-card: #0f1d32;
+            --bg-card-hover: #132440;
+            --text-primary: #e8edf5;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --accent: #3b82f6;
+            --accent-light: #60a5fa;
+            --accent-dim: rgba(59, 130, 246, 0.15);
+            --accent-glow: rgba(59, 130, 246, 0.08);
+            --border: #1e3050;
+            --border-hover: #2a4a6e;
+            --green: #22c55e;
+            --gold: #f59e0b;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html { scroll-behavior: smooth; }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-deep);
+            color: var(--text-primary);
+            line-height: 1.7;
+            overflow-x: hidden;
+        }
+
+        /* NAV */
+        nav {
+            position: fixed;
+            top: 0; left: 0; right: 0;
+            z-index: 1000;
+            padding: 0 2rem;
+            height: 64px;
+            background: rgba(10, 22, 40, 0.9);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+        }
+
+        nav .container {
+            max-width: 900px;
+            margin: 0 auto;
+            width: 100%;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            font-weight: 700;
+            font-size: 1.15rem;
+            color: var(--text-primary);
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .logo-icon {
+            width: 32px;
+            height: 32px;
+            background: var(--accent);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            font-weight: 700;
+            color: #fff;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 1.5rem;
+            align-items: center;
+        }
+
+        .nav-links a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: color 0.2s;
+        }
+
+        .nav-links a:hover { color: var(--text-primary); }
+
+        /* HERO */
+        .hero {
+            min-height: 50vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            padding: 10rem 2rem 4rem;
+            position: relative;
+        }
+
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 700px;
+            height: 700px;
+            background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .hero-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1.25rem;
+            background: var(--accent-dim);
+            border: 1px solid rgba(59, 130, 246, 0.25);
+            border-radius: 100px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--accent-light);
+            margin-bottom: 2rem;
+        }
+
+        .hero h1 {
+            font-size: clamp(2.25rem, 6vw, 3.5rem);
+            font-weight: 800;
+            line-height: 1.15;
+            margin-bottom: 1.25rem;
+            letter-spacing: -0.02em;
+        }
+
+        .hero .tagline {
+            font-size: 1.2rem;
+            color: var(--text-secondary);
+            max-width: 550px;
+            font-style: italic;
+        }
+
+        /* TIMELINE */
+        .timeline {
+            max-width: 780px;
+            margin: 0 auto;
+            padding: 2rem 2rem 6rem;
+            position: relative;
+        }
+
+        .timeline::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 42px;
+            width: 2px;
+            height: 100%;
+            background: linear-gradient(180deg, var(--accent) 0%, var(--border) 100%);
+        }
+
+        .timeline-card {
+            position: relative;
+            margin-bottom: 3rem;
+            padding-left: 80px;
+        }
+
+        .timeline-card:last-child { margin-bottom: 0; }
+
+        /* Timeline dot */
+        .timeline-card::before {
+            content: '';
+            position: absolute;
+            left: 35px;
+            top: 2rem;
+            width: 16px;
+            height: 16px;
+            background: var(--accent);
+            border-radius: 50%;
+            border: 3px solid var(--bg-deep);
+            box-shadow: 0 0 0 3px var(--accent-dim);
+            z-index: 1;
+        }
+
+        .card-inner {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 2rem;
+            transition: all 0.3s ease;
+        }
+
+        .card-inner:hover {
+            border-color: var(--border-hover);
+            background: var(--bg-card-hover);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+
+        .card-era {
+            display: inline-block;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--accent-light);
+            background: var(--accent-dim);
+            padding: 0.25rem 0.75rem;
+            border-radius: 6px;
+            margin-bottom: 1rem;
+        }
+
+        .card-inner h2 {
+            font-size: 1.4rem;
+            font-weight: 700;
+            margin-bottom: 0.75rem;
+            color: var(--text-primary);
+        }
+
+        .card-inner p {
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+            line-height: 1.8;
+            margin-bottom: 0.75rem;
+        }
+
+        .card-inner p:last-child { margin-bottom: 0; }
+
+        .card-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            color: var(--accent-light);
+            text-decoration: none;
+            font-size: 0.9rem;
+            font-weight: 500;
+            margin-top: 0.5rem;
+            transition: color 0.2s;
+        }
+
+        .card-link:hover { color: #93bbfd; }
+
+        .card-link svg {
+            width: 14px;
+            height: 14px;
+        }
+
+        /* FOOTER */
+        footer {
+            border-top: 1px solid var(--border);
+            padding: 3rem 2rem;
+        }
+
+        .footer-content {
+            max-width: 900px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 1.5rem;
+        }
+
+        .footer-left {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+
+        .footer-left strong {
+            color: var(--text-secondary);
+        }
+
+        .footer-links {
+            display: flex;
+            gap: 1.5rem;
+        }
+
+        .footer-links a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: color 0.2s;
+        }
+
+        .footer-links a:hover { color: var(--text-primary); }
+
+        /* RESPONSIVE */
+        @media (max-width: 768px) {
+            .nav-links { display: none; }
+
+            .hero { padding: 8rem 1.5rem 3rem; }
+
+            .timeline { padding: 2rem 1rem 4rem; }
+
+            .timeline::before { left: 20px; }
+
+            .timeline-card { padding-left: 52px; }
+
+            .timeline-card::before { left: 13px; }
+
+            .card-inner { padding: 1.5rem; }
+
+            .footer-content { flex-direction: column; text-align: center; }
+        }
+
+        /* FADE IN */
+        @keyframes fadeUp {
+            from { opacity: 0; transform: translateY(24px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .fade-in {
+            opacity: 0;
+            animation: fadeUp 0.6s ease-out forwards;
+        }
+
+        .fade-in.d1 { animation-delay: 0.1s; }
+        .fade-in.d2 { animation-delay: 0.2s; }
+        .fade-in.d3 { animation-delay: 0.3s; }
+        .fade-in.d4 { animation-delay: 0.4s; }
+        .fade-in.d5 { animation-delay: 0.5s; }
+        .fade-in.d6 { animation-delay: 0.6s; }
+    </style>
+</head>
+<body>
+
+    <nav>
+        <div class="container">
+            <a href="/" class="logo">
+                <span class="logo-icon">SC</span>
+                Sassy Consulting
+            </a>
+            <div class="nav-links">
+                <a href="/">Home</a>
+                <a href="/#products">Products</a>
+                <a href="https://github.com/sassyconsultingllc" target="_blank" rel="noopener">GitHub</a>
+            </div>
+        </div>
+    </nav>
+
+    <section class="hero">
+        <div class="hero-badge fade-in">Veteran-Owned &bull; Wisconsin</div>
+        <h1 class="fade-in d1">About Shane</h1>
+        <p class="tagline fade-in d2">Built by hand. Forged in service. Driven by purpose.</p>
+    </section>
+
+    <div class="timeline">
+
+        <!-- CARD 1: ROOTS -->
+        <div class="timeline-card fade-in d3">
+            <div class="card-inner">
+                <span class="card-era">Since Childhood</span>
+                <h2>Roots &mdash; Growing Up Building</h2>
+                <p>I grew up in a family that built custom homes. Zach Builders was the family business, and the job site was my classroom. Before I understood blueprints, I understood work &mdash; showing up early, doing the job right, taking pride in something you built with your own hands.</p>
+                <p>Framing walls, pouring foundations, finishing trim &mdash; I learned that everything worth having starts from the ground up. That stuck with me.</p>
+                <a href="https://zachbuilders.com" class="card-link" target="_blank" rel="noopener">
+                    Zach Builders
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 17L17 7"/><path d="M7 7h10v10"/></svg>
+                </a>
+            </div>
+        </div>
+
+        <!-- CARD 2: MOM -->
+        <div class="timeline-card fade-in d4">
+            <div class="card-inner">
+                <span class="card-era">Growing Up</span>
+                <h2>Side by Side &mdash; Mom's Cleaning Company</h2>
+                <p>My mom ran a cleaning company, and her primary client was the building company. So while the crew built the homes, we came behind them and made them shine. I was right there beside her, learning what it means to finish the job &mdash; not just do it, but do it so well nobody questions it.</p>
+                <p>She taught me that the work nobody sees is the work that matters most. Attention to detail. Showing up when you said you would. Taking care of people's spaces like they were your own. I carry that with me in everything I build today.</p>
+            </div>
+        </div>
+
+        <!-- CARD 3: COLLEGE -->
+        <div class="timeline-card fade-in d5">
+            <div class="card-inner">
+                <span class="card-era">2010 &ndash; 2014</span>
+                <h2>College &mdash; Eau Claire, WI</h2>
+                <p>Headed to Eau Claire, Wisconsin for college. Balanced classes with the work ethic that was already second nature &mdash; the kind you pick up when you've been on job sites and cleaning crews since you were a kid.</p>
+            </div>
+        </div>
+
+        <!-- CARD 4: SERVICE -->
+        <div class="timeline-card fade-in d6">
+            <div class="card-inner">
+                <span class="card-era">11 Years</span>
+                <h2>Service &mdash; U.S. Army</h2>
+                <p>I served 11 years in the United States Army as a Chemical Warfare Officer. Chemical Warfare isn't about using weapons &mdash; it's about understanding threats invisible to the naked eye. Protecting people from dangers they can't see coming. Building systems that keep everyone safe, even when they don't know they're in danger.</p>
+                <p>That mission shaped everything I do now. The threats changed &mdash; from chemical agents to malware, from battlefields to browsers &mdash; but the job is the same: protect people who didn't sign up for this fight.</p>
+            </div>
+        </div>
+
+        <!-- CARD 5: CORY'S WEBSITE -->
+        <div class="timeline-card fade-in d6">
+            <div class="card-inner">
+                <span class="card-era">Recent</span>
+                <h2>Helping Others Build &mdash; Riverview Adventure Company</h2>
+                <p>Built the website for Cory's Riverview Adventure Company. Same principle as always &mdash; someone needs something built right, you show up and build it. Whether it's a house, a clean space, or a website, the craft is the same.</p>
+                <a href="https://riverviewadventurecompany.com" class="card-link" target="_blank" rel="noopener">
+                    Riverview Adventure Company
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 17L17 7"/><path d="M7 7h10v10"/></svg>
+                </a>
+            </div>
+        </div>
+
+        <!-- CARD 6: NOW -->
+        <div class="timeline-card fade-in d6">
+            <div class="card-inner">
+                <span class="card-era">Now</span>
+                <h2>Building Again &mdash; Sassy Consulting LLC</h2>
+                <p>Everything I learned &mdash; building homes with my family, cleaning and finishing alongside my mom, protecting people in the Army &mdash; it all led here. Sassy Consulting LLC is a veteran-owned software company in Wisconsin, and I build privacy-focused tools that put control back in people's hands.</p>
+                <p>No tracking. No telemetry. No data harvesting. Just tools that work, built by someone who knows what it means to protect people and take pride in the craft. Still serving. Different uniform.</p>
+            </div>
+        </div>
+
+    </div>
+
+    <footer>
+        <div class="footer-content">
+            <div class="footer-left">
+                <strong>Sassy Consulting LLC</strong> &mdash; Veteran-Owned, Wisconsin-Made
+            </div>
+            <div class="footer-links">
+                <a href="/">Home</a>
+                <a href="/#products">Products</a>
+                <a href="https://github.com/sassyconsultingllc" target="_blank" rel="noopener">GitHub</a>
+            </div>
+        </div>
+    </footer>
+
+</body>
+</html>

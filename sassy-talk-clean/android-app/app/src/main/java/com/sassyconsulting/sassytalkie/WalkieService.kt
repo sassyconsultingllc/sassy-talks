@@ -216,10 +216,14 @@ class WalkieService : Service() {
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 "Sassy-Talk Radio",
-                NotificationManager.IMPORTANCE_LOW  // No sound, just persistent icon
+                NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
                 description = "Keeps the walkie-talkie radio active"
-                setShowBadge(false)
+                setShowBadge(true)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                // No sound for ongoing updates — only visual presence
+                setSound(null, null)
+                enableVibration(false)
             }
             val nm = getSystemService(NotificationManager::class.java)
             nm.createNotificationChannel(channel)
@@ -228,7 +232,7 @@ class WalkieService : Service() {
 
     private fun buildNotification(status: String): Notification {
         val launchIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         val pendingIntent = PendingIntent.getActivity(
             this, 0, launchIntent,
@@ -242,6 +246,12 @@ class WalkieService : Service() {
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setSilent(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setShowWhen(false)
+            .setNumber(1)
+            .setBadgeIconType(NotificationCompat.BADGE_ICON_SMALL)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .build()
     }
 

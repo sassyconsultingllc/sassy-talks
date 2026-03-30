@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Contact | Sassy Consulting LLC</title>
+    <meta name="description" content="Get in touch with Sassy Consulting LLC.">
+    <style>
+        :root {
+            --bg-primary: #0a0a0a;
+            --bg-secondary: #111111;
+            --bg-tertiary: #1a1a1a;
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0a0;
+            --accent-primary: #22c55e;
+            --accent-secondary: #16a34a;
+            --border-subtle: #222222;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+        }
+        .container {
+            width: 100%;
+            max-width: 500px;
+        }
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+        }
+        .subtitle {
+            color: var(--text-secondary);
+            margin-bottom: 2rem;
+        }
+        form {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-subtle);
+            border-radius: 16px;
+            padding: 2rem;
+        }
+        .field {
+            margin-bottom: 1.5rem;
+        }
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+        input, textarea {
+            width: 100%;
+            padding: 0.75rem 1rem;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-subtle);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 1rem;
+            font-family: inherit;
+        }
+        input:focus, textarea:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+        }
+        textarea {
+            resize: vertical;
+            min-height: 120px;
+        }
+        button {
+            width: 100%;
+            padding: 1rem 2rem;
+            background: var(--accent-primary);
+            color: #000;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: var(--accent-secondary);
+        }
+        .back-link {
+            display: block;
+            text-align: center;
+            margin-top: 1.5rem;
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.9rem;
+        }
+        .back-link:hover {
+            color: var(--text-primary);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Contact Us</h1>
+        <p class="subtitle">Have questions? We'd love to hear from you.</p>
+        
+        <form action="/api/contact" method="POST">
+            <div class="field">
+                <label for="name">Name</label>
+                <input type="text" id="name" name="name" required minlength="2" maxlength="100" placeholder="Your name">
+            </div>
+            <div class="field">
+                <label for="email">Email</label>
+                <input type="email" id="email" name="email" required placeholder="you@example.com">
+            </div>
+            <div class="field">
+                <label for="message">Message</label>
+                <textarea id="message" name="message" required minlength="10" maxlength="1000" placeholder="How can we help?"></textarea>
+            </div>
+            <button type="submit">Send Message →</button>
+        </form>
+        
+        <a href="/" class="back-link">← Back to Home</a>
+    </div>
+</body>
+</html>

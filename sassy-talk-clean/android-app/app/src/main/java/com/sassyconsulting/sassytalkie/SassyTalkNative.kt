@@ -17,6 +17,7 @@ object SassyTalkNative {
 
     private const val TAG = "SassyTalkNative"
     private var initialized = false
+    var appContext: android.content.Context? = null
 
     /** Transport type constants matching Rust enum */
     const val TRANSPORT_NONE = 0
@@ -169,7 +170,13 @@ object SassyTalkNative {
     fun generateSessionQR(durationHours: Int = 24): String {
         if (!initialized) return ""
         return try {
-            nativeGenerateSessionQR(durationHours)
+            val json = nativeGenerateSessionQR(durationHours)
+            // Persist session so it survives app restart
+            if (json.isNotEmpty()) {
+                appContext?.getSharedPreferences("sassy_session", android.content.Context.MODE_PRIVATE)
+                    ?.edit()?.putString("session_json", json)?.apply()
+            }
+            json
         } catch (e: Exception) {
             Log.e(TAG, "generateSessionQR failed: ${e.message}")
             ""
@@ -179,11 +186,58 @@ object SassyTalkNative {
     fun importSessionFromQR(qrJson: String): Boolean {
         if (!initialized) return false
         return try {
-            nativeImportSessionFromQR(qrJson)
+            val ok = nativeImportSessionFromQR(qrJson)
+            if (ok) {
+                // Extract channel from JSON to persist per-channel
+                val channel = try {
+                    org.json.JSONObject(qrJson).optInt("channel", 1)
+                } catch (_: Exception) { 1 }
+                appContext?.getSharedPreferences("sassy_session", android.content.Context.MODE_PRIVATE)
+                    ?.edit()?.putString("session_ch_$channel", qrJson)?.apply()
+            }
+            ok
         } catch (e: Exception) {
             Log.e(TAG, "importSessionFromQR failed: ${e.message}")
             false
         }
+    }
+
+    /** Restore all previously persisted per-channel sessions (call after nativeInit). */
+    fun restoreSession(): Boolean {
+        if (!initialized) return false
+        val prefs = appContext?.getSharedPreferences("sassy_session", android.content.Context.MODE_PRIVATE)
+            ?: return false
+
+        var anyRestored = false
+        // Try per-channel keys first (new format)
+        for (ch in 1..8) {
+            val json = prefs.getString("session_ch_$ch", null) ?: continue
+            try {
+                if (nativeImportSessionFromQR(json)) {
+                    anyRestored = true
+                    Log.d(TAG, "Restored session for channel $ch")
+                }
+            } catch (e: Exception) {
+                Log.d(TAG, "restoreSession ch$ch: expired or invalid, clearing")
+                prefs.edit().remove("session_ch_$ch").apply()
+            }
+        }
+        // Also try legacy single-session key for backward compat
+        if (!anyRestored) {
+            val legacyJson = prefs.getString("session_json", null)
+            if (legacyJson != null) {
+                try {
+                    if (nativeImportSessionFromQR(legacyJson)) {
+                        anyRestored = true
+                        // Migrate legacy to per-channel
+                        prefs.edit().putString("session_ch_1", legacyJson).remove("session_json").apply()
+                    }
+                } catch (_: Exception) {
+                    prefs.edit().remove("session_json").apply()
+                }
+            }
+        }
+        return anyRestored
     }
 
     fun isAuthenticated(): Boolean {
@@ -269,6 +323,9 @@ object SassyTalkNative {
                 Log.e(TAG, "clearSession failed: ${e.message}")
             }
         }
+        // Clear persisted session
+        appContext?.getSharedPreferences("sassy_session", android.content.Context.MODE_PRIVATE)
+            ?.edit()?.remove("session_json")?.apply()
     }
 
     // ── User Registration ──
@@ -548,6 +605,18 @@ object SassyTalkNative {
         if (!initialized) return null
         return try {
             val json = JSONObject(nativeGetSessionStatus())
+            // Per-channel format: find first active channel's session_id
+            val channels = json.optJSONArray("channels")
+            if (channels != null) {
+                for (i in 0 until channels.length()) {
+                    val ch = channels.getJSONObject(i)
+                    if (ch.optBoolean("active", false)) {
+                        val id = ch.optString("session_id", "")
+                        if (id.isNotEmpty()) return id
+                    }
+                }
+            }
+            // Legacy fallback
             val id = json.optString("session_id", "")
             if (id.isNotEmpty()) id else null
         } catch (e: Exception) { null }
@@ -707,4 +776,56 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeBtDisconnected()
     @JvmStatic private external fun nativeBtEncodeFrame(): ByteArray?
     @JvmStatic private external fun nativeBtDecodeFrame(data: ByteArray): Boolean
+
+    // ── Whisper transcription ──
+
+    /** Initialize whisper model from file path. Call once after model download. */
+    // ── Per-channel session management ──
+
+    @JvmStatic private external fun nativeGenerateChannelQR(channel: Int, durationHours: Int, groupName: String?): String
+    @JvmStatic private external fun nativeSetSubchannel(subchannel: Byte)
+    @JvmStatic private external fun nativeGetChannelInfo(): String
+
+    fun setSubchannel(sub: Int) {
+        if (initialized) try { nativeSetSubchannel(sub.toByte()) } catch (_: Exception) {}
+    }
+    @JvmStatic private external fun nativeSetGroupName(channel: Int, name: String)
+    @JvmStatic private external fun nativeGetGroupName(channel: Int): String
+
+    fun generateChannelQR(channel: Int, durationHours: Int = 24, groupName: String = ""): String {
+        if (!initialized) return ""
+        return try {
+            val json = nativeGenerateChannelQR(channel, durationHours, groupName.ifEmpty { null })
+            if (json.isNotEmpty()) {
+                appContext?.getSharedPreferences("sassy_session", android.content.Context.MODE_PRIVATE)
+                    ?.edit()?.putString("session_ch_$channel", json)?.apply()
+            }
+            json
+        } catch (e: Exception) {
+            Log.e(TAG, "generateChannelQR failed: ${e.message}")
+            ""
+        }
+    }
+
+    fun getChannelInfo(): String {
+        if (!initialized) return "[]"
+        return try { nativeGetChannelInfo() } catch (e: Exception) { "[]" }
+    }
+
+    fun setGroupName(channel: Int, name: String) {
+        if (initialized) try { nativeSetGroupName(channel, name) } catch (_: Exception) {}
+    }
+
+    fun getGroupName(channel: Int): String {
+        if (!initialized) return "Channel $channel"
+        return try { nativeGetGroupName(channel) } catch (_: Exception) { "Channel $channel" }
+    }
+
+    @JvmStatic external fun nativeInitWhisper(modelPath: String): Boolean
+
+    /** Transcribe 16kHz f32 PCM → text. Blocks during inference (~1-3s). */
+    @JvmStatic external fun nativeTranscribe(samples16k: FloatArray): String
+
+    /** Transcribe 48kHz i16 PCM → text (downsamples internally). */
+    @JvmStatic external fun nativeTranscribe48k(samples48k: ShortArray): String
 }

@@ -42,6 +42,15 @@ class CellularWebSocketClient {
             Log.w(TAG, "Already connected")
             return true
         }
+        // Respect build-time flag to disable cellular relay (opt-in at build)
+        try {
+            if (!BuildConfig.ENABLE_CELLULAR_RELAY) {
+                Log.w(TAG, "Cellular relay disabled by build config")
+                return false
+            }
+        } catch (e: Throwable) {
+            // If BuildConfig is not available for any reason, proceed normally
+        }
 
         val wsUrl = SassyTalkNative.cellularGetWsUrl()
         if (wsUrl.isBlank()) {

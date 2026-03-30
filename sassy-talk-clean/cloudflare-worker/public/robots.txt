@@ -1,0 +1,7 @@
+# Sassy Consulting LLC - robots.txt
+User-agent: *
+Allow: /
+Disallow: /api/
+
+# Sitemaps
+Sitemap: https://sassyconsultingllc.com/sitemap.xml

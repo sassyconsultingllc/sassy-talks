@@ -1,9 +1,15 @@
 package com.sassyconsulting.sassytalkie.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
+import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -15,6 +21,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -27,9 +34,13 @@ import org.json.JSONObject
 
 @Composable
 fun QRAuthScreen(onAuthenticated: () -> Unit) {
+    val context = LocalContext.current
     var selectedTab by remember { mutableIntStateOf(0) }
+    var selectedChannel by remember { mutableIntStateOf(1) }
+    var groupName by remember { mutableStateOf("") }
     var durationHours by remember { mutableIntStateOf(24) }
     var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var lastGeneratedJson by remember { mutableStateOf("") }
     var scanResult by remember { mutableStateOf<String?>(null) }
     var showScanner by remember { mutableStateOf(false) }
     val hasExistingSession = remember { mutableStateOf(SassyTalkNative.isAuthenticated()) }
@@ -54,7 +65,7 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
         Spacer(modifier = Modifier.height(8.dp))
 
         Text(
-            text = "Scan a QR code to establish a secure session",
+            text = "Scan a QR code or share a session code",
             fontSize = 14.sp,
             color = TextGray,
             textAlign = TextAlign.Center
@@ -70,28 +81,35 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
                     SassyTalkNative.clearSession()
                     hasExistingSession.value = false
                     qrBitmap = null
+                    lastGeneratedJson = ""
                     scanResult = null
                 }
             )
             Spacer(modifier = Modifier.height(16.dp))
         }
 
-        // Tab row
-        TabRow(
+        // Tab row: Show QR | Scan QR | Enter Code
+        ScrollableTabRow(
             selectedTabIndex = selectedTab,
             containerColor = CardBg,
             contentColor = Orange,
+            edgePadding = 0.dp,
             modifier = Modifier.clip(RoundedCornerShape(12.dp))
         ) {
             Tab(
                 selected = selectedTab == 0,
                 onClick = { selectedTab = 0 },
-                text = { Text("Show My QR", color = if (selectedTab == 0) Orange else TextGray) }
+                text = { Text("Show QR", color = if (selectedTab == 0) Orange else TextGray, fontSize = 13.sp) }
             )
             Tab(
                 selected = selectedTab == 1,
                 onClick = { selectedTab = 1 },
-                text = { Text("Scan QR", color = if (selectedTab == 1) Orange else TextGray) }
+                text = { Text("Scan QR", color = if (selectedTab == 1) Orange else TextGray, fontSize = 13.sp) }
+            )
+            Tab(
+                selected = selectedTab == 2,
+                onClick = { selectedTab = 2 },
+                text = { Text("Enter Code", color = if (selectedTab == 2) Orange else TextGray, fontSize = 13.sp) }
             )
         }
 
@@ -99,12 +117,21 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
 
         when (selectedTab) {
             0 -> ShowQRTab(
+                context = context,
+                selectedChannel = selectedChannel,
+                onChannelChange = { selectedChannel = it },
+                groupName = groupName,
+                onGroupNameChange = { groupName = it },
                 durationHours = durationHours,
                 onDurationChange = { durationHours = it },
                 qrBitmap = qrBitmap,
+                sessionJson = lastGeneratedJson,
                 onGenerate = {
-                    val qrJson = SassyTalkNative.generateSessionQR(durationHours)
+                    val qrJson = SassyTalkNative.generateChannelQR(
+                        selectedChannel, durationHours, groupName
+                    )
                     if (qrJson.isNotEmpty()) {
+                        lastGeneratedJson = qrJson
                         qrBitmap = generateQRBitmap(qrJson, 600)
                         hasExistingSession.value = true
                     }
@@ -127,6 +154,13 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
                     }
                 }
             )
+            2 -> EnterCodeTab(
+                context = context,
+                onAuthenticated = {
+                    hasExistingSession.value = true
+                    onAuthenticated()
+                }
+            )
         }
     }
 }
@@ -138,8 +172,24 @@ private fun ActiveSessionCard(
 ) {
     val sessionJson = SassyTalkNative.getSessionStatus()
     val session = try { JSONObject(sessionJson) } catch (_: Exception) { null }
-    val peerDevice = session?.optString("peer_device", "") ?: ""
-    val remainingSecs = session?.optLong("remaining_seconds", 0) ?: 0
+    // Find first active channel from per-channel status
+    val channels = session?.optJSONArray("channels")
+    var peerDevice = ""
+    var remainingSecs = 0L
+    if (channels != null) {
+        for (i in 0 until channels.length()) {
+            val ch = channels.getJSONObject(i)
+            if (ch.optBoolean("active", false)) {
+                peerDevice = ch.optString("peer_device", "")
+                remainingSecs = ch.optLong("remaining_seconds", 0)
+                break
+            }
+        }
+    } else {
+        // Legacy fallback
+        peerDevice = session?.optString("peer_device", "") ?: ""
+        remainingSecs = session?.optLong("remaining_seconds", 0) ?: 0
+    }
     val hours = remainingSecs / 3600
     val mins = (remainingSecs % 3600) / 60
 
@@ -193,11 +243,18 @@ private fun ActiveSessionCard(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ShowQRTab(
+    context: Context,
+    selectedChannel: Int,
+    onChannelChange: (Int) -> Unit,
+    groupName: String,
+    onGroupNameChange: (String) -> Unit,
     durationHours: Int,
     onDurationChange: (Int) -> Unit,
     qrBitmap: Bitmap?,
+    sessionJson: String,
     onGenerate: () -> Unit,
     onContinue: () -> Unit
 ) {
@@ -207,6 +264,62 @@ private fun ShowQRTab(
             .fillMaxWidth()
             .verticalScroll(rememberScrollState())
     ) {
+        // Channel picker
+        Card(
+            colors = CardDefaults.cardColors(containerColor = CardBg),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text("Channel", color = TextGray, fontSize = 14.sp)
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                ) {
+                    for (ch in 1..8) {
+                        FilterChip(
+                            selected = ch == selectedChannel,
+                            onClick = { onChannelChange(ch) },
+                            label = { Text("$ch", fontSize = 13.sp, color = if (ch == selectedChannel) DarkBg else TextGray) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Orange,
+                                containerColor = SurfaceBg
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Group name input
+        OutlinedTextField(
+            value = groupName,
+            onValueChange = { if (it.length <= 30) onGroupNameChange(it) },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            placeholder = { Text("Group name (optional)", color = TextMuted) },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = Orange,
+                unfocusedBorderColor = CardBg,
+                focusedTextColor = TextWhite,
+                unfocusedTextColor = TextWhite,
+                cursorColor = Orange,
+                focusedContainerColor = SurfaceBg,
+                unfocusedContainerColor = SurfaceBg
+            ),
+            shape = RoundedCornerShape(12.dp)
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
         // Duration picker
         Card(
             colors = CardDefaults.cardColors(containerColor = CardBg),
@@ -262,23 +375,66 @@ private fun ShowQRTab(
                     bitmap = qrBitmap.asImageBitmap(),
                     contentDescription = "Session QR Code",
                     modifier = Modifier
-                        .size(280.dp)
-                        .padding(16.dp)
+                        .size(200.dp)
+                        .padding(12.dp)
                 )
             }
 
             Spacer(modifier = Modifier.height(12.dp))
 
             Text(
-                text = "Have the other device scan this QR code",
+                text = "Scan this QR, or share the code for long-distance relay",
                 color = TextGray,
                 fontSize = 13.sp,
                 textAlign = TextAlign.Center
             )
 
-            Spacer(modifier = Modifier.height(20.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
-            // Continue button — crypto is already set when QR was generated
+            // Share / Copy row for long-distance relay
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Copy to clipboard
+                OutlinedButton(
+                    onClick = {
+                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(ClipData.newPlainText("SassyTalk Session", sessionJson))
+                        Toast.makeText(context, "Session code copied", Toast.LENGTH_SHORT).show()
+                    },
+                    shape = RoundedCornerShape(25.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Cyan),
+                    modifier = Modifier.weight(1f).height(44.dp)
+                ) {
+                    Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Copy Code", fontSize = 13.sp)
+                }
+
+                // Share via intent (text, Signal, WhatsApp, etc.)
+                OutlinedButton(
+                    onClick = {
+                        val intent = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_TEXT, sessionJson)
+                            putExtra(Intent.EXTRA_SUBJECT, "SassyTalk Session Code")
+                        }
+                        context.startActivity(Intent.createChooser(intent, "Share session code"))
+                    },
+                    shape = RoundedCornerShape(25.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Cyan),
+                    modifier = Modifier.weight(1f).height(44.dp)
+                ) {
+                    Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Share", fontSize = 13.sp)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Continue button
             Button(
                 onClick = onContinue,
                 colors = ButtonDefaults.buttonColors(containerColor = Green),
@@ -295,7 +451,7 @@ private fun ShowQRTab(
             Spacer(modifier = Modifier.height(8.dp))
 
             Text(
-                text = "Your session key is active — the other device just needs to scan before connecting.",
+                text = "Your session key is active — the other device just needs to scan or enter the code.",
                 color = TextMuted,
                 fontSize = 12.sp,
                 textAlign = TextAlign.Center
@@ -377,6 +533,119 @@ private fun ScanQRTab(
                 text = scanResult,
                 color = if (scanResult.contains("established")) Green else StatusDisconnected,
                 fontSize = 16.sp,
+                fontWeight = FontWeight.Medium
+            )
+        }
+    }
+}
+
+@Composable
+private fun EnterCodeTab(
+    context: Context,
+    onAuthenticated: () -> Unit
+) {
+    var codeText by remember { mutableStateOf("") }
+    var result by remember { mutableStateOf<String?>(null) }
+
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Icon(
+            Icons.Default.Key,
+            contentDescription = null,
+            tint = Cyan,
+            modifier = Modifier.size(48.dp)
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Text(
+            text = "Paste a session code received from another device",
+            color = TextGray,
+            fontSize = 14.sp,
+            textAlign = TextAlign.Center
+        )
+
+        Spacer(modifier = Modifier.height(20.dp))
+
+        // Code input field
+        OutlinedTextField(
+            value = codeText,
+            onValueChange = { codeText = it },
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 120.dp),
+            placeholder = { Text("Paste session code here...", color = TextMuted) },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = Orange,
+                unfocusedBorderColor = CardBg,
+                focusedTextColor = TextWhite,
+                unfocusedTextColor = TextWhite,
+                cursorColor = Orange,
+                focusedContainerColor = SurfaceBg,
+                unfocusedContainerColor = SurfaceBg
+            ),
+            shape = RoundedCornerShape(12.dp),
+            maxLines = 6
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Paste from clipboard button
+        OutlinedButton(
+            onClick = {
+                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val clip = cm.primaryClip
+                if (clip != null && clip.itemCount > 0) {
+                    codeText = clip.getItemAt(0).text?.toString() ?: ""
+                }
+            },
+            shape = RoundedCornerShape(25.dp),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = Cyan),
+            modifier = Modifier.fillMaxWidth().height(44.dp)
+        ) {
+            Icon(Icons.Default.ContentPaste, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Paste from Clipboard", fontSize = 14.sp)
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Join button
+        Button(
+            onClick = {
+                val trimmed = codeText.trim()
+                if (trimmed.isEmpty()) {
+                    result = "Please paste a session code first"
+                    return@Button
+                }
+                val success = SassyTalkNative.importSessionFromQR(trimmed)
+                result = if (success) "Session established!" else "Invalid session code"
+                if (success) {
+                    onAuthenticated()
+                }
+            },
+            colors = ButtonDefaults.buttonColors(containerColor = Orange),
+            shape = RoundedCornerShape(25.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp),
+            enabled = codeText.isNotBlank()
+        ) {
+            Icon(Icons.Default.VpnKey, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Join Session", fontSize = 16.sp)
+        }
+
+        if (result != null) {
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = result!!,
+                color = if (result!!.contains("established")) Green else StatusDisconnected,
+                fontSize = 15.sp,
                 fontWeight = FontWeight.Medium
             )
         }

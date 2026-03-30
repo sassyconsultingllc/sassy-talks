@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NDA — Sassy Browser | Sassy Consulting LLC</title>
+<meta name="description" content="Review and sign the Mutual Non-Disclosure Agreement to access Sassy Browser builds.">
+<meta name="robots" content="noindex, nofollow">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0a0c10;--surface:#111318;--surface2:#181b22;--surface3:#1f2330;
+  --border:#2a2e3a;--border-active:#3d4258;
+  --text:#e8eaf0;--text-dim:#8b90a0;--text-muted:#5c6070;
+  --accent:#6c8aff;--accent-glow:#6c8aff33;--accent-deep:#4a6adf;
+  --gold:#d4a853;--gold-glow:#d4a85322;
+  --red:#ff5c5c;--green:#4ae0a0;
+  --serif:'DM Serif Display',Georgia,serif;
+  --sans:'DM Sans',-apple-system,BlinkMacSystemFont,sans-serif;
+  --mono:'JetBrains Mono',monospace;
+  --radius:8px;--radius-lg:14px;
+}
+html{scroll-behavior:smooth}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);line-height:1.65;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* ═══ NAV ═══ */
+.nav{position:sticky;top:0;z-index:100;background:rgba(10,12,16,.92);backdrop-filter:blur(16px);border-bottom:1px solid var(--border);padding:0 2rem;height:60px;display:flex;align-items:center;justify-content:space-between}
+.nav-brand{font-family:var(--serif);font-size:1.15rem;color:var(--text);letter-spacing:-.02em}
+.nav-brand span{color:var(--accent)}
+.nav-links{display:flex;gap:1.5rem;font-size:.875rem;font-weight:500}
+.nav-links a{color:var(--text-dim);transition:color .2s}
+.nav-links a:hover{color:var(--text);text-decoration:none}
+
+/* ═══ HERO ═══ */
+.hero{text-align:center;padding:4rem 2rem 2rem;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;top:-80px;left:50%;transform:translateX(-50%);width:600px;height:600px;background:radial-gradient(circle,var(--accent-glow) 0%,transparent 70%);pointer-events:none}
+.hero-badge{display:inline-flex;align-items:center;gap:.5rem;background:var(--surface2);border:1px solid var(--border);border-radius:100px;padding:.35rem 1rem;font-size:.75rem;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:1.5rem}
+.hero-badge::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--gold);box-shadow:0 0 8px var(--gold)}
+.hero h1{font-family:var(--serif);font-size:clamp(2rem,5vw,3.2rem);line-height:1.15;margin-bottom:1rem;color:var(--text)}
+.hero h1 span{color:var(--accent)}
+.hero p{max-width:600px;margin:0 auto;color:var(--text-dim);font-size:1rem}
+
+/* ═══ LAYOUT ═══ */
+.container{max-width:1100px;margin:0 auto;padding:0 2rem}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:2rem}
+@media(max-width:800px){.grid-2{grid-template-columns:1fr}}
+
+/* ═══ STEPS ═══ */
+.steps{display:flex;justify-content:center;gap:0;margin:2rem auto 3rem;max-width:700px}
+.step{flex:1;text-align:center;position:relative;padding:1rem .5rem}
+.step-num{width:36px;height:36px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:.8rem;font-weight:700;border:2px solid var(--border);color:var(--text-muted);margin-bottom:.5rem;transition:all .3s}
+.step-label{font-size:.75rem;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.06em;transition:color .3s}
+.step.active .step-num{background:var(--accent);border-color:var(--accent);color:#fff;box-shadow:0 0 20px var(--accent-glow)}
+.step.active .step-label{color:var(--text)}
+.step.done .step-num{background:var(--green);border-color:var(--green);color:#fff}
+.step.done .step-label{color:var(--green)}
+.step:not(:last-child)::after{content:'';position:absolute;top:27px;left:calc(50% + 24px);width:calc(100% - 48px);height:2px;background:var(--border)}
+.step.done:not(:last-child)::after{background:var(--green)}
+
+/* ═══ SECTIONS ═══ */
+.section{margin-bottom:3rem;display:none}
+.section.visible{display:block;animation:fadeUp .4s ease}
+@keyframes fadeUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+
+/* ═══ DOCUMENT VIEWER ═══ */
+.doc-viewer{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);overflow:hidden}
+.doc-toolbar{display:flex;align-items:center;justify-content:space-between;padding:.75rem 1.25rem;background:var(--surface2);border-bottom:1px solid var(--border);font-size:.8rem;color:var(--text-dim)}
+.doc-toolbar-left{display:flex;align-items:center;gap:.75rem}
+.doc-icon{width:20px;height:20px;fill:var(--accent)}
+.doc-frame{width:100%;height:70vh;min-height:500px;border:none;background:#fff}
+.doc-notice{padding:1rem 1.25rem;background:var(--surface3);border-top:1px solid var(--border);font-size:.8rem;color:var(--text-muted);display:flex;align-items:center;gap:.5rem}
+.doc-notice svg{flex-shrink:0;width:16px;height:16px;fill:var(--gold)}
+
+/* ═══ PASSWORD GATE ═══ */
+.gate{text-align:center;padding:4rem 2rem;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg)}
+.gate-icon{width:64px;height:64px;margin:0 auto 1.5rem;fill:var(--accent);opacity:.6}
+.gate h2{font-family:var(--serif);font-size:1.5rem;margin-bottom:.75rem}
+.gate p{color:var(--text-dim);max-width:460px;margin:0 auto 2rem}
+.gate-form{max-width:380px;margin:0 auto}
+.gate-input-wrap{position:relative;margin-bottom:1rem}
+.gate-input-wrap input{width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:.85rem 1rem .85rem 2.75rem;color:var(--text);font-size:.95rem;font-family:var(--mono);outline:none;transition:border-color .2s}
+.gate-input-wrap input:focus{border-color:var(--accent)}
+.gate-input-wrap svg{position:absolute;left:.85rem;top:50%;transform:translateY(-50%);width:18px;height:18px;fill:var(--text-muted)}
+.gate-error{color:var(--red);font-size:.8rem;margin-top:.5rem;display:none}
+
+/* ═══ FORM ═══ */
+.form-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:2rem}
+.form-card h2{font-family:var(--serif);font-size:1.4rem;margin-bottom:.25rem}
+.form-card p.sub{color:var(--text-dim);font-size:.875rem;margin-bottom:1.5rem}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+@media(max-width:600px){.form-grid{grid-template-columns:1fr}}
+.field{display:flex;flex-direction:column;gap:.35rem}
+.field.full{grid-column:1/-1}
+.field label{font-size:.78rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text-dim)}
+.field input,.field select,.field textarea{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:.75rem 1rem;color:var(--text);font-size:.9rem;font-family:var(--sans);outline:none;transition:border-color .2s}
+.field input:focus,.field select:focus,.field textarea:focus{border-color:var(--accent)}
+.field textarea{resize:vertical;min-height:80px}
+.field .error-msg{font-size:.75rem;color:var(--red);display:none}
+.field.invalid input,.field.invalid select{border-color:var(--red)}
+.field.invalid .error-msg{display:block}
+
+/* ═══ SIGNATURE PAD ═══ */
+.sig-section{margin-top:1.5rem;border-top:1px solid var(--border);padding-top:1.5rem}
+.sig-section h3{font-family:var(--serif);font-size:1.15rem;margin-bottom:.25rem}
+.sig-section p.sub{color:var(--text-dim);font-size:.82rem;margin-bottom:1rem}
+.sig-tabs{display:flex;gap:0;margin-bottom:1rem;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.sig-tab{flex:1;padding:.6rem;text-align:center;font-size:.8rem;font-weight:600;background:var(--surface2);color:var(--text-muted);cursor:pointer;transition:all .2s;border:none}
+.sig-tab.active{background:var(--accent);color:#fff}
+.sig-draw-area{position:relative}
+.sig-canvas{width:100%;height:160px;background:var(--surface2);border:2px dashed var(--border);border-radius:var(--radius);cursor:crosshair;touch-action:none}
+.sig-canvas.has-sig{border-style:solid;border-color:var(--accent)}
+.sig-placeholder{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:var(--text-muted);font-size:.85rem;pointer-events:none;transition:opacity .2s}
+.sig-canvas.has-sig+.sig-placeholder{opacity:0}
+.sig-typed{width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:1rem;color:var(--text);font-size:1.8rem;font-family:'Brush Script MT','Segoe Script','Comic Sans MS',cursive;text-align:center;outline:none;display:none}
+.sig-typed:focus{border-color:var(--accent)}
+.sig-typed.visible{display:block}
+.sig-actions{display:flex;justify-content:flex-end;gap:.75rem;margin-top:.75rem}
+.sig-clear{background:none;border:1px solid var(--border);border-radius:var(--radius);padding:.45rem 1rem;color:var(--text-dim);font-size:.8rem;cursor:pointer;transition:all .2s}
+.sig-clear:hover{border-color:var(--text-dim);color:var(--text)}
+
+/* ═══ CONSENT ═══ */
+.consent-area{margin-top:2rem;border-top:1px solid var(--border);padding-top:1.5rem}
+.consent-item{display:flex;align-items:flex-start;gap:.75rem;margin-bottom:1rem}
+.consent-item input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent);flex-shrink:0;margin-top:2px;cursor:pointer}
+.consent-item label{font-size:.84rem;color:var(--text-dim);cursor:pointer;line-height:1.5}
+.consent-item label strong{color:var(--text);font-weight:600}
+
+/* ═══ BUTTONS ═══ */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:.5rem;padding:.85rem 2rem;border-radius:var(--radius);font-size:.9rem;font-weight:600;font-family:var(--sans);border:none;cursor:pointer;transition:all .25s;text-decoration:none}
+.btn:hover{text-decoration:none}
+.btn-primary{background:var(--accent);color:#fff;box-shadow:0 2px 20px var(--accent-glow)}
+.btn-primary:hover{background:var(--accent-deep);transform:translateY(-1px);box-shadow:0 4px 28px var(--accent-glow)}
+.btn-primary:disabled{opacity:.4;cursor:not-allowed;transform:none;box-shadow:none}
+.btn-outline{background:transparent;color:var(--text);border:1px solid var(--border)}
+.btn-outline:hover{border-color:var(--text-dim)}
+.btn-gold{background:linear-gradient(135deg,var(--gold),#b8912f);color:#111;box-shadow:0 2px 20px var(--gold-glow)}
+.btn-gold:hover{transform:translateY(-1px);box-shadow:0 4px 28px var(--gold-glow)}
+.btn-lg{padding:1rem 2.5rem;font-size:1rem}
+.btn-block{width:100%}
+
+.btn-spinner{display:none;width:18px;height:18px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.btn.loading .btn-text{opacity:0}
+.btn.loading .btn-spinner{display:block;position:absolute}
+.btn{position:relative}
+
+/* ═══ DOWNLOAD ═══ */
+.download-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);padding:3rem 2rem;text-align:center}
+.download-card .check-icon{width:72px;height:72px;margin:0 auto 1.5rem;fill:var(--green)}
+.download-card h2{font-family:var(--serif);font-size:1.8rem;margin-bottom:.5rem}
+.download-card p{color:var(--text-dim);max-width:500px;margin:0 auto 2rem}
+.platform-chooser{display:flex;justify-content:center;gap:1rem;margin-bottom:2rem;flex-wrap:wrap}
+.platform-btn{display:flex;flex-direction:column;align-items:center;gap:.5rem;padding:1.5rem 2.5rem;background:var(--surface2);border:2px solid var(--border);border-radius:var(--radius-lg);cursor:pointer;transition:all .25s;min-width:180px}
+.platform-btn:hover{border-color:var(--accent);background:var(--surface3)}
+.platform-btn.selected{border-color:var(--accent);box-shadow:0 0 20px var(--accent-glow)}
+.platform-btn svg{width:40px;height:40px;fill:var(--text)}
+.platform-btn .p-name{font-weight:700;font-size:.95rem}
+.platform-btn .p-file{font-size:.75rem;color:var(--text-muted);font-family:var(--mono)}
+.download-meta{font-size:.78rem;color:var(--text-muted);margin-top:1.5rem}
+.download-meta code{font-family:var(--mono);background:var(--surface2);padding:.15rem .4rem;border-radius:4px}
+
+/* ═══ FOOTER ═══ */
+.footer{text-align:center;padding:3rem 2rem;border-top:1px solid var(--border);font-size:.8rem;color:var(--text-muted);margin-top:4rem}
+
+/* ═══ TOASTS ═══ */
+.toast{position:fixed;bottom:2rem;right:2rem;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:1rem 1.5rem;font-size:.875rem;color:var(--text);box-shadow:0 8px 32px rgba(0,0,0,.4);transform:translateY(100px);opacity:0;transition:all .3s;z-index:200}
+.toast.show{transform:translateY(0);opacity:1}
+.toast.error{border-color:var(--red)}
+.toast.success{border-color:var(--green)}
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav class="nav">
+  <a href="/" class="nav-brand">Sassy <span>Consulting</span></a>
+  <div class="nav-links">
+    <a href="/">Home</a>
+    <a href="/browser-v2">Browser</a>
+    <a href="/contact">Contact</a>
+  </div>
+</nav>
+
+<!-- HERO -->
+<div class="hero">
+  <div class="hero-badge">Confidential Access</div>
+  <h1>Sassy Browser — <span>NDA &amp; Download</span></h1>
+  <p>Review and electronically sign the Mutual Non-Disclosure Agreement to access the latest Sassy Browser build.</p>
+</div>
+
+<!-- STEPS -->
+<div class="container">
+  <div class="steps">
+    <div class="step active" data-step="1">
+      <div class="step-num">1</div>
+      <div class="step-label">Enter Code</div>
+    </div>
+    <div class="step" data-step="2">
+      <div class="step-num">2</div>
+      <div class="step-label">Review NDA</div>
+    </div>
+    <div class="step" data-step="3">
+      <div class="step-num">3</div>
+      <div class="step-label">Sign</div>
+    </div>
+    <div class="step" data-step="4">
+      <div class="step-num">4</div>
+      <div class="step-label">Download</div>
+    </div>
+  </div>
+
+  <!-- STEP 1: PASSWORD GATE -->
+  <section class="section visible" id="sec-gate">
+    <div class="gate">
+      <svg class="gate-icon" viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zM12 17c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
+      <h2>Access Code Required</h2>
+      <p>Enter the access code provided by Sassy Consulting LLC to view the Non-Disclosure Agreement.</p>
+      <div class="gate-form">
+        <div class="gate-input-wrap">
+          <svg viewBox="0 0 24 24"><path d="M12.65 10A5.99 5.99 0 007 6c-3.31 0-6 2.69-6 6s2.69 6 6 6a5.99 5.99 0 005.65-4H17v4h4v-4h2v-4H12.65zM7 14c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg>
+          <input type="password" id="gateCode" placeholder="Enter access code" autocomplete="off" spellcheck="false">
+        </div>
+        <button class="btn btn-primary btn-block" id="gateBtn" onclick="verifyGate()">
+          <span class="btn-text">Unlock Document</span>
+          <div class="btn-spinner"></div>
+        </button>
+        <div class="gate-error" id="gateError">Invalid access code. Please try again.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- STEP 2: DOCUMENT VIEWER -->
+  <section class="section" id="sec-review">
+    <div class="doc-viewer">
+      <div class="doc-toolbar">
+        <div class="doc-toolbar-left">
+          <svg class="doc-icon" viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zM6 20V4h7v5h5v11H6z"/></svg>
+          <span>MUTUAL NON-DISCLOSURE AGREEMENT — Sassy Consulting LLC</span>
+        </div>
+        <span>15 pages • Confidential</span>
+      </div>
+      <iframe class="doc-frame" id="ndaFrame" src="/nda-document.pdf" title="NDA Document"></iframe>
+      <div class="doc-notice">
+        <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+        Read the entire agreement before proceeding. Scroll to the end to enable the sign button.
+      </div>
+    </div>
+    <div style="text-align:center;margin-top:2rem">
+      <button class="btn btn-primary btn-lg" id="proceedToSign" disabled onclick="goToStep(3)">
+        I Have Reviewed — Proceed to Sign
+      </button>
+      <p style="font-size:.75rem;color:var(--text-muted);margin-top:.75rem">Scroll through the complete document to enable signing.</p>
+    </div>
+  </section>
+
+  <!-- STEP 3: SIGN -->
+  <section class="section" id="sec-sign">
+    <div class="form-card">
+      <h2>Electronic Signature — Party B</h2>
+      <p class="sub">Complete all fields. Your electronic signature is legally binding under the ESIGN Act and UETA.</p>
+
+      <div class="form-grid">
+        <div class="field">
+          <label for="sigName">Full Legal Name *</label>
+          <input type="text" id="sigName" required placeholder="Jane A. Doe">
+          <span class="error-msg">Full legal name is required</span>
+        </div>
+        <div class="field">
+          <label for="sigOrg">Organization</label>
+          <input type="text" id="sigOrg" placeholder="Company, LLC">
+        </div>
+        <div class="field full">
+          <label for="sigAddress">Address *</label>
+          <input type="text" id="sigAddress" required placeholder="123 Main St, City, ST 00000">
+          <span class="error-msg">Address is required</span>
+        </div>
+        <div class="field">
+          <label for="sigJurisdiction">Jurisdiction *</label>
+          <input type="text" id="sigJurisdiction" required placeholder="State of Wisconsin, USA">
+          <span class="error-msg">Jurisdiction is required</span>
+        </div>
+        <div class="field">
+          <label for="sigEmail">Email *</label>
+          <input type="email" id="sigEmail" required placeholder="you@company.com">
+          <span class="error-msg">Valid email is required</span>
+        </div>
+        <div class="field">
+          <label for="sigTitle">Title / Role *</label>
+          <input type="text" id="sigTitle" required placeholder="CTO, Developer, etc.">
+          <span class="error-msg">Title is required</span>
+        </div>
+        <div class="field">
+          <label for="sigInitials">Initials *</label>
+          <input type="text" id="sigInitials" required placeholder="JAD" maxlength="5" style="text-transform:uppercase">
+          <span class="error-msg">Initials are required</span>
+        </div>
+      </div>
+
+      <!-- SIGNATURE -->
+      <div class="sig-section">
+        <h3>Authorized Signature</h3>
+        <p class="sub">Draw your signature or type your full name.</p>
+        <div class="sig-tabs">
+          <button class="sig-tab active" onclick="switchSigMode('draw')">Draw</button>
+          <button class="sig-tab" onclick="switchSigMode('type')">Type</button>
+        </div>
+        <div class="sig-draw-area" id="sigDrawArea">
+          <canvas id="sigCanvas" class="sig-canvas" width="800" height="160"></canvas>
+          <div class="sig-placeholder">Draw your signature here</div>
+        </div>
+        <input type="text" class="sig-typed" id="sigTyped" placeholder="Type your full legal name">
+        <div class="sig-actions">
+          <button class="sig-clear" onclick="clearSignature()">Clear Signature</button>
+        </div>
+      </div>
+
+      <!-- CONSENT -->
+      <div class="consent-area">
+        <div class="consent-item">
+          <input type="checkbox" id="consentRead">
+          <label for="consentRead"><strong>I have read and understand</strong> the Mutual Non-Disclosure Agreement in its entirety, including all 10 sections covering Confidential Information, Obligations, AI Restrictions, Term, IP, Non-Solicitation, Compelled Disclosure, Dispute Resolution, Representations, and General Provisions.</label>
+        </div>
+        <div class="consent-item">
+          <input type="checkbox" id="consentElectronic">
+          <label for="consentElectronic"><strong>I consent to conduct this transaction electronically</strong> and acknowledge that my electronic signature has the same legal effect as a handwritten signature under the ESIGN Act (15 U.S.C. § 7001) and the Uniform Electronic Transactions Act (UETA).</label>
+        </div>
+        <div class="consent-item">
+          <input type="checkbox" id="consentBind">
+          <label for="consentBind"><strong>I have authority to sign</strong> this Agreement on behalf of myself or the organization identified above, and I intend to be legally bound by its terms upon execution.</label>
+        </div>
+        <div class="consent-item">
+          <input type="checkbox" id="consentRetention">
+          <label for="consentRetention"><strong>I understand a copy will be retained</strong> by both parties. An executed copy of this Agreement will be sent to the email address provided above. I can access and retain this document.</label>
+        </div>
+      </div>
+
+      <div style="margin-top:2rem">
+        <button class="btn btn-gold btn-lg btn-block" id="signBtn" onclick="submitSignature()" disabled>
+          <span class="btn-text">Execute Agreement &amp; Access Sassy Browser</span>
+          <div class="btn-spinner"></div>
+        </button>
+        <p style="font-size:.72rem;color:var(--text-muted);text-align:center;margin-top:.75rem">
+          By clicking "Execute Agreement" you are electronically signing this NDA. Timestamp, IP address, and document hash will be recorded.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- STEP 4: DOWNLOAD -->
+  <section class="section" id="sec-download">
+    <div class="download-card">
+      <svg class="check-icon" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+      <h2>NDA Executed Successfully</h2>
+      <p>Your signed Agreement has been recorded. An executed copy will be sent to <strong id="dlEmail"></strong>. Choose your platform to download Sassy Browser.</p>
+
+      <div class="platform-chooser">
+        <div class="platform-btn" onclick="selectPlatform('windows')" data-platform="windows">
+          <svg viewBox="0 0 24 24"><path d="M3 12V6.75l8-1.25V12H3zm0 .5h8v6.5L3 17.75V12.5zM11.5 5.34l9.5-1.34v8h-9.5V5.34zM11.5 12.5h9.5v8l-9.5-1.34V12.5z"/></svg>
+          <span class="p-name">Windows</span>
+          <span class="p-file">sassybrowser.exe</span>
+        </div>
+        <div class="platform-btn" onclick="selectPlatform('macos')" data-platform="macos">
+          <svg viewBox="0 0 24 24"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.8-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>
+          <span class="p-name">macOS</span>
+          <span class="p-file">sassybrowser.dmg</span>
+        </div>
+      </div>
+
+      <button class="btn btn-primary btn-lg" id="downloadBtn" disabled onclick="startDownload()">
+        <span class="btn-text">Download Sassy Browser</span>
+        <div class="btn-spinner"></div>
+      </button>
+
+      <div class="download-meta">
+        <p>Agreement No: <code id="dlAgreementNo">—</code> &nbsp;|&nbsp; Signed: <code id="dlTimestamp">—</code></p>
+        <p style="margin-top:.5rem">Document Hash (SHA-256): <code id="dlDocHash">—</code></p>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<!-- FOOTER -->
+<footer class="footer">
+  <p>&copy; 2024-2026 Sassy Consulting LLC &nbsp;|&nbsp; 798 Water Street, Prairie du Sac, WI 53578</p>
+  <p style="margin-top:.5rem">All access is logged and monitored. Unauthorized use is prohibited.</p>
+</footer>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ═══════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════
+let currentStep = 1;
+let sigMode = 'draw';
+let isDrawing = false;
+let hasSig = false;
+let selectedPlatform = null;
+let signatureToken = null;
+let ndaScrolledFully = false;
+
+// ═══════════════════════════════════════════
+// STEP NAVIGATION
+// ═══════════════════════════════════════════
+function goToStep(n) {
+  currentStep = n;
+  document.querySelectorAll('.step').forEach(s => {
+    const sn = +s.dataset.step;
+    s.classList.remove('active','done');
+    if (sn < n) s.classList.add('done');
+    if (sn === n) s.classList.add('active');
+  });
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('visible'));
+  const secs = ['sec-gate','sec-review','sec-sign','sec-download'];
+  document.getElementById(secs[n-1]).classList.add('visible');
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+
+// ═══════════════════════════════════════════
+// STEP 1: PASSWORD GATE
+// ═══════════════════════════════════════════
+document.getElementById('gateCode').addEventListener('keydown', e => {
+  if (e.key === 'Enter') verifyGate();
+});
+
+async function verifyGate() {
+  const code = document.getElementById('gateCode').value.trim();
+  if (!code) return;
+  const btn = document.getElementById('gateBtn');
+  btn.classList.add('loading');
+  btn.disabled = true;
+  document.getElementById('gateError').style.display = 'none';
+
+  try {
+    const res = await fetch('/api/nda/verify-code', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({code})
+    });
+    const data = await res.json();
+    if (data.valid) {
+      goToStep(2);
+      initDocScroll();
+    } else {
+      document.getElementById('gateError').style.display = 'block';
+      document.getElementById('gateError').textContent = data.error || 'Invalid access code.';
+    }
+  } catch(e) {
+    document.getElementById('gateError').style.display = 'block';
+    document.getElementById('gateError').textContent = 'Connection error. Please try again.';
+  }
+  btn.classList.remove('loading');
+  btn.disabled = false;
+}
+
+// ═══════════════════════════════════════════
+// STEP 2: DOCUMENT SCROLL TRACKING
+// ═══════════════════════════════════════════
+function initDocScroll() {
+  // For PDF iframe, we use a simple timer + manual acknowledgment approach
+  // since cross-origin iframe scroll detection is unreliable
+  const btn = document.getElementById('proceedToSign');
+  // Enable after 30 seconds (reasonable reading time), or user can scroll to bottom
+  setTimeout(() => {
+    btn.disabled = false;
+    ndaScrolledFully = true;
+  }, 15000); // 15 second minimum review time
+
+  // Also try to detect iframe scroll for embedded viewers
+  try {
+    const frame = document.getElementById('ndaFrame');
+    frame.addEventListener('load', () => {
+      try {
+        const doc = frame.contentDocument || frame.contentWindow.document;
+        doc.addEventListener('scroll', () => {
+          const sh = doc.documentElement.scrollHeight;
+          const st = doc.documentElement.scrollTop;
+          const ch = doc.documentElement.clientHeight;
+          if (st + ch >= sh - 100) {
+            btn.disabled = false;
+            ndaScrolledFully = true;
+          }
+        });
+      } catch(e) { /* cross-origin - timer fallback handles it */ }
+    });
+  } catch(e) {}
+}
+
+// ═══════════════════════════════════════════
+// STEP 3: SIGNATURE PAD
+// ═══════════════════════════════════════════
+const canvas = document.getElementById('sigCanvas');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width;
+  canvas.height = 160;
+  ctx.strokeStyle = '#e8eaf0';
+  ctx.lineWidth = 2;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+function getPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  const touch = e.touches ? e.touches[0] : e;
+  return { x: touch.clientX - rect.left, y: touch.clientY - rect.top };
+}
+
+canvas.addEventListener('pointerdown', e => {
+  isDrawing = true;
+  const p = getPos(e);
+  ctx.beginPath();
+  ctx.moveTo(p.x, p.y);
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  if (!isDrawing) return;
+  const p = getPos(e);
+  ctx.lineTo(p.x, p.y);
+  ctx.stroke();
+  hasSig = true;
+  canvas.classList.add('has-sig');
+  updateSignBtn();
+});
+canvas.addEventListener('pointerup', () => { isDrawing = false; });
+canvas.addEventListener('pointerleave', () => { isDrawing = false; });
+
+function switchSigMode(mode) {
+  sigMode = mode;
+  document.querySelectorAll('.sig-tab').forEach(t => t.classList.remove('active'));
+  event.target.classList.add('active');
+  if (mode === 'draw') {
+    document.getElementById('sigDrawArea').style.display = 'block';
+    document.getElementById('sigTyped').classList.remove('visible');
+  } else {
+    document.getElementById('sigDrawArea').style.display = 'none';
+    document.getElementById('sigTyped').classList.add('visible');
+  }
+  updateSignBtn();
+}
+
+function clearSignature() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  hasSig = false;
+  canvas.classList.remove('has-sig');
+  document.getElementById('sigTyped').value = '';
+  updateSignBtn();
+}
+
+document.getElementById('sigTyped').addEventListener('input', updateSignBtn);
+
+// Consent checkboxes
+['consentRead','consentElectronic','consentBind','consentRetention'].forEach(id => {
+  document.getElementById(id).addEventListener('change', updateSignBtn);
+});
+
+function updateSignBtn() {
+  const allChecked = ['consentRead','consentElectronic','consentBind','consentRetention'].every(
+    id => document.getElementById(id).checked
+  );
+  const hasSigInput = sigMode === 'draw' ? hasSig : document.getElementById('sigTyped').value.trim().length > 2;
+  document.getElementById('signBtn').disabled = !(allChecked && hasSigInput);
+}
+
+// ═══════════════════════════════════════════
+// STEP 3: SUBMIT
+// ═══════════════════════════════════════════
+async function submitSignature() {
+  // Validate fields
+  const fields = [
+    {id:'sigName',req:true},
+    {id:'sigAddress',req:true},
+    {id:'sigJurisdiction',req:true},
+    {id:'sigEmail',req:true,email:true},
+    {id:'sigTitle',req:true},
+    {id:'sigInitials',req:true}
+  ];
+  let valid = true;
+  fields.forEach(f => {
+    const el = document.getElementById(f.id);
+    const field = el.closest('.field');
+    const val = el.value.trim();
+    if (f.req && !val) { field.classList.add('invalid'); valid = false; }
+    else if (f.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(val)) { field.classList.add('invalid'); valid = false; }
+    else { field.classList.remove('invalid'); }
+  });
+  if (!valid) { showToast('Please complete all required fields.','error'); return; }
+
+  const btn = document.getElementById('signBtn');
+  btn.classList.add('loading');
+  btn.disabled = true;
+
+  // Capture signature data
+  let signatureData;
+  if (sigMode === 'draw') {
+    signatureData = canvas.toDataURL('image/png');
+  } else {
+    signatureData = 'typed:' + document.getElementById('sigTyped').value.trim();
+  }
+
+  const payload = {
+    name: document.getElementById('sigName').value.trim(),
+    organization: document.getElementById('sigOrg').value.trim(),
+    address: document.getElementById('sigAddress').value.trim(),
+    jurisdiction: document.getElementById('sigJurisdiction').value.trim(),
+    email: document.getElementById('sigEmail').value.trim(),
+    title: document.getElementById('sigTitle').value.trim(),
+    initials: document.getElementById('sigInitials').value.trim().toUpperCase(),
+    signature_data: signatureData,
+    signature_mode: sigMode,
+    consents: {
+      read: document.getElementById('consentRead').checked,
+      electronic: document.getElementById('consentElectronic').checked,
+      bind: document.getElementById('consentBind').checked,
+      retention: document.getElementById('consentRetention').checked
+    },
+    user_agent: navigator.userAgent,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    screen: `${screen.width}x${screen.height}`
+  };
+
+  try {
+    const res = await fetch('/api/nda/sign', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (data.success) {
+      signatureToken = data.token;
+      document.getElementById('dlEmail').textContent = payload.email;
+      document.getElementById('dlAgreementNo').textContent = data.agreement_no;
+      document.getElementById('dlTimestamp').textContent = data.signed_at;
+      document.getElementById('dlDocHash').textContent = data.doc_hash;
+      goToStep(4);
+      showToast('NDA executed successfully!','success');
+    } else {
+      showToast(data.error || 'Signing failed. Please try again.','error');
+    }
+  } catch(e) {
+    showToast('Connection error. Please try again.','error');
+  }
+  btn.classList.remove('loading');
+  btn.disabled = false;
+}
+
+// ═══════════════════════════════════════════
+// STEP 4: DOWNLOAD
+// ═══════════════════════════════════════════
+function selectPlatform(p) {
+  selectedPlatform = p;
+  document.querySelectorAll('.platform-btn').forEach(b => b.classList.remove('selected'));
+  document.querySelector(`[data-platform="${p}"]`).classList.add('selected');
+  document.getElementById('downloadBtn').disabled = false;
+}
+
+async function startDownload() {
+  if (!selectedPlatform || !signatureToken) return;
+  const btn = document.getElementById('downloadBtn');
+  btn.classList.add('loading');
+
+  try {
+    const res = await fetch('/api/nda/download', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({token: signatureToken, platform: selectedPlatform})
+    });
+    const data = await res.json();
+    if (data.download_url) {
+      window.location.href = data.download_url;
+      showToast('Download starting...','success');
+    } else {
+      showToast(data.error || 'Download unavailable.','error');
+    }
+  } catch(e) {
+    showToast('Connection error.','error');
+  }
+  btn.classList.remove('loading');
+}
+
+// ═══════════════════════════════════════════
+// TOAST
+// ═══════════════════════════════════════════
+function showToast(msg, type='') {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + type;
+  setTimeout(() => t.classList.remove('show'), 4000);
+}
+</script>
+</body>
+</html>

@@ -37,6 +37,7 @@ pub struct StateMachine {
     user_registry: Arc<Mutex<UserRegistry>>,
     ptt_pressed: Arc<AtomicBool>,
     current_channel: Arc<AtomicU8>,
+    current_subchannel: Arc<AtomicU8>,
     tx_running: Arc<AtomicBool>,
     rx_running: Arc<AtomicBool>,
     device_name: String,
@@ -44,7 +45,7 @@ pub struct StateMachine {
 }
 
 impl StateMachine {
-    pub fn new(ptt: Arc<AtomicBool>, channel: Arc<AtomicU8>) -> Self {
+    pub fn new(ptt: Arc<AtomicBool>, channel: Arc<AtomicU8>, subchannel: Arc<AtomicU8>) -> Self {
         let device_name = "SassyTalkie-Android".to_string();
         let local_sender_id = crate::users::UserRegistry::derive_user_id(device_name.as_bytes());
 
@@ -56,6 +57,7 @@ impl StateMachine {
             user_registry: Arc::new(Mutex::new(UserRegistry::new())),
             ptt_pressed: ptt,
             current_channel: channel,
+            current_subchannel: subchannel,
             tx_running: Arc::new(AtomicBool::new(false)),
             rx_running: Arc::new(AtomicBool::new(false)),
             device_name,
@@ -97,6 +99,7 @@ impl StateMachine {
             Arc::clone(&self.tx_running),
             Arc::clone(&self.ptt_pressed),
             Arc::clone(&self.current_channel),
+            Arc::clone(&self.current_subchannel),
             Arc::clone(&self.audio),
             Arc::clone(&self.transport),
             self.local_sender_id.clone(),
@@ -106,10 +109,12 @@ impl StateMachine {
         audio_pipeline::spawn_rx_thread(
             Arc::clone(&self.rx_running),
             Arc::clone(&self.current_channel),
+            Arc::clone(&self.current_subchannel),
             Arc::clone(&self.audio),
             Arc::clone(&self.transport),
             Arc::clone(&self.audio_cache),
             Arc::clone(&self.user_registry),
+            self.local_sender_id.clone(),
         );
 
         info!("StateMachine: audio pipeline started");

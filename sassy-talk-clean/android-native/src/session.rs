@@ -1,11 +1,15 @@
-/// Session Management - QR-based key exchange with time-limited sessions
+/// Session Management - Per-channel QR-based key exchange with time-limited sessions
+///
+/// Each channel (1-8) can have its own independent AES-256-GCM encryption key
+/// and custom group name. This allows a user to be in multiple encrypted groups
+/// simultaneously — e.g., "Alpha Team" on channel 1, "Night Shift" on channel 3.
 ///
 /// Flow:
-/// 1. Device A calls generate_session_qr() → gets JSON with key + metadata
-/// 2. Device A displays QR code containing the JSON
-/// 3. Device B scans QR → calls import_session() with the JSON
-/// 4. Both devices now share the same AES-256-GCM key
-/// 5. Session expires after configured duration (1 day default, 3 day max)
+/// 1. Device A calls generate_session_qr(channel, duration, group_name)
+/// 2. QR JSON includes the channel number + group name
+/// 3. Device B scans QR → key stored in the same channel slot
+/// 4. Both devices share the same AES key for that channel
+/// 5. Switching channels switches which key is used for encrypt/decrypt
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use log::info;
@@ -17,8 +21,10 @@ use crate::crypto::CryptoSession;
 const MAX_SESSION_HOURS: u32 = 72;
 /// Default session duration: 1 day
 const DEFAULT_SESSION_HOURS: u32 = 24;
+/// Maximum number of channels (displayed as 1-8)
+pub const MAX_CHANNELS: usize = 8;
 
-/// Session key with metadata
+/// Session key with metadata (now includes channel + group name)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionKey {
     /// Base64-encoded 32-byte AES key
@@ -31,30 +37,50 @@ pub struct SessionKey {
     pub expires_at: u64,
     /// Unique session ID
     pub session_id: String,
+    /// Channel number (1-8). Legacy QR codes without this field default to 1.
+    #[serde(default = "default_channel")]
+    pub channel: u8,
+    /// User-facing group name. Defaults to "Channel N".
+    #[serde(default)]
+    pub group_name: String,
 }
 
-/// Manages active sessions
+fn default_channel() -> u8 { 1 }
+
+/// Per-channel session slot
+#[derive(Debug, Clone)]
+pub struct ChannelSession {
+    pub key: SessionKey,
+    pub group_name: String,
+}
+
+/// Per-channel session registry (replaces the old single-session SessionManager)
 pub struct SessionManager {
-    active_session: Option<SessionKey>,
+    channels: [Option<ChannelSession>; MAX_CHANNELS],
     device_name: String,
 }
 
 impl SessionManager {
     pub fn new(device_name: &str) -> Self {
         Self {
-            active_session: None,
+            channels: Default::default(),
             device_name: device_name.to_string(),
         }
     }
 
-    /// Generate a new session and return its QR payload as JSON
-    pub fn generate_session_qr(&mut self, duration_hours: u32) -> Result<String, String> {
+    /// Generate a new session QR for a specific channel.
+    pub fn generate_session_qr(
+        &mut self,
+        channel: u8,
+        duration_hours: u32,
+        group_name: &str,
+    ) -> Result<String, String> {
+        let ch_idx = validate_channel(channel)?;
         let hours = if duration_hours == 0 { DEFAULT_SESSION_HOURS } else { duration_hours };
         let duration = hours.min(MAX_SESSION_HOURS).max(1);
         let now = current_unix_time()?;
         let expires = now + (duration as u64 * 3600);
 
-        // Generate 32-byte random key
         let key_bytes: [u8; 32] = rand::random();
         let key_b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
@@ -62,42 +88,55 @@ impl SessionManager {
         );
 
         let session_id = uuid::Uuid::new_v4().to_string();
+        let name = if group_name.is_empty() {
+            format!("Channel {}", channel)
+        } else {
+            group_name.to_string()
+        };
 
         let session = SessionKey {
             key: key_b64,
             device: self.device_name.clone(),
             created_at: now,
             expires_at: expires,
-            session_id,
+            session_id: session_id.clone(),
+            channel,
+            group_name: name.clone(),
         };
 
         let json = serde_json::to_string(&session)
             .map_err(|e| format!("Failed to serialize session: {}", e))?;
 
-        self.active_session = Some(session.clone());
-        info!("Session generated: {} (expires in {}h)", session.session_id, duration);
+        self.channels[ch_idx] = Some(ChannelSession {
+            key: session,
+            group_name: name.clone(),
+        });
+
+        info!("Session generated for ch{} '{}': {} (expires in {}h)",
+            channel, name, session_id, duration);
 
         Ok(json)
     }
 
-    /// Import a session from a scanned QR code JSON payload
-    pub fn import_session(&mut self, qr_json: &str) -> Result<CryptoSession, String> {
+    /// Import a session from a scanned QR code JSON payload.
+    /// Returns (channel, CryptoSession) so the caller can set the active channel.
+    pub fn import_session(&mut self, qr_json: &str) -> Result<(u8, CryptoSession), String> {
         let session: SessionKey = serde_json::from_str(qr_json)
             .map_err(|e| format!("Invalid QR data: {}", e))?;
 
-        // Validate expiry
+        let channel = session.channel;
+        let ch_idx = validate_channel(channel)?;
+
         let now = current_unix_time()?;
         if now > session.expires_at {
             return Err("Session has expired".to_string());
         }
 
-        // Validate duration doesn't exceed max
         let duration_secs = session.expires_at - session.created_at;
         if duration_secs > MAX_SESSION_HOURS as u64 * 3600 {
             return Err("Session duration exceeds maximum".to_string());
         }
 
-        // Decode key
         let key_bytes = base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
             &session.key,
@@ -109,82 +148,186 @@ impl SessionManager {
 
         let mut key_array = [0u8; 32];
         key_array.copy_from_slice(&key_bytes);
-
         let crypto = CryptoSession::from_psk(&key_array);
 
-        self.active_session = Some(session.clone());
-        info!("Session imported from {}: {}", session.device, session.session_id);
+        let name = if session.group_name.is_empty() {
+            format!("Channel {}", channel)
+        } else {
+            session.group_name.clone()
+        };
 
-        Ok(crypto)
+        info!("Session imported for ch{} '{}' from {}: {}",
+            channel, name, session.device, session.session_id);
+
+        self.channels[ch_idx] = Some(ChannelSession {
+            key: session,
+            group_name: name,
+        });
+
+        Ok((channel, crypto))
     }
 
-    /// Get the CryptoSession from the active session key
-    pub fn get_crypto_session(&self) -> Result<CryptoSession, String> {
-        let session = self.active_session.as_ref()
-            .ok_or("No active session")?;
+    /// Get the CryptoSession for a specific channel (if it has a valid key).
+    pub fn get_crypto_for_channel(&self, channel: u8) -> Option<CryptoSession> {
+        let ch_idx = match validate_channel(channel) {
+            Ok(i) => i,
+            Err(_) => return None,
+        };
 
-        // Check expiry
-        let now = current_unix_time()?;
-        if now > session.expires_at {
-            return Err("Session has expired".to_string());
+        let cs = self.channels[ch_idx].as_ref()?;
+        let now = current_unix_time().ok()?;
+        if now > cs.key.expires_at {
+            return None; // expired
         }
 
         let key_bytes = base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
-            &session.key,
-        ).map_err(|e| format!("Invalid key: {}", e))?;
+            &cs.key.key,
+        ).ok()?;
 
-        let mut key_array = [0u8; 32];
-        key_array.copy_from_slice(&key_bytes);
-
-        Ok(CryptoSession::from_psk(&key_array))
+        if key_bytes.len() != 32 { return None; }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&key_bytes);
+        Some(CryptoSession::from_psk(&arr))
     }
 
-    /// Check if there's a valid (non-expired) session
+    /// Check if ANY channel has a valid (non-expired) session.
     pub fn is_authenticated(&self) -> bool {
-        match &self.active_session {
-            Some(session) => {
-                match current_unix_time() {
-                    Ok(now) => now < session.expires_at,
-                    Err(_) => false,
-                }
+        self.channels.iter().any(|slot| {
+            if let Some(cs) = slot {
+                current_unix_time().map(|now| now < cs.key.expires_at).unwrap_or(false)
+            } else {
+                false
             }
-            None => false,
+        })
+    }
+
+    /// Check if a specific channel has a valid session.
+    pub fn channel_is_authenticated(&self, channel: u8) -> bool {
+        self.get_crypto_for_channel(channel).is_some()
+    }
+
+    /// Get the group name for a channel.
+    pub fn get_group_name(&self, channel: u8) -> String {
+        let ch_idx = match validate_channel(channel) {
+            Ok(i) => i,
+            Err(_) => return format!("Channel {}", channel),
+        };
+        self.channels[ch_idx].as_ref()
+            .map(|cs| cs.group_name.clone())
+            .unwrap_or_else(|| format!("Channel {}", channel))
+    }
+
+    /// Set a custom group name for a channel.
+    pub fn set_group_name(&mut self, channel: u8, name: &str) {
+        if let Ok(idx) = validate_channel(channel) {
+            if let Some(cs) = self.channels[idx].as_mut() {
+                cs.group_name = name.to_string();
+                cs.key.group_name = name.to_string();
+            }
         }
     }
 
-    /// Get session status as JSON
+    /// Get the session_id for a channel (used as relay room ID).
+    pub fn get_session_id(&self, channel: u8) -> Option<String> {
+        let ch_idx = validate_channel(channel).ok()?;
+        self.channels[ch_idx].as_ref().map(|cs| cs.key.session_id.clone())
+    }
+
+    /// Get the first valid session_id across all channels (for relay room).
+    pub fn get_any_session_id(&self) -> Option<String> {
+        self.channels.iter().filter_map(|slot| {
+            slot.as_ref().map(|cs| cs.key.session_id.clone())
+        }).next()
+    }
+
+    /// Get session status as JSON (for UI display).
     pub fn get_session_status(&self) -> String {
-        match &self.active_session {
-            Some(session) => {
-                let now = current_unix_time().unwrap_or(0);
-                let expired = now > session.expires_at;
-                let remaining_secs = if expired { 0 } else { session.expires_at - now };
+        let now = current_unix_time().unwrap_or(0);
 
-                serde_json::json!({
-                    "active": !expired,
-                    "session_id": session.session_id,
-                    "peer_device": session.device,
-                    "created_at": session.created_at,
-                    "expires_at": session.expires_at,
-                    "remaining_seconds": remaining_secs,
-                    "expired": expired,
-                }).to_string()
-            }
-            None => {
-                serde_json::json!({
+        let channels: Vec<serde_json::Value> = (0..MAX_CHANNELS).map(|i| {
+            let ch = (i + 1) as u8;
+            match &self.channels[i] {
+                Some(cs) => {
+                    let expired = now > cs.key.expires_at;
+                    let remaining = if expired { 0 } else { cs.key.expires_at - now };
+                    serde_json::json!({
+                        "channel": ch,
+                        "active": !expired,
+                        "group_name": cs.group_name,
+                        "session_id": cs.key.session_id,
+                        "peer_device": cs.key.device,
+                        "remaining_seconds": remaining,
+                        "fingerprint": &cs.key.session_id[..8],
+                    })
+                }
+                None => serde_json::json!({
+                    "channel": ch,
                     "active": false,
-                }).to_string()
+                    "group_name": format!("Channel {}", ch),
+                }),
+            }
+        }).collect();
+
+        serde_json::json!({
+            "channels": channels,
+            "any_active": self.is_authenticated(),
+        }).to_string()
+    }
+
+    /// Get channel info as JSON array (lightweight, for channel picker).
+    pub fn get_channel_info(&self) -> String {
+        let now = current_unix_time().unwrap_or(0);
+        let info: Vec<serde_json::Value> = (0..MAX_CHANNELS).map(|i| {
+            let ch = (i + 1) as u8;
+            match &self.channels[i] {
+                Some(cs) => {
+                    let active = now < cs.key.expires_at;
+                    serde_json::json!({
+                        "channel": ch,
+                        "active": active,
+                        "name": cs.group_name,
+                        "fingerprint": &cs.key.session_id[..8],
+                    })
+                }
+                None => serde_json::json!({
+                    "channel": ch,
+                    "active": false,
+                    "name": format!("Channel {}", ch),
+                }),
+            }
+        }).collect();
+        serde_json::to_string(&info).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// Clear a specific channel's session.
+    pub fn clear_channel(&mut self, channel: u8) {
+        if let Ok(idx) = validate_channel(channel) {
+            if let Some(cs) = self.channels[idx].take() {
+                info!("Session cleared for ch{}: {}", channel, cs.key.session_id);
             }
         }
     }
 
-    /// Clear the active session
+    /// Clear ALL channel sessions.
     pub fn clear_session(&mut self) {
-        if let Some(ref session) = self.active_session {
-            info!("Session cleared: {}", session.session_id);
+        for i in 0..MAX_CHANNELS {
+            if let Some(cs) = self.channels[i].take() {
+                info!("Session cleared for ch{}: {}", i + 1, cs.key.session_id);
+            }
         }
-        self.active_session = None;
+    }
+
+    pub fn set_device_name(&mut self, name: &str) {
+        self.device_name = name.to_string();
+    }
+}
+
+fn validate_channel(channel: u8) -> Result<usize, String> {
+    if channel < 1 || channel > MAX_CHANNELS as u8 {
+        Err(format!("Invalid channel {} (must be 1-{})", channel, MAX_CHANNELS))
+    } else {
+        Ok((channel - 1) as usize)
     }
 }
 
@@ -202,34 +345,74 @@ mod tests {
     #[test]
     fn test_session_generate_and_import() {
         let mut host = SessionManager::new("Host");
-        let qr_json = host.generate_session_qr(24).unwrap();
+        let qr_json = host.generate_session_qr(1, 24, "Alpha Team").unwrap();
 
         let mut joiner = SessionManager::new("Joiner");
-        let mut crypto = joiner.import_session(&qr_json).unwrap();
+        let (ch, mut crypto) = joiner.import_session(&qr_json).unwrap();
 
-        // Both should be authenticated
+        assert_eq!(ch, 1);
         assert!(host.is_authenticated());
         assert!(joiner.is_authenticated());
+        assert!(joiner.channel_is_authenticated(1));
+        assert!(!joiner.channel_is_authenticated(2));
 
         // Crypto should work
         let plaintext = b"test audio data";
         let encrypted = crypto.encrypt(plaintext).unwrap();
-        let host_crypto = host.get_crypto_session().unwrap();
+        let host_crypto = host.get_crypto_for_channel(1).unwrap();
         let decrypted = host_crypto.decrypt(&encrypted).unwrap();
         assert_eq!(&decrypted, plaintext);
     }
 
     #[test]
+    fn test_per_channel_isolation() {
+        let mut mgr = SessionManager::new("Test");
+        mgr.generate_session_qr(1, 24, "Team A").unwrap();
+        mgr.generate_session_qr(3, 24, "Team B").unwrap();
+
+        assert!(mgr.channel_is_authenticated(1));
+        assert!(!mgr.channel_is_authenticated(2));
+        assert!(mgr.channel_is_authenticated(3));
+
+        assert_eq!(mgr.get_group_name(1), "Team A");
+        assert_eq!(mgr.get_group_name(2), "Channel 2");
+        assert_eq!(mgr.get_group_name(3), "Team B");
+
+        // Different keys for different channels
+        let c1 = mgr.get_crypto_for_channel(1).unwrap();
+        let mut c3 = mgr.get_crypto_for_channel(3).unwrap();
+        let encrypted = c3.encrypt(b"secret").unwrap();
+        assert!(c1.decrypt(&encrypted).is_err()); // wrong key
+    }
+
+    #[test]
+    fn test_legacy_qr_defaults_to_channel_1() {
+        // Legacy QR without channel field
+        let mut host = SessionManager::new("Host");
+        let qr = host.generate_session_qr(1, 24, "").unwrap();
+
+        // Strip channel field to simulate legacy
+        let mut parsed: serde_json::Value = serde_json::from_str(&qr).unwrap();
+        parsed.as_object_mut().unwrap().remove("channel");
+        parsed.as_object_mut().unwrap().remove("group_name");
+        let legacy_json = serde_json::to_string(&parsed).unwrap();
+
+        let mut joiner = SessionManager::new("Joiner");
+        let (ch, _) = joiner.import_session(&legacy_json).unwrap();
+        assert_eq!(ch, 1); // defaults to channel 1
+    }
+
+    #[test]
     fn test_session_expiry_validation() {
         let mut mgr = SessionManager::new("Test");
-
-        // Create an already-expired session
         let expired_json = serde_json::json!({
             "key": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[0u8; 32]),
             "device": "Old",
             "created_at": 1000,
             "expires_at": 1001,
             "session_id": "expired-session",
+            "channel": 1,
+            "group_name": "Expired",
         }).to_string();
 
         let result = mgr.import_session(&expired_json);
@@ -238,12 +421,11 @@ mod tests {
     }
 
     #[test]
-    fn test_session_max_duration() {
+    fn test_channel_info_json() {
         let mut mgr = SessionManager::new("Test");
-        // Request 100 hours, should be clamped to 72
-        let qr = mgr.generate_session_qr(100).unwrap();
-        let session: SessionKey = serde_json::from_str(&qr).unwrap();
-        let duration_hours = (session.expires_at - session.created_at) / 3600;
-        assert!(duration_hours <= 72);
+        mgr.generate_session_qr(2, 24, "Ops").unwrap();
+        let info = mgr.get_channel_info();
+        assert!(info.contains("\"Ops\""));
+        assert!(info.contains("\"channel\":2"));
     }
 }

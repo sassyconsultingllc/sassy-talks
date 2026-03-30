@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sassy Browser — Open, Edit, Save, Print 200+ Formats. Built-in Ad Blocker. Zero Subscriptions.</title>
+    <link rel="canonical" href="https://sassyconsultingllc.com/browser">
+    <meta name="description" content="A privacy-first desktop browser built in pure Rust. Opens and edits PDFs, images, Word docs, spreadsheets, PDB molecules, CAD files and 200+ formats natively. Built-in ad blocker, user script manager, password vault. No Chrome. No Google. No subscriptions.">
+    <meta name="keywords" content="PDF editor free, image editor free, DOCX editor free, PDB viewer, molecular viewer, Chrome alternative, Adobe alternative, Microsoft 365 alternative, secure browser, Rust browser, ad blocker built-in, tampermonkey alternative, ublock alternative, web3 browser, RAW photo editor, DICOM viewer, CAD viewer, privacy browser, open source browser">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://sassyconsultingllc.com/browser">
+    <meta property="og:title" content="Sassy Browser — One Browser Replaces $15K/yr in Software">
+    <meta property="og:description" content="Open, edit, save, print 200+ file formats. PDF editor, image editor, document editor, molecular viewer. Built-in ad blocker. No subscriptions. Pure Rust.">
+    <meta property="og:image" content="https://sassyconsultingllc.com/sassy-browser-logo.jpg">
+    <meta property="og:site_name" content="Sassy Consulting LLC">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Sassy Browser — The Browser That Replaces Everything">
+    <meta name="twitter:description" content="200+ file formats. Edit, save, print. Built-in ad blocker. No subscriptions. Pure Rust.">
+    <script type="application/ld+json">
+    {
+        "@context": "https://schema.org", "@type": "SoftwareApplication",
+        "name": "Sassy Browser", "alternateName": "ACE Browser",
+        "applicationCategory": "BrowserApplication", "operatingSystem": "Windows, Linux",
+        "url": "https://sassyconsultingllc.com/browser",
+        "downloadUrl": "https://github.com/sassyconsultingllc/ACE/releases",
+        "softwareVersion": "2.0.0",
+        "author": {"@type": "Organization", "name": "Sassy Consulting LLC"},
+        "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}
+    }
+    </script>
+    <link rel="icon" type="image/x-icon" href="/sassy-browser-logo.jpg">
+    <link rel="apple-touch-icon" href="/sassy-browser-logo.jpg">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&family=Lora:ital,wght@0,400;0,500;1,400;1,500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --void: #03040a; --bg: #070810; --bg2: #0d0e1c; --bg3: #13142a;
+            --card: #0f1020; --card2: #151628;
+            --green: #00e676; --green-d: #00b856; --green-glow: rgba(0,230,118,0.12); --green-dim: rgba(0,230,118,0.08);
+            --gold: #ffc947; --gold-d: rgba(255,201,71,0.15);
+            --blue: #448aff; --blue-d: rgba(68,138,255,0.12);
+            --purple: #b388ff; --purple-d: rgba(179,136,255,0.1);
+            --cyan: #18ffff; --cyan-d: rgba(24,255,255,0.1);
+            --red: #ff5252; --amber: #ffab40;
+            --text: #eeeef8; --text2: #7878a0; --text3: #45455c;
+            --border: rgba(255,255,255,0.055); --border2: rgba(255,255,255,0.1);
+            --r: 12px; --r2: 20px;
+        }
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        html { scroll-behavior: smooth; font-size: 16px; }
+        body { font-family: 'Sora', -apple-system, sans-serif; background: var(--void); color: var(--text); line-height: 1.65; overflow-x: hidden; -webkit-font-smoothing: antialiased; }
+        body::before { content: ''; position: fixed; inset: 0; background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E"); opacity: 0.4; pointer-events: none; z-index: 0; }
+        nav { position: fixed; top: 0; left: 0; right: 0; z-index: 900; height: 62px; padding: 0 2rem; background: rgba(7,8,16,0.88); backdrop-filter: blur(20px) saturate(1.5); border-bottom: 1px solid var(--border); display: flex; align-items: center; }
+        .nav-inner { max-width: 1260px; width: 100%; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; }
+        .logo { display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--text); }
+        .logo img { width: 28px; height: 28px; border-radius: 7px; }
+        .logo-name { font-weight: 700; font-size: 0.98rem; letter-spacing: -0.02em; }
+        .logo-tag { font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--green); background: var(--green-dim); border: 1px solid rgba(0,230,118,0.25); padding: 2px 7px; border-radius: 4px; margin-left: 4px; }
+        .nav-links { display: flex; gap: 1.5rem; align-items: center; }
+        .nav-links a { color: var(--text2); text-decoration: none; font-size: 0.85rem; font-weight: 500; transition: color 0.18s; }
+        .nav-links a:hover { color: var(--text); }
+        .nav-dl { background: var(--green) !important; color: #000 !important; padding: 7px 16px; border-radius: 7px; font-weight: 700 !important; font-size: 0.82rem; transition: all 0.2s; }
+        .nav-dl:hover { background: var(--cyan) !important; transform: translateY(-1px); }
+        .hamburger { display: none; background: none; border: none; color: var(--text); font-size: 1.4rem; cursor: pointer; }
+        #donate-splash { min-height: 100vh; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; padding: 2rem; position: relative; overflow: hidden; }
+        #donate-splash::before { content: ''; position: absolute; top: 0; left: 50%; transform: translateX(-50%); width: 900px; height: 900px; background: radial-gradient(ellipse, rgba(255,201,71,0.07) 0%, transparent 65%); pointer-events: none; }
+        .splash-inner { position: relative; z-index: 1; max-width: 600px; }
+        .splash-heart { font-size: 3.5rem; margin-bottom: 1.5rem; animation: heartbeat 2s ease-in-out infinite; }
+        @keyframes heartbeat { 0%,100% { transform: scale(1); } 50% { transform: scale(1.12); } }
+        #donate-splash h2 { font-size: clamp(1.6rem, 4vw, 2.4rem); font-weight: 800; letter-spacing: -0.03em; margin-bottom: 1rem; line-height: 1.25; }
+        #donate-splash p { color: var(--text2); font-size: 1.1rem; margin-bottom: 2.5rem; line-height: 1.75; }
+        .donate-btn { display: inline-flex; align-items: center; gap: 10px; padding: 15px 34px; border-radius: 10px; background: var(--gold); color: #000; font-weight: 700; font-size: 1rem; text-decoration: none; transition: all 0.25s; box-shadow: 0 0 40px rgba(255,201,71,0.25); }
+        .donate-btn:hover { background: #ffe082; transform: translateY(-2px); box-shadow: 0 8px 40px rgba(255,201,71,0.4); }
+        .splash-skip { margin-top: 2.5rem; color: var(--text3); font-size: 0.8rem; display: flex; align-items: center; justify-content: center; gap: 6px; }
+        .splash-skip svg { opacity: 0.5; animation: bounce 1.5s ease-in-out infinite; }
+        @keyframes bounce { 0%,100% { transform: translateY(0); } 50% { transform: translateY(4px); } }
+        #countdown { color: var(--gold); font-weight: 700; }
+        .hero { min-height: 100vh; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; padding: 8rem 2rem 5rem; position: relative; }
+        .hero-glow { position: absolute; top: -100px; left: 50%; transform: translateX(-50%); width: 1100px; height: 1100px; background: radial-gradient(ellipse, rgba(0,230,118,0.06) 0%, rgba(68,138,255,0.04) 35%, transparent 65%); pointer-events: none; }
+        .hero-grid-bg { position: absolute; inset: 0; background-image: linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px); background-size: 48px 48px; mask-image: radial-gradient(ellipse 80% 60% at 50% 50%, black 20%, transparent 80%); pointer-events: none; }
+        .hero-content { position: relative; z-index: 1; max-width: 920px; }
+        .pill { display: inline-flex; align-items: center; gap: 8px; padding: 7px 16px; border-radius: 100px; font-size: 0.8rem; font-weight: 600; letter-spacing: 0.02em; margin-bottom: 2rem; animation: fadeUp 0.7s ease-out both; }
+        .pill-gold { background: var(--gold-d); border: 1px solid rgba(255,201,71,0.35); color: var(--gold); }
+        .pill-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; animation: pulse 2s ease-in-out infinite; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+        h1.hero-h1 { font-size: clamp(3rem, 7vw, 5.2rem); font-weight: 800; line-height: 1.03; letter-spacing: -0.04em; margin-bottom: 1.5rem; animation: fadeUp 0.7s ease-out 0.1s both; }
+        .h1-italic { font-family: 'Lora', Georgia, serif; font-style: italic; font-weight: 400; }
+        .h1-green { color: var(--green); }
+        .h1-gold { color: var(--gold); }
+        .h1-dim { color: var(--text2); }
+        .hero-sub { font-size: 1.15rem; color: var(--text2); max-width: 700px; margin: 0 auto 2.5rem; line-height: 1.75; animation: fadeUp 0.7s ease-out 0.2s both; }
+        .hero-sub strong { color: var(--text); font-weight: 600; }
+        .hero-sub em { color: var(--green); font-style: normal; font-weight: 600; }
+        .hero-actions { display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; margin-bottom: 4rem; animation: fadeUp 0.7s ease-out 0.3s both; }
+        .btn { display: inline-flex; align-items: center; gap: 8px; padding: 14px 28px; border-radius: 10px; font-size: 0.92rem; font-weight: 700; text-decoration: none; transition: all 0.22s; cursor: pointer; border: none; letter-spacing: -0.01em; font-family: 'Sora', sans-serif; }
+        .btn-green { background: var(--green); color: #000; }
+        .btn-green:hover { background: var(--cyan); transform: translateY(-2px); box-shadow: 0 8px 32px rgba(0,230,118,0.28); }
+        .btn-outline { background: transparent; color: var(--text); border: 1px solid var(--border2); }
+        .btn-outline:hover { background: var(--bg3); border-color: var(--text3); }
+        .btn-lg { padding: 16px 34px; font-size: 1rem; }
+        .stat-bar { display: flex; border: 1px solid var(--border); border-radius: var(--r2); overflow: hidden; background: var(--card); animation: fadeUp 0.7s ease-out 0.4s both; }
+        .stat-item { padding: 1.5rem 2.25rem; text-align: center; border-right: 1px solid var(--border); flex: 1; }
+        .stat-item:last-child { border-right: none; }
+        .stat-val { font-size: 1.75rem; font-weight: 800; color: var(--green); letter-spacing: -0.04em; line-height: 1; }
+        .stat-lbl { font-size: 0.72rem; color: var(--text3); margin-top: 4px; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
+        @keyframes fadeUp { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: translateY(0); } }
+        .wrap { max-width: 1260px; margin: 0 auto; padding: 6rem 2rem; position: relative; z-index: 1; }
+        .wrap-narrow { max-width: 860px; margin: 0 auto; padding: 5rem 2rem; }
+        .section-eyebrow { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.14em; color: var(--green); display: flex; align-items: center; gap: 10px; margin-bottom: 0.9rem; }
+        .section-eyebrow::before { content: ''; width: 22px; height: 2px; background: var(--green); flex-shrink: 0; }
+        .section-eyebrow.purple { color: var(--purple); } .section-eyebrow.purple::before { background: var(--purple); }
+        .section-eyebrow.gold { color: var(--gold); } .section-eyebrow.gold::before { background: var(--gold); }
+        .section-eyebrow.cyan { color: var(--cyan); } .section-eyebrow.cyan::before { background: var(--cyan); }
+        .section-eyebrow.blue { color: var(--blue); } .section-eyebrow.blue::before { background: var(--blue); }
+        h2.sh { font-size: clamp(1.9rem, 4vw, 3rem); font-weight: 800; letter-spacing: -0.03em; margin-bottom: 0.8rem; line-height: 1.15; }
+        p.sd { font-size: 1.05rem; color: var(--text2); max-width: 640px; margin-bottom: 2.5rem; line-height: 1.75; }
+        .audience-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--border); border-radius: var(--r2); overflow: hidden; }
+        .aud-card { background: var(--card); padding: 2.5rem 1.75rem; text-align: center; transition: background 0.25s; }
+        .aud-card:hover { background: var(--bg3); }
+        .aud-card.featured { background: rgba(0,230,118,0.05); }
+        .aud-icon { font-size: 2.25rem; margin-bottom: 1rem; }
+        .aud-card h3 { font-size: 1rem; font-weight: 700; margin-bottom: 0.5rem; }
+        .aud-card.featured h3 { color: var(--green); }
+        .aud-card p { font-size: 0.87rem; color: var(--text2); line-height: 1.65; }
+        .web3-panel { background: linear-gradient(135deg, rgba(179,136,255,0.07) 0%, rgba(24,255,255,0.05) 100%); border: 1px solid rgba(179,136,255,0.2); border-radius: var(--r2); padding: 3.5rem; margin: 4rem 0; position: relative; overflow: hidden; }
+        .web3-panel::before { content: 'Web3'; position: absolute; right: -20px; top: 50%; transform: translateY(-50%); font-size: 10rem; font-weight: 900; color: rgba(179,136,255,0.04); pointer-events: none; letter-spacing: -0.05em; user-select: none; }
+        .web3-panel h3 { font-size: 1.6rem; font-weight: 800; margin-bottom: 0.6rem; letter-spacing: -0.02em; }
+        .web3-panel > p { color: var(--text2); margin-bottom: 2.5rem; max-width: 600px; line-height: 1.75; }
+        .web3-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 2rem; position: relative; z-index: 1; }
+        .w3-item { display: flex; gap: 1rem; align-items: flex-start; }
+        .w3-item .wi { font-size: 1.6rem; flex-shrink: 0; margin-top: 2px; }
+        .w3-item h4 { font-size: 0.92rem; font-weight: 700; margin-bottom: 4px; }
+        .w3-item p { font-size: 0.85rem; color: var(--text2); line-height: 1.65; }
+        .caps-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 1.15rem; }
+        .cap-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--r); padding: 2rem; transition: all 0.25s; position: relative; overflow: hidden; }
+        .cap-card::after { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--green-glow), transparent); opacity: 0; transition: opacity 0.3s; }
+        .cap-card:hover { border-color: var(--border2); transform: translateY(-3px); box-shadow: 0 12px 40px rgba(0,0,0,0.4); }
+        .cap-card:hover::after { opacity: 1; }
+        .cap-icon { font-size: 1.7rem; margin-bottom: 0.75rem; }
+        .cap-card h4 { font-size: 1rem; font-weight: 700; margin-bottom: 0.4rem; }
+        .cap-sub { font-size: 0.8rem; color: var(--text3); font-weight: 500; }
+        .formats { font-family: 'JetBrains Mono', monospace; font-size: 0.77rem; color: var(--text3); margin: 0.75rem 0; line-height: 1.9; }
+        .tag-row { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 0.75rem; }
+        .tag { font-size: 0.7rem; font-weight: 700; padding: 3px 9px; border-radius: 5px; text-transform: uppercase; letter-spacing: 0.04em; }
+        .tag-v { background: var(--bg3); color: var(--text2); }
+        .tag-e { background: rgba(0,230,118,0.15); color: var(--green); }
+        .tag-s { background: var(--blue-d); color: var(--blue); }
+        .tag-p { background: var(--purple-d); color: var(--purple); }
+        .tag-full { background: rgba(0,230,118,0.22); color: var(--green); border: 1px solid rgba(0,230,118,0.35); }
+        .cap-note { font-size: 0.82rem; color: var(--text2); margin-top: 0.75rem; line-height: 1.65; }
+        .savings-wrap { background: var(--card); border: 1px solid var(--border); border-radius: var(--r2); overflow: hidden; }
+        .savings-table { width: 100%; border-collapse: collapse; }
+        .savings-table th { padding: 1rem 1.5rem; text-align: left; background: var(--bg3); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text3); font-weight: 700; }
+        .savings-table td { padding: 0.95rem 1.5rem; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+        .savings-table tr:last-child td { border-bottom: none; }
+        .savings-table tr:hover td { background: rgba(255,255,255,0.018); }
+        .killed { text-decoration: line-through; color: var(--red); font-weight: 600; }
+        .free-tag { color: var(--green); font-weight: 700; }
+        .total-row td { background: var(--bg3) !important; font-weight: 800; font-size: 1.05rem; padding: 1.25rem 1.5rem; }
+        .tools-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(276px, 1fr)); gap: 1.15rem; }
+        .tool-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--r); padding: 1.9rem; position: relative; transition: all 0.25s; }
+        .tool-card:hover { border-color: var(--border2); transform: translateY(-2px); }
+        .tool-card.hl { border-color: rgba(0,230,118,0.3); background: rgba(0,230,118,0.03); }
+        .tool-badge { position: absolute; top: -1px; right: 18px; background: var(--green); color: #000; font-size: 0.6rem; font-weight: 800; padding: 3px 9px; border-radius: 0 0 6px 6px; letter-spacing: 0.08em; text-transform: uppercase; }
+        .tool-badge.gold-b { background: var(--gold); }
+        .tool-icon { font-size: 1.7rem; margin-bottom: 0.75rem; }
+        .tool-card h3 { font-size: 1rem; font-weight: 700; margin-bottom: 0.5rem; }
+        .tool-card p { font-size: 0.87rem; color: var(--text2); line-height: 1.65; }
+        .compare-wrap { background: var(--card); border: 1px solid var(--border); border-radius: var(--r2); overflow: hidden; }
+        .compare-table { width: 100%; border-collapse: collapse; }
+        .compare-table th { padding: 1rem 1.25rem; font-size: 0.82rem; font-weight: 700; background: var(--bg3); text-align: center; }
+        .compare-table th:first-child { text-align: left; }
+        .compare-table td { padding: 0.8rem 1.25rem; border-bottom: 1px solid var(--border); text-align: center; font-size: 0.88rem; }
+        .compare-table td:first-child { text-align: left; color: var(--text2); }
+        .compare-table tr:last-child td { border-bottom: none; }
+        .y { color: var(--green); font-weight: 700; } .n { color: var(--red); opacity: 0.7; } .m { color: var(--gold); font-size: 0.8rem; }
+        .sassy-col-h { color: var(--green); background: rgba(0,230,118,0.1) !important; }
+        .sassy-col { background: rgba(0,230,118,0.025); }
+        .sec-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(255px, 1fr)); gap: 1.15rem; }
+        .sec-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--r); padding: 1.75rem; transition: all 0.25s; }
+        .sec-card:hover { border-color: var(--border2); }
+        .sec-card h4 { font-size: 0.92rem; font-weight: 700; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
+        .sec-card p { font-size: 0.85rem; color: var(--text2); line-height: 1.65; }
+        .rust-block { background: var(--card); border: 1px solid var(--border); border-radius: var(--r2); padding: 4rem; text-align: center; margin: 4rem 0; position: relative; overflow: hidden; }
+        .rust-block::before { content: '🦀'; position: absolute; right: -40px; top: 50%; transform: translateY(-50%); font-size: 14rem; opacity: 0.035; pointer-events: none; }
+        .rust-big { font-size: clamp(3rem, 8vw, 5rem); font-weight: 900; color: var(--green); letter-spacing: -0.05em; line-height: 1; }
+        .rust-lbl { font-size: 1.05rem; color: var(--text2); margin: 0.5rem 0 1.5rem; }
+        .rust-block p { color: var(--text3); max-width: 540px; margin: 0 auto; font-size: 0.9rem; line-height: 1.75; }
+        .rust-badge { display: inline-flex; align-items: center; gap: 8px; background: #bf3600; color: white; padding: 8px 16px; border-radius: 8px; font-weight: 700; font-size: 0.82rem; margin-top: 1.5rem; }
+        .story-block { border-left: 3px solid var(--green); padding-left: 2.5rem; margin: 4rem 0; }
+        .vet-badge { display: inline-flex; align-items: center; gap: 8px; background: rgba(0,230,118,0.08); border: 1px solid rgba(0,230,118,0.2); padding: 7px 14px; border-radius: 7px; font-size: 0.82rem; font-weight: 600; color: var(--green); margin-bottom: 1.5rem; }
+        .story-block h2 { font-size: 2rem; font-weight: 800; letter-spacing: -0.02em; margin-bottom: 1rem; }
+        .story-block p { color: var(--text2); margin-bottom: 1rem; max-width: 700px; line-height: 1.8; font-size: 0.98rem; }
+        .story-block .quiet { color: var(--text3); font-size: 0.85rem; margin-top: 1.5rem; font-style: italic; }
+        .final-cta { text-align: center; padding: 8rem 2rem; background: linear-gradient(180deg, var(--void) 0%, var(--bg2) 50%, var(--void) 100%); position: relative; }
+        .final-cta::before { content: ''; position: absolute; top: 0; left: 50%; transform: translateX(-50%); width: 800px; height: 400px; background: radial-gradient(ellipse, rgba(0,230,118,0.06) 0%, transparent 70%); pointer-events: none; }
+        .final-cta h2 { font-size: clamp(2rem, 5vw, 3.5rem); font-weight: 800; letter-spacing: -0.03em; margin-bottom: 1rem; position: relative; }
+        .final-cta .sub { font-size: 1.1rem; color: var(--text2); margin: 0 auto 2.5rem; max-width: 560px; line-height: 1.75; position: relative; }
+        .cta-row { display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; margin-bottom: 1.5rem; position: relative; }
+        .support-link { color: var(--gold); text-decoration: none; font-size: 0.88rem; font-weight: 600; opacity: 0.8; }
+        .support-link:hover { opacity: 1; }
+        footer { border-top: 1px solid var(--border); padding: 2.5rem 2rem; max-width: 1260px; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; position: relative; z-index: 1; }
+        .footer-l { color: var(--text3); font-size: 0.82rem; }
+        .footer-l strong { color: var(--text2); }
+        .footer-links { display: flex; gap: 1.5rem; }
+        .footer-links a { color: var(--text2); text-decoration: none; font-size: 0.82rem; transition: color 0.18s; }
+        .footer-links a:hover { color: var(--text); }
+        .divider { border: none; border-top: 1px solid var(--border); margin: 0; }
+        #download { scroll-margin-top: 80px; }
+        .dl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1.15rem; margin: 2rem 0; }
+        .dl-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--r); padding: 1.75rem; text-align: center; transition: all 0.25s; }
+        .dl-card:hover { border-color: var(--border2); transform: translateY(-2px); }
+        .dl-card.main-dl { border-color: rgba(0,230,118,0.4); background: rgba(0,230,118,0.04); }
+        .dl-card .dl-os { font-size: 2rem; margin-bottom: 0.75rem; }
+        .dl-card h4 { font-size: 0.98rem; font-weight: 700; margin-bottom: 0.35rem; }
+        .dl-card p { font-size: 0.82rem; color: var(--text2); margin-bottom: 1.25rem; }
+        .dl-card a { display: inline-flex; align-items: center; gap: 6px; padding: 10px 20px; border-radius: 8px; font-size: 0.85rem; font-weight: 700; text-decoration: none; transition: all 0.2s; }
+        .dl-card.main-dl a { background: var(--green); color: #000; }
+        .dl-card.main-dl a:hover { background: var(--cyan); }
+        .dl-card:not(.main-dl) a { background: var(--bg3); color: var(--text); border: 1px solid var(--border2); }
+        .dl-card:not(.main-dl) a:hover { background: var(--card2); }
+        @media (max-width: 900px) { .audience-grid { grid-template-columns: repeat(2, 1fr); } .stat-bar { flex-direction: column; } .stat-item { border-right: none !important; border-bottom: 1px solid var(--border); } .stat-item:last-child { border-bottom: none; } }
+        @media (max-width: 700px) { .nav-links { display: none; } .nav-links.open { display: flex; flex-direction: column; position: absolute; top: 62px; left: 0; right: 0; background: var(--void); border-bottom: 1px solid var(--border); padding: 1.25rem 2rem; gap: 1rem; } .hamburger { display: block; } .audience-grid { grid-template-columns: 1fr; } .savings-table th:nth-child(2), .savings-table td:nth-child(2) { display: none; } .web3-panel { padding: 2rem; } .rust-block { padding: 2.5rem; } .story-block { padding-left: 1.25rem; } footer { flex-direction: column; text-align: center; } }
+        @media (min-width: 701px) { .nav-links { display: flex !important; } }
+    </style>
+</head>
+<body>
+
+<!-- DONATE SPLASH -->
+<section id="donate-splash">
+    <div class="splash-inner">
+        <div class="splash-heart">💚</div>
+        <h2>Know someone who hates<br>using the internet?</h2>
+        <p>Send them here. Donate to the cause.<br><span style="font-size:0.95rem;opacity:0.6;">Every dollar funds a browser that protects everyone — built by a veteran, for all of us.</span></p>
+        <a href="https://donate.stripe.com/8x2bJ36N25lket2bX57AI01" target="_blank" rel="noopener" class="donate-btn">❤️ Donate via Stripe</a>
+        <div class="splash-skip">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+            scrolling to browser in <span id="countdown">4</span>s
+        </div>
+    </div>
+</section>
+<script>
+(function(){
+    var c=4,el=document.getElementById('countdown');
+    var t=setInterval(function(){ c--;if(el)el.textContent=c; if(c<=0){clearInterval(t);document.getElementById('top').scrollIntoView({behavior:'smooth'});} },1000);
+    document.getElementById('donate-splash').addEventListener('click',function(e){ if(e.target.closest('a'))return; clearInterval(t); document.getElementById('top').scrollIntoView({behavior:'smooth'}); });
+})();
+</script>
+
+<!-- NAV -->
+<nav>
+    <div class="nav-inner">
+        <a href="/browser" class="logo">
+            <img src="/sassy-browser-logo.jpg" alt="Sassy Browser" loading="lazy">
+            <span class="logo-name">Sassy Browser <span class="logo-tag">ACE</span></span>
+        </a>
+        <div class="nav-links" id="nav-links">
+            <a href="#for-everyone">For Everyone</a>
+            <a href="#capabilities">What It Opens</a>
+            <a href="#savings">Savings</a>
+            <a href="#features">Features</a>
+            <a href="#security">Security</a>
+            <a href="https://github.com/sassyconsultingllc/ACE" target="_blank" rel="noopener">GitHub</a>
+            <a href="#download" class="nav-dl">Download Free</a>
+        </div>
+        <button class="hamburger" onclick="document.getElementById('nav-links').classList.toggle('open')" aria-label="Menu">☰</button>
+    </div>
+</nav>
+
+<!-- HERO -->
+<section class="hero" id="top">
+    <div class="hero-glow"></div>
+    <div class="hero-grid-bg"></div>
+    <div class="hero-content">
+        <div class="pill pill-gold"><span class="pill-dot"></span>Replaces $15,248/year in software subscriptions</div>
+        <h1 class="hero-h1">
+            <span class="h1-italic h1-dim">One browser.</span><br>
+            <span class="h1-green">Open. Edit. Save. Print.</span><br>
+            <span class="h1-gold">Everything.</span>
+        </h1>
+        <p class="hero-sub">
+            Open <strong>any file. Edit it. Print it. Save it.</strong> PDFs, photos, Word docs, spreadsheets,
+            molecular structures, 3D models — <em>200+ formats</em>, full editing, zero extra software.
+            Built-in ad blocker and user script manager powerful enough to replace uBlock Origin and Tampermonkey.
+            No Chrome. No Google. No subscriptions.
+            <strong>Simple enough for your parents. Deep enough for your engineers.</strong>
+        </p>
+        <div class="hero-actions">
+            <a href="#download" class="btn btn-green btn-lg">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                Download Free — Windows
+            </a>
+            <a href="https://github.com/sassyconsultingllc/ACE" class="btn btn-outline btn-lg" target="_blank" rel="noopener">View Source — ACE</a>
+        </div>
+        <div class="stat-bar">
+            <div class="stat-item"><div class="stat-val">139K+</div><div class="stat-lbl">Lines of Rust</div></div>
+            <div class="stat-item"><div class="stat-val">145</div><div class="stat-lbl">Source Files</div></div>
+            <div class="stat-item"><div class="stat-val">200+</div><div class="stat-lbl">File Formats</div></div>
+            <div class="stat-item"><div class="stat-val">$0</div><div class="stat-lbl">Subscriptions</div></div>
+        </div>
+    </div>
+</section>
+
+<!-- FOR EVERYONE -->
+<div class="wrap" id="for-everyone">
+    <div class="section-eyebrow">Built for real people</div>
+    <h2 class="sh">No Computer Science Degree Required</h2>
+    <p class="sd">Whether you're checking email, editing a photo, or debugging an API — Sassy Browser just works. The internet shouldn't require a manual.</p>
+    <div class="audience-grid">
+        <div class="aud-card">
+            <div class="aud-icon">👨‍👩‍👧‍👦</div>
+            <h3>Your Parents</h3>
+            <p>Clean, familiar interface. No confusing popups, no accidental malware. Recommend it to family without becoming their unpaid IT support forever.</p>
+        </div>
+        <div class="aud-card featured">
+            <div class="aud-icon">👩‍💻</div>
+            <h3>Developers</h3>
+            <p>REST client, syntax highlighting for 200+ languages, built-in user scripts, devtools with network waterfall. Stop paying $180/yr for Postman.</p>
+        </div>
+        <div class="aud-card">
+            <div class="aud-icon">🔬</div>
+            <h3>Scientists &amp; Researchers</h3>
+            <p>Open PDB proteins. View DICOM scans. Analyze MOL structures. Read FASTA sequences. No $2,600 ChemDraw license. No PACS subscription.</p>
+        </div>
+        <div class="aud-card">
+            <div class="aud-icon">🌐</div>
+            <h3>Web3 Newcomers</h3>
+            <p>Stepping into crypto, NFTs, or dApps? We walk you through it — plain English, no jargon, scam detection built right in. You're not behind. The internet just changed.</p>
+        </div>
+    </div>
+    <div class="web3-panel">
+        <div class="section-eyebrow purple">The web is changing</div>
+        <h3>Web3 Feels Like Learning to Drive All Over Again — We'll Be Your Passenger.</h3>
+        <p>Crypto wallets, NFTs, dApps, gas fees — it can feel like everyone else got a memo you didn't. Sassy Browser explains the new internet <em>as you browse it</em>, in plain English. No judgment. No condescension.</p>
+        <div class="web3-grid">
+            <div class="w3-item"><div class="wi">💡</div><div><h4>Plain-English Tooltips</h4><p>Hovering over "Connect Wallet"? We explain what it does — and what you're agreeing to — before you click anything.</p></div></div>
+            <div class="w3-item"><div class="wi">⛽</div><div><h4>Gas Fee Explainer</h4><p>Why does it cost money to send crypto? We explain gas fees, why they fluctuate, and whether now is a good time to confirm.</p></div></div>
+            <div class="w3-item"><div class="wi">🛡️</div><div><h4>Scam &amp; Phishing Detection</h4><p>Fake wallet sites and drain contracts are everywhere. We flag suspicious sites and explain the red flags in plain language.</p></div></div>
+            <div class="w3-item"><div class="wi">📖</div><div><h4>Built-in Glossary</h4><p>Highlight any Web3 term — "seed phrase," "smart contract," "airdrop" — and get a real explanation written for humans, not engineers.</p></div></div>
+            <div class="w3-item"><div class="wi">🔐</div><div><h4>Transaction Preview</h4><p>Before you sign anything on-chain, we decode the transaction and tell you exactly what it does. Know before you click.</p></div></div>
+            <div class="w3-item"><div class="wi">📰</div><div><h4>Web3 News Filter</h4><p>Filter out the hype and noise. See what's actually happening in crypto and DeFi — sorted by relevance, not paid promotion.</p></div></div>
+        </div>
+    </div>
+</div>
+
+<hr class="divider">
+
+<!-- CAPABILITIES -->
+<div class="wrap" id="capabilities">
+    <div class="section-eyebrow cyan">What it opens</div>
+    <h2 class="sh">200+ Formats. Open. Edit. Save. Print.</h2>
+    <p class="sd">Not just a viewer. Full editing, export, and printing for every file type. This is the software replacement engine.</p>
+    <div class="caps-grid">
+        <div class="cap-card">
+            <div class="cap-icon">🖼️</div>
+            <h4>Images <span class="cap-sub">— 30+ formats including all RAW</span></h4>
+            <div class="formats">PNG · JPG · WebP · GIF · BMP · TIFF · PSD · SVG · ICO · AVIF · HEIC<br>HDR · EXR · DDS · QOI · TGA · PCX · PPM · PGM · XBM · XPM<br>RAW: CR2 · CR3 · NEF · ARW · DNG · ORF · RW2 · RAF · PEF · SRW · X3F</div>
+            <div class="tag-row"><span class="tag tag-v">View</span><span class="tag tag-e">Edit</span><span class="tag tag-s">Save</span><span class="tag tag-p">Print</span></div>
+            <p class="cap-note">Crop, resize, rotate, flip, adjustments, filters, curves. Export to PNG/JPEG/WebP/BMP/TIFF. RAW processing from Canon, Nikon, Sony, Fuji, Olympus. Replaces Photoshop + Lightroom.</p>
+        </div>
+        <div class="cap-card">
+            <div class="cap-icon">📄</div>
+            <h4>Documents <span class="cap-sub">— like LibreOffice, inside your browser</span></h4>
+            <div class="formats">DOCX · DOC · ODT · RTF · WPD · WPS · TXT · Markdown · HTML</div>
+            <div class="tag-row"><span class="tag tag-v">View</span><span class="tag tag-e">Edit</span><span class="tag tag-s">Save DOCX/ODT/RTF/PDF/MD</span><span class="tag tag-p">Print</span></div>
+            <p class="cap-note">Rich text editing with styles, headings, lists, tables, images, find/replace. Replaces Microsoft Word and LibreOffice Writer.</p>
+        </div>
+        <div class="cap-card">
+            <div class="cap-icon">📊</div>
+            <h4>Presentations <span class="cap-sub">— slide editing</span></h4>
+            <div class="formats">PPTX · PPT · ODP · KEY (import)</div>
+            <div class="tag-row"><span class="tag tag-v">View</span><span class="tag tag-e">Edit Slides</span><span class="tag tag-s">Save</span><span class="tag tag-p">Present / Print</span></div>
+            <p class="cap-note">Slide editor with text, images, shapes, speaker notes, transitions. No PowerPoint license needed.</p>
+        </div>
+        <div class="cap-card">
+            <div class="cap-icon">📑</div>
+            <h4>PDFs <span class="cap-sub">— full editing suite</span></h4>
+            <div class="formats">PDF (all versions) · XPS · OXPS</div>
+            <div class="tag-row"><span class="tag tag-v">View</span><span class="tag tag-e">Annotate</span><span class="tag tag-e">Highlight</span><span class="tag tag-e">Forms</span><span class="tag tag-s">Save</span><span class="tag tag-p">Print</span></div>
+            <p class="cap-note">Annotations, highlights, sticky notes, freehand drawing, text search, form filling, merge/split pages. Replaces Adobe Acrobat Pro at $240/yr.</p>
+        </div>
+        <div class="cap-card">
+            <div class="cap-icon">📈</div>
+            <h4>Spreadsheets <span class="cap-sub">— formulas + multi-sheet</span></h4>
+            <div class="formats">XLSX · XLS · XLSM · ODS · CSV · TSV · NUMBERS (import)</div>
+            <div class="tag-row"><span class="tag tag-v">View</span><span class="tag tag-e">Cell Edit</span><span class="tag tag-e">Formulas</span><span class="tag tag-e">Charts</span><span class="tag tag-s">Save XLSX/ODS</span><span class="tag tag-p">Print</span></div>
+            <p class="cap-note">Multi-sheet workbooks, formula bar, cell formatting, charts. Import CSV/TSV. No Office 365 subscription.</p>
+        </div>
+        <div class="cap-card">
+            <div class="cap-icon">🧬</div>
+            <h4>Chemical &amp; Biological <span class="cap-sub">— 3D interactive</span></h4>
+            <div class="formats">PDB · mmCIF · MOL · MOL2 · SDF · XYZ · CIF · FASTA · FASTQ<br>DICOM · NIfTI · SMILES · InChI</div>
+            <div class="tag-row"><span class="tag tag-v">3D View</span><span class="tag tag-v">Rotate/Zoom</span><span class="tag tag-v">Measure</span><span class="tag tag-p">Print</span><span class="tag tag-full">Complete</span></div>
+            <p class="cap-note">Ball-and-stick, wireframe, ribbon, spacefill, surface rendering. Color by element, chain, residue, B-factor. Distance measurements. DICOM medical imaging viewer. FASTA/FASTQ sequence viewer. Replaces ChemDraw ($2,600/yr) and PACS viewers ($5,000+/yr).</p>
+        </div>
+        <div class="cap-card">
+            <div class="cap-icon">📐</div>
+            <h4>CAD &amp; Vector <span class="cap-sub">— engineering files</span></h4>
+            <div class="formats">DXF · SVG · AI (import) · EPS (import) · CDR (import)</div>
+            <div class="tag-row"><span class="tag tag-v">View</span><span class="tag tag-v">Layer Control</span><span class="tag tag-s">Export SVG/PNG</span><span class="tag tag-p">Print</span></div>
+            <p class="cap-note">DXF viewer with layer visibility, zoom to entity, print to scale. SVG editor. Replaces AutoCAD LT view tier ($525/yr).</p>
+        </div>
+        <div class="cap-card">
+            <div class="cap-icon">🎯</div>
+            <h4>3D Models <span class="cap-sub">— interactive viewer</span></h4>
+            <div class="formats">OBJ · STL · GLTF · GLB · FBX · 3DS · PLY · DAE · DXF</div>
+            <div class="tag-row"><span class="tag tag-v">3D View</span><span class="tag tag-v">Rotate/Zoom</span><span class="tag tag-v">Wireframe</span><span class="tag tag-v">Lighting</span><span class="tag tag-p">Print</span></div>
+            <p class="cap-note">Full 3D rendering with orbit controls, solid/wireframe/points/normals render modes, material display, bounding box overlay.</p>
+        </div>
+        <div class="cap-card">
+            <div class="cap-icon">💻</div>
+            <h4>Code &amp; Data <span class="cap-sub">— 200+ languages</span></h4>
+            <div class="formats">Rust · Python · JS/TS · C/C++ · Java · Go · Ruby · PHP · Swift · Kotlin<br>JSON · YAML · TOML · XML · CSV · SQL · GraphQL · 190+ more</div>
+            <div class="tag-row"><span class="tag tag-v">Syntax Highlight</span><span class="tag tag-e">Edit</span><span class="tag tag-s">Save</span><span class="tag tag-p">Print</span><span class="tag tag-full">Complete</span></div>
+            <p class="cap-note">Syntax highlighting, code folding, line numbers, find/replace with regex, minimap. Full code editor functionality.</p>
+        </div>
+        <div class="cap-card">
+            <div class="cap-icon">📦</div>
+            <h4>Archives <span class="cap-sub">— browse without extracting</span></h4>
+            <div class="formats">ZIP · 7Z · RAR · TAR · GZ · XZ · BZ2 · ZSTD · JAR · WAR · APK · DEB · RPM · ISO</div>
+            <div class="tag-row"><span class="tag tag-v">Browse</span><span class="tag tag-v">Preview Files</span><span class="tag tag-s">Extract</span><span class="tag tag-e">Create ZIP</span></div>
+            <p class="cap-note">Browse archive contents, preview individual files inside archives, selective extraction. Android APKs, Linux packages, ISO disk images.</p>
+        </div>
+        <div class="cap-card">
+            <div class="cap-icon">🎵</div>
+            <h4>Audio &amp; Video</h4>
+            <div class="formats">Audio: MP3 · FLAC · WAV · OGG · AAC · OPUS · AIFF · M4A · WMA<br>Video: MP4 · MKV · WebM · AVI · MOV · WMV · FLV · M4V</div>
+            <div class="tag-row"><span class="tag tag-v">Play</span><span class="tag tag-v">Waveform</span><span class="tag tag-v">Metadata</span><span class="tag tag-v">Chapters</span></div>
+            <p class="cap-note">Full media player with waveform visualization, metadata inspector, chapter navigation, speed controls.</p>
+        </div>
+        <div class="cap-card">
+            <div class="cap-icon">📚</div>
+            <h4>eBooks &amp; Fonts</h4>
+            <div class="formats">EPUB · MOBI · AZW · AZW3 · FB2 · LIT · PDB (palm)<br>Fonts: TTF · OTF · WOFF · WOFF2 · EOT</div>
+            <div class="tag-row"><span class="tag tag-v">Read</span><span class="tag tag-v">Chapters</span><span class="tag tag-v">Bookmarks</span><span class="tag tag-v">Glyph Preview</span><span class="tag tag-p">Print</span></div>
+            <p class="cap-note">Full ebook reader with chapter navigation, bookmarks, reading progress. Font preview with full glyph map and character tables.</p>
+        </div>
+    </div>
+</div>
+
+<hr class="divider">
+
+<!-- SAVINGS -->
+<div class="wrap" id="savings">
+    <div class="section-eyebrow gold">Kill subscriptions</div>
+    <h2 class="sh">$15,248/year. Gone.</h2>
+    <p class="sd">One browser replaces all of this. No monthly fees. No Adobe. No Microsoft tax. No specialty software that only runs on expensive hardware.</p>
+    <div class="savings-wrap">
+        <table class="savings-table">
+            <thead><tr><th>Software It Replaces</th><th>What It Does</th><th>Their Price</th><th>Sassy Browser</th></tr></thead>
+            <tbody>
+                <tr><td><strong>Adobe Photoshop</strong></td><td>Image editing, PSD, filters, adjustments</td><td class="killed">$263/yr</td><td class="free-tag">✓ Included</td></tr>
+                <tr><td><strong>Adobe Lightroom</strong></td><td>RAW photo processing (CR2, NEF, ARW, DNG…)</td><td class="killed">$120/yr</td><td class="free-tag">✓ Included</td></tr>
+                <tr><td><strong>Adobe Acrobat Pro</strong></td><td>PDF edit, annotate, form fill, merge/split</td><td class="killed">$240/yr</td><td class="free-tag">✓ Included</td></tr>
+                <tr><td><strong>Microsoft 365</strong></td><td>DOCX, XLSX, PPTX editing and saving</td><td class="killed">$100/yr</td><td class="free-tag">✓ Included</td></tr>
+                <tr><td><strong>ChemDraw / PerkinElmer</strong></td><td>Molecular structures (PDB, MOL, SDF)</td><td class="killed">$2,600/yr</td><td class="free-tag">✓ Included</td></tr>
+                <tr><td><strong>PACS / DICOM Viewer</strong></td><td>Medical imaging (DICOM, NIfTI)</td><td class="killed">$5,000/yr</td><td class="free-tag">✓ Included</td></tr>
+                <tr><td><strong>AutoCAD LT (view tier)</strong></td><td>DXF/DWG file viewing and printing</td><td class="killed">$525/yr</td><td class="free-tag">✓ Included</td></tr>
+                <tr><td><strong>Postman Pro</strong></td><td>REST API testing, collections, environments</td><td class="killed">$180/yr</td><td class="free-tag">✓ Included</td></tr>
+                <tr><td><strong>uBlock Origin + Tampermonkey</strong></td><td>Ad blocking and user script management</td><td class="killed">Extensions</td><td class="free-tag">✓ Native, built-in</td></tr>
+                <tr><td><strong>1Password / LastPass</strong></td><td>Password management and autofill</td><td class="killed">$36/yr</td><td class="free-tag">✓ Included</td></tr>
+                <tr><td><strong>+ 12 more applications</strong></td><td>Ebook readers, font tools, archive managers, media players…</td><td class="killed">$6,184/yr</td><td class="free-tag">✓ All included</td></tr>
+                <tr class="total-row"><td colspan="2"><strong>TOTAL ANNUAL SAVINGS</strong></td><td class="killed" style="font-size:1.2rem;">$15,248/yr</td><td class="free-tag" style="font-size:1.2rem;">$0 Forever</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<hr class="divider">
+
+<!-- FEATURES -->
+<div class="wrap" id="features">
+    <div class="section-eyebrow">Everything built in</div>
+    <h2 class="sh">Nothing Extra to Install. Ever.</h2>
+    <p class="sd">Ad blocker, user scripts, password vault, devtools, REST client — all native. No extensions. No plugins. No attack surface to exploit.</p>
+    <div class="tools-grid">
+        <div class="tool-card hl">
+            <div class="tool-badge">Core</div>
+            <div class="tool-icon">🛡️</div>
+            <h3>Native Ad Blocker</h3>
+            <p>EasyList, EasyPrivacy, and Fanboy's Annoyances bundled and active from first launch. Blocks ads, trackers, and annoyances before the page even loads — like uBlock Origin, but it can never be bought out, disabled by a browser update, or compromised. Yours, permanently.</p>
+        </div>
+        <div class="tool-card hl">
+            <div class="tool-badge">Core</div>
+            <div class="tool-icon">📜</div>
+            <h3>User Script Manager</h3>
+            <p>Full Tampermonkey / Greasemonkey compatibility with the complete <code>GM_*</code> API — <code>@match</code>, <code>@include</code>, <code>@run-at</code>, auto-updates, storage, notifications. Import scripts from Greasy Fork. Built-in editor with syntax highlighting. Runs sandboxed — no external extension attack surface.</p>
+        </div>
+        <div class="tool-card">
+            <div class="tool-icon">🖼️</div>
+            <h3>Image Editor</h3>
+            <p>Crop, resize, rotate, flip, brightness/contrast/saturation, filters, curves. Opens every RAW format from Canon, Nikon, Sony, Fuji, and Olympus. Export to PNG, JPEG, WebP, BMP, TIFF. Replaces Photoshop and Lightroom combined.</p>
+        </div>
+        <div class="tool-card">
+            <div class="tool-icon">📄</div>
+            <h3>Document Editor</h3>
+            <p>Full rich text with styles, headings, bullet lists, tables, images, find/replace. Open DOCX or ODT files, edit, export to PDF or save back as DOCX. Like OpenOffice Writer, running inside your browser.</p>
+        </div>
+        <div class="tool-card">
+            <div class="tool-icon">📈</div>
+            <h3>Spreadsheet Editor</h3>
+            <p>Full XLSX/ODS editing with formula bar, cell formatting, conditional formatting, charts, multi-sheet workbooks. Import CSV/TSV, export to Excel. No Office 365 subscription required.</p>
+        </div>
+        <div class="tool-card">
+            <div class="tool-icon">📑</div>
+            <h3>PDF Studio</h3>
+            <p>View, annotate, highlight, add sticky notes, draw freehand, search text, fill forms, merge PDFs, split pages. Full editing suite that replaces Acrobat Pro at $240/yr.</p>
+        </div>
+        <div class="tool-card">
+            <div class="tool-icon">🧬</div>
+            <h3>Molecular &amp; Medical Viewer</h3>
+            <p>Interactive 3D protein structures (PDB). Chemical structures (MOL/SDF). DICOM and NIfTI medical imaging. Ball-and-stick, ribbon, surface rendering. Distance measurements. Replaces ChemDraw ($2,600/yr) and PACS viewers.</p>
+        </div>
+        <div class="tool-card">
+            <div class="tool-icon">🔑</div>
+            <h3>Password Vault</h3>
+            <p>Built-in password manager with ChaCha20-Poly1305 encryption. Your key never leaves your machine. Argon2id PIN protection. Autofill on login forms. Replaces 1Password and LastPass at zero cost.</p>
+        </div>
+        <div class="tool-card">
+            <div class="tool-icon">🔌</div>
+            <h3>REST Client</h3>
+            <p>Built-in API testing — send GET/POST/PUT/DELETE requests, inspect responses with syntax highlighting, save request collections, manage headers and auth. No Postman Pro subscription needed.</p>
+        </div>
+        <div class="tool-card">
+            <div class="tool-icon">🤖</div>
+            <h3>AI Integration</h3>
+            <p>Optional assistant powered by Claude (Anthropic) and Grok (xAI). Sandboxed file access — the AI sees only what you share. Git integration for code context. Voice input via Whisper. Your conversations stay private.</p>
+        </div>
+        <div class="tool-card">
+            <div class="tool-icon">👨‍👩‍👧‍👦</div>
+            <h3>Family Profiles &amp; Parental Controls</h3>
+            <p>Adult, Teen, and Kid modes with distinct permission levels. Time limits per profile, site allowlists and blocklists, NSFW detection, weekly reports, PIN-locked profile switching. Parental controls that actually work.</p>
+        </div>
+        <div class="tool-card">
+            <div class="tool-badge gold-b">Privacy</div>
+            <div class="tool-icon">🕵️</div>
+            <h3>Anti-Fingerprinting &amp; Smart History</h3>
+            <p>Canvas and WebGL fingerprinting randomization, smart 14.7-second history delay with NSFW detection, data poisoning mode. Network activity monitor shows every connection your browser makes — nothing hidden.</p>
+        </div>
+        <div class="tool-card">
+            <div class="tool-icon">📱</div>
+            <h3>Phone Sync</h3>
+            <p>Share tabs, bookmarks, and files between desktop and phone via Tailscale P2P — no cloud server, no accounts on our systems, fully end-to-end encrypted. Works on any network, anywhere.</p>
+        </div>
+        <div class="tool-card">
+            <div class="tool-icon">🎤</div>
+            <h3>Voice Input via Whisper</h3>
+            <p>Dictate into any text field using on-device Whisper speech recognition. GPU-accelerated for fast transcription. Your voice never leaves your machine.</p>
+        </div>
+    </div>
+</div>
+
+<hr class="divider">
+
+<!-- COMPARE -->
+<div class="wrap">
+    <div class="section-eyebrow blue">How we compare</div>
+    <h2 class="sh">Chrome vs Brave vs Sassy Browser</h2>
+    <p class="sd">The others are still just browsers. We replaced an entire software stack.</p>
+    <div class="compare-wrap">
+        <table class="compare-table">
+            <thead><tr><th>Feature</th><th>Chrome</th><th>Brave</th><th class="sassy-col-h">Sassy Browser</th></tr></thead>
+            <tbody>
+                <tr><td>Built on Chromium / Google code</td><td class="y">Yes</td><td class="y">Yes</td><td class="n sassy-col">Never</td></tr>
+                <tr><td>Sends telemetry to Google</td><td class="y">Yes</td><td class="m">Some</td><td class="n sassy-col">Zero</td></tr>
+                <tr><td>Native ad blocker</td><td class="n">No</td><td class="y">Yes</td><td class="y sassy-col">Yes — EasyList + EasyPrivacy</td></tr>
+                <tr><td>User script manager (Tampermonkey-equiv)</td><td class="n">Extension</td><td class="n">Extension</td><td class="y sassy-col">Native, sandboxed</td></tr>
+                <tr><td>PDF editor</td><td class="n">View only</td><td class="n">View only</td><td class="y sassy-col">Full edit/annotate/merge</td></tr>
+                <tr><td>Image editor (PSD, RAW)</td><td class="n">No</td><td class="n">No</td><td class="y sassy-col">Yes — 30+ formats</td></tr>
+                <tr><td>DOCX / XLSX / PPTX editing</td><td class="n">No</td><td class="n">No</td><td class="y sassy-col">Yes — full edit + save</td></tr>
+                <tr><td>PDB / MOL / DICOM viewer</td><td class="n">No</td><td class="n">No</td><td class="y sassy-col">Yes — 3D interactive</td></tr>
+                <tr><td>REST API client</td><td class="n">No</td><td class="n">No</td><td class="y sassy-col">Yes — built-in Postman-equiv</td></tr>
+                <tr><td>Password vault (local encrypted)</td><td class="m">Cloud-only</td><td class="m">Basic</td><td class="y sassy-col">Yes — ChaCha20, local</td></tr>
+                <tr><td>Web3 explainer / scam protection</td><td class="n">No</td><td class="m">Partial</td><td class="y sassy-col">Yes — plain-English guides</td></tr>
+                <tr><td>Written in memory-safe language</td><td class="n">C++</td><td class="n">C++</td><td class="y sassy-col">100% Rust</td></tr>
+                <tr><td>Family / parental profiles</td><td class="n">No</td><td class="n">No</td><td class="y sassy-col">Yes — PIN-locked</td></tr>
+                <tr><td>Archive browser (ZIP, RAR, 7Z…)</td><td class="n">No</td><td class="n">No</td><td class="y sassy-col">Yes — 14 formats</td></tr>
+                <tr><td>3D model viewer (OBJ, STL, GLTF)</td><td class="n">No</td><td class="n">No</td><td class="y sassy-col">Yes</td></tr>
+                <tr><td>Annual cost</td><td>Free*</td><td>Free*</td><td class="y sassy-col">Free — no asterisk</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<hr class="divider">
+
+<!-- SECURITY -->
+<div class="wrap" id="security">
+    <div class="section-eyebrow">Security architecture</div>
+    <h2 class="sh">4-Layer Security Sandbox. Zero Google.</h2>
+    <p class="sd">Security isn't a marketing checkbox — it's baked into the architecture. Pure Rust eliminates entire classes of vulnerabilities that haunt Chrome and Brave.</p>
+    <div class="sec-grid">
+        <div class="sec-card"><h4>🦀 Memory Safety by Default</h4><p>Written entirely in Rust — no null pointers, no buffer overflows, no use-after-free. The classes of bugs that power 70%+ of browser CVEs simply cannot exist in safe Rust code.</p></div>
+        <div class="sec-card"><h4>🔲 4-Layer Process Sandbox</h4><p>Web content, file viewers, extensions, and AI each run in isolated sandboxes. A compromised webpage cannot reach your files. A malicious script cannot escape its layer.</p></div>
+        <div class="sec-card"><h4>🚫 Zero Google Dependencies</h4><p>No Chromium. No V8. No SafeBrowsing. No telemetry. No sync servers. No Google APIs. Your browsing data exists only on your machine.</p></div>
+        <div class="sec-card"><h4>🛡️ Anti-Fingerprint Engine</h4><p>Canvas, WebGL, AudioContext, and font enumeration fingerprinting are randomized or blocked. Advertisers cannot build a persistent profile of your device across sites.</p></div>
+        <div class="sec-card"><h4>🔐 Local Encryption</h4><p>Passwords use ChaCha20-Poly1305 with Argon2id key derivation. Your vault key never leaves your machine. No cloud sync means no breach risk from our servers — because we don't have any.</p></div>
+        <div class="sec-card"><h4>📊 Network Transparency</h4><p>Real-time network activity monitor shows every connection your browser makes. Nothing is hidden. See trackers blocked, requests made, and data transferred — all in plain view.</p></div>
+        <div class="sec-card"><h4>🕵️ Data Poisoning</h4><p>Actively frustrates trackers that slip through the blocker by injecting false behavioral signals. Makes harvested data unreliable — the tracking still happens, but the profile is garbage.</p></div>
+        <div class="sec-card"><h4>📜 Sandboxed Scripts</h4><p>User scripts run in an isolated context inside the browser process — not as external processes or loaded extensions. No extension attack surface. Scripts cannot reach system APIs.</p></div>
+    </div>
+    <div class="rust-block">
+        <div class="rust-big">139,000+</div>
+        <div class="rust-lbl">Lines of pure Rust. Zero C/C++ in the core.</div>
+        <p>145 source files across viewers, engine, security, networking, AI integration, and UI. Compiles clean. Runs fast. No garbage collection pauses, no memory leaks, no undefined behavior. This is what it looks like when a security professional builds a browser from scratch.</p>
+        <div class="rust-badge">🦀 Built in Rust</div>
+    </div>
+</div>
+
+<hr class="divider">
+
+<!-- STORY -->
+<div class="wrap-narrow">
+    <div class="story-block">
+        <div class="vet-badge">🎖️ Veteran-founded · Madison, WI</div>
+        <h2>Why I Built This</h2>
+        <p>I spent 11 years as a Chemical Warfare Officer in the U.S. Army and National Guard, then earned a Chemistry degree from UW-Eau Claire. I know what it's like to need specialized scientific software that costs more than most people's monthly rent.</p>
+        <p>I watched researchers share cracked copies of ChemDraw because $2,600/year is prohibitive on a grad student stipend. I watched my parents get harassed by ads and browser hijackers because Chrome's extension ecosystem is a minefield. I watched small businesses pay $100/month for Microsoft 365 because there was no real alternative that just worked.</p>
+        <p>So I built one. In Rust. From scratch. With no compromises on privacy, security, or capability.</p>
+        <p>Sassy Browser is the browser I always wanted to exist. I think you'll want it too.</p>
+        <div class="quiet">— Shane Smith, Founder &amp; CEO, Sassy Consulting LLC</div>
+    </div>
+</div>
+
+<hr class="divider">
+
+<!-- DOWNLOAD -->
+<div class="wrap" id="download">
+    <div class="section-eyebrow">Get started</div>
+    <h2 class="sh">Download Sassy Browser — Free</h2>
+    <p class="sd">No account required. No email address. No license key. Download, run, done.</p>
+    <div class="dl-grid">
+        <div class="dl-card main-dl">
+            <div class="dl-os">🪟</div>
+            <h4>Windows</h4>
+            <p>Windows 10 / 11, x64. Portable or installer.</p>
+            <a href="https://github.com/sassyconsultingllc/ACE/releases" target="_blank" rel="noopener">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                Download for Windows
+            </a>
+        </div>
+        <div class="dl-card">
+            <div class="dl-os">🐧</div>
+            <h4>Linux</h4>
+            <p>Build from source. Debian/Ubuntu, Arch, Fedora.</p>
+            <a href="https://github.com/sassyconsultingllc/ACE" target="_blank" rel="noopener">View on GitHub</a>
+        </div>
+        <div class="dl-card">
+            <div class="dl-os">🍎</div>
+            <h4>macOS</h4>
+            <p>Coming soon. Follow the repo for updates.</p>
+            <a href="https://github.com/sassyconsultingllc/ACE" target="_blank" rel="noopener">Watch on GitHub</a>
+        </div>
+        <div class="dl-card">
+            <div class="dl-os">📦</div>
+            <h4>Source Code</h4>
+            <p>139K lines of Rust. Build it yourself.</p>
+            <a href="https://github.com/sassyconsultingllc/ACE" target="_blank" rel="noopener">ACE Repository</a>
+        </div>
+    </div>
+</div>
+
+<!-- FINAL CTA -->
+<section class="final-cta">
+    <h2>The browser that replaces<br><span style="color:var(--green);">everything</span>.</h2>
+    <p class="sub">Free. Forever. No subscriptions. No ads. No Google. No compromises.</p>
+    <div class="cta-row">
+        <a href="https://github.com/sassyconsultingllc/ACE/releases" class="btn btn-green btn-lg">Download Free</a>
+        <a href="https://github.com/sassyconsultingllc/ACE" class="btn btn-outline btn-lg" target="_blank" rel="noopener">View Source</a>
+    </div>
+    <a href="https://donate.stripe.com/8x2bJ36N25lket2bX57AI01" class="support-link" target="_blank" rel="noopener">❤️ Support development with a donation</a>
+</section>
+
+<!-- FOOTER -->
+<footer>
+    <div class="footer-l">
+        <strong>Sassy Consulting LLC</strong> · Madison, Wisconsin<br>
+        &copy; 2025&ndash;2026 Sassy Consulting LLC. All rights reserved.
+    </div>
+    <div class="footer-links">
+        <a href="https://github.com/sassyconsultingllc/ACE" target="_blank" rel="noopener">GitHub</a>
+        <a href="/privacy-policy">Privacy Policy</a>
+        <a href="/terms">Terms</a>
+        <a href="https://donate.stripe.com/8x2bJ36N25lket2bX57AI01" target="_blank" rel="noopener">Donate</a>
+        <a href="mailto:shane@sassyconsultingllc.com">Contact</a>
+    </div>
+</footer>
+
+</body>
+</html>

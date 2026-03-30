@@ -322,6 +322,7 @@ struct JniAppState {
     user_registry: UserRegistry,
     ptt_pressed: Arc<AtomicBool>,
     current_channel: Arc<AtomicU8>,
+    current_subchannel: Arc<AtomicU8>,
     pending_key_exchange: Option<crate::crypto::KeyExchange>,
     /// BT TX buffer: Kotlin reads encoded frames from here for RFCOMM transmission
     bt_tx_buffer: Arc<Mutex<Option<Vec<u8>>>>,
@@ -336,6 +337,7 @@ impl JniAppState {
     fn new() -> Self {
         let ptt_pressed = Arc::new(AtomicBool::new(false));
         let current_channel = Arc::new(AtomicU8::new(1));
+        let current_subchannel = Arc::new(AtomicU8::new(0));
 
         Self {
             state_machine: None,
@@ -343,6 +345,7 @@ impl JniAppState {
             user_registry: UserRegistry::new(),
             ptt_pressed,
             current_channel,
+            current_subchannel,
             pending_key_exchange: None,
             bt_tx_buffer: Arc::new(Mutex::new(None)),
             bt_encoder: VoiceEncoder::new(),
@@ -357,6 +360,7 @@ impl JniAppState {
         let state_machine = StateMachine::new(
             Arc::clone(&self.ptt_pressed),
             Arc::clone(&self.current_channel),
+            Arc::clone(&self.current_subchannel),
         );
 
         match state_machine.initialize() {
@@ -506,6 +510,21 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     guard.current_channel.store(ch, Ordering::Relaxed);
 }
 
+/// JNI: Set subchannel (0=Main, 1=A, 2=B)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetSubchannel(
+    _env: JNIEnv,
+    _class: JClass,
+    subchannel: jbyte,
+) {
+    let sub = (subchannel as u8).min(2);
+    info!("JNI: Set subchannel to {}", sub);
+
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    guard.current_subchannel.store(sub, Ordering::Relaxed);
+}
+
 /// JNI: Get current channel (for Kotlin BT transport to include in frames)
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetChannel(
@@ -519,7 +538,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Encode one audio frame for BT transmission.
 ///
-/// Reads mic → ADPCM encode → pack wire frame → return byte[] for Kotlin to send via RFCOMM.
+/// Reads mic → Opus encode → pack wire frame → return byte[] for Kotlin to send via RFCOMM.
 /// Returns null if no audio data available.
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btEncodeFrame<'local>(
@@ -573,21 +592,37 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btEn
         return std::ptr::null_mut(); // Incomplete frame, caller should retry
     }
 
-    // Encode with ADPCM
+    // Encode with Opus
     let compressed = guard.bt_encoder.encode(&pcm_buffer[..CODEC_FRAME_SIZE]);
 
     // Pack wire frame
     let channel = guard.current_channel.load(Ordering::Relaxed);
+    let subchannel = guard.current_subchannel.load(Ordering::Relaxed);
     let (sender_id, device_name) = if let Some(ref sm) = guard.state_machine {
         (sm.get_local_sender_id(), sm.get_device_name())
     } else {
         ("unknown".to_string(), "unknown".to_string())
     };
     let timestamp = audio_pipeline::now_ms();
-    let wire_data = audio_pipeline::pack_wire_frame(channel, &sender_id, &device_name, timestamp, &compressed);
+    let wire_data = audio_pipeline::pack_wire_frame(channel, subchannel, &sender_id, &device_name, timestamp, &compressed);
+
+    // Encrypt through the same AES-256-GCM path as WiFi/cellular
+    let encrypted = if let Some(ref sm) = guard.state_machine {
+        let transport = sm.get_transport();
+        if let Ok(mut tm) = transport.lock() {
+            match tm.encrypt_raw(&wire_data) {
+                Ok(enc) => enc,
+                Err(_) => wire_data.clone(), // fallback to unencrypted if no session
+            }
+        } else {
+            wire_data.clone()
+        }
+    } else {
+        wire_data.clone()
+    };
 
     // Return as byte array
-    match env.byte_array_from_slice(&wire_data) {
+    match env.byte_array_from_slice(&encrypted) {
         Ok(arr) => arr.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
@@ -615,8 +650,23 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btDe
     let state = get_jni_state();
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Unpack wire frame
-    let (channel, sender_id, device_name, timestamp, compressed) = match audio_pipeline::unpack_wire_frame(&raw_bytes) {
+    // Decrypt through the same AES-256-GCM path as WiFi/cellular
+    let decrypted = if let Some(ref sm) = guard.state_machine {
+        let transport = sm.get_transport();
+        if let Ok(mut tm) = transport.lock() {
+            match tm.decrypt_raw(&raw_bytes) {
+                Ok(dec) => dec,
+                Err(_) => raw_bytes.clone(), // fallback if no crypto session
+            }
+        } else {
+            raw_bytes.clone()
+        }
+    } else {
+        raw_bytes.clone()
+    };
+
+    // Unpack wire frame (now decrypted)
+    let (channel, _subchannel, sender_id, device_name, timestamp, compressed) = match audio_pipeline::unpack_wire_frame(&decrypted) {
         Ok(parsed) => parsed,
         Err(e) => {
             warn!("btDecodeFrame: invalid wire frame: {}", e);
@@ -630,9 +680,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btDe
         return JNI_FALSE;
     }
 
-    // Validate compressed size
-    if compressed.len() != crate::codec::COMPRESSED_FRAME_SIZE {
-        warn!("btDecodeFrame: unexpected compressed size: {}", compressed.len());
+    // Validate compressed payload is non-empty (Opus uses variable-length frames)
+    if compressed.is_empty() {
+        warn!("btDecodeFrame: empty compressed payload");
         return JNI_FALSE;
     }
 
@@ -743,17 +793,51 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     _class: JClass<'local>,
     duration_hours: jni::sys::jint,
 ) -> JObject<'local> {
-    info!("JNI: Generate session QR ({}h)", duration_hours);
+    // Legacy: generate for current channel with default name
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let channel = guard.current_channel.load(std::sync::atomic::Ordering::Relaxed);
+    drop(guard);
+
+    Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGenerateChannelQR(
+        env, _class, channel as jni::sys::jint, duration_hours,
+        std::ptr::null_mut(), // null group_name = use default
+    )
+}
+
+/// JNI: Generate session QR for a specific channel with optional group name
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGenerateChannelQR<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    channel: jni::sys::jint,
+    duration_hours: jni::sys::jint,
+    group_name: jni::sys::jstring,
+) -> JObject<'local> {
+    let ch = channel as u8;
+    let name: String = if !group_name.is_null() {
+        let j_name = unsafe { JString::from_raw(group_name) };
+        env.get_string(&j_name).map(|s| s.into()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    info!("JNI: Generate session QR ch{} '{}' ({}h)", ch, name, duration_hours);
 
     let state = get_jni_state();
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    let json = match guard.session_manager.generate_session_qr(duration_hours as u32) {
+    let json = match guard.session_manager.generate_session_qr(ch, duration_hours as u32, &name) {
         Ok(qr_json) => {
-            // Also set the crypto session on the transport
-            if let Ok(crypto) = guard.session_manager.get_crypto_session() {
-                if let Some(ref sm) = guard.state_machine {
-                    sm.set_crypto_session(crypto);
+            // Set crypto for this channel + legacy field on the transport
+            if let Some(ref sm) = guard.state_machine {
+                let mut tm = sm.get_transport().lock().unwrap();
+                if let Some(crypto) = guard.session_manager.get_crypto_for_channel(ch) {
+                    tm.set_channel_crypto(ch, crypto);
+                }
+                // Also set legacy crypto for send()/receive() compat
+                if let Some(crypto2) = guard.session_manager.get_crypto_for_channel(ch) {
+                    tm.set_crypto(crypto2);
                 }
             }
             qr_json
@@ -789,11 +873,18 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     match guard.session_manager.import_session(&json) {
-        Ok(crypto) => {
+        Ok((channel, crypto)) => {
             if let Some(ref sm) = guard.state_machine {
-                sm.set_crypto_session(crypto);
+                let mut tm = sm.get_transport().lock().unwrap();
+                tm.set_channel_crypto(channel, crypto);
+                // Also set legacy crypto for send()/receive() compat
+                if let Some(crypto2) = guard.session_manager.get_crypto_for_channel(channel) {
+                    tm.set_crypto(crypto2);
+                }
             }
-            info!("JNI: Session imported successfully");
+            // Auto-switch to the imported channel
+            guard.current_channel.store(channel, std::sync::atomic::Ordering::Relaxed);
+            info!("JNI: Session imported successfully for ch{}", channel);
             JNI_TRUE
         }
         Err(e) => {
@@ -849,7 +940,14 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let state = get_jni_state();
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    let json = guard.user_registry.to_json();
+    // Read from the StateMachine's registry (where RX thread registers users),
+    // NOT from JniState.user_registry which is a separate instance.
+    let json = if let Some(ref sm) = guard.state_machine {
+        let reg = sm.get_user_registry().lock().unwrap();
+        reg.to_json()
+    } else {
+        guard.user_registry.to_json()
+    };
     drop(guard);
 
     env.new_string(&json)
@@ -936,6 +1034,50 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     guard.session_manager.clear_session();
+}
+
+/// JNI: Get per-channel info as JSON array
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetChannelInfo<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> JObject<'local> {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let json = guard.session_manager.get_channel_info();
+    drop(guard);
+    env.new_string(&json).map(|s| s.into()).unwrap_or_else(|_| JObject::null())
+}
+
+/// JNI: Set custom group name for a channel
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetGroupName<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    channel: jni::sys::jint,
+    name: JString<'local>,
+) {
+    let group_name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    guard.session_manager.set_group_name(channel as u8, &group_name);
+}
+
+/// JNI: Get group name for a specific channel
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetGroupName<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    channel: jni::sys::jint,
+) -> JObject<'local> {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let name = guard.session_manager.get_group_name(channel as u8);
+    drop(guard);
+    env.new_string(&name).map(|s| s.into()).unwrap_or_else(|_| JObject::null())
 }
 
 /// JNI: Register a user in the registry (called when a peer connects)
@@ -1955,4 +2097,92 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         let mut transport = sm.get_transport().lock().unwrap();
         transport.on_bluetooth_disconnected();
     }
+}
+
+//==============================================================================
+// WHISPER TRANSCRIPTION JNI EXPORTS
+//==============================================================================
+
+/// JNI: Initialize whisper model from file path.
+/// Call once after model download completes.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeInitWhisper<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    model_path: JString<'local>,
+) -> jboolean {
+    let path: String = match env.get_string(&model_path) {
+        Ok(s) => s.into(),
+        Err(_) => return JNI_FALSE,
+    };
+
+    info!("JNI: initializing whisper model: {}", path);
+    if crate::transcription::init_global(&path) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// JNI: Transcribe 16 kHz f32 PCM samples.
+/// Returns transcribed text as a Java String (empty on failure).
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeTranscribe<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    samples: jni::sys::jfloatArray,
+) -> JObject<'local> {
+    use jni::objects::JFloatArray;
+
+    let j_arr = unsafe { JFloatArray::from_raw(samples) };
+
+    let len = match env.get_array_length(&j_arr) {
+        Ok(n) => n as usize,
+        Err(_) => {
+            return env.new_string("").map(|s| s.into()).unwrap_or(JObject::null());
+        }
+    };
+
+    let mut buf = vec![0f32; len];
+    if env.get_float_array_region(&j_arr, 0, &mut buf).is_err() {
+        return env.new_string("").map(|s| s.into()).unwrap_or(JObject::null());
+    }
+
+    let text = crate::transcription::transcribe_global(&buf);
+
+    env.new_string(&text)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| JObject::null())
+}
+
+/// JNI: Transcribe 48 kHz i16 PCM (convenience - downsamples internally).
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeTranscribe48k<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    samples: jni::sys::jshortArray,
+) -> JObject<'local> {
+    use jni::objects::JShortArray;
+
+    let j_arr = unsafe { JShortArray::from_raw(samples) };
+
+    let len = match env.get_array_length(&j_arr) {
+        Ok(n) => n as usize,
+        Err(_) => {
+            return env.new_string("").map(|s| s.into()).unwrap_or(JObject::null());
+        }
+    };
+
+    let mut buf = vec![0i16; len];
+    if env.get_short_array_region(&j_arr, 0, &mut buf).is_err() {
+        return env.new_string("").map(|s| s.into()).unwrap_or(JObject::null());
+    }
+
+    // Downsample 48kHz i16 → 16kHz f32
+    let samples_16k = crate::transcription::downsample_48k_to_16k(&buf);
+    let text = crate::transcription::transcribe_global(&samples_16k);
+
+    env.new_string(&text)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| JObject::null())
 }

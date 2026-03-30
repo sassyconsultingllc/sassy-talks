@@ -244,8 +244,13 @@ impl AudioCache {
             self.mode = CacheMode::Queue;
         }
 
-        // In Live mode with single speaker, pass through immediately
+        // In Live mode with single speaker, pass through immediately.
+        // Remove the frame we just pushed so it doesn't get re-queued
+        // when tick() finalizes the SpeakerBuffer into an Utterance.
         if self.mode == CacheMode::Live && active_speakers <= 1 && self.now_playing.is_none() {
+            if let Some(buf) = self.active_buffers.get_mut(sender_id) {
+                buf.frames.pop();
+            }
             return Some(samples);
         }
 

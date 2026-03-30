@@ -110,7 +110,10 @@ export default {
       } else if (path === "/privacy-policy.html" || path.startsWith("/legal/")) {
         response = await handlePrivacyPage(path, env, corsHeaders);
       } else {
-        response = await env.ASSETS.fetch(request);
+        // Pass through to origin (Cloudflare Pages) for non-API routes
+        response = env.ASSETS
+          ? await env.ASSETS.fetch(request)
+          : new Response("Not found", { status: 404 });
       }
 
       return addSecurityHeaders(response, securityHeaders);

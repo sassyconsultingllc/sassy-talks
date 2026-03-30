@@ -31,6 +31,9 @@ pub struct TransportManager {
     wifi: WifiTransport,
     wifi_direct: WifiDirectManager,
     cellular: CellularTransport,
+    /// Per-channel encryption keys (index 0 = channel 1, etc.)
+    channel_crypto: [Option<CryptoSession>; 8],
+    /// Legacy single-key field (used as fallback for old code paths)
     crypto: Option<CryptoSession>,
     active: ActiveTransport,
     device_name: String,
@@ -48,6 +51,7 @@ impl TransportManager {
             wifi,
             wifi_direct,
             cellular,
+            channel_crypto: Default::default(),
             crypto: None,
             active: ActiveTransport::None,
             device_name: device_name.to_string(),
@@ -59,7 +63,16 @@ impl TransportManager {
         self.wifi.init()
     }
 
-    /// Set encryption session (call after key exchange)
+    /// Set encryption session for a specific channel.
+    /// Also sets the legacy crypto field for backward compat.
+    pub fn set_channel_crypto(&mut self, channel: u8, session: CryptoSession) {
+        if channel >= 1 && channel <= 8 {
+            self.channel_crypto[(channel - 1) as usize] = Some(session);
+            info!("TransportManager: encryption enabled for channel {}", channel);
+        }
+    }
+
+    /// Set encryption session (legacy — sets for all channels as fallback)
     pub fn set_crypto(&mut self, session: CryptoSession) {
         self.crypto = Some(session);
         info!("TransportManager: encryption enabled");
@@ -162,6 +175,48 @@ impl TransportManager {
         self.crypto.is_some()
     }
 
+    /// Encrypt raw data for a specific channel (for BT path).
+    /// Falls back to legacy crypto if no per-channel key.
+    pub fn encrypt_raw(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        // Try legacy crypto first (backward compat)
+        if let Some(ref mut crypto) = self.crypto {
+            crypto.encrypt(data)
+        } else {
+            Err("No encryption session".to_string())
+        }
+    }
+
+    /// Encrypt for a specific channel.
+    pub fn encrypt_for_channel(&mut self, channel: u8, data: &[u8]) -> Result<Vec<u8>, String> {
+        if channel >= 1 && channel <= 8 {
+            if let Some(ref mut crypto) = self.channel_crypto[(channel - 1) as usize] {
+                return crypto.encrypt(data);
+            }
+        }
+        // Fallback to legacy
+        self.encrypt_raw(data)
+    }
+
+    /// Decrypt raw data. Falls back to legacy crypto.
+    pub fn decrypt_raw(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+        if let Some(ref crypto) = self.crypto {
+            crypto.decrypt(data)
+        } else {
+            Err("No encryption session".to_string())
+        }
+    }
+
+    /// Decrypt for a specific channel.
+    pub fn decrypt_for_channel(&self, channel: u8, data: &[u8]) -> Result<Vec<u8>, String> {
+        if channel >= 1 && channel <= 8 {
+            if let Some(ref crypto) = self.channel_crypto[(channel - 1) as usize] {
+                return crypto.decrypt(data);
+            }
+        }
+        // Fallback to legacy
+        self.decrypt_raw(data)
+    }
+
     /// Send data through the active transport with encryption
     /// SECURITY: Refuses to send if no encryption session is active.
     pub fn send(&mut self, data: &[u8]) -> Result<usize, String> {
@@ -172,7 +227,8 @@ impl TransportManager {
             return Err("Encryption required: authenticate via QR code first".to_string());
         };
 
-        match self.active {
+        // Send on primary transport
+        let primary_result = match self.active {
             ActiveTransport::WifiDirect | ActiveTransport::Wifi => {
                 self.wifi.send_audio(&payload)
             }
@@ -180,13 +236,22 @@ impl TransportManager {
                 self.cellular.send_audio(&payload)
             }
             ActiveTransport::Bluetooth => {
-                // BT TX is handled by Kotlin via btEncodeFrame JNI, not here
                 Ok(payload.len())
             }
             ActiveTransport::None => {
                 Err("No active transport".to_string())
             }
+        };
+
+        // Also send on cellular relay if it's active and primary is WiFi
+        // (dual-path: local peers get multicast, remote peers get relay)
+        if matches!(self.active, ActiveTransport::Wifi | ActiveTransport::WifiDirect) {
+            if self.cellular.get_state() == CellularState::Connected {
+                let _ = self.cellular.send_audio(&payload);
+            }
         }
+
+        primary_result
     }
 
     /// Receive data from active transport with decryption

@@ -2,19 +2,20 @@ package com.sassyconsulting.sassytalkie
 
 import android.util.Log
 import com.sassyconsulting.sassytalkie.ui.TranscriptionEntry
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlin.math.sqrt
 
 /**
- * Bridges the Rust native RX audio thread to live transcription.
+ * Bridges the Rust native RX audio thread to live transcription via Whisper.
  *
  * Rust calls [onAudioReceived] via JNI with decoded PCM frames from remote
- * speakers. This object performs energy-based voice activity detection (VAD)
- * to segment speech, then emits [TranscriptionEntry] items for the Compose UI.
- *
- * TODO: Integrate a real STT engine (Vosk / Whisper) to replace placeholder text.
+ * speakers. This object performs energy-based voice activity detection (VAD),
+ * buffers PCM during speech, then runs on-device Whisper inference when
+ * speech ends. Results are emitted as [TranscriptionEntry] items for the
+ * Compose UI.
  */
 object TranscriptionBridge {
 
@@ -32,6 +33,9 @@ object TranscriptionBridge {
     /** Maximum number of entries kept in the feed to bound memory usage. */
     private const val MAX_ENTRIES = 200
 
+    /** Maximum buffered frames (10 seconds at 20ms/frame = 500 frames). */
+    private const val MAX_BUFFER_FRAMES = 500
+
     // ── State ──
 
     private val _entries = MutableStateFlow<List<TranscriptionEntry>>(emptyList())
@@ -45,6 +49,15 @@ object TranscriptionBridge {
     @Volatile
     private var initialized = false
 
+    @Volatile
+    var whisperReady = false
+        private set
+
+    // Background scope for whisper inference (doesn't block RX thread)
+    private val transcriptionScope = CoroutineScope(
+        Dispatchers.Default + SupervisorJob()
+    )
+
     // ── Active speech tracking (guarded by [lock]) ──
 
     private val lock = Any()
@@ -56,12 +69,22 @@ object TranscriptionBridge {
     private var silentFrameCount = 0
     private var inSpeech = false
 
+    /** PCM frame buffer — accumulated during speech for whisper inference. */
+    private val pcmBuffer = mutableListOf<ShortArray>()
+
     // ── Lifecycle ──
 
     fun initialize(@Suppress("UNUSED_PARAMETER") context: android.content.Context) {
         if (initialized) return
         initialized = true
         Log.i(TAG, "Initialized")
+    }
+
+    /** Call after model download completes. */
+    fun initWhisper(modelPath: String): Boolean {
+        whisperReady = SassyTalkNative.nativeInitWhisper(modelPath)
+        Log.i(TAG, "Whisper init: ready=$whisperReady path=$modelPath")
+        return whisperReady
     }
 
     fun setEnabled(enabled: Boolean) {
@@ -78,7 +101,7 @@ object TranscriptionBridge {
      *
      * @param senderId   unique identifier of the remote speaker
      * @param senderName human-readable display name
-     * @param pcmSamples 16-bit mono PCM samples (typically one 20 ms frame)
+     * @param pcmSamples 16-bit mono PCM samples (typically one 20 ms frame at 48kHz)
      * @param isFavorite whether this sender is marked as a favorite
      * @param isMuted    whether this sender is muted
      */
@@ -97,7 +120,7 @@ object TranscriptionBridge {
 
         synchronized(lock) {
             if (isSpeech) {
-                handleSpeechFrame(senderId, senderName, isFavorite, isMuted)
+                handleSpeechFrame(senderId, senderName, pcmSamples, isFavorite, isMuted)
             } else {
                 handleSilenceFrame()
             }
@@ -127,8 +150,10 @@ object TranscriptionBridge {
 
     fun release() {
         clearEntries()
+        transcriptionScope.cancel()
         initialized = false
         enabled = false
+        whisperReady = false
         Log.i(TAG, "Released")
     }
 
@@ -137,6 +162,7 @@ object TranscriptionBridge {
     private fun handleSpeechFrame(
         senderId: String,
         senderName: String,
+        pcmSamples: ShortArray,
         isFavorite: Boolean,
         isMuted: Boolean,
     ) {
@@ -150,6 +176,12 @@ object TranscriptionBridge {
             activeIsFavorite = isFavorite
             activeIsMuted = isMuted
             speechStartTime = System.currentTimeMillis()
+            pcmBuffer.clear()
+        }
+
+        // Buffer PCM for whisper inference (cap at MAX_BUFFER_FRAMES)
+        if (pcmBuffer.size < MAX_BUFFER_FRAMES) {
+            pcmBuffer.add(pcmSamples.copyOf())
         }
     }
 
@@ -162,24 +194,64 @@ object TranscriptionBridge {
         }
     }
 
-    /** End the current speech segment and emit a [TranscriptionEntry]. */
+    /** End the current speech segment and run whisper inference. */
     private fun finalizeSpeechSegment() {
         val id = activeSenderId ?: return
         val name = activeSenderName ?: return
         val durationMs = System.currentTimeMillis() - speechStartTime
+        val isFav = activeIsFavorite
+        val isMuted = activeIsMuted
+        val ts = speechStartTime
 
-        // TODO: Replace placeholder with real STT result (Vosk / Whisper)
-        val entry = TranscriptionEntry(
-            senderId = id,
-            senderName = name,
-            text = "[${name} spoke for ${durationMs}ms]",
-            timestamp = speechStartTime,
-            isFavorite = activeIsFavorite,
-            isMuted = activeIsMuted,
-        )
-
-        addEntry(entry)
+        // Concatenate all buffered frames into one contiguous PCM array
+        val totalSamples = pcmBuffer.sumOf { it.size }
+        val fullPcm = ShortArray(totalSamples)
+        var offset = 0
+        for (frame in pcmBuffer) {
+            frame.copyInto(fullPcm, offset)
+            offset += frame.size
+        }
+        pcmBuffer.clear()
         resetSpeechState()
+
+        if (totalSamples < 960) return // skip sub-20ms utterances
+
+        if (whisperReady) {
+            // Run whisper inference on background thread (1-3s on weak phones)
+            transcriptionScope.launch {
+                val text = try {
+                    SassyTalkNative.nativeTranscribe48k(fullPcm)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Whisper inference failed: ${e.message}")
+                    ""
+                }
+
+                val displayText = text.trim().ifEmpty {
+                    "[${name} spoke for ${durationMs}ms]"
+                }
+
+                val entry = TranscriptionEntry(
+                    senderId = id,
+                    senderName = name,
+                    text = displayText,
+                    timestamp = ts,
+                    isFavorite = isFav,
+                    isMuted = isMuted,
+                )
+                addEntry(entry)
+            }
+        } else {
+            // Whisper not loaded — use placeholder
+            val entry = TranscriptionEntry(
+                senderId = id,
+                senderName = name,
+                text = "[${name} spoke for ${durationMs}ms]",
+                timestamp = ts,
+                isFavorite = isFav,
+                isMuted = isMuted,
+            )
+            addEntry(entry)
+        }
     }
 
     private fun addEntry(entry: TranscriptionEntry) {

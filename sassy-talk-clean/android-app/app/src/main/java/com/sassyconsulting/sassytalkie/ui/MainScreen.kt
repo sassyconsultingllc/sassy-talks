@@ -28,17 +28,39 @@ import kotlinx.coroutines.withContext
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.WalkieService
 import com.sassyconsulting.sassytalkie.ui.theme.*
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.CircularProgressIndicator
 
 @Composable
 fun MainScreen(
     onDisconnect: () -> Unit = {},
     onShowUsers: () -> Unit = {},
-    walkieService: WalkieService? = null
+    onShowTranscription: () -> Unit = {},
+    walkieService: WalkieService? = null,
+    autoConnect: AutoConnectManager,
 ) {
     var isTransmitting by remember { mutableStateOf(false) }
     var currentChannel by remember { mutableIntStateOf(1) }
+    var currentSubchannel by remember { mutableIntStateOf(0) } // 0=Main, 1=A, 2=B
+    var pttHoldMode by remember { mutableStateOf(false) } // toggle PTT vs hold-to-talk
     var showEncryptionWarning by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+
+    val connectState by autoConnect.state.collectAsState()
+    val connectStatusText by autoConnect.statusText.collectAsState()
+
+    // Auto-connect on composition if not already connected.
+    // AutoConnectManager is owned by AppNavigation (singleton), not recreated here.
+    LaunchedEffect(Unit) {
+        if (connectState != ConnectState.CONNECTED) {
+            autoConnect.reset()
+            autoConnect.autoConnect(walkieService)
+        }
+    }
 
     // Pulse animation for transmitting
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
@@ -56,6 +78,7 @@ fun MainScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(DarkBg)
+            .safeDrawingPadding()
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
@@ -76,12 +99,22 @@ fun MainScreen(
                 Icon(Icons.Default.ArrowBack, contentDescription = "Disconnect", tint = TextGray)
             }
 
+            // Group name (editable per-channel) — defaults to "Sassy-Talk" if no name set
+            val channelGroupName = remember(currentChannel) {
+                SassyTalkNative.getGroupName(currentChannel)
+            }
             Text(
-                text = "Sassy-Talk",
-                fontSize = 28.sp,
+                text = channelGroupName.ifEmpty { "Sassy-Talk" },
+                fontSize = 24.sp,
                 fontWeight = FontWeight.Bold,
-                color = Orange
+                color = Orange,
+                maxLines = 1
             )
+
+            // Transcription log button
+            IconButton(onClick = onShowTranscription) {
+                Icon(Icons.Default.Chat, contentDescription = "Transcription", tint = Cyan)
+            }
 
             // Users/people button
             IconButton(onClick = onShowUsers) {
@@ -95,19 +128,55 @@ fun MainScreen(
             horizontalArrangement = Arrangement.Center,
             modifier = Modifier.fillMaxWidth()
         ) {
-            val isConnected = SassyTalkNative.isConnected()
-            Box(
-                modifier = Modifier
-                    .size(10.dp)
-                    .clip(CircleShape)
-                    .background(if (isConnected) StatusConnected else StatusDisconnected)
-            )
-            Spacer(modifier = Modifier.width(6.dp))
-            Text(
-                text = if (isConnected) "Connected via ${SassyTalkNative.getTransportName()}" else "Offline",
-                fontSize = 13.sp,
-                color = TextGray
-            )
+            when (connectState) {
+                ConnectState.CONNECTED -> {
+                    Box(
+                        modifier = Modifier
+                            .size(10.dp)
+                            .clip(CircleShape)
+                            .background(StatusConnected)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Connected via ${SassyTalkNative.getTransportName()}",
+                        fontSize = 13.sp,
+                        color = TextGray
+                    )
+                }
+                ConnectState.FAILED -> {
+                    Box(
+                        modifier = Modifier
+                            .size(10.dp)
+                            .clip(CircleShape)
+                            .background(StatusDisconnected)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = connectStatusText,
+                        fontSize = 13.sp,
+                        color = Color(0xFFFF6B6B)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    TextButton(onClick = {
+                        scope.launch { autoConnect.autoConnect(walkieService) }
+                    }) {
+                        Text("Retry", fontSize = 12.sp, color = Cyan)
+                    }
+                }
+                else -> {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(14.dp),
+                        strokeWidth = 2.dp,
+                        color = Cyan
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = connectStatusText,
+                        fontSize = 13.sp,
+                        color = TextGray
+                    )
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -120,6 +189,52 @@ fun MainScreen(
                 SassyTalkNative.setChannel(newChannel)
             }
         )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Subchannel selector (Main / A / B)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            val subLabels = listOf("Main", "A", "B")
+            subLabels.forEachIndexed { idx, label ->
+                val selected = idx == currentSubchannel
+                TextButton(
+                    onClick = {
+                        currentSubchannel = idx
+                        SassyTalkNative.setSubchannel(idx)
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = if (selected) Orange else TextMuted
+                    )
+                ) {
+                    Text(
+                        text = label,
+                        fontSize = 14.sp,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.width(16.dp))
+
+            // PTT Hold toggle
+            Text(text = "Hold", color = TextMuted, fontSize = 12.sp)
+            Spacer(modifier = Modifier.width(4.dp))
+            Switch(
+                checked = pttHoldMode,
+                onCheckedChange = { pttHoldMode = it },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = Orange,
+                    checkedTrackColor = Orange.copy(alpha = 0.3f),
+                    uncheckedThumbColor = TextMuted,
+                    uncheckedTrackColor = SurfaceBg
+                ),
+                modifier = Modifier.height(24.dp)
+            )
+        }
 
         Spacer(modifier = Modifier.weight(1f))
 
@@ -143,13 +258,31 @@ fun MainScreen(
             Spacer(modifier = Modifier.height(8.dp))
         }
 
+        val pttEnabled = connectState == ConnectState.CONNECTED
+
         PTTButton(
             isTransmitting = isTransmitting,
             pulseScale = if (isTransmitting) pulseScale else 1f,
+            enabled = pttEnabled,
+            holdMode = pttHoldMode,
             onPressStart = {
+                if (!pttEnabled) return@PTTButton
                 if (!SassyTalkNative.isEncrypted()) {
                     showEncryptionWarning = true
+                } else if (pttHoldMode) {
+                    // Toggle mode: tap to start/stop
+                    if (isTransmitting) {
+                        isTransmitting = false
+                        SassyTalkNative.pttStop()
+                        walkieService?.updateNotification("Radio active \u2014 ${SassyTalkNative.getTransportName()}")
+                    } else {
+                        showEncryptionWarning = false
+                        isTransmitting = true
+                        SassyTalkNative.pttStart()
+                        walkieService?.updateNotification("Transmitting on CH $currentChannel")
+                    }
                 } else {
+                    // Push-to-talk: press to start
                     showEncryptionWarning = false
                     isTransmitting = true
                     SassyTalkNative.pttStart()
@@ -157,10 +290,11 @@ fun MainScreen(
                 }
             },
             onPressEnd = {
-                if (isTransmitting) {
+                // Only stop on release in push-to-talk mode (not hold mode)
+                if (!pttHoldMode && isTransmitting) {
                     isTransmitting = false
                     SassyTalkNative.pttStop()
-                    walkieService?.updateNotification("Radio active — ${SassyTalkNative.getTransportName()}")
+                    walkieService?.updateNotification("Radio active \u2014 ${SassyTalkNative.getTransportName()}")
                 }
             }
         )
@@ -176,7 +310,7 @@ fun MainScreen(
         val encStatus = if (SassyTalkNative.isEncrypted()) "AES-256-GCM" else "\uD83D\uDD13 UNENCRYPTED"
         val encColor = if (SassyTalkNative.isEncrypted()) TextMuted else Color(0xFFFF6B6B)
         Text(
-            text = "$encStatus \u2022 ADPCM \u2022 ${SassyTalkNative.getTransportName()}",
+            text = "$encStatus \u2022 Opus \u2022 ${SassyTalkNative.getTransportName()}",
             fontSize = 11.sp,
             color = encColor,
             textAlign = TextAlign.Center,
@@ -264,6 +398,8 @@ private fun ChannelSelector(
 private fun PTTButton(
     isTransmitting: Boolean,
     pulseScale: Float,
+    enabled: Boolean = true,
+    holdMode: Boolean = false,
     onPressStart: () -> Unit,
     onPressEnd: () -> Unit
 ) {
@@ -301,6 +437,7 @@ private fun PTTButton(
                 .border(8.dp, ringColor, CircleShape)
                 .background(buttonColor)
                 .pointerInteropFilter { event ->
+                    if (!enabled) return@pointerInteropFilter false
                     when (event.action) {
                         android.view.MotionEvent.ACTION_DOWN -> {
                             onPressStart()

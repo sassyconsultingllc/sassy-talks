@@ -1,18 +1,21 @@
-plugins {
+﻿plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
 
 android {
     namespace = "com.sassyconsulting.sassytalkie"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.sassyconsulting.sassytalkie"
         minSdk = 24
-        targetSdk = 34
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
+        
+        // Feature flag: enable or disable cellular (relay) transport at build time
+        buildConfigField("boolean", "ENABLE_CELLULAR_RELAY", "true")
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
@@ -24,9 +27,9 @@ android {
             val ksFile = file("keystore/release.keystore")
             if (ksFile.exists()) {
                 storeFile = ksFile
-                storePassword = System.getenv("RELEASE_STORE_PASSWORD") ?: ""
-                keyAlias = System.getenv("RELEASE_KEY_ALIAS") ?: ""
-                keyPassword = System.getenv("RELEASE_KEY_PASSWORD") ?: ""
+                storePassword = System.getenv("RELEASE_STORE_PASSWORD") ?: "sassytalk2025"
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS") ?: "sassytalkie"
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD") ?: "sassytalk2025"
             }
         }
     }
@@ -59,6 +62,8 @@ android {
     
     buildFeatures {
         compose = true
+        // Enable generation of BuildConfig fields used for feature flags
+        buildConfig = true
     }
     
     composeOptions {
@@ -105,3 +110,4 @@ dependencies {
     
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
+

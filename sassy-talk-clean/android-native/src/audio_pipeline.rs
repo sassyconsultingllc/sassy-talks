@@ -15,7 +15,7 @@ use std::time::Duration;
 use log::{error, info, warn};
 
 use crate::audio::AudioEngine;
-use crate::codec::{VoiceEncoder, VoiceDecoder, CODEC_FRAME_SIZE, COMPRESSED_FRAME_SIZE};
+use crate::codec::{VoiceEncoder, VoiceDecoder, CODEC_FRAME_SIZE};
 use crate::transport::TransportManager;
 use crate::audio_cache::AudioCache;
 use crate::users::UserRegistry;
@@ -28,14 +28,16 @@ const MAX_DEVICE_NAME_LEN: usize = 64;
 
 /// Encapsulate an audio frame for transport over the wire.
 ///
-/// Format: [channel:1][sender_id_len:1][sender_id:N][name_len:1][device_name:M][timestamp:8][compressed_audio:484]
-pub fn pack_wire_frame(channel: u8, sender_id: &str, device_name: &str, timestamp: u64, compressed: &[u8]) -> Vec<u8> {
+/// Format: [channel:1][subchannel:1][sender_id_len:1][sender_id:N][name_len:1][device_name:M][timestamp:8][compressed_audio]
+/// subchannel: 0=Main, 1=A, 2=B
+pub fn pack_wire_frame(channel: u8, subchannel: u8, sender_id: &str, device_name: &str, timestamp: u64, compressed: &[u8]) -> Vec<u8> {
     let id_bytes = sender_id.as_bytes();
     let id_len = id_bytes.len().min(MAX_SENDER_ID_LEN);
     let name_bytes = device_name.as_bytes();
     let name_len = name_bytes.len().min(MAX_DEVICE_NAME_LEN);
-    let mut packet = Vec::with_capacity(1 + 1 + id_len + 1 + name_len + 8 + compressed.len());
+    let mut packet = Vec::with_capacity(2 + 1 + id_len + 1 + name_len + 8 + compressed.len());
     packet.push(channel);
+    packet.push(subchannel);
     packet.push(id_len as u8);
     packet.extend_from_slice(&id_bytes[..id_len]);
     packet.push(name_len as u8);
@@ -47,23 +49,24 @@ pub fn pack_wire_frame(channel: u8, sender_id: &str, device_name: &str, timestam
 
 /// Parse a wire frame back into its components.
 ///
-/// Returns (channel, sender_id, device_name, timestamp, compressed_audio) or error.
-pub fn unpack_wire_frame(data: &[u8]) -> Result<(u8, String, String, u64, Vec<u8>), String> {
-    // Minimum: channel(1) + id_len(1) + name_len(1) + timestamp(8) = 11
-    if data.len() < 11 {
+/// Returns (channel, subchannel, sender_id, device_name, timestamp, compressed_audio) or error.
+pub fn unpack_wire_frame(data: &[u8]) -> Result<(u8, u8, String, String, u64, Vec<u8>), String> {
+    // Minimum: channel(1) + subchannel(1) + id_len(1) + name_len(1) + timestamp(8) = 12
+    if data.len() < 12 {
         return Err(format!("Wire frame too short: {} bytes", data.len()));
     }
 
     let channel = data[0];
-    let id_len = data[1] as usize;
+    let subchannel = data[1];
+    let id_len = data[2] as usize;
 
-    if id_len > MAX_SENDER_ID_LEN || data.len() < 2 + id_len + 1 {
+    if id_len > MAX_SENDER_ID_LEN || data.len() < 3 + id_len + 1 {
         return Err(format!("Invalid sender_id length: {}", id_len));
     }
 
-    let sender_id = String::from_utf8_lossy(&data[2..2 + id_len]).to_string();
+    let sender_id = String::from_utf8_lossy(&data[3..3 + id_len]).to_string();
 
-    let name_len_offset = 2 + id_len;
+    let name_len_offset = 3 + id_len;
     let name_len = data[name_len_offset] as usize;
 
     if name_len > MAX_DEVICE_NAME_LEN || data.len() < name_len_offset + 1 + name_len + 8 {
@@ -82,7 +85,7 @@ pub fn unpack_wire_frame(data: &[u8]) -> Result<(u8, String, String, u64, Vec<u8
     let audio_offset = ts_offset + 8;
     let compressed = data[audio_offset..].to_vec();
 
-    Ok((channel, sender_id, device_name, timestamp, compressed))
+    Ok((channel, subchannel, sender_id, device_name, timestamp, compressed))
 }
 
 /// Get current time in milliseconds since epoch
@@ -101,6 +104,7 @@ pub fn spawn_tx_thread(
     tx_running: Arc<AtomicBool>,
     ptt_pressed: Arc<AtomicBool>,
     current_channel: Arc<AtomicU8>,
+    current_subchannel: Arc<AtomicU8>,
     audio: Arc<Mutex<AudioEngine>>,
     transport: Arc<Mutex<TransportManager>>,
     local_sender_id: String,
@@ -114,6 +118,22 @@ pub fn spawn_tx_thread(
             let mut encoder = VoiceEncoder::new();
             let mut pcm_buffer = vec![0i16; CODEC_FRAME_SIZE];
             let mut was_transmitting = false;
+            let mut idle_ticks = 0u32;
+
+            // Send initial presence beacon so peers register us immediately on connect
+            {
+                let silence = vec![0i16; CODEC_FRAME_SIZE];
+                let compressed = encoder.encode(&silence);
+                if !compressed.is_empty() {
+                    let channel = current_channel.load(Ordering::Relaxed);
+                    let subch = current_subchannel.load(Ordering::Relaxed);
+                    let ts = now_ms();
+                    let wire = pack_wire_frame(channel, subch, &local_sender_id, &local_device_name, ts, &compressed);
+                    let mut tm = transport.lock().unwrap();
+                    let _ = tm.send(&wire);
+                    info!("TX: sent initial presence beacon");
+                }
+            }
 
             while tx_running.load(Ordering::Relaxed) {
                 if !ptt_pressed.load(Ordering::Relaxed) {
@@ -125,6 +145,21 @@ pub fn spawn_tx_thread(
                         was_transmitting = false;
                         encoder.reset();
                         info!("TX: stopped recording (PTT released)");
+                    }
+                    // Periodic presence heartbeat every ~10 seconds so peers keep seeing us
+                    idle_ticks += 1;
+                    if idle_ticks >= 2000 {
+                        idle_ticks = 0;
+                        let silence = vec![0i16; CODEC_FRAME_SIZE];
+                        let compressed = encoder.encode(&silence);
+                        if !compressed.is_empty() {
+                            let ch = current_channel.load(Ordering::Relaxed);
+                            let subch = current_subchannel.load(Ordering::Relaxed);
+                            let ts = now_ms();
+                            let wire = pack_wire_frame(ch, subch, &local_sender_id, &local_device_name, ts, &compressed);
+                            let mut tm = transport.lock().unwrap();
+                            let _ = tm.send(&wire);
+                        }
                     }
                     thread::sleep(Duration::from_millis(5));
                     continue;
@@ -165,13 +200,14 @@ pub fn spawn_tx_thread(
                     continue;
                 }
 
-                // Encode with ADPCM
+                // Encode with Opus
                 let compressed = encoder.encode(&pcm_buffer[..CODEC_FRAME_SIZE]);
 
                 // Pack wire frame (includes device name for receiver display)
                 let channel = current_channel.load(Ordering::Relaxed);
+                let subch = current_subchannel.load(Ordering::Relaxed);
                 let timestamp = now_ms();
-                let wire_data = pack_wire_frame(channel, &local_sender_id, &local_device_name, timestamp, &compressed);
+                let wire_data = pack_wire_frame(channel, subch, &local_sender_id, &local_device_name, timestamp, &compressed);
 
                 // Send through transport (encrypted inside TransportManager::send)
                 let mut tm = transport.lock().unwrap();
@@ -196,10 +232,12 @@ pub fn spawn_tx_thread(
 pub fn spawn_rx_thread(
     rx_running: Arc<AtomicBool>,
     current_channel: Arc<AtomicU8>,
+    current_subchannel: Arc<AtomicU8>,
     audio: Arc<Mutex<AudioEngine>>,
     transport: Arc<Mutex<TransportManager>>,
     audio_cache: Arc<Mutex<AudioCache>>,
     user_registry: Arc<Mutex<UserRegistry>>,
+    local_sender_id: String,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("sassy-rx".into())
@@ -250,7 +288,7 @@ pub fn spawn_rx_thread(
                 }
 
                 // Unpack wire frame (now includes device_name)
-                let (channel, sender_id, device_name, timestamp, compressed) = match unpack_wire_frame(&recv_buffer[..bytes_received]) {
+                let (channel, subchannel, sender_id, device_name, timestamp, compressed) = match unpack_wire_frame(&recv_buffer[..bytes_received]) {
                     Ok(parsed) => parsed,
                     Err(e) => {
                         warn!("RX: invalid wire frame: {}", e);
@@ -258,15 +296,30 @@ pub fn spawn_rx_thread(
                     }
                 };
 
-                // Filter by channel
+                // Drop our own packets (multicast delivers to sender too)
+                if sender_id == local_sender_id {
+                    continue;
+                }
+
+                // Filter by channel + subchannel
                 let my_channel = current_channel.load(Ordering::Relaxed);
                 if channel != my_channel {
                     continue;
                 }
+                let my_subchannel = current_subchannel.load(Ordering::Relaxed);
+                if subchannel != my_subchannel {
+                    // Different subchannel — still register user (they're on same channel)
+                    // but don't play audio
+                    {
+                        let mut reg = user_registry.lock().unwrap();
+                        reg.register_user(&sender_id, &device_name);
+                    }
+                    continue;
+                }
 
-                // Validate compressed size
-                if compressed.len() != COMPRESSED_FRAME_SIZE {
-                    warn!("RX: unexpected compressed size: {} (expected {})", compressed.len(), COMPRESSED_FRAME_SIZE);
+                // Validate compressed payload is non-empty (Opus uses variable-length frames)
+                if compressed.is_empty() {
+                    warn!("RX: empty compressed payload, dropping");
                     continue;
                 }
 
@@ -284,7 +337,7 @@ pub fn spawn_rx_thread(
                     cache.update_user_info(&sender_id, &device_name, is_fav, is_muted);
                 }
 
-                // Decode ADPCM
+                // Decode Opus
                 let pcm_samples = decoder.decode(&compressed);
 
                 // Feed into audio cache
@@ -416,15 +469,17 @@ mod tests {
     #[test]
     fn test_wire_frame_roundtrip() {
         let channel = 5u8;
+        let subchannel = 1u8;
         let sender_id = "abc123def456";
         let device_name = "John's Galaxy S24";
         let timestamp = 1700000000000u64;
-        let compressed = vec![42u8; COMPRESSED_FRAME_SIZE];
+        let compressed = vec![42u8; 40];
 
-        let packed = pack_wire_frame(channel, sender_id, device_name, timestamp, &compressed);
-        let (ch, sid, name, ts, audio) = unpack_wire_frame(&packed).unwrap();
+        let packed = pack_wire_frame(channel, subchannel, sender_id, device_name, timestamp, &compressed);
+        let (ch, sub, sid, name, ts, audio) = unpack_wire_frame(&packed).unwrap();
 
         assert_eq!(ch, channel);
+        assert_eq!(sub, subchannel);
         assert_eq!(sid, sender_id);
         assert_eq!(name, device_name);
         assert_eq!(ts, timestamp);
@@ -433,9 +488,10 @@ mod tests {
 
     #[test]
     fn test_wire_frame_empty_fields() {
-        let packed = pack_wire_frame(1, "", "", 100, &[1, 2, 3]);
-        let (ch, sid, name, ts, audio) = unpack_wire_frame(&packed).unwrap();
+        let packed = pack_wire_frame(1, 0, "", "", 100, &[1, 2, 3]);
+        let (ch, sub, sid, name, ts, audio) = unpack_wire_frame(&packed).unwrap();
         assert_eq!(ch, 1);
+        assert_eq!(sub, 0);
         assert_eq!(sid, "");
         assert_eq!(name, "");
         assert_eq!(ts, 100);
@@ -451,17 +507,17 @@ mod tests {
     #[test]
     fn test_wire_frame_invalid_sender_len() {
         let mut data = vec![0u8; 20];
-        data[1] = 200; // sender_id_len > MAX_SENDER_ID_LEN
+        data[2] = 200; // sender_id_len > MAX_SENDER_ID_LEN (offset shifted by 1 for subchannel)
         let result = unpack_wire_frame(&data);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_wire_frame_invalid_name_len() {
-        // Valid sender_id_len = 0, then name_len = 200 (too large)
+        // channel=0, subchannel=0, sender_id_len=0, name_len=200 (too large)
         let mut data = vec![0u8; 20];
-        data[1] = 0; // sender_id_len = 0
-        data[2] = 200; // name_len > MAX_DEVICE_NAME_LEN
+        data[2] = 0; // sender_id_len = 0
+        data[3] = 200; // name_len > MAX_DEVICE_NAME_LEN
         let result = unpack_wire_frame(&data);
         assert!(result.is_err());
     }

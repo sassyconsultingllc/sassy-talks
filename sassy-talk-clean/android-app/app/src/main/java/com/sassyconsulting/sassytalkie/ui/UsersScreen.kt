@@ -14,6 +14,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
@@ -24,10 +26,27 @@ import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.ui.theme.*
 
 @Composable
-fun UsersScreen(onBack: () -> Unit) {
+fun UsersScreen(
+    onBack: () -> Unit,
+    onEditProfile: () -> Unit = {}
+) {
+    val context = LocalContext.current
     var users by remember { mutableStateOf(SassyTalkNative.getUsers()) }
     var isRefreshing by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+
+    // Local "You" profile from SharedPreferences
+    val myName = remember { getSavedProfileName(context) }
+    val myEmoji = remember { getSavedEmoji(context) }
+    val myColorIdx = remember { getSavedColorIdx(context) }
+
+    // Auto-refresh every 3 seconds so new users appear without manual tap
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(3000)
+            users = SassyTalkNative.getUsers()
+        }
+    }
 
     val favorites = users.filter { it.isFavorite }
     val others = users.filter { !it.isFavorite }
@@ -36,6 +55,7 @@ fun UsersScreen(onBack: () -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .background(DarkBg)
+            .safeDrawingPadding()
             .padding(16.dp)
     ) {
         // Header
@@ -55,55 +75,81 @@ fun UsersScreen(onBack: () -> Unit) {
                 color = Orange
             )
 
-            Box(
-                modifier = Modifier.size(48.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                RainbowRefreshIndicator(
-                    isRefreshing = isRefreshing,
-                    onRefresh = {
-                        scope.launch {
-                            isRefreshing = true
-                            delay(600)
-                            users = SassyTalkNative.getUsers()
-                            isRefreshing = false
-                        }
-                    },
-                    size = 28.dp,
-                    strokeWidth = 3.dp
-                )
+            // Edit profile + refresh row
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onEditProfile) {
+                    Icon(Icons.Default.Edit, contentDescription = "Edit Profile", tint = Cyan)
+                }
+                Box(
+                    modifier = Modifier.size(48.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    RainbowRefreshIndicator(
+                        isRefreshing = isRefreshing,
+                        onRefresh = {
+                            scope.launch {
+                                isRefreshing = true
+                                delay(600)
+                                users = SassyTalkNative.getUsers()
+                                isRefreshing = false
+                            }
+                        },
+                        size = 28.dp,
+                        strokeWidth = 3.dp
+                    )
+                }
             }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        if (users.isEmpty()) {
-            // Empty state
-            Spacer(modifier = Modifier.height(60.dp))
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Icon(
-                    Icons.Default.PeopleOutline,
-                    contentDescription = null,
-                    tint = TextMuted,
-                    modifier = Modifier.size(64.dp)
-                )
-                Spacer(modifier = Modifier.height(16.dp))
-                Text("No users yet", color = TextGray, fontSize = 16.sp)
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    "Users will appear here when they connect to your channel",
-                    color = TextMuted,
-                    fontSize = 13.sp
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            // ── You (local user) ──
+            item {
+                SectionHeader(
+                    title = "You",
+                    icon = Icons.Default.Person,
+                    iconColor = Cyan,
+                    count = null
                 )
             }
-        } else {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            item {
+                YouCard(
+                    name = myName,
+                    emoji = myEmoji,
+                    colorIdx = myColorIdx,
+                    onEditProfile = onEditProfile
+                )
+            }
+
+            if (users.isEmpty()) {
+                item {
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(
+                            Icons.Default.PeopleOutline,
+                            contentDescription = null,
+                            tint = TextMuted,
+                            modifier = Modifier.size(48.dp)
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text("No one else yet", color = TextGray, fontSize = 15.sp)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            "Others will appear here when they transmit on your channel",
+                            color = TextMuted,
+                            fontSize = 13.sp
+                        )
+                    }
+                }
+            } else {
                 // Favorites section
                 if (favorites.isNotEmpty()) {
                     item {
+                        Spacer(modifier = Modifier.height(8.dp))
                         SectionHeader(
                             title = "Favorites",
                             icon = Icons.Default.Star,
@@ -111,7 +157,6 @@ fun UsersScreen(onBack: () -> Unit) {
                             count = favorites.size
                         )
                     }
-
                     items(favorites) { user ->
                         UserCard(
                             user = user,
@@ -125,13 +170,12 @@ fun UsersScreen(onBack: () -> Unit) {
                             }
                         )
                     }
-
-                    item { Spacer(modifier = Modifier.height(8.dp)) }
                 }
 
                 // Others section
                 if (others.isNotEmpty()) {
                     item {
+                        Spacer(modifier = Modifier.height(8.dp))
                         SectionHeader(
                             title = "Others",
                             icon = Icons.Default.People,
@@ -139,7 +183,6 @@ fun UsersScreen(onBack: () -> Unit) {
                             count = others.size
                         )
                     }
-
                     items(others) { user ->
                         UserCard(
                             user = user,
@@ -160,21 +203,78 @@ fun UsersScreen(onBack: () -> Unit) {
 }
 
 @Composable
+private fun YouCard(
+    name: String,
+    emoji: String,
+    colorIdx: Int,
+    onEditProfile: () -> Unit
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = CardBg),
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Emoji avatar
+            Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(CircleShape)
+                    .background(avatarColor(colorIdx)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(text = emoji, fontSize = 22.sp)
+            }
+
+            Spacer(modifier = Modifier.width(12.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = name,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = Cyan
+                )
+                Text(
+                    text = "This device",
+                    fontSize = 12.sp,
+                    color = TextMuted
+                )
+            }
+
+            IconButton(onClick = onEditProfile) {
+                Icon(
+                    Icons.Default.Edit,
+                    contentDescription = "Edit profile",
+                    tint = TextMuted,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun SectionHeader(
     title: String,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
-    iconColor: androidx.compose.ui.graphics.Color,
-    count: Int
+    iconColor: Color,
+    count: Int?
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier.padding(vertical = 8.dp)
+        modifier = Modifier.padding(vertical = 4.dp)
     ) {
-        Icon(icon, contentDescription = null, tint = iconColor, modifier = Modifier.size(20.dp))
-        Spacer(modifier = Modifier.width(8.dp))
+        Icon(icon, contentDescription = null, tint = iconColor, modifier = Modifier.size(18.dp))
+        Spacer(modifier = Modifier.width(6.dp))
         Text(
-            text = "$title ($count)",
-            fontSize = 14.sp,
+            text = if (count != null) "$title ($count)" else title,
+            fontSize = 13.sp,
             fontWeight = FontWeight.SemiBold,
             color = TextGray,
             letterSpacing = 1.sp
@@ -203,7 +303,7 @@ private fun UserCard(
                 .padding(12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Avatar
+            // Initials avatar
             Box(
                 modifier = Modifier
                     .size(44.dp)
@@ -221,7 +321,6 @@ private fun UserCard(
 
             Spacer(modifier = Modifier.width(12.dp))
 
-            // Name
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = user.name,
@@ -231,15 +330,10 @@ private fun UserCard(
                     textDecoration = if (isMuted) TextDecoration.LineThrough else TextDecoration.None
                 )
                 if (isMuted) {
-                    Text(
-                        text = "Muted",
-                        fontSize = 12.sp,
-                        color = StatusDisconnected
-                    )
+                    Text(text = "Muted", fontSize = 12.sp, color = StatusDisconnected)
                 }
             }
 
-            // Favorite toggle
             IconButton(onClick = onToggleFavorite) {
                 Icon(
                     if (user.isFavorite) Icons.Default.Star else Icons.Default.StarOutline,
@@ -249,7 +343,6 @@ private fun UserCard(
                 )
             }
 
-            // Mute toggle
             IconButton(onClick = onToggleMute) {
                 Icon(
                     if (isMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp,

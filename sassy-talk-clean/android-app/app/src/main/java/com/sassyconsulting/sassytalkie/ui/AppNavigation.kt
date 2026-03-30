@@ -1,5 +1,6 @@
 package com.sassyconsulting.sassytalkie.ui
 
+import android.content.Context
 import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
@@ -10,8 +11,10 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -19,14 +22,17 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import com.sassyconsulting.sassytalkie.SassyTalkNative
+import com.sassyconsulting.sassytalkie.TranscriptionBridge
 import com.sassyconsulting.sassytalkie.WalkieService
+import com.sassyconsulting.sassytalkie.WhisperModelManager
 import com.sassyconsulting.sassytalkie.ui.theme.*
 
 enum class Screen {
+    Profile,
     Auth,
-    DevicePicker,
     Main,
     Users,
+    Transcription,
 }
 
 /**
@@ -35,7 +41,8 @@ enum class Screen {
  * Startup sequence:
  *   1. Wait for [permissionsGranted] = true  (MainActivity handles the request)
  *   2. Initialize native Rust library on IO thread
- *   3. Navigate to Auth screen
+ *   3. If first launch (no saved profile): navigate to Profile setup
+ *   4. Otherwise: navigate to Auth screen
  *
  * This ensures AudioRecord/AudioTrack JNI calls never happen before
  * RECORD_AUDIO is granted, eliminating the permission race condition.
@@ -46,10 +53,14 @@ fun AppNavigation(
     walkieService: WalkieService?,
     onRequestPermissions: () -> Unit
 ) {
+    val context = LocalContext.current
     var currentScreen by remember { mutableStateOf(Screen.Auth) }
     var nativeReady by remember { mutableStateOf(false) }
     var initFailed by remember { mutableStateOf(false) }
     var bleReady by remember { mutableStateOf(false) }
+
+    // AutoConnectManager lives here (singleton for the session) — NOT in MainScreen
+    val autoConnect = remember { AutoConnectManager(context) }
 
     // ── Phase 1: Wait for permissions ──
     if (!permissionsGranted) {
@@ -94,6 +105,7 @@ fun AppNavigation(
     LaunchedEffect(permissionsGranted) {
         if (permissionsGranted && !nativeReady) {
             val success = withContext(Dispatchers.IO) {
+                SassyTalkNative.appContext = context.applicationContext
                 if (!SassyTalkNative.isInitialized()) {
                     SassyTalkNative.init()
                 } else {
@@ -101,11 +113,36 @@ fun AppNavigation(
                 }
             }
             if (success) {
-                // Set device name to the Android model
+                // Restore persisted session (survives app restart)
+                val sessionRestored = withContext(Dispatchers.IO) {
+                    SassyTalkNative.restoreSession()
+                }
+
+                // Determine starting screen: profile setup on first launch
+                val prefs = context.getSharedPreferences("sassy_profile", Context.MODE_PRIVATE)
+                val profileSet = prefs.getBoolean(KEY_PROFILE_SET, false)
+                val savedName = getSavedProfileName(context)
+
+                // Apply saved profile name to native library
                 withContext(Dispatchers.IO) {
-                    SassyTalkNative.setDeviceName(Build.MODEL)
+                    if (profileSet) {
+                        SassyTalkNative.setDeviceName(savedName)
+                    } else {
+                        SassyTalkNative.setDeviceName(Build.MODEL)
+                        currentScreen = Screen.Profile
+                    }
+                }
+
+                // If session was restored from disk, skip auth and go straight to main
+                if (sessionRestored && profileSet) {
+                    currentScreen = Screen.Main
                 }
                 nativeReady = true
+
+                // Initialize transcription + whisper model (downloads ~75MB on first run)
+                TranscriptionBridge.initialize(context)
+                TranscriptionBridge.setEnabled(true)
+                WhisperModelManager.ensureReady(context)
             } else {
                 initFailed = true
             }
@@ -162,37 +199,43 @@ fun AppNavigation(
     // ── Phase 3: Main navigation ──
 
     // Hardware back button support
-    BackHandler(enabled = currentScreen != Screen.Auth) {
+    BackHandler(enabled = currentScreen != Screen.Auth && currentScreen != Screen.Profile) {
         when (currentScreen) {
-            Screen.DevicePicker -> currentScreen = Screen.Auth
             Screen.Main -> {
-                // Release multicast lock when leaving main screen
                 walkieService?.releaseMulticastLock()
-                currentScreen = Screen.DevicePicker
+                currentScreen = Screen.Auth
             }
             Screen.Users -> currentScreen = Screen.Main
+            Screen.Transcription -> currentScreen = Screen.Main
             else -> {}
         }
     }
 
     when (currentScreen) {
-        Screen.Auth -> QRAuthScreen(
-            onAuthenticated = { currentScreen = Screen.DevicePicker }
+        Screen.Profile -> ProfileScreen(
+            onDone = { currentScreen = Screen.Auth },
+            showBackButton = false
         )
-        Screen.DevicePicker -> DevicePickerScreen(
-            onConnected = { currentScreen = Screen.Main },
-            onBack = { currentScreen = Screen.Auth },
-            walkieService = walkieService
+        Screen.Auth -> QRAuthScreen(
+            onAuthenticated = { currentScreen = Screen.Main }
         )
         Screen.Main -> MainScreen(
             onDisconnect = {
+                autoConnect.disconnect()
                 walkieService?.releaseMulticastLock()
-                currentScreen = Screen.DevicePicker
+                currentScreen = Screen.Auth
             },
             onShowUsers = { currentScreen = Screen.Users },
-            walkieService = walkieService
+            onShowTranscription = { currentScreen = Screen.Transcription },
+            walkieService = walkieService,
+            autoConnect = autoConnect
         )
         Screen.Users -> UsersScreen(
+            onBack = { currentScreen = Screen.Main },
+            onEditProfile = { currentScreen = Screen.Profile }
+        )
+        Screen.Transcription -> TranscriptionFeedScreen(
+            entries = TranscriptionBridge.entries.collectAsState().value,
             onBack = { currentScreen = Screen.Main }
         )
     }
