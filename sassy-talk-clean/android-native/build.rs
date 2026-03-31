@@ -265,55 +265,5 @@ fn main() {
     // Tell cargo where to find the compiled library (handled by cc::Build::compile)
     println!("cargo:rustc-link-lib=static=opus");
 
-    // ── Whisper.cpp (pre-built static libraries + thin C wrapper) ──
-    //
-    // The heavy whisper.cpp + ggml libraries were compiled once by CMake
-    // (see whisper-libs/{arm64-v8a,x86_64}/). We only compile a tiny
-    // C wrapper here to avoid exposing the complex whisper_full_params
-    // struct to Rust FFI.
-
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let whisper_libs = std::path::PathBuf::from(&manifest_dir).join("whisper-libs");
-
-    // Map Rust target triple to Android ABI directory name
-    let abi_dir = if target.contains("aarch64") {
-        "arm64-v8a"
-    } else if target.contains("x86_64") {
-        "x86_64"
-    } else if target.contains("armv7") {
-        "armeabi-v7a"
-    } else {
-        // Skip whisper for unsupported targets (e.g. host unit tests)
-        return;
-    };
-
-    let lib_dir = whisper_libs.join(abi_dir);
-    if !lib_dir.join("libwhisper.a").exists() {
-        println!("cargo:warning=Whisper libraries not found for {}; skipping whisper build", abi_dir);
-        return;
-    }
-
-    // Compile the thin C wrapper that calls whisper API
-    cc::Build::new()
-        .file(whisper_libs.join("whisper_wrapper.c"))
-        .include(whisper_libs.join("include"))
-        .define("NDEBUG", None)
-        .flag("-w")
-        .compile("whisper_wrapper");
-
-    // Link the pre-built whisper + ggml static libraries
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=static=whisper");
-    println!("cargo:rustc-link-lib=static=ggml");
-    println!("cargo:rustc-link-lib=static=ggml-base");
-    println!("cargo:rustc-link-lib=static=ggml-cpu");
-
-    // Link C++ standard library (required by whisper.cpp).
-    // Use static linking so we don't need to bundle libc++_shared.so in the APK.
-    if target.contains("android") {
-        println!("cargo:rustc-link-lib=static=c++_static");
-        println!("cargo:rustc-link-lib=static=c++abi");
-    } else {
-        println!("cargo:rustc-link-lib=dylib=stdc++");
-    }
+    // Whisper.cpp libraries removed — transcription stripped to slim down binary size.
 }

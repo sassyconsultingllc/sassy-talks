@@ -10,7 +10,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.Lifecycle
-import com.sassyconsulting.sassytalkie.ui.TranscriptionEntry
+import com.sassyconsulting.sassytalkie.ui.ActivityEntry
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -18,58 +18,46 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlin.math.sqrt
 
 /**
- * Bridges the Rust native RX audio thread to live transcription via Whisper.
+ * Bridges the Rust native RX audio thread to the activity log and notifications.
  *
  * Rust calls [onAudioReceived] via JNI with decoded PCM frames from remote
- * speakers. This object performs energy-based voice activity detection (VAD),
- * buffers PCM during speech, then runs on-device Whisper inference when
- * speech ends. Results are emitted as [TranscriptionEntry] items for the
- * Compose UI.
+ * speakers. This object performs energy-based voice activity detection (VAD)
+ * to detect speech start/end, then emits [ActivityEntry] items (who spoke,
+ * when, how long) for the Compose UI and fires notifications when backgrounded.
  */
 object TranscriptionBridge {
 
     private const val TAG = "TranscriptionBridge"
-    private const val TRANSCRIPTION_CHANNEL_ID = "sassytalkie_transcription"
-    private const val TRANSCRIPTION_NOTIFICATION_BASE_ID = 5000
+    private const val ACTIVITY_CHANNEL_ID = "sassytalkie_activity"
+    private const val ACTIVITY_NOTIFICATION_BASE_ID = 5000
 
     private var appContext: Context? = null
-    private var notificationIdCounter = TRANSCRIPTION_NOTIFICATION_BASE_ID
+    private var notificationIdCounter = ACTIVITY_NOTIFICATION_BASE_ID
 
     /** RMS amplitude below which a frame is considered silence. */
     private const val SILENCE_THRESHOLD = 500
 
-    /**
-     * Number of consecutive silent frames required to finalize a speech segment.
-     * At 20 ms per frame this equals 400 ms of silence.
-     */
+    /** Consecutive silent frames to finalize speech (400ms at 20ms/frame). */
     private const val SILENCE_FRAMES_TO_END = 20
 
-    /** Maximum number of entries kept in the feed to bound memory usage. */
+    /** Maximum entries kept in the feed. */
     private const val MAX_ENTRIES = 200
-
-    /** Maximum buffered frames (10 seconds at 20ms/frame = 500 frames). */
-    private const val MAX_BUFFER_FRAMES = 500
 
     // ── State ──
 
-    private val _entries = MutableStateFlow<List<TranscriptionEntry>>(emptyList())
+    private val _entries = MutableStateFlow<List<ActivityEntry>>(emptyList())
+    val entries: StateFlow<List<ActivityEntry>> = _entries.asStateFlow()
 
-    /** Observable feed of transcription entries for Compose UI. */
-    val entries: StateFlow<List<TranscriptionEntry>> = _entries.asStateFlow()
+    /** Observable flag for UI: true when any remote speaker is actively talking. */
+    private val _incomingAudio = MutableStateFlow(false)
+    val incomingAudio: StateFlow<Boolean> = _incomingAudio.asStateFlow()
 
-    @Volatile
-    private var enabled = false
+    /** Name of the currently active speaker (for UI indicator). */
+    private val _activeSpeakerName = MutableStateFlow("")
+    val activeSpeakerName: StateFlow<String> = _activeSpeakerName.asStateFlow()
 
     @Volatile
     private var initialized = false
-
-    @Volatile
-    var whisperReady = false
-
-    // Background scope for whisper inference (doesn't block RX thread)
-    private val transcriptionScope = CoroutineScope(
-        Dispatchers.Default + SupervisorJob()
-    )
 
     // ── Active speech tracking (guarded by [lock]) ──
 
@@ -81,9 +69,6 @@ object TranscriptionBridge {
     private var speechStartTime = 0L
     private var silentFrameCount = 0
     private var inSpeech = false
-
-    /** PCM frame buffer — accumulated during speech for whisper inference. */
-    private val pcmBuffer = mutableListOf<ShortArray>()
 
     // ── Lifecycle ──
 
@@ -98,9 +83,9 @@ object TranscriptionBridge {
     private fun createNotificationChannel(context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                TRANSCRIPTION_CHANNEL_ID,
-                "Transcription Alerts",
-                NotificationManager.IMPORTANCE_DEFAULT
+                ACTIVITY_CHANNEL_ID,
+                "Incoming Voice",
+                NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "Notifications when someone speaks while the app is in the background"
             }
@@ -113,70 +98,14 @@ object TranscriptionBridge {
         return try {
             ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
         } catch (e: Exception) {
-            true // default to foreground (don't notify) if we can't tell
+            true
         }
     }
-
-    private fun showTranscriptionNotification(entry: TranscriptionEntry) {
-        val ctx = appContext ?: return
-        if (isAppInForeground()) return
-        if (entry.isMuted) return
-
-        val launchIntent = Intent(ctx, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            putExtra("open_transcription", true)
-        }
-        val pendingIntent = PendingIntent.getActivity(
-            ctx, 0, launchIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val notification = NotificationCompat.Builder(ctx, TRANSCRIPTION_CHANNEL_ID)
-            .setContentTitle(entry.senderName)
-            .setContentText(entry.text)
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentIntent(pendingIntent)
-            .setAutoCancel(true)
-            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-            .build()
-
-        try {
-            val nm = ctx.getSystemService(NotificationManager::class.java)
-            nm.notify(notificationIdCounter++, notification)
-            // Keep IDs from growing unbounded
-            if (notificationIdCounter > TRANSCRIPTION_NOTIFICATION_BASE_ID + 50) {
-                notificationIdCounter = TRANSCRIPTION_NOTIFICATION_BASE_ID
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to show transcription notification: ${e.message}")
-        }
-    }
-
-    /** Call after model download completes. */
-    fun initWhisper(modelPath: String): Boolean {
-        whisperReady = SassyTalkNative.nativeInitWhisper(modelPath)
-        Log.i(TAG, "Whisper init: ready=$whisperReady path=$modelPath")
-        return whisperReady
-    }
-
-    fun setEnabled(enabled: Boolean) {
-        this.enabled = enabled
-        Log.d(TAG, "Transcription enabled=$enabled")
-    }
-
-    fun isEnabled(): Boolean = enabled
 
     // ── JNI entry point ──
 
     /**
      * Called from the Rust native RX thread with a chunk of decoded PCM audio.
-     *
-     * @param senderId   unique identifier of the remote speaker
-     * @param senderName human-readable display name
-     * @param pcmSamples 16-bit mono PCM samples (typically one 20 ms frame at 48kHz)
-     * @param isFavorite whether this sender is marked as a favorite
-     * @param isMuted    whether this sender is muted
      */
     @JvmStatic
     fun onAudioReceived(
@@ -186,14 +115,14 @@ object TranscriptionBridge {
         isFavorite: Boolean,
         isMuted: Boolean,
     ) {
-        if (!enabled || !initialized) return
+        if (!initialized) return
 
         val rms = computeRms(pcmSamples)
         val isSpeech = rms >= SILENCE_THRESHOLD
 
         synchronized(lock) {
             if (isSpeech) {
-                handleSpeechFrame(senderId, senderName, pcmSamples, isFavorite, isMuted)
+                handleSpeechFrame(senderId, senderName, isFavorite, isMuted)
             } else {
                 handleSilenceFrame()
             }
@@ -202,7 +131,6 @@ object TranscriptionBridge {
 
     // ── User status ──
 
-    /** Update favorite/muted flags for an existing sender across all entries. */
     fun updateUserStatus(senderId: String, isFavorite: Boolean, isMuted: Boolean) {
         val current = _entries.value
         val updated = current.map { entry ->
@@ -230,10 +158,7 @@ object TranscriptionBridge {
 
     fun release() {
         clearEntries()
-        transcriptionScope.cancel()
         initialized = false
-        enabled = false
-        whisperReady = false
         Log.i(TAG, "Released")
     }
 
@@ -242,26 +167,22 @@ object TranscriptionBridge {
     private fun handleSpeechFrame(
         senderId: String,
         senderName: String,
-        pcmSamples: ShortArray,
         isFavorite: Boolean,
         isMuted: Boolean,
     ) {
         silentFrameCount = 0
 
         if (!inSpeech) {
-            // New speech segment begins
             inSpeech = true
             activeSenderId = senderId
             activeSenderName = senderName
             activeIsFavorite = isFavorite
             activeIsMuted = isMuted
             speechStartTime = System.currentTimeMillis()
-            pcmBuffer.clear()
-        }
 
-        // Buffer PCM for whisper inference (cap at MAX_BUFFER_FRAMES)
-        if (pcmBuffer.size < MAX_BUFFER_FRAMES) {
-            pcmBuffer.add(pcmSamples.copyOf())
+            // Update incoming audio indicator
+            _incomingAudio.value = true
+            _activeSpeakerName.value = senderName
         }
     }
 
@@ -274,7 +195,7 @@ object TranscriptionBridge {
         }
     }
 
-    /** End the current speech segment and run whisper inference. */
+    /** End the current speech segment — log who spoke and for how long. */
     private fun finalizeSpeechSegment() {
         val id = activeSenderId ?: return
         val name = activeSenderName ?: return
@@ -283,68 +204,35 @@ object TranscriptionBridge {
         val isMuted = activeIsMuted
         val ts = speechStartTime
 
-        // Concatenate all buffered frames into one contiguous PCM array
-        val totalSamples = pcmBuffer.sumOf { it.size }
-        val fullPcm = ShortArray(totalSamples)
-        var offset = 0
-        for (frame in pcmBuffer) {
-            frame.copyInto(fullPcm, offset)
-            offset += frame.size
-        }
-        pcmBuffer.clear()
         resetSpeechState()
 
-        if (totalSamples < 960) return // skip sub-20ms utterances
+        // Update incoming audio indicator
+        _incomingAudio.value = false
+        _activeSpeakerName.value = ""
 
-        // Wait briefly for Rust audio cache to finalize the utterance into history,
-        // then grab its unique ID for replay linkage
+        if (durationMs < 200) return // skip sub-200ms blips
+
+        // Get utterance ID for replay linkage
         val utteranceId = run {
-            // Give tick() a moment to finalize the live accumulator
             Thread.sleep(50)
             SassyTalkNative.lastHistoryId()
         }
 
-        if (whisperReady) {
-            // Run whisper inference on background thread (1-3s on weak phones)
-            transcriptionScope.launch {
-                val text = try {
-                    SassyTalkNative.nativeTranscribe48k(fullPcm)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Whisper inference failed: ${e.message}")
-                    ""
-                }
+        val durationSec = "%.1f".format(durationMs / 1000.0)
 
-                val displayText = text.trim().ifEmpty {
-                    "[${name} spoke for ${durationMs}ms]"
-                }
-
-                val entry = TranscriptionEntry(
-                    senderId = id,
-                    senderName = name,
-                    text = displayText,
-                    timestamp = ts,
-                    isFavorite = isFav,
-                    isMuted = isMuted,
-                    utteranceId = utteranceId,
-                )
-                addEntry(entry)
-            }
-        } else {
-            // Whisper not loaded — use placeholder
-            val entry = TranscriptionEntry(
-                senderId = id,
-                senderName = name,
-                text = "[${name} spoke for ${durationMs}ms]",
-                timestamp = ts,
-                isFavorite = isFav,
-                isMuted = isMuted,
-                utteranceId = utteranceId,
-            )
-            addEntry(entry)
-        }
+        val entry = ActivityEntry(
+            senderId = id,
+            senderName = name,
+            durationText = "${durationSec}s",
+            timestamp = ts,
+            isFavorite = isFav,
+            isMuted = isMuted,
+            utteranceId = utteranceId,
+        )
+        addEntry(entry)
     }
 
-    private fun addEntry(entry: TranscriptionEntry) {
+    private fun addEntry(entry: ActivityEntry) {
         val current = _entries.value
         val updated = if (current.size >= MAX_ENTRIES) {
             current.drop(1) + entry
@@ -354,7 +242,47 @@ object TranscriptionBridge {
         _entries.value = updated
 
         // Fire notification if app is backgrounded
-        showTranscriptionNotification(entry)
+        showActivityNotification(entry)
+    }
+
+    private fun showActivityNotification(entry: ActivityEntry) {
+        val ctx = appContext ?: return
+        if (isAppInForeground()) return
+        if (entry.isMuted) return
+
+        val launchIntent = Intent(ctx, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("open_activity", true)
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            ctx, 0, launchIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val timeStr = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
+            .format(java.util.Date(entry.timestamp))
+
+        val notification = NotificationCompat.Builder(ctx, ACTIVITY_CHANNEL_ID)
+            .setContentTitle("${entry.senderName} spoke")
+            .setContentText("${entry.durationText} at $timeStr")
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setWhen(entry.timestamp)
+            .setShowWhen(true)
+            .build()
+
+        try {
+            val nm = ctx.getSystemService(NotificationManager::class.java)
+            nm.notify(notificationIdCounter++, notification)
+            if (notificationIdCounter > ACTIVITY_NOTIFICATION_BASE_ID + 50) {
+                notificationIdCounter = ACTIVITY_NOTIFICATION_BASE_ID
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to show activity notification: ${e.message}")
+        }
     }
 
     private fun resetSpeechState() {
@@ -367,7 +295,6 @@ object TranscriptionBridge {
         silentFrameCount = 0
     }
 
-    /** Compute root-mean-square amplitude for a PCM sample buffer. */
     private fun computeRms(samples: ShortArray): Double {
         if (samples.isEmpty()) return 0.0
         var sumSquares = 0.0

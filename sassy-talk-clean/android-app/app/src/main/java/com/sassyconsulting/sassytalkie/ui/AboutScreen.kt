@@ -1,6 +1,5 @@
 package com.sassyconsulting.sassytalkie.ui
 
-import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -26,8 +25,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sassyconsulting.sassytalkie.BuildConfig
 import com.sassyconsulting.sassytalkie.SassyTalkNative
-import com.sassyconsulting.sassytalkie.TranscriptionBridge
-import com.sassyconsulting.sassytalkie.WhisperModelManager
 import com.sassyconsulting.sassytalkie.ui.theme.*
 
 @Composable
@@ -37,33 +34,8 @@ fun AboutScreen(
     val context = LocalContext.current
     val scrollState = rememberScrollState()
 
-    // Gather live status
     val transportName = remember { SassyTalkNative.getTransportName() }
     val isEncrypted = remember { SassyTalkNative.isEncrypted() }
-    val whisperReady = TranscriptionBridge.whisperReady
-    val transcriptionEnabled = remember { mutableStateOf(TranscriptionBridge.isEnabled()) }
-    val modelState by WhisperModelManager.state.collectAsState()
-    var selectedModel by remember { mutableStateOf(WhisperModelManager.currentModel) }
-
-    // Check device RAM to filter available models
-    val totalRamMb = remember {
-        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        val memInfo = ActivityManager.MemoryInfo()
-        am.getMemoryInfo(memInfo)
-        (memInfo.totalMem / (1024 * 1024)).toInt()
-    }
-    // Base needs ~400MB free, Small ~700MB, Medium ~2GB, Large ~4GB
-    val availableModels = remember(totalRamMb) {
-        WhisperModelManager.ModelSize.entries.filter { model ->
-            when (model) {
-                WhisperModelManager.ModelSize.BASE_EN -> totalRamMb >= 3000
-                WhisperModelManager.ModelSize.SMALL_EN -> totalRamMb >= 4000
-                WhisperModelManager.ModelSize.MEDIUM_EN -> totalRamMb >= 6000
-                WhisperModelManager.ModelSize.LARGE_V3 -> totalRamMb >= 8000
-            }
-        }
-    }
-    val lowRamDevice = availableModels.isEmpty()
 
     Column(
         modifier = Modifier
@@ -138,113 +110,6 @@ fun AboutScreen(
                     value = if (isEncrypted) "AES-256-GCM" else "Not active",
                     valueColor = if (isEncrypted) StatusConnected else StatusDisconnected
                 )
-                StatusRow(
-                    icon = Icons.Default.Subtitles,
-                    label = "Whisper Model",
-                    value = when (modelState) {
-                        is WhisperModelManager.ModelState.Ready -> "${WhisperModelManager.currentModel.label} - Ready"
-                        is WhisperModelManager.ModelState.Downloading -> "Downloading..."
-                        is WhisperModelManager.ModelState.Error -> "Error"
-                        else -> "Not loaded"
-                    },
-                    valueColor = when (modelState) {
-                        is WhisperModelManager.ModelState.Ready -> StatusConnected
-                        is WhisperModelManager.ModelState.Downloading -> Orange
-                        is WhisperModelManager.ModelState.Error -> StatusDisconnected
-                        else -> TextMuted
-                    }
-                )
-
-                // Transcription toggle
-                Spacer(modifier = Modifier.height(8.dp))
-                if (lowRamDevice) {
-                    Text(
-                        text = "Transcription unavailable — device has insufficient RAM (${totalRamMb}MB)",
-                        fontSize = 12.sp,
-                        color = TextMuted
-                    )
-                } else {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Transcription", fontSize = 13.sp, color = TextGray, modifier = Modifier.weight(1f))
-                        Switch(
-                            checked = transcriptionEnabled.value,
-                            onCheckedChange = { enabled ->
-                                if (enabled && !whisperReady) {
-                                    WhisperModelManager.ensureReady(context)
-                                }
-                                TranscriptionBridge.setEnabled(enabled)
-                                transcriptionEnabled.value = enabled
-                            },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = Orange,
-                                checkedTrackColor = Orange.copy(alpha = 0.3f),
-                                uncheckedThumbColor = TextMuted,
-                                uncheckedTrackColor = SurfaceBg
-                            )
-                        )
-                    }
-                }
-
-                // Download progress bar
-                if (modelState is WhisperModelManager.ModelState.Downloading) {
-                    val progress = (modelState as WhisperModelManager.ModelState.Downloading).progress
-                    Spacer(modifier = Modifier.height(6.dp))
-                    LinearProgressIndicator(
-                        progress = progress,
-                        modifier = Modifier.fillMaxWidth().height(6.dp),
-                        color = Orange,
-                        trackColor = SurfaceBg,
-                    )
-                    Text(
-                        text = "Downloading ${selectedModel.label}... ${(progress * 100).toInt()}%",
-                        fontSize = 11.sp,
-                        color = TextMuted,
-                        modifier = Modifier.padding(top = 4.dp)
-                    )
-                }
-
-                if (modelState is WhisperModelManager.ModelState.Error) {
-                    val err = (modelState as WhisperModelManager.ModelState.Error).message
-                    Text(text = "Error: $err", fontSize = 11.sp, color = StatusDisconnected, modifier = Modifier.padding(top = 4.dp))
-                }
-
-                // Model selector — vertical list
-                Spacer(modifier = Modifier.height(8.dp))
-                Text("Select Model", fontSize = 12.sp, color = TextMuted)
-                Spacer(modifier = Modifier.height(4.dp))
-                availableModels.forEach { model ->
-                    val isSelected = model == WhisperModelManager.currentModel
-                    val isDownloading = modelState is WhisperModelManager.ModelState.Downloading
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(if (isSelected) SurfaceBg else Color.Transparent)
-                            .clickable(enabled = !isDownloading) {
-                                selectedModel = model
-                                WhisperModelManager.switchModel(context, model)
-                            }
-                            .padding(horizontal = 12.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            if (isSelected) Icons.Default.RadioButtonChecked else Icons.Default.RadioButtonUnchecked,
-                            contentDescription = null,
-                            tint = if (isSelected) Orange else TextMuted,
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Text(
-                            text = model.label,
-                            fontSize = 14.sp,
-                            color = if (isSelected) Orange else TextGray,
-                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal
-                        )
-                    }
-                }
             }
 
             Spacer(modifier = Modifier.height(12.dp))
@@ -256,7 +121,7 @@ fun AboutScreen(
                 PermissionRow(label = "Bluetooth", reason = "Discover and connect to nearby peers")
                 PermissionRow(label = "Internet", reason = "Cellular relay for cross-network comms")
                 PermissionRow(label = "Foreground Service", reason = "Keep radio active when screen is off")
-                PermissionRow(label = "Notifications", reason = "Transcription alerts when backgrounded")
+                PermissionRow(label = "Notifications", reason = "Activity alerts when backgrounded")
             }
 
             Spacer(modifier = Modifier.height(12.dp))
@@ -291,7 +156,6 @@ fun AboutScreen(
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            // Credits
             Text(
                 text = "Built by Sassy Consulting LLC",
                 fontSize = 13.sp,

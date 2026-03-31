@@ -230,7 +230,7 @@ class WalkieService : Service() {
         }
     }
 
-    private fun buildNotification(status: String): Notification {
+    private fun buildNotification(status: String, showPttAction: Boolean = false): Notification {
         val launchIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
@@ -239,7 +239,7 @@ class WalkieService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Sassy-Talk")
             .setContentText(status)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
@@ -247,18 +247,42 @@ class WalkieService : Service() {
             .setOngoing(true)
             .setSilent(true)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setShowWhen(false)
+            .setShowWhen(true)
+            .setWhen(System.currentTimeMillis())
             .setNumber(1)
             .setBadgeIconType(NotificationCompat.BADGE_ICON_SMALL)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-            .build()
+
+        // Add PTT action if lock screen PTT is enabled
+        if (showPttAction) {
+            val pttIntent = Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+                putExtra("ptt_from_notification", true)
+            }
+            val pttPendingIntent = PendingIntent.getActivity(
+                this, 1, pttIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            builder.addAction(
+                android.R.drawable.ic_btn_speak_now,
+                "Open PTT",
+                pttPendingIntent
+            )
+        }
+
+        return builder.build()
     }
 
     fun updateNotification(status: String) {
+        val lockScreenPtt = try {
+            getSharedPreferences("sassy_settings", Context.MODE_PRIVATE)
+                .getBoolean("lock_screen_ptt", false)
+        } catch (_: Exception) { false }
+
         try {
             val nm = getSystemService(NotificationManager::class.java)
-            nm.notify(NOTIFICATION_ID, buildNotification(status))
+            nm.notify(NOTIFICATION_ID, buildNotification(status, showPttAction = lockScreenPtt))
         } catch (e: Exception) {
             Log.w(TAG, "Failed to update notification: ${e.message}")
         }

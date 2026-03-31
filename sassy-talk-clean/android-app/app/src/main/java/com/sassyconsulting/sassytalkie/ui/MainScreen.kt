@@ -28,6 +28,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.sassyconsulting.sassytalkie.SassyTalkNative
+import com.sassyconsulting.sassytalkie.TranscriptionBridge
 import com.sassyconsulting.sassytalkie.WalkieService
 import com.sassyconsulting.sassytalkie.ui.theme.*
 import androidx.compose.foundation.layout.safeDrawingPadding
@@ -41,13 +42,16 @@ import androidx.compose.material3.CircularProgressIndicator
 fun MainScreen(
     onDisconnect: () -> Unit = {},
     onShowUsers: () -> Unit = {},
-    onShowTranscription: () -> Unit = {},
+    onShowActivity: () -> Unit = {},
     onShowAbout: () -> Unit = {},
+    onShowSettings: () -> Unit = {},
+    onEndSession: () -> Unit = {},
     walkieService: WalkieService? = null,
     autoConnect: AutoConnectManager,
 ) {
     var isTransmitting by remember { mutableStateOf(false) }
     var showMenu by remember { mutableStateOf(false) }
+    var showEndSessionDialog by remember { mutableStateOf(false) }
     var currentChannel by remember { mutableIntStateOf(1) }
     var currentSubchannel by remember { mutableIntStateOf(0) } // 0=Main, 1=A, 2=B
     var pttHoldMode by remember { mutableStateOf(false) } // toggle PTT vs hold-to-talk
@@ -58,17 +62,23 @@ fun MainScreen(
     val connectState by autoConnect.state.collectAsState()
     val connectStatusText by autoConnect.statusText.collectAsState()
 
-    // Auto-connect on composition if not already connected.
-    // AutoConnectManager is owned by AppNavigation (singleton), not recreated here.
+    // Incoming audio indicator
+    val incomingAudio by TranscriptionBridge.incomingAudio.collectAsState()
+    val activeSpeaker by TranscriptionBridge.activeSpeakerName.collectAsState()
+
+    // Relay readiness
+    val relayReady by autoConnect.relayReady.collectAsState()
+
+    // Auto-connect and set cache to queue mode (cache-first)
     LaunchedEffect(Unit) {
         if (connectState != ConnectState.CONNECTED) {
             autoConnect.reset()
             autoConnect.autoConnect(walkieService)
         }
-        // Re-apply persisted session crypto after transport is connected.
-        // restoreSession() sets crypto before transport init, so it can get lost.
         withContext(Dispatchers.IO) {
             SassyTalkNative.restoreSession()
+            // Default to queue mode so incoming audio caches until user is done speaking
+            SassyTalkNative.setCacheMode(SassyTalkNative.CACHE_MODE_QUEUE)
         }
     }
 
@@ -148,9 +158,9 @@ fun MainScreen(
                         modifier = Modifier.background(CardBg)
                     ) {
                         DropdownMenuItem(
-                            text = { Text("Transcription", color = TextWhite) },
-                            onClick = { showMenu = false; onShowTranscription() },
-                            leadingIcon = { Icon(Icons.Default.Chat, contentDescription = null, tint = Cyan, modifier = Modifier.size(20.dp)) }
+                            text = { Text("Activity", color = TextWhite) },
+                            onClick = { showMenu = false; onShowActivity() },
+                            leadingIcon = { Icon(Icons.Default.History, contentDescription = null, tint = Cyan, modifier = Modifier.size(20.dp)) }
                         )
                         DropdownMenuItem(
                             text = { Text("Users", color = TextWhite) },
@@ -158,9 +168,20 @@ fun MainScreen(
                             leadingIcon = { Icon(Icons.Default.People, contentDescription = null, tint = Cyan, modifier = Modifier.size(20.dp)) }
                         )
                         DropdownMenuItem(
+                            text = { Text("Settings", color = TextWhite) },
+                            onClick = { showMenu = false; onShowSettings() },
+                            leadingIcon = { Icon(Icons.Default.Settings, contentDescription = null, tint = Cyan, modifier = Modifier.size(20.dp)) }
+                        )
+                        DropdownMenuItem(
                             text = { Text("About", color = TextWhite) },
                             onClick = { showMenu = false; onShowAbout() },
                             leadingIcon = { Icon(Icons.Default.Info, contentDescription = null, tint = Cyan, modifier = Modifier.size(20.dp)) }
+                        )
+                        HorizontalDivider(color = SurfaceBg)
+                        DropdownMenuItem(
+                            text = { Text("End Session", color = Color(0xFFFF6B6B)) },
+                            onClick = { showMenu = false; showEndSessionDialog = true },
+                            leadingIcon = { Icon(Icons.Default.ExitToApp, contentDescription = null, tint = Color(0xFFFF6B6B), modifier = Modifier.size(20.dp)) }
                         )
                     }
                 }
@@ -219,6 +240,53 @@ fun MainScreen(
                         text = connectStatusText,
                         fontSize = 13.sp,
                         color = TextGray
+                    )
+                }
+            }
+        }
+
+        // Relay readiness indicator
+        if (connectState == ConnectState.CONNECTED && !relayReady && autoConnect.isUsingRelay()) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(10.dp),
+                    strokeWidth = 1.5.dp,
+                    color = Orange
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "Waiting for relay confirmation...",
+                    fontSize = 11.sp,
+                    color = Orange
+                )
+            }
+        }
+
+        // Incoming audio indicator
+        if (incomingAudio && !isTransmitting) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1A3A2A)),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Icon(Icons.Default.VolumeUp, contentDescription = null, tint = StatusConnected, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "$activeSpeaker is speaking",
+                        fontSize = 13.sp,
+                        color = StatusConnected,
+                        fontWeight = FontWeight.Medium
                     )
                 }
             }
@@ -421,6 +489,35 @@ fun MainScreen(
                         Text("No active session for this channel", color = TextMuted)
                     }
                 }
+            },
+            containerColor = CardBg
+        )
+    }
+
+    // End Session confirmation dialog
+    if (showEndSessionDialog) {
+        AlertDialog(
+            onDismissRequest = { showEndSessionDialog = false },
+            confirmButton = {
+                TextButton(onClick = {
+                    showEndSessionDialog = false
+                    onEndSession()
+                }) {
+                    Text("End Session", color = Color(0xFFFF6B6B))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEndSessionDialog = false }) {
+                    Text("Cancel", color = Cyan)
+                }
+            },
+            title = { Text("End Session?", color = Orange) },
+            text = {
+                Text(
+                    "This will kill all active encrypted sessions and disconnect all transports. You will need to re-authenticate via QR to resume.",
+                    color = TextGray,
+                    fontSize = 14.sp
+                )
             },
             containerColor = CardBg
         )

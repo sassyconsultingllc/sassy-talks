@@ -36,6 +36,9 @@ class CellularWebSocketClient {
     private val isRunning = AtomicBoolean(false)
     private var outboundThread: Thread? = null
 
+    /** Callback for DO readiness confirmation. */
+    var onRelayReady: (() -> Unit)? = null
+
     /** Connect to the cellular relay. Room must be set first via SassyTalkNative.cellularSetRoom() */
     fun connect(): Boolean {
         if (isConnected.get()) {
@@ -80,6 +83,11 @@ class CellularWebSocketClient {
             override fun onMessage(webSocket: WebSocket, text: String) {
                 // Text message = control (peer_joined, peer_left, welcome, pong, etc.)
                 Log.d(TAG, "Control: $text")
+                // Parse "welcome" message as DO readiness confirmation
+                if (text.contains("\"welcome\"") || text.contains("\"type\":\"welcome\"")) {
+                    Log.i(TAG, "DO welcome received — relay is ready")
+                    onRelayReady?.invoke()
+                }
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {

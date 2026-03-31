@@ -335,9 +335,9 @@ object SassyTalkNative {
                 Log.e(TAG, "clearSession failed: ${e.message}")
             }
         }
-        // Clear persisted session
+        // Clear all persisted sessions (per-channel + legacy)
         appContext?.getSharedPreferences("sassy_session", android.content.Context.MODE_PRIVATE)
-            ?.edit()?.remove("session_json")?.apply()
+            ?.edit()?.clear()?.apply()
     }
 
     // ── User Registration ──
@@ -505,8 +505,6 @@ object SassyTalkNative {
                 Log.e(TAG, "clearAudioCache failed: ${e.message}")
             }
         }
-        // Clear transcription entries in sync with audio cache
-        try { com.sassyconsulting.sassytalkie.TranscriptionBridge.clearEntries() } catch (_: Exception) {}
     }
 
     /** Replay a previous utterance from history by index (legacy) */
@@ -812,9 +810,6 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeBtEncodeFrame(): ByteArray?
     @JvmStatic private external fun nativeBtDecodeFrame(data: ByteArray): Boolean
 
-    // ── Whisper transcription ──
-
-    /** Initialize whisper model from file path. Call once after model download. */
     // ── Per-channel session management ──
 
     @JvmStatic private external fun nativeGenerateChannelQR(channel: Int, durationHours: Int, groupName: String?): String
@@ -856,11 +851,4 @@ object SassyTalkNative {
         return try { nativeGetGroupName(channel) } catch (_: Exception) { "Channel $channel" }
     }
 
-    @JvmStatic external fun nativeInitWhisper(modelPath: String): Boolean
-
-    /** Transcribe 16kHz f32 PCM → text. Blocks during inference (~1-3s). */
-    @JvmStatic external fun nativeTranscribe(samples16k: FloatArray): String
-
-    /** Transcribe 48kHz i16 PCM → text (downsamples internally). */
-    @JvmStatic external fun nativeTranscribe48k(samples48k: ShortArray): String
 }

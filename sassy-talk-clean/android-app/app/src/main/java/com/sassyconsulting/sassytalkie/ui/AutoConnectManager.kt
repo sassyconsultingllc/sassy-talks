@@ -38,6 +38,10 @@ class AutoConnectManager(private val context: Context) {
     private val _statusText = MutableStateFlow("")
     val statusText: StateFlow<String> = _statusText
 
+    /** True once the Cloudflare Durable Object sends a "welcome" confirmation. */
+    private val _relayReady = MutableStateFlow(false)
+    val relayReady: StateFlow<Boolean> = _relayReady
+
     private var cellularClient: CellularWebSocketClient? = null
     private var walkieServiceRef: WalkieService? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -120,6 +124,7 @@ class AutoConnectManager(private val context: Context) {
 
         SassyTalkNative.cellularSetRoom(sessionId)
         val client = CellularWebSocketClient()
+        client.onRelayReady = { onRelayReady() }
         cellularClient = client
         client.connect()
 
@@ -151,6 +156,7 @@ class AutoConnectManager(private val context: Context) {
 
         SassyTalkNative.cellularSetRoom(sessionId)
         val client = CellularWebSocketClient()
+        client.onRelayReady = { onRelayReady() }
         cellularClient = client
         client.connect()
 
@@ -258,9 +264,18 @@ class AutoConnectManager(private val context: Context) {
         }
     }
 
+    fun isUsingRelay(): Boolean = activeTransport == "cellular" || activeTransport == "both"
+
+    /** Called by CellularWebSocketClient when DO sends "welcome" confirmation. */
+    fun onRelayReady() {
+        _relayReady.value = true
+        Log.i(TAG, "Relay confirmed ready (DO welcome received)")
+    }
+
     fun reset() {
         _state.value = ConnectState.IDLE
         _statusText.value = ""
+        _relayReady.value = false
         activeTransport = "none"
     }
 
@@ -269,6 +284,7 @@ class AutoConnectManager(private val context: Context) {
         cellularClient?.disconnect()
         cellularClient = null
         activeTransport = "none"
+        _relayReady.value = false
         _state.value = ConnectState.IDLE
     }
 }

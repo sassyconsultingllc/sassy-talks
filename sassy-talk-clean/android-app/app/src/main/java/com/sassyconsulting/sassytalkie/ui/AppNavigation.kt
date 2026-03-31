@@ -24,7 +24,6 @@ import kotlinx.coroutines.withContext
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.TranscriptionBridge
 import com.sassyconsulting.sassytalkie.WalkieService
-import com.sassyconsulting.sassytalkie.WhisperModelManager
 import com.sassyconsulting.sassytalkie.ui.theme.*
 
 enum class Screen {
@@ -32,8 +31,9 @@ enum class Screen {
     Auth,
     Main,
     Users,
-    Transcription,
+    Activity,
     About,
+    Settings,
 }
 
 /**
@@ -140,11 +140,8 @@ fun AppNavigation(
                 }
                 nativeReady = true
 
-                // Initialize transcription but don't enable by default
-                // User can enable via About screen after model downloads
+                // Initialize the activity bridge for incoming-audio detection + notifications
                 TranscriptionBridge.initialize(context)
-                TranscriptionBridge.setEnabled(false)
-                // Don't auto-download whisper model — let user choose in About screen
             } else {
                 initFailed = true
             }
@@ -208,8 +205,9 @@ fun AppNavigation(
                 currentScreen = Screen.Auth
             }
             Screen.Users -> currentScreen = Screen.Main
-            Screen.Transcription -> currentScreen = Screen.Main
+            Screen.Activity -> currentScreen = Screen.Main
             Screen.About -> currentScreen = Screen.Main
+            Screen.Settings -> currentScreen = Screen.Main
             else -> {}
         }
     }
@@ -229,8 +227,22 @@ fun AppNavigation(
                 currentScreen = Screen.Auth
             },
             onShowUsers = { currentScreen = Screen.Users },
-            onShowTranscription = { currentScreen = Screen.Transcription },
+            onShowActivity = { currentScreen = Screen.Activity },
             onShowAbout = { currentScreen = Screen.About },
+            onShowSettings = { currentScreen = Screen.Settings },
+            onEndSession = {
+                // Clean session kill without restarting app
+                SassyTalkNative.pttStop()
+                autoConnect.disconnect()
+                walkieService?.releaseMulticastLock()
+                SassyTalkNative.clearSession()
+                // Clear all per-channel sessions from prefs
+                context.getSharedPreferences("sassy_session", Context.MODE_PRIVATE)
+                    .edit().clear().apply()
+                SassyTalkNative.clearAudioCache()
+                TranscriptionBridge.clearEntries()
+                currentScreen = Screen.Auth
+            },
             walkieService = walkieService,
             autoConnect = autoConnect
         )
@@ -238,11 +250,14 @@ fun AppNavigation(
             onBack = { currentScreen = Screen.Main },
             onEditProfile = { currentScreen = Screen.Profile }
         )
-        Screen.Transcription -> TranscriptionFeedScreen(
+        Screen.Activity -> ActivityFeedScreen(
             entries = TranscriptionBridge.entries.collectAsState().value,
             onBack = { currentScreen = Screen.Main }
         )
         Screen.About -> AboutScreen(
+            onBack = { currentScreen = Screen.Main }
+        )
+        Screen.Settings -> SettingsScreen(
             onBack = { currentScreen = Screen.Main }
         )
     }

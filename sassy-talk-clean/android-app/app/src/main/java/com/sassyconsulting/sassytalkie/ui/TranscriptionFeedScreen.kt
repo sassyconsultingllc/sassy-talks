@@ -23,11 +23,11 @@ import com.sassyconsulting.sassytalkie.ui.theme.*
 import java.text.SimpleDateFormat
 import java.util.*
 
-/** A single transcription entry */
-data class TranscriptionEntry(
+/** A single activity entry — who spoke, when, how long */
+data class ActivityEntry(
     val senderId: String,
     val senderName: String,
-    val text: String,
+    val durationText: String,
     val timestamp: Long,
     val isFavorite: Boolean = false,
     val isMuted: Boolean = false,
@@ -52,8 +52,8 @@ private fun userColor(userId: String): Color {
 }
 
 @Composable
-fun TranscriptionFeedScreen(
-    entries: List<TranscriptionEntry>,
+fun ActivityFeedScreen(
+    entries: List<ActivityEntry>,
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -79,35 +79,34 @@ fun TranscriptionFeedScreen(
             }
 
             Text(
-                text = "Transcription",
+                text = "Activity",
                 fontSize = 24.sp,
                 fontWeight = FontWeight.Bold,
                 color = Orange
             )
 
-            Spacer(modifier = Modifier.width(48.dp)) // balance the back button
+            Spacer(modifier = Modifier.width(48.dp))
         }
 
         Spacer(modifier = Modifier.height(12.dp))
 
         if (entries.isEmpty()) {
-            // Empty state
             Spacer(modifier = Modifier.height(60.dp))
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Icon(
-                    Icons.Default.SubtitlesOff,
+                    Icons.Default.History,
                     contentDescription = null,
                     tint = TextMuted,
                     modifier = Modifier.size(64.dp)
                 )
                 Spacer(modifier = Modifier.height(16.dp))
-                Text("No transcriptions yet", color = TextGray, fontSize = 16.sp)
+                Text("No activity yet", color = TextGray, fontSize = 16.sp)
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    "Transcriptions will appear here when others speak",
+                    "Activity will appear here when others speak",
                     color = TextMuted,
                     fontSize = 13.sp
                 )
@@ -118,7 +117,6 @@ fun TranscriptionFeedScreen(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
                 modifier = Modifier.weight(1f)
             ) {
-                // Favorites section
                 if (favorites.isNotEmpty()) {
                     item {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -139,13 +137,12 @@ fun TranscriptionFeedScreen(
                     }
 
                     items(favorites) { entry ->
-                        TranscriptionBubble(entry, timeFormatter)
+                        ActivityBubble(entry, timeFormatter)
                     }
 
                     item { Spacer(modifier = Modifier.height(4.dp)) }
                 }
 
-                // Others section
                 if (others.isNotEmpty()) {
                     if (favorites.isNotEmpty()) {
                         item {
@@ -168,7 +165,7 @@ fun TranscriptionFeedScreen(
                     }
 
                     items(others) { entry ->
-                        TranscriptionBubble(entry, timeFormatter)
+                        ActivityBubble(entry, timeFormatter)
                     }
                 }
             }
@@ -177,8 +174,8 @@ fun TranscriptionFeedScreen(
 }
 
 @Composable
-private fun TranscriptionBubble(
-    entry: TranscriptionEntry,
+private fun ActivityBubble(
+    entry: ActivityEntry,
     timeFormatter: SimpleDateFormat
 ) {
     val color = userColor(entry.senderId)
@@ -187,7 +184,7 @@ private fun TranscriptionBubble(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 2.dp),
-        verticalAlignment = Alignment.Top
+        verticalAlignment = Alignment.CenterVertically
     ) {
         // Avatar
         Box(
@@ -208,31 +205,29 @@ private fun TranscriptionBubble(
         Spacer(modifier = Modifier.width(8.dp))
 
         Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = entry.senderName,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = color
+            )
+
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = entry.senderName,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = color
-                )
-                Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     text = timeFormatter.format(Date(entry.timestamp)),
                     fontSize = 11.sp,
                     color = TextMuted
                 )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = entry.durationText,
+                    fontSize = 11.sp,
+                    color = TextGray
+                )
             }
-
-            Spacer(modifier = Modifier.height(2.dp))
-
-            Text(
-                text = entry.text,
-                fontSize = 14.sp,
-                color = TextWhite
-            )
         }
 
-        // Replay button — only shown if audio is still in cache
+        // Replay button
         if (entry.utteranceId >= 0) {
             IconButton(
                 onClick = { SassyTalkNative.replayById(entry.utteranceId) },
