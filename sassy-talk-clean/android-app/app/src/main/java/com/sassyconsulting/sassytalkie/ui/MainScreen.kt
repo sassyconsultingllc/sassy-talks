@@ -177,7 +177,7 @@ fun MainScreen(
                             onClick = { showMenu = false; onShowAbout() },
                             leadingIcon = { Icon(Icons.Default.Info, contentDescription = null, tint = Cyan, modifier = Modifier.size(20.dp)) }
                         )
-                        HorizontalDivider(color = SurfaceBg)
+                        Divider(color = SurfaceBg)
                         DropdownMenuItem(
                             text = { Text("End Session", color = Color(0xFFFF6B6B)) },
                             onClick = { showMenu = false; showEndSessionDialog = true },
