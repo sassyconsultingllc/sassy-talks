@@ -17,6 +17,9 @@ android {
         // Feature flag: enable or disable cellular (relay) transport at build time
         buildConfigField("boolean", "ENABLE_CELLULAR_RELAY", "true")
 
+        // Feature flag: block screenshots and screen recording via FLAG_SECURE
+        buildConfigField("boolean", "NO_SCREENSHOTS", "true")
+
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }

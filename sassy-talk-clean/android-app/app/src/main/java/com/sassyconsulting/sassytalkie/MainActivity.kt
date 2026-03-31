@@ -92,10 +92,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         // Block screenshots, screen recording, and app preview in recent apps
-        window.setFlags(
-            WindowManager.LayoutParams.FLAG_SECURE,
-            WindowManager.LayoutParams.FLAG_SECURE
-        )
+        if (BuildConfig.NO_SCREENSHOTS) {
+            window.setFlags(
+                WindowManager.LayoutParams.FLAG_SECURE,
+                WindowManager.LayoutParams.FLAG_SECURE
+            )
+        }
 
         setContent {
             SassyTalkTheme {
