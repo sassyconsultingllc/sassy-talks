@@ -32,8 +32,10 @@ fn next_utterance_id() -> u64 {
     NEXT_UTTERANCE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// How long silence before we consider a speaker "done talking"
-const SPEECH_GAP_MS: u64 = 400;
+/// How long silence before we consider a speaker "done talking".
+/// 800ms accommodates relay jitter (100-500ms variance) without
+/// fragmenting utterances mid-sentence.
+const SPEECH_GAP_MS: u64 = 800;
 
 /// Maximum cached frames per speaker (prevents memory bloat)
 /// At 20ms/frame, 500 frames = 10 seconds of audio per speaker
@@ -352,11 +354,11 @@ impl AudioCache {
             self.mode = CacheMode::Live;
         }
 
-        // Enforce queue size limit
+        // Enforce queue size limit — drop oldest (front) to make room for newer speech
         while self.playback_queue.len() > MAX_QUEUED_UTTERANCES {
-            let dropped = self.playback_queue.pop_back();
+            let dropped = self.playback_queue.pop_front();
             if let Some(u) = dropped {
-                warn!("AudioCache: dropping oldest utterance from {} (queue full)", u.sender_name);
+                warn!("AudioCache: dropping oldest utterance from {} (queue full, {} queued)", u.sender_name, self.playback_queue.len());
             }
         }
     }

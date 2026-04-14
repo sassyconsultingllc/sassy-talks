@@ -14,8 +14,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use log::{info, warn, error};
 
-/// Max queued packets before dropping oldest
-const MAX_QUEUE_SIZE: usize = 64;
+/// Max queued packets before dropping oldest.
+/// 128 packets × 20ms = 2.56 seconds of audio buffer — enough to absorb
+/// relay jitter spikes without dropping frames during normal speech.
+const MAX_QUEUE_SIZE: usize = 128;
 
 /// Max single packet size (encrypted audio frame + overhead)
 const MAX_PACKET_SIZE: usize = 1500;
@@ -49,8 +51,14 @@ impl PacketQueue {
         let mut q = self.inner.lock().unwrap();
         if q.len() >= MAX_QUEUE_SIZE {
             q.pop_front(); // Drop oldest to prevent unbounded growth
+            log::warn!("PacketQueue: FULL ({} packets), dropped oldest frame — relay may be congested", MAX_QUEUE_SIZE);
         }
         q.push_back(data);
+    }
+
+    /// Returns true if queue is more than half full (backpressure signal).
+    pub fn is_congested(&self) -> bool {
+        self.inner.lock().unwrap().len() > MAX_QUEUE_SIZE / 2
     }
 
     /// Pop a packet (FIFO). Returns None if empty.
@@ -169,6 +177,12 @@ impl CellularTransport {
     /// Poll outbound queue — called by Kotlin to get next packet to send
     pub fn poll_outbound(&self) -> Option<Vec<u8>> {
         self.outbound.pop()
+    }
+
+    /// Returns true if the outbound queue is more than half full.
+    /// Used by TransportManager to skip dual-path sends under congestion.
+    pub fn is_outbound_congested(&self) -> bool {
+        self.outbound.is_congested()
     }
 
     // ── Called by TransportManager (audio pipeline) ──
