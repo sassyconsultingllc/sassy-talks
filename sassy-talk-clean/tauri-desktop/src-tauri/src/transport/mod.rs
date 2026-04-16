@@ -10,6 +10,7 @@
 /// 
 /// Copyright 2025 Sassy Consulting LLC. All rights reserved.
 
+pub mod control;
 pub mod discovery;
 pub mod manager;
 
