@@ -9,14 +9,16 @@
 /// Copyright 2025 Sassy Consulting LLC. All rights reserved.
 
 use super::{TransportError, MAX_PACKET_SIZE, PEER_TIMEOUT_SECS};
+use super::liveness::LivenessTracker;
+use super::control;
 use crate::constants::{DEFAULT_MULTICAST_ADDR, DEFAULT_MULTICAST_PORT, PORT_RANGE_START, PORT_RANGE_END, KEEPALIVE_INTERVAL_SECS};
 use crate::protocol::{Packet, PacketType};
 use crate::security::CryptoEngine;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use tokio::sync::mpsc;
 use tokio::time;
@@ -115,10 +117,19 @@ pub struct TransportManager {
     
     // Control
     running: Arc<AtomicBool>,
-    
+
     // Channels for audio data
     audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     audio_rx: Arc<RwLock<Option<mpsc::UnboundedReceiver<Vec<u8>>>>>,
+
+    // Liveness tracking
+    liveness: Arc<Mutex<LivenessTracker>>,
+
+    // Session epoch (generated once at start, used in heartbeats)
+    session_epoch: u64,
+
+    // Heartbeat sequence counter
+    heartbeat_seq: Arc<AtomicU32>,
 }
 
 impl TransportManager {
@@ -187,7 +198,10 @@ impl TransportManager {
         // Generate our keypair for encryption
         let mut crypto = CryptoEngine::new();
         let our_public = crypto.generate_keypair();
-        
+
+        // Generate session epoch once for this run
+        let session_epoch = control::new_session_epoch();
+
         Ok(Self {
             socket: Arc::new(socket),
             multicast_addr,
@@ -202,6 +216,9 @@ impl TransportManager {
             running: Arc::new(AtomicBool::new(false)),
             audio_tx,
             audio_rx: Arc::new(RwLock::new(Some(audio_rx))),
+            liveness: Arc::new(Mutex::new(LivenessTracker::new())),
+            session_epoch,
+            heartbeat_seq: Arc::new(AtomicU32::new(0)),
         })
     }
     
@@ -296,6 +313,48 @@ impl TransportManager {
             }
         });
         
+        // Start heartbeat emit loop (every 2 seconds)
+        let socket_hb = Arc::clone(&self.socket);
+        let multicast_addr_hb = self.multicast_addr;
+        let running_hb = Arc::clone(&self.running);
+        let liveness_hb = Arc::clone(&self.liveness);
+        let hb_seq = Arc::clone(&self.heartbeat_seq);
+        let hb_epoch = self.session_epoch;
+        let device_id_hb = self.device_id;
+
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(2));
+            let peer_key = format!("{:08X}", device_id_hb);
+
+            while running_hb.load(Ordering::Relaxed) {
+                interval.tick().await;
+
+                let seq = hb_seq.fetch_add(1, Ordering::Relaxed);
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+
+                // Record that we sent this heartbeat (for RTT calculation when echoed back)
+                liveness_hb.lock().unwrap()
+                    .on_heartbeat_sent(&peer_key, hb_epoch, seq, now_ms);
+
+                let frame = control::encode_heartbeat(
+                    hb_epoch,
+                    seq,
+                    now_ms,
+                    control::PresenceState::Idle,
+                    0,
+                );
+
+                if let Err(e) = socket_hb.send_to(&frame, &multicast_addr_hb.into()) {
+                    warn!("Failed to send heartbeat: {}", e);
+                } else {
+                    debug!("Sent heartbeat seq={} epoch={:#x}", seq, hb_epoch);
+                }
+            }
+        });
+
         // Start receive loop
         let socket_rx = Arc::clone(&self.socket);
         let peers = Arc::clone(&self.peers);
@@ -305,6 +364,7 @@ impl TransportManager {
         let running_rx = Arc::clone(&self.running);
         let device_id_rx = self.device_id;
         let config = Arc::clone(&self.config);
+        let liveness_rx = Arc::clone(&self.liveness);
         
         tokio::spawn(async move {
             let mut buf = vec![std::mem::MaybeUninit::<u8>::uninit(); MAX_PACKET_SIZE];
@@ -316,6 +376,35 @@ impl TransportManager {
                         let received = unsafe {
                             std::slice::from_raw_parts(buf.as_ptr() as *const u8, size)
                         };
+
+                        // Control frames have first byte >= 0x10; handle before Packet deserialize
+                        if received.first().copied().unwrap_or(0) >= 0x10 {
+                            let decoded = control::decode(received);
+                            if decoded.opcode == control::OP_HEARTBEAT {
+                                if let Some(hb) = control::parse_heartbeat(&decoded.payload) {
+                                    let now_ms = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as u64;
+                                    let peer_key = src_addr
+                                        .as_socket()
+                                        .map(|a| a.to_string())
+                                        .unwrap_or_else(|| "unknown".to_string());
+                                    liveness_rx.lock().unwrap().on_heartbeat(
+                                        &peer_key,
+                                        hb.epoch,
+                                        hb.seq,
+                                        hb.ts_ms,
+                                        now_ms,
+                                        hb.state.as_byte(),
+                                    );
+                                    debug!("Received heartbeat from {} seq={} epoch={:#x}",
+                                           peer_key, hb.seq, hb.epoch);
+                                }
+                            }
+                            continue;
+                        }
+
                         if let Ok(packet) = Packet::deserialize(received) {
                             // Ignore own packets
                             if packet.device_id == device_id_rx {

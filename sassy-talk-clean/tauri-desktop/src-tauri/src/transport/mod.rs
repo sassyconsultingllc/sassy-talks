@@ -12,6 +12,7 @@
 
 pub mod control;
 pub mod discovery;
+pub mod liveness;
 pub mod manager;
 
 pub use manager::{TransportManager, PeerInfo, TransportConfig};
