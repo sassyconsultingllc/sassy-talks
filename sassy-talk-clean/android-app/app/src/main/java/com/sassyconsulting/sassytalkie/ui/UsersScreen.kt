@@ -22,13 +22,16 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import com.sassyconsulting.sassytalkie.PresenceState
 import com.sassyconsulting.sassytalkie.SassyTalkNative
+import com.sassyconsulting.sassytalkie.WalkieService
 import com.sassyconsulting.sassytalkie.ui.theme.*
 
 @Composable
 fun UsersScreen(
     onBack: () -> Unit,
-    onEditProfile: () -> Unit = {}
+    onEditProfile: () -> Unit = {},
+    walkieService: WalkieService? = null
 ) {
     val context = LocalContext.current
     var users by remember { mutableStateOf(SassyTalkNative.getUsers()) }
@@ -158,8 +161,11 @@ fun UsersScreen(
                         )
                     }
                     items(favorites) { user ->
+                        val liveness = walkieService?.pttCoordinator?.liveness
                         UserCard(
                             user = user,
+                            presenceState = liveness?.presence(user.id) ?: PresenceState.IDLE,
+                            rttMs = liveness?.rttMs(user.id) ?: -1,
                             onToggleMute = {
                                 SassyTalkNative.setUserMuted(user.id, !user.isMuted)
                                 users = SassyTalkNative.getUsers()
@@ -184,8 +190,11 @@ fun UsersScreen(
                         )
                     }
                     items(others) { user ->
+                        val liveness = walkieService?.pttCoordinator?.liveness
                         UserCard(
                             user = user,
+                            presenceState = liveness?.presence(user.id) ?: PresenceState.IDLE,
+                            rttMs = liveness?.rttMs(user.id) ?: -1,
                             onToggleMute = {
                                 SassyTalkNative.setUserMuted(user.id, !user.isMuted)
                                 users = SassyTalkNative.getUsers()
@@ -285,6 +294,8 @@ private fun SectionHeader(
 @Composable
 private fun UserCard(
     user: SassyTalkNative.UserInfo,
+    presenceState: PresenceState = PresenceState.IDLE,
+    rttMs: Int = -1,
     onToggleMute: () -> Unit,
     onToggleFavorite: () -> Unit
 ) {
@@ -331,6 +342,9 @@ private fun UserCard(
                 )
                 if (isMuted) {
                     Text(text = "Muted", fontSize = 12.sp, color = StatusDisconnected)
+                } else {
+                    Spacer(modifier = Modifier.height(2.dp))
+                    PresenceChip(state = presenceState, rttMs = rttMs)
                 }
             }
 
@@ -352,5 +366,50 @@ private fun UserCard(
                 )
             }
         }
+    }
+}
+
+/**
+ * Small presence indicator chip showing the peer's current PresenceState and RTT.
+ *
+ * Visual spec:
+ *   LISTENING   -> green dot  + "Listening"
+ *   SPEAKING    -> blue dot   + "Speaking"
+ *   MUTED       -> orange dot + "Muted"
+ *   AWAY        -> gray dot   + "Away"
+ *   BACKGROUNDED -> gray dot  + "Background"
+ *   DND         -> purple dot + "DND"
+ *   IDLE        -> gray dot   + "Idle"
+ *
+ * If rttMs is in 1..999 an RTT label is appended (e.g. "42 ms").
+ */
+@Composable
+fun PresenceChip(state: PresenceState, rttMs: Int) {
+    val (dotColor, label) = when (state) {
+        PresenceState.LISTENING    -> Green  to "Listening"
+        PresenceState.SPEAKING     -> Color(0xFF2979FF) to "Speaking"
+        PresenceState.MUTED        -> Orange to "Muted"
+        PresenceState.AWAY         -> TextMuted to "Away"
+        PresenceState.BACKGROUNDED -> TextMuted to "Background"
+        PresenceState.DND          -> Purple to "DND"
+        PresenceState.IDLE         -> TextMuted to "Idle"
+    }
+
+    val rttLabel = if (rttMs in 1..999) "  ${rttMs} ms" else ""
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            modifier = Modifier
+                .size(7.dp)
+                .clip(CircleShape)
+                .background(dotColor)
+        )
+        Spacer(modifier = Modifier.width(4.dp))
+        Text(
+            text = "$label$rttLabel",
+            fontSize = 11.sp,
+            color = dotColor,
+            fontWeight = FontWeight.Normal
+        )
     }
 }

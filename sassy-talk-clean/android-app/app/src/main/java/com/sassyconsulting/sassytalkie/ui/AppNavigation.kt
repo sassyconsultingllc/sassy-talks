@@ -248,9 +248,10 @@ fun AppNavigation(
         )
         Screen.Users -> UsersScreen(
             onBack = { currentScreen = Screen.Main },
-            onEditProfile = { currentScreen = Screen.Profile }
+            onEditProfile = { currentScreen = Screen.Profile },
+            walkieService = walkieService
         )
-        Screen.Activity -> ActivityFeedScreen(
+        Screen.Activity -> TranscriptionFeedScreen(
             entries = TranscriptionBridge.entries.collectAsState().value,
             onBack = { currentScreen = Screen.Main }
         )
