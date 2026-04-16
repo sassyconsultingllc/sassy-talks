@@ -116,6 +116,9 @@ class PttCoordinator(
     /** Timestamp (ms) when the probe frame was sent; 0 means no probe in-flight. */
     @Volatile private var probeSentMs = 0L
 
+    /** Timeout job for in-flight probe — cancelled when echo arrives. */
+    private var probeTimeoutJob: Job? = null
+
     // —— Stale-peer banner (Task 6.2) ——
 
     /** True when at least one connected peer has health == STALE. */
@@ -302,13 +305,13 @@ class PttCoordinator(
         probeSentMs = System.currentTimeMillis()
         audioPathDegraded.value = false
         Log.d(TAG, "Probe sent at $probeSentMs")
-        // Send through the same path as real audio
+        // Send through BLE only — probes must NOT go through the cellular relay
         btTransport.sendRaw(frame)
-        cellularClient?.sendBinary(frame)
         // Timeout check: if no echo within 800ms, mark degraded
-        scope.launch {
+        probeTimeoutJob?.cancel()
+        probeTimeoutJob = scope.launch {
             delay(800)
-            if (probeSentMs > 0 && System.currentTimeMillis() - probeSentMs >= 700) {
+            if (probeSentMs > 0) {
                 audioPathDegraded.value = true
                 probeSentMs = 0
                 Log.w(TAG, "Probe timeout — audioPathDegraded=true")
@@ -326,21 +329,23 @@ class PttCoordinator(
     fun onAudioFrameV2(peerId: String, decoded: AudioV2Decoded) {
         when {
             decoded.epoch == PROBE_EPOCH && decoded.seq == PROBE_SEQ -> {
-                // We are the receiver — echo it back
-                Log.d(TAG, "Probe received from $peerId — echoing back")
+                // We are the receiver — echo back via BLE only, NOT the relay
+                Log.d(TAG, "Probe received from $peerId — echoing back via BLE")
                 val echoFrame = AudioFrameV2.encode(PROBE_EPOCH, PROBE_ECHO_SEQ, ByteArray(0))
                 btTransport.sendRaw(echoFrame)
-                cellularClient?.sendBinary(echoFrame)
             }
             decoded.epoch == PROBE_EPOCH && decoded.seq == PROBE_ECHO_SEQ -> {
-                // We are the sender — measure RTT
-                val sentMs = probeSentMs
-                if (sentMs > 0) {
-                    val rtt = System.currentTimeMillis() - sentMs
-                    audioPathDegraded.value = rtt > 400
-                    probeSentMs = 0
-                    Log.d(TAG, "Probe echo RTT=${rtt}ms → degraded=${audioPathDegraded.value}")
+                // We are the sender — measure RTT (drop if no probe in flight)
+                if (probeSentMs == 0L) {
+                    Log.w(TAG, "Spurious probe echo from $peerId — no probe in flight, dropping")
+                    return
                 }
+                val rtt = System.currentTimeMillis() - probeSentMs
+                probeSentMs = 0
+                probeTimeoutJob?.cancel()
+                probeTimeoutJob = null
+                audioPathDegraded.value = rtt > 400
+                Log.d(TAG, "Probe echo RTT=${rtt}ms → degraded=${audioPathDegraded.value}")
             }
             else -> {
                 // Normal audio frame — update RECV_ACK tracking
@@ -366,6 +371,7 @@ class PttCoordinator(
 
     override fun onPttStopReceived(deviceAddress: String) {
         Log.i(TAG, "\u2190 PTT_STOP from $deviceAddress")
+        stopRecvAckJob()
         // Clear peer speaking indicator (Task 6.2)
         setPeerSpeaking(false)
         // TODO: Play roger beep
@@ -483,7 +489,7 @@ class PttCoordinator(
      */
     fun onControlFrame(peerId: String, bytes: ByteArray) {
         if (bytes.isEmpty()) return
-        val frame = ControlFrame.decode(bytes)
+        val frame = ControlFrame.decode(bytes) ?: return
 
         when (frame.opcode) {
             // Legacy opcodes — delegate to existing handler methods (Listener contract preserved)
@@ -610,6 +616,7 @@ class PttCoordinator(
      * Wait 300ms for jitter buffer to drain, then send EOT_ACK back.
      */
     private fun handlePttStopV2(peerId: String, payload: ByteArray) {
+        stopRecvAckJob()
         if (payload.size < 12) {
             Log.w(TAG, "PTT_STOP_V2 from $peerId: payload too short (${payload.size})")
             return
@@ -639,9 +646,14 @@ class PttCoordinator(
             return
         }
         val bb = java.nio.ByteBuffer.wrap(payload).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        val epoch = bb.long
-        val upToSeq = bb.int
-        Log.d(TAG, "EOT_ACK from $peerId epoch=$epoch upToSeq=$upToSeq → Delivered")
+        val ackEpoch = bb.long
+        val ackSeq = bb.int
+        val expectedEpoch = if (lastTxEpoch != 0L) lastTxEpoch else selfEpoch
+        if (ackEpoch != expectedEpoch || ackSeq < lastTxSeq) {
+            Log.w(TAG, "Stale/spoofed EOT_ACK: epoch=$ackEpoch seq=$ackSeq, expected epoch=$expectedEpoch seq>=$lastTxSeq")
+            return
+        }
+        Log.d(TAG, "EOT_ACK from $peerId epoch=$ackEpoch upToSeq=$ackSeq → Delivered")
         eotTimeoutJob?.cancel()
         deliveredState.value = DeliveryState.Delivered
         deliveredResetJob?.cancel()
@@ -728,6 +740,8 @@ class PttCoordinator(
         _reachingPeer.value = false
         audioPathDegraded.value = false
         probeSentMs = 0
+        probeTimeoutJob?.cancel()
+        probeTimeoutJob = null
         eotTimeoutJob?.cancel()
         deliveredResetJob?.cancel()
         deliveredState.value = DeliveryState.Idle
