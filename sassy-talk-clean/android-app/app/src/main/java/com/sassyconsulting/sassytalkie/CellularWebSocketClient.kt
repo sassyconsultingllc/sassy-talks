@@ -23,12 +23,12 @@ class CellularWebSocketClient {
     companion object {
         private const val TAG = "CellularWS"
         private const val POLL_INTERVAL_MS = 5L  // Poll outbound queue every 5ms (200 fps)
-        private const val PING_INTERVAL_MS = 25_000L
+        private const val PING_INTERVAL_SEC = 15L
     }
 
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)   // No timeout for WebSocket
-        .pingInterval(PING_INTERVAL_MS, TimeUnit.MILLISECONDS)
+        .pingInterval(PING_INTERVAL_SEC, TimeUnit.SECONDS)
         .build()
 
     private var webSocket: WebSocket? = null
@@ -38,6 +38,9 @@ class CellularWebSocketClient {
 
     /** Callback for DO readiness confirmation. */
     var onRelayReady: (() -> Unit)? = null
+
+    /** PttCoordinator to route binary control frames (opcodes 0x10–0x1F). */
+    var pttCoordinator: PttCoordinator? = null
 
     /** Connect to the cellular relay. Room must be set first via SassyTalkNative.cellularSetRoom() */
     fun connect(): Boolean {
@@ -76,8 +79,14 @@ class CellularWebSocketClient {
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                // Binary message = encrypted audio frame from relay
-                SassyTalkNative.cellularOnMessage(bytes.toByteArray())
+                val raw = bytes.toByteArray()
+                // Binary control frames have first byte in 0x10..0x1F — route to PttCoordinator
+                if (raw.isNotEmpty() && (raw[0].toInt() and 0xFF) in 0x10..0x1F) {
+                    pttCoordinator?.onControlFrame("relay", raw)
+                    return
+                }
+                // Otherwise treat as encrypted audio frame
+                SassyTalkNative.cellularOnMessage(raw)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -104,6 +113,12 @@ class CellularWebSocketClient {
                 Log.e(TAG, "WebSocket failure: ${t.message}")
                 SassyTalkNative.cellularOnError(t.message ?: "unknown error")
                 onDisconnected("failure: ${t.message}")
+                // Attempt reconnect after a brief delay
+                Thread {
+                    try { Thread.sleep(3_000) } catch (_: InterruptedException) { return@Thread }
+                    Log.i(TAG, "Reconnecting after failure…")
+                    connect()
+                }.also { it.isDaemon = true; it.start() }
             }
         })
 
@@ -160,6 +175,11 @@ class CellularWebSocketClient {
             stopOutboundPump()
             SassyTalkNative.cellularOnDisconnected(reason)
         }
+    }
+
+    /** Send a raw binary frame via the WebSocket relay. */
+    fun sendBinary(bytes: ByteArray) {
+        webSocket?.send(ByteString.of(*bytes))
     }
 
     /** Send a heartbeat ping to the relay (JSON control message) */

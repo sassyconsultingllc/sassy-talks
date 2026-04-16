@@ -38,6 +38,9 @@ class PttCoordinator(
     private val btTransport: BluetoothTransport
 ) : BleSignalingService.Listener {
 
+    /** Optional cellular relay client — set after construction when relay connects. */
+    var cellularClient: CellularWebSocketClient? = null
+
     companion object {
         private const val TAG = "PTT.Coord"
         private const val READY_ACK_TIMEOUT_MS = 200L
@@ -174,7 +177,8 @@ class PttCoordinator(
                     liveness.onHeartbeatSent(peerId, selfEpoch, seq, nowMs)
                 }
                 bleSignaling.broadcastControl(frame)
-                Log.d(TAG, "HB seq=$seq broadcast to ${bleSignaling.blePeerCount} peers")
+                cellularClient?.sendBinary(frame)
+                Log.d(TAG, "HB seq=$seq broadcast to ${bleSignaling.blePeerCount} peers (relay=${cellularClient != null})")
                 delay(HEARTBEAT_INTERVAL_MS)
             }
         }
@@ -222,6 +226,17 @@ class PttCoordinator(
             // New TLV opcodes
             ControlFrame.OP_HEARTBEAT -> handleHeartbeat(peerId, frame.payload)
             ControlFrame.OP_CAPABILITIES -> handleCapabilities(peerId, frame.payload)
+            ControlFrame.OP_PARTNER_OFFLINE -> {
+                if (frame.payload.isNotEmpty()) {
+                    val idLen = frame.payload[0].toInt() and 0xFF
+                    if (frame.payload.size >= 1 + idLen) {
+                        val offlinePeerId = String(frame.payload, 1, idLen, Charsets.UTF_8)
+                        liveness.removePeer(offlinePeerId)
+                        // Will be surfaced to UI in a later task
+                        android.util.Log.w("PttCoord", "Partner offline: $offlinePeerId")
+                    }
+                }
+            }
 
             else -> {
                 // Future opcodes — no-op for now
