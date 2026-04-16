@@ -700,6 +700,36 @@ impl TransportManager {
     pub fn get_public_key(&self) -> Option<String> {
         self.our_public_key.read().unwrap().map(|k| hex::encode(k))
     }
+
+    /// Get connection quality for each known peer.
+    /// Returns a vec of (peer_id_hex, health_str, rtt_ms_option, transport_str).
+    pub fn get_connection_quality(&self) -> Vec<(String, String, Option<u32>, String)> {
+        let peers = self.peers.read().unwrap();
+        let liveness = self.liveness.lock().unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        peers.values()
+            .filter(|p| p.is_active())
+            .map(|p| {
+                // Liveness is keyed by socket address string
+                let addr_key = p.address.to_string();
+                let health = match liveness.health(&addr_key, now_ms) {
+                    super::liveness::PeerHealth::Healthy  => "healthy",
+                    super::liveness::PeerHealth::Degraded => "degraded",
+                    super::liveness::PeerHealth::Stale    => "stale",
+                };
+                let rtt = liveness.rtt_ms(&addr_key);
+                let peer_id_hex = format!("{:08X}", p.device_id);
+                // All peers on desktop are reached via UDP multicast
+                let transport = "UDP".to_string();
+                (peer_id_hex, health.to_string(), rtt, transport)
+            })
+            .collect()
+    }
 }
 
 impl Drop for TransportManager {

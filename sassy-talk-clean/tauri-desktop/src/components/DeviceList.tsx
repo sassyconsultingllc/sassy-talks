@@ -1,5 +1,6 @@
 import './DeviceList.css';
 import { IconLobby } from './Icons';
+import { ConnectionBadge } from './ConnectionBadge';
 import type { PeerInfo } from '../types';
 
 interface DeviceListProps {
@@ -46,7 +47,10 @@ function DeviceList({ peers, currentChannel }: DeviceListProps) {
               {activePeers.map(peer => (
                 <div key={peer.device_id} className="device-item active">
                   <div className="device-info">
-                    <div className="device-name">{peer.device_name}</div>
+                    <div className="device-name">
+                      {peer.device_name}
+                      <ConnectionBadge peerId={formatDeviceId(peer.device_id)} />
+                    </div>
                     <div className="device-details">
                       ID: {formatDeviceId(peer.device_id)} • CH {peer.channel}
                     </div>
@@ -66,7 +70,10 @@ function DeviceList({ peers, currentChannel }: DeviceListProps) {
               {otherPeers.map(peer => (
                 <div key={peer.device_id} className="device-item">
                   <div className="device-info">
-                    <div className="device-name">{peer.device_name}</div>
+                    <div className="device-name">
+                      {peer.device_name}
+                      <ConnectionBadge peerId={formatDeviceId(peer.device_id)} />
+                    </div>
                     <div className="device-details">
                       ID: {formatDeviceId(peer.device_id)} • CH {peer.channel}
                     </div>

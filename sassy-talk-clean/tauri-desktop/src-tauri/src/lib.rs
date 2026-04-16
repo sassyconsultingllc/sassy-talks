@@ -546,4 +546,10 @@ impl AppState {
         let transport = self.transport.lock().await;
         transport.get_public_key()
     }
+
+    /// Get connection quality per peer
+    pub async fn get_connection_quality(&self) -> Vec<(String, String, Option<u32>, String)> {
+        let transport = self.transport.lock().await;
+        transport.get_connection_quality()
+    }
 }

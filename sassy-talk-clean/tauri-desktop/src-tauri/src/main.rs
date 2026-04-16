@@ -138,6 +138,8 @@ fn main() {
             commands::get_network_info,
             commands::set_encryption_enabled,
             commands::set_random_port_enabled,
+            // Connection quality (Task 6.1)
+            commands::get_connection_quality,
         ])
         .setup(|_app| {
             info!("Sassy-Talk setup complete");

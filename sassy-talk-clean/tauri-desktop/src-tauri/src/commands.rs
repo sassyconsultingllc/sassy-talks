@@ -363,3 +363,13 @@ pub async fn set_random_port_enabled(
     state.set_transport_config(config).await;
     Ok(())
 }
+
+/// Connection quality entry: (peer_id_hex, health, rtt_ms_option, transport)
+/// Health: "healthy" | "degraded" | "stale"
+/// Transport: "UDP" | "BLE" | "Relay"
+#[tauri::command]
+pub async fn get_connection_quality(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<(String, String, Option<u32>, String)>, String> {
+    Ok(state.get_connection_quality().await)
+}
