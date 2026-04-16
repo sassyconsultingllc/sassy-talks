@@ -12,13 +12,11 @@ android {
         minSdk = 24
         targetSdk = 35
         versionCode = 4
-        versionName = "1.1.0"
+        versionName = "1.0.0"
         
         // Feature flag: enable or disable cellular (relay) transport at build time
         buildConfigField("boolean", "ENABLE_CELLULAR_RELAY", "true")
-
-        // Feature flag: block screenshots and screen recording via FLAG_SECURE
-        buildConfigField("boolean", "NO_SCREENSHOTS", "true")
+        buildConfigField("boolean", "NO_SCREENSHOTS", "false")
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
@@ -113,5 +111,7 @@ dependencies {
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    testImplementation("junit:junit:4.13.2")
 }
 
