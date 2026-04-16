@@ -99,6 +99,13 @@ class BluetoothTransport(private val context: Context) {
     var audioFrameCallback: ((peerId: String, epoch: Long, seq: Int) -> Unit)? = null
 
     /**
+     * Optional callback invoked whenever a V2 audio frame is received, with full decoded frame.
+     * Called on the RX thread with (peerId, decoded).
+     * Used by PttCoordinator for probe detection (Task 7.1).
+     */
+    var audioFrameV2Callback: ((peerId: String, decoded: com.sassyconsulting.sassytalkie.AudioV2Decoded) -> Unit)? = null
+
+    /**
      * Optional callback invoked whenever a V2 audio frame is successfully transmitted.
      * Called on the TX pump thread with (epoch, seq).
      * Used by PttCoordinator to track lastTxSeq for PTT_STOP_V2 / EOT_ACK.
@@ -278,6 +285,28 @@ class BluetoothTransport(private val context: Context) {
         txPumpRunning.set(false)
     }
 
+    /**
+     * Send a raw byte array directly to all connected peers (no length prefix added).
+     * The caller is responsible for including any required framing.
+     * Used by probe/heartbeat paths that pre-build the full wire frame.
+     */
+    fun sendRaw(frame: ByteArray) {
+        val deadPeers = mutableListOf<String>()
+        for ((addr, peer) in connectedPeers) {
+            try {
+                synchronized(peer.output) {
+                    peer.output.write(frame)
+                    peer.output.flush()
+                }
+                peer.lastActivity = System.currentTimeMillis()
+            } catch (e: IOException) {
+                Log.w(TAG, "sendRaw write failed for ${peer.device.name}: ${e.message}")
+                deadPeers.add(addr)
+            }
+        }
+        deadPeers.forEach { removePeer(it) }
+    }
+
     /** Disconnect all peers and stop */
     fun shutdown() {
         Log.i(TAG, "Shutting down BluetoothTransport")
@@ -392,16 +421,25 @@ class BluetoothTransport(private val context: Context) {
                         continue
                     }
 
-                    // Audio frame — pass to Rust for decoding and playback
-                    SassyTalkNative.btDecodeFrame(payload)
-
-                    // If it's a V2 frame, notify PttCoordinator for RECV_ACK tracking
-                    val cb = audioFrameCallback
-                    if (cb != null && AudioFrameV2.isV2(payload)) {
-                        AudioFrameV2.decode(payload)?.let { frame ->
-                            cb(peer.device.address, frame.epoch, frame.seq)
+                    // If it's a V2 frame, check for probe marker before passing to Rust
+                    if (AudioFrameV2.isV2(payload)) {
+                        val frame = AudioFrameV2.decode(payload)
+                        if (frame != null) {
+                            // Fire full-frame callback (probe detection / RECV_ACK)
+                            audioFrameV2Callback?.invoke(peer.device.address, frame)
+                            // Also fire legacy seq-only callback for RECV_ACK
+                            audioFrameCallback?.invoke(peer.device.address, frame.epoch, frame.seq)
+                            // Only pass non-probe frames to Rust for playback
+                            val isProbe = frame.epoch == -1L && (frame.seq == -1 || frame.seq == -2)
+                            if (!isProbe) {
+                                SassyTalkNative.btDecodeFrame(payload)
+                            }
+                            continue
                         }
                     }
+
+                    // Audio frame — pass to Rust for decoding and playback
+                    SassyTalkNative.btDecodeFrame(payload)
                 }
             } catch (e: IOException) {
                 if (running.get()) {
