@@ -8,6 +8,7 @@ import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.util.Log
+import com.sassyconsulting.sassytalkie.AudioFrameV2
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import java.io.IOException
 import java.io.InputStream
@@ -89,6 +90,13 @@ class BluetoothTransport(private val context: Context) {
     val isConnected: Boolean get() = connectedPeers.isNotEmpty()
     val connectedPeerCount: Int get() = peerCount.get()
     val peerNames: List<String> get() = connectedPeers.values.map { it.device.name ?: it.device.address }
+
+    /**
+     * Optional callback invoked whenever a V2 audio frame is received.
+     * Called on the RX thread with (peerId, epoch, seq).
+     * Used by PttCoordinator to track lastRxEpoch/lastRxSeq for RECV_ACK.
+     */
+    var audioFrameCallback: ((peerId: String, epoch: Long, seq: Int) -> Unit)? = null
 
     /** Check if we have an active RFCOMM connection to a specific device */
     fun isConnectedTo(address: String): Boolean = connectedPeers.containsKey(address)
@@ -373,6 +381,14 @@ class BluetoothTransport(private val context: Context) {
 
                     // Audio frame — pass to Rust for decoding and playback
                     SassyTalkNative.btDecodeFrame(payload)
+
+                    // If it's a V2 frame, notify PttCoordinator for RECV_ACK tracking
+                    val cb = audioFrameCallback
+                    if (cb != null && AudioFrameV2.isV2(payload)) {
+                        AudioFrameV2.decode(payload)?.let { frame ->
+                            cb(peer.device.address, frame.epoch, frame.seq)
+                        }
+                    }
                 }
             } catch (e: IOException) {
                 if (running.get()) {

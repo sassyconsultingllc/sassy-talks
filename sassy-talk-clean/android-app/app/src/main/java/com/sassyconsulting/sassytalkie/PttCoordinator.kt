@@ -2,6 +2,8 @@ package com.sassyconsulting.sassytalkie
 
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -65,6 +67,8 @@ class PttCoordinator(
         private const val TAG = "PTT.Coord"
         private const val READY_ACK_TIMEOUT_MS = 200L
         private const val HEARTBEAT_INTERVAL_MS = 2_000L
+        private const val RECV_ACK_INTERVAL_MS = 500L
+        private const val REACHING_PEER_TIMEOUT_MS = 1_000L
     }
 
     private val transmitting = AtomicBoolean(false)
@@ -78,6 +82,28 @@ class PttCoordinator(
     private var hbSeq = AtomicInteger(0)
     private var heartbeatJob: Job? = null
 
+    // —— RECV_ACK (Task 4.2) — Receiver side ——
+
+    /** Last received audio frame epoch (updated on each incoming audio frame). */
+    @Volatile private var lastRxEpoch: Long = 0L
+    /** Last received audio frame sequence number (updated on each incoming audio frame). */
+    @Volatile private var lastRxSeq: Int = 0
+    /** Peer that sent the most recent audio frame. */
+    @Volatile private var lastRxPeerId: String? = null
+    /** Coroutine job that sends RECV_ACK every 500ms while audio is arriving. */
+    private var recvAckJob: Job? = null
+
+    // —— Reaching-Peer indicator (Task 4.2) — Sender side ——
+
+    /** True while PTT is held and at least one RECV_ACK arrived within the last second. */
+    private val _reachingPeer = MutableStateFlow(false)
+    val reachingPeer = _reachingPeer.asStateFlow()
+
+    /** Timestamp (ms) of the most recent OP_RECV_ACK received from any peer. */
+    @Volatile private var lastAckMs: Long = 0L
+    /** Watchdog coroutine while PTT is held — clears reachingPeer if no ACK for 1s. */
+    private var watchdogJob: Job? = null
+
     /** Per-peer Capabilities we've received (keyed by peer device address). */
     private val peerCaps = ConcurrentHashMap<String, Capabilities>()
 
@@ -85,6 +111,8 @@ class PttCoordinator(
         bleSignaling.listener = this
         // Route raw control frames from BLE up to onControlFrame
         bleSignaling.controlFrameCallback = { peerId, bytes -> onControlFrame(peerId, bytes) }
+        // Track incoming audio frames for RECV_ACK (Task 4.2)
+        btTransport.audioFrameCallback = { peerId, epoch, seq -> onAudioFrameReceived(peerId, epoch, seq) }
         startHeartbeat()
     }
 
@@ -103,6 +131,11 @@ class PttCoordinator(
             transmitting.set(false)
             return
         }
+
+        // Reset reaching-peer state on press
+        _reachingPeer.value = false
+        lastAckMs = 0L
+        startWatchdog()
 
         // Step 1: BLE signal to all peers
         readyAckCount.set(0)
@@ -129,6 +162,10 @@ class PttCoordinator(
         if (!transmitting.getAndSet(false)) return
 
         Log.i(TAG, "PTT RELEASED")
+
+        // Stop watchdog and reset reaching-peer indicator
+        stopWatchdog()
+        _reachingPeer.value = false
 
         // Stop native audio
         SassyTalkNative.pttStop()
@@ -245,6 +282,7 @@ class PttCoordinator(
 
             // New TLV opcodes
             ControlFrame.OP_HEARTBEAT -> handleHeartbeat(peerId, frame.payload)
+            ControlFrame.OP_RECV_ACK -> handleRecvAck(peerId, frame.payload)
             ControlFrame.OP_CAPABILITIES -> handleCapabilities(peerId, frame.payload)
             ControlFrame.OP_PARTNER_OFFLINE -> {
                 if (frame.payload.isNotEmpty()) {
@@ -299,6 +337,81 @@ class PttCoordinator(
         bleSignaling.sendControl(peerId, echo)
     }
 
+    // —— RECV_ACK — Receiver side (Task 4.2) ——
+
+    /**
+     * Called by BluetoothTransport whenever a V2 audio frame arrives.
+     * Updates lastRxEpoch/lastRxSeq and (re)starts the 500ms RECV_ACK loop.
+     */
+    private fun onAudioFrameReceived(peerId: String, epoch: Long, seq: Int) {
+        lastRxEpoch = epoch
+        lastRxSeq = seq
+        lastRxPeerId = peerId
+        // Ensure the ACK loop is running
+        if (recvAckJob?.isActive != true) {
+            recvAckJob = scope.launch {
+                Log.d(TAG, "RECV_ACK loop started for $peerId epoch=$epoch")
+                while (isActive) {
+                    val ackEpoch = lastRxEpoch
+                    val ackSeq = lastRxSeq
+                    val ackPeer = lastRxPeerId ?: break
+                    val frame = ControlFrame.encodeRecvAck(ackEpoch, ackSeq, System.currentTimeMillis())
+                    bleSignaling.sendControl(ackPeer, frame)
+                    cellularClient?.sendBinary(frame)
+                    Log.d(TAG, "RECV_ACK sent epoch=$ackEpoch seq=$ackSeq to $ackPeer")
+                    delay(RECV_ACK_INTERVAL_MS)
+                }
+                Log.d(TAG, "RECV_ACK loop stopped")
+            }
+        }
+    }
+
+    /** Stop the RECV_ACK coroutine (called when PTT session ends). */
+    private fun stopRecvAckJob() {
+        recvAckJob?.cancel()
+        recvAckJob = null
+    }
+
+    // —— Reaching-Peer Watchdog — Sender side (Task 4.2) ——
+
+    /**
+     * Handle an incoming OP_RECV_ACK while we are transmitting.
+     * Sets reachingPeer = true and records the timestamp.
+     */
+    private fun handleRecvAck(peerId: String, payload: ByteArray) {
+        if (payload.size < 20) {
+            Log.w(TAG, "RECV_ACK from $peerId: payload too short (${payload.size})")
+            return
+        }
+        val (epoch, seq, tsMs) = ControlFrame.parseRecvAck(payload)
+        Log.d(TAG, "RECV_ACK from $peerId epoch=$epoch seq=$seq ts=$tsMs")
+        lastAckMs = System.currentTimeMillis()
+        _reachingPeer.value = true
+    }
+
+    /** Start the watchdog coroutine while PTT is held. */
+    private fun startWatchdog() {
+        watchdogJob?.cancel()
+        watchdogJob = scope.launch {
+            Log.d(TAG, "Reaching-peer watchdog started")
+            while (isActive) {
+                delay(200L)
+                val elapsed = System.currentTimeMillis() - lastAckMs
+                if (lastAckMs > 0L && elapsed > REACHING_PEER_TIMEOUT_MS) {
+                    _reachingPeer.value = false
+                    Log.d(TAG, "Reaching-peer: no ACK for ${elapsed}ms → false")
+                }
+            }
+        }
+    }
+
+    /** Stop the watchdog coroutine. */
+    private fun stopWatchdog() {
+        watchdogJob?.cancel()
+        watchdogJob = null
+        Log.d(TAG, "Reaching-peer watchdog stopped")
+    }
+
     private fun handleCapabilities(peerId: String, payload: ByteArray) {
         try {
             val caps = Capabilities.parse(payload)
@@ -330,6 +443,9 @@ class PttCoordinator(
 
     fun shutdown() {
         stopHeartbeat()
+        stopRecvAckJob()
+        stopWatchdog()
+        _reachingPeer.value = false
         scope.cancel()
         transmitting.set(false)
     }

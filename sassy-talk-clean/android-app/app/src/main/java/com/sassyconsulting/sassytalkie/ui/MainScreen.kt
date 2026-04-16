@@ -69,6 +69,10 @@ fun MainScreen(
     // Relay readiness
     val relayReady by autoConnect.relayReady.collectAsState()
 
+    // Reaching-peer indicator (Task 4.2)
+    val reachingPeer by (walkieService?.pttCoordinator?.reachingPeer
+        ?: kotlinx.coroutines.flow.MutableStateFlow(false)).collectAsState()
+
     // Auto-connect and set cache to queue mode (cache-first)
     LaunchedEffect(Unit) {
         if (connectState != ConnectState.CONNECTED) {
@@ -411,6 +415,29 @@ fun MainScreen(
                 }
             }
         )
+
+        // Reaching-peer indicator (Task 4.2) — shown only while transmitting
+        if (isTransmitting) {
+            Spacer(modifier = Modifier.height(12.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(10.dp)
+                        .clip(CircleShape)
+                        .background(if (reachingPeer) Color(0xFF4CAF50) else Color(0xFFFF5252))
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = if (reachingPeer) "Reaching peer" else "Not reaching",
+                    fontSize = 13.sp,
+                    color = if (reachingPeer) Color(0xFF4CAF50) else Color(0xFFFF5252)
+                )
+            }
+        }
 
         Spacer(modifier = Modifier.weight(1f))
 
