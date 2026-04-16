@@ -41,6 +41,26 @@ class PttCoordinator(
     /** Optional cellular relay client — set after construction when relay connects. */
     var cellularClient: CellularWebSocketClient? = null
 
+    /** Presence sensor — set after construction once a Context is available. */
+    lateinit var presenceSensor: PresenceSensor
+
+    private fun currentPresenceState(): PresenceState {
+        if (::presenceSensor.isInitialized) presenceSensor.refresh()
+        return if (::presenceSensor.isInitialized) presenceSensor.state.value else PresenceState.LISTENING
+    }
+
+    fun setMicMuted(muted: Boolean) {
+        if (::presenceSensor.isInitialized) {
+            presenceSensor.micMuted = muted
+            presenceSensor.refresh()
+        }
+        // Immediate heartbeat push
+        val now = System.currentTimeMillis()
+        val frame = ControlFrame.encodeHeartbeat(selfEpoch, hbSeq.getAndIncrement(), now, currentPresenceState(), 0)
+        bleSignaling.broadcastControl(frame)
+        cellularClient?.sendBinary(frame)
+    }
+
     companion object {
         private const val TAG = "PTT.Coord"
         private const val READY_ACK_TIMEOUT_MS = 200L
@@ -169,7 +189,7 @@ class PttCoordinator(
                     epoch  = selfEpoch,
                     seq    = seq,
                     tsMs   = nowMs,
-                    state  = PresenceState.IDLE,  // UI task will update presence later
+                    state  = currentPresenceState(),
                     rttMs  = 0,
                 )
                 // Track sent heartbeat for RTT measurement per peer
@@ -273,7 +293,7 @@ class PttCoordinator(
             epoch  = selfEpoch,
             seq    = hb.seq,      // echo same seq for RTT matching
             tsMs   = nowMs,
-            state  = PresenceState.IDLE,
+            state  = currentPresenceState(),
             rttMs  = rtt.coerceAtLeast(0),
         )
         bleSignaling.sendControl(peerId, echo)
