@@ -54,6 +54,13 @@ class BleSignalingService(
 
     var listener: Listener? = null
 
+    /**
+     * Raw-frame callback (Task 2.2). When set, every write received on the PTT characteristic
+     * (both legacy single-byte and new TLV frames) is forwarded here as (peerId, bytes).
+     * The existing [Listener] methods are still invoked for backward compatibility.
+     */
+    var controlFrameCallback: ((peerId: String, bytes: ByteArray) -> Unit)? = null
+
     private val advertising = AtomicBoolean(false)
     private val scanning = AtomicBoolean(false)
     private var gattServer: BluetoothGattServer? = null
@@ -124,18 +131,27 @@ class BleSignalingService(
             offset: Int, value: ByteArray?
         ) {
             if (characteristic.uuid == PTT_CHAR_UUID && value != null && value.isNotEmpty()) {
-                when (value[0]) {
-                    CMD_PTT_START -> {
-                        Log.i(TAG, "\u2190 PTT_START from ${device.name ?: device.address}")
-                        listener?.onPttStartReceived(device.address)
-                    }
-                    CMD_PTT_STOP -> {
-                        Log.i(TAG, "\u2190 PTT_STOP from ${device.name ?: device.address}")
-                        listener?.onPttStopReceived(device.address)
-                    }
-                    CMD_READY_ACK -> {
-                        Log.i(TAG, "\u2190 READY_ACK from ${device.name ?: device.address}")
-                        listener?.onReadyAckReceived(device.address)
+                // Route through the general control-frame dispatcher first (Task 2.2).
+                // The dispatcher handles legacy opcodes by calling the Listener methods,
+                // so we only fall back to direct Listener calls when no dispatcher is set.
+                val cb = controlFrameCallback
+                if (cb != null) {
+                    cb(device.address, value)
+                } else {
+                    // Legacy fallback — no dispatcher wired up yet
+                    when (value[0]) {
+                        CMD_PTT_START -> {
+                            Log.i(TAG, "\u2190 PTT_START from ${device.name ?: device.address}")
+                            listener?.onPttStartReceived(device.address)
+                        }
+                        CMD_PTT_STOP -> {
+                            Log.i(TAG, "\u2190 PTT_STOP from ${device.name ?: device.address}")
+                            listener?.onPttStopReceived(device.address)
+                        }
+                        CMD_READY_ACK -> {
+                            Log.i(TAG, "\u2190 READY_ACK from ${device.name ?: device.address}")
+                            listener?.onReadyAckReceived(device.address)
+                        }
                     }
                 }
             }
@@ -257,6 +273,45 @@ class BleSignalingService(
         sendCommandToPeer(deviceAddress, CMD_READY_ACK, "READY_ACK")
     }
 
+    // —— Task 2.2: multi-byte control frame send helpers ——
+
+    /**
+     * Broadcast an arbitrary TLV control frame to all connected BLE peers.
+     * Used by the heartbeat loop in PttCoordinator.
+     */
+    fun broadcastControl(bytes: ByteArray) {
+        val count = peerGattClients.size
+        Log.d(TAG, "\u2192 broadcastControl ${bytes.size}B to $count BLE peers")
+        for ((address, gatt) in peerGattClients) {
+            writeBytes(gatt, bytes, address)
+        }
+    }
+
+    /**
+     * Send an arbitrary TLV control frame to a single peer.
+     * Used for heartbeat echo and targeted Capabilities delivery.
+     */
+    fun sendControl(peerId: String, bytes: ByteArray) {
+        val gatt = peerGattClients[peerId]
+        if (gatt != null) {
+            writeBytes(gatt, bytes, peerId)
+        } else {
+            Log.w(TAG, "No GATT client for $peerId, cannot sendControl")
+        }
+    }
+
+    private fun writeBytes(gatt: BluetoothGatt, bytes: ByteArray, address: String) {
+        val service = gatt.getService(SERVICE_UUID)
+        val char = service?.getCharacteristic(PTT_CHAR_UUID)
+        if (char != null) {
+            char.value = bytes
+            val success = gatt.writeCharacteristic(char)
+            Log.d(TAG, "\u2192 writeBytes ${bytes.size}B to $address (success=$success)")
+        } else {
+            Log.w(TAG, "PTT char not found for $address in writeBytes")
+        }
+    }
+
     private fun broadcastCommand(cmd: Byte, label: String) {
         val count = peerGattClients.size
         Log.i(TAG, "\u2192 Broadcasting $label to $count BLE peers")
@@ -334,10 +389,17 @@ class BleSignalingService(
                 if (characteristic.uuid == PTT_CHAR_UUID) {
                     val value = characteristic.value
                     if (value != null && value.isNotEmpty()) {
-                        when (value[0]) {
-                            CMD_PTT_START -> listener?.onPttStartReceived(device.address)
-                            CMD_PTT_STOP -> listener?.onPttStopReceived(device.address)
-                            CMD_READY_ACK -> listener?.onReadyAckReceived(device.address)
+                        // Route through the general control-frame dispatcher (Task 2.2).
+                        val cb = controlFrameCallback
+                        if (cb != null) {
+                            cb(device.address, value)
+                        } else {
+                            // Legacy fallback
+                            when (value[0]) {
+                                CMD_PTT_START -> listener?.onPttStartReceived(device.address)
+                                CMD_PTT_STOP -> listener?.onPttStopReceived(device.address)
+                                CMD_READY_ACK -> listener?.onReadyAckReceived(device.address)
+                            }
                         }
                     }
                 }
@@ -349,6 +411,8 @@ class BleSignalingService(
 
     val blePeerCount: Int get() = connectedPeers.size
     val blePeers: List<BluetoothDevice> get() = connectedPeers.values.toList()
+    /** Set of device addresses for all currently-connected BLE peers. */
+    val blePeerAddresses: Set<String> get() = connectedPeers.keys.toSet()
 
     fun shutdown() {
         stopAdvertising()
