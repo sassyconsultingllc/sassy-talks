@@ -107,6 +107,7 @@ class PttCoordinator(
     val selfEpoch: Long = SessionEpoch.generate()
     private var hbSeq = AtomicInteger(0)
     private var heartbeatJob: Job? = null
+    private var staleCheckJob: Job? = null
 
     // —— Audio Path Probe (Task 7.1) ——
 
@@ -350,6 +351,7 @@ class PttCoordinator(
             else -> {
                 // Normal audio frame — update RECV_ACK tracking
                 lastRxSeq = decoded.seq
+                lastRxEpoch = decoded.epoch
             }
         }
     }
@@ -430,7 +432,6 @@ class PttCoordinator(
         if (heartbeatJob?.isActive == true) return
         heartbeatJob = scope.launch {
             Log.i(TAG, "Heartbeat loop started (epoch=$selfEpoch)")
-            var tickCount = 0
             while (isActive) {
                 val seq = hbSeq.getAndIncrement()
                 val nowMs = System.currentTimeMillis()
@@ -450,7 +451,6 @@ class PttCoordinator(
                 Log.d(TAG, "HB seq=$seq broadcast to ${bleSignaling.blePeerCount} peers (relay=${cellularClient != null})")
 
                 // Poll stale status every 1s (heartbeat fires every 2s, check every tick)
-                tickCount++
                 val peerIds = liveness.peerIds()
                 val stale = peerIds.isNotEmpty() && peerIds.any { liveness.health(it, nowMs) == PeerHealth.STALE }
                 if (anyPeerStale.value != stale) anyPeerStale.value = stale
@@ -459,7 +459,7 @@ class PttCoordinator(
             }
         }
         // Also run a 1s stale-check loop independent of the 2s heartbeat
-        scope.launch {
+        staleCheckJob = scope.launch {
             while (true) {
                 delay(1_000L)
                 val nowMs = System.currentTimeMillis()
@@ -473,6 +473,8 @@ class PttCoordinator(
     fun stopHeartbeat() {
         heartbeatJob?.cancel()
         heartbeatJob = null
+        staleCheckJob?.cancel()
+        staleCheckJob = null
         Log.i(TAG, "Heartbeat loop stopped")
     }
 

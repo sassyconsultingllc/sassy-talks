@@ -54,7 +54,11 @@
 
 # --- Kotlin coroutines ---
 -dontwarn kotlinx.coroutines.**
--keep class kotlinx.coroutines.** { *; }
+-keepnames class kotlinx.coroutines.internal.MainDispatcherFactory {}
+-keepnames class kotlinx.coroutines.CoroutineExceptionHandler {}
+-keepclassmembernames class kotlinx.coroutines.** {
+    volatile <fields>;
+}
 
 # --- OkHttp ---
 -dontwarn okhttp3.internal.platform.**

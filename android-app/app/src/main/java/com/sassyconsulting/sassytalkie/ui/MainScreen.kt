@@ -417,7 +417,7 @@ fun MainScreen(
             Spacer(modifier = Modifier.height(8.dp))
         }
 
-        val pttEnabled = connectState == ConnectState.CONNECTED && !anyPeerStale
+        val pttEnabled = connectState == ConnectState.CONNECTED
 
         PTTButton(
             isTransmitting = isTransmitting,

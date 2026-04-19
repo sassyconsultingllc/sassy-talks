@@ -396,27 +396,28 @@ impl TransportManager {
 
                         // Control frames have first byte >= 0x10; handle before Packet deserialize
                         if received.first().copied().unwrap_or(0) >= 0x10 {
-                            let decoded = control::decode(received);
-                            if decoded.opcode == control::OP_HEARTBEAT {
-                                if let Some(hb) = control::parse_heartbeat(&decoded.payload) {
-                                    let now_ms = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis() as u64;
-                                    let peer_key = src_addr
-                                        .as_socket()
-                                        .map(|a| a.to_string())
-                                        .unwrap_or_else(|| "unknown".to_string());
-                                    liveness_rx.lock().unwrap().on_heartbeat(
-                                        &peer_key,
-                                        hb.epoch,
-                                        hb.seq,
-                                        hb.ts_ms,
-                                        now_ms,
-                                        hb.state.as_byte(),
-                                    );
-                                    debug!("Received heartbeat from {} seq={} epoch={:#x}",
-                                           peer_key, hb.seq, hb.epoch);
+                            if let Some(decoded) = control::decode(received) {
+                                if decoded.opcode == control::OP_HEARTBEAT {
+                                    if let Some(hb) = control::parse_heartbeat(&decoded.payload) {
+                                        let now_ms = SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as u64;
+                                        let peer_key = src_addr
+                                            .as_socket()
+                                            .map(|a| a.to_string())
+                                            .unwrap_or_else(|| "unknown".to_string());
+                                        liveness_rx.lock().unwrap().on_heartbeat(
+                                            &peer_key,
+                                            hb.epoch,
+                                            hb.seq,
+                                            hb.ts_ms,
+                                            now_ms,
+                                            hb.state.as_byte(),
+                                        );
+                                        debug!("Received heartbeat from {} seq={} epoch={:#x}",
+                                               peer_key, hb.seq, hb.epoch);
+                                    }
                                 }
                             }
                             continue;
@@ -466,19 +467,34 @@ impl TransportManager {
                                         let encryption_enabled = config.read().unwrap().encryption_enabled;
                                         
                                         if encryption_enabled {
-                                            let mut engines = crypto_engines.write().unwrap();
-                                            if !engines.contains_key(&packet.device_id) {
-                                                let mut engine = CryptoEngine::new();
-                                                let _ = engine.generate_keypair();
-                                                if engine.key_exchange(&peer_public).is_ok() {
-                                                    info!("Key exchange completed with peer {:08X}", packet.device_id);
-                                                    engines.insert(packet.device_id, engine);
-                                                    
-                                                    // Mark peer as key exchanged
-                                                    let mut peers_w = peers.write().unwrap();
-                                                    if let Some(p) = peers_w.get_mut(&packet.device_id) {
-                                                        p.key_exchanged = true;
+                                            // Lock ordering: always acquire crypto_engines BEFORE peers.
+                                            // Complete all crypto_engines mutations first, then drop the
+                                            // guard, and only then acquire peers — this prevents a
+                                            // lock-ordering inversion if any future path ever holds
+                                            // peers while trying to acquire crypto_engines.
+                                            let key_exchange_succeeded = {
+                                                let mut engines = crypto_engines.write().unwrap();
+                                                if !engines.contains_key(&packet.device_id) {
+                                                    let mut engine = CryptoEngine::new();
+                                                    let _ = engine.generate_keypair();
+                                                    if engine.key_exchange(&peer_public).is_ok() {
+                                                        info!("Key exchange completed with peer {:08X}", packet.device_id);
+                                                        engines.insert(packet.device_id, engine);
+                                                        true
+                                                    } else {
+                                                        false
                                                     }
+                                                } else {
+                                                    false
+                                                }
+                                                // `engines` (crypto_engines write guard) is dropped here
+                                            };
+
+                                            // Now safe to acquire peers without holding crypto_engines
+                                            if key_exchange_succeeded {
+                                                let mut peers_w = peers.write().unwrap();
+                                                if let Some(p) = peers_w.get_mut(&packet.device_id) {
+                                                    p.key_exchanged = true;
                                                 }
                                             }
                                         }

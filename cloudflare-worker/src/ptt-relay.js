@@ -151,6 +151,11 @@ export class PttRoom extends DurableObject {
         }
       }
 
+      // Defensive: ensure the sweeper alarm is always armed while sockets are active
+      if (!(await this.ctx.storage.getAlarm())) {
+        await this.ctx.storage.setAlarm(Date.now() + SWEEP_INTERVAL_MS);
+      }
+
       // Binary broadcast to all other peers
       // This is the hot path — zero parsing, zero copying, just fan-out.
       const sockets = this.ctx.getWebSockets();
@@ -223,25 +228,9 @@ export class PttRoom extends DurableObject {
     this.sessions.delete(ws);
     try { ws.close(code, reason); } catch { /* already closed */ }
 
-    // Notify remaining peers
-    const leaveMsg = JSON.stringify({
-      type: "peer_left",
-      client_id: session.id || "unknown",
-      device: session.device || "Unknown",
-      peers: this.ctx.getWebSockets().length,
-    });
-
     const sockets = this.ctx.getWebSockets();
-    for (const peer of sockets) {
-      try {
-        peer.send(leaveMsg);
-      } catch {
-        // Dead socket — will be cleaned up on next message or close
-        this.sessions.delete(peer);
-      }
-    }
 
-    // Also push binary PARTNER_OFFLINE TLV for clients that parse binary control
+    // Push binary PARTNER_OFFLINE TLV to remaining peers
     const offlineFrame = buildPartnerOfflineFrame(session.id || "unknown");
     for (const peer of sockets) {
       try { peer.send(offlineFrame); } catch {}
