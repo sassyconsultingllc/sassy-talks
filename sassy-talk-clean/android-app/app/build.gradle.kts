@@ -58,14 +58,27 @@ android {
                 !System.getenv("RELEASE_STORE_PASSWORD").isNullOrBlank() &&
                 !System.getenv("RELEASE_KEY_ALIAS").isNullOrBlank() &&
                 !System.getenv("RELEASE_KEY_PASSWORD").isNullOrBlank()
-            signingConfig = if (hasReleaseCreds) {
-                signingConfigs.getByName("release")
-            } else {
-                // No release credentials in the environment — fall back to the
-                // debug keystore for local reproducibility. CI must set the
-                // env vars above to get a properly-signed release APK.
-                logger.warn("Release build without RELEASE_*_PASSWORD/ALIAS env vars — signing with debug keystore.")
-                signingConfigs.getByName("debug")
+            // Allow local devs to opt into a debug-signed release build with
+            // ALLOW_DEBUG_SIGNED_RELEASE=1, but never silently — and never on CI.
+            val allowDebugSigned = System.getenv("ALLOW_DEBUG_SIGNED_RELEASE") == "1"
+            val onCi = System.getenv("CI") == "true" || !System.getenv("GITHUB_ACTIONS").isNullOrBlank()
+            signingConfig = when {
+                hasReleaseCreds -> signingConfigs.getByName("release")
+                onCi -> error(
+                    "Release build on CI without release signing credentials. " +
+                    "Set RELEASE_KEYSTORE_BASE64 / RELEASE_STORE_PASSWORD / " +
+                    "RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD secrets and re-run."
+                )
+                allowDebugSigned -> {
+                    logger.warn("ALLOW_DEBUG_SIGNED_RELEASE=1 — signing release with the DEBUG keystore. NEVER upload this AAB.")
+                    signingConfigs.getByName("debug")
+                }
+                else -> error(
+                    "Release build without signing credentials. Set RELEASE_STORE_PASSWORD / " +
+                    "RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD env vars (and ensure " +
+                    "app/keystore/release.keystore exists), or set ALLOW_DEBUG_SIGNED_RELEASE=1 " +
+                    "for a throwaway debug-signed local build."
+                )
             }
         }
     }
