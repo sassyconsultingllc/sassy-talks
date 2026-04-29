@@ -2,6 +2,19 @@ name: Build Release AAB
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_to_play:
+        description: 'Upload the AAB to Google Play (internal track)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+      play_track:
+        description: 'Play track to publish to (only used when publish_to_play=true)'
+        required: false
+        default: 'internal'
+        type: choice
+        options: ['internal', 'alpha', 'beta', 'production']
   push:
     branches:
       - main
@@ -92,3 +105,19 @@ jobs:
           name: sassy-talkie-release-aab
           path: sassy-talk-clean/android-app/app/build/outputs/bundle/release/*.aab
           retention-days: 30
+
+      - name: Publish to Google Play
+        # Only on manual workflow_dispatch with publish_to_play=true.
+        # Pushes never auto-publish — they only build + upload artifact.
+        # Note: the very first AAB for a fresh app must be uploaded
+        # manually via the Play Console UI (Google API limitation);
+        # this step is for v2.4.0+ once v2.3.0 is live.
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_to_play == 'true'
+        uses: r0adkll/upload-google-play@v1.1.3
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.sassyconsulting.sassytalkie
+          releaseFiles: sassy-talk-clean/android-app/app/build/outputs/bundle/release/app-release.aab
+          track: ${{ inputs.play_track }}
+          status: completed
+          changesNotSentForReview: false
