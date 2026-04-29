@@ -166,6 +166,7 @@ fun UsersScreen(
                             user = user,
                             presenceState = liveness?.presence(user.id) ?: PresenceState.IDLE,
                             rttMs = liveness?.rttMs(user.id) ?: -1,
+                            lastHeardMs = liveness?.lastHeardMs(user.id) ?: 0L,
                             onToggleMute = {
                                 SassyTalkNative.setUserMuted(user.id, !user.isMuted)
                                 users = SassyTalkNative.getUsers()
@@ -195,6 +196,7 @@ fun UsersScreen(
                             user = user,
                             presenceState = liveness?.presence(user.id) ?: PresenceState.IDLE,
                             rttMs = liveness?.rttMs(user.id) ?: -1,
+                            lastHeardMs = liveness?.lastHeardMs(user.id) ?: 0L,
                             onToggleMute = {
                                 SassyTalkNative.setUserMuted(user.id, !user.isMuted)
                                 users = SassyTalkNative.getUsers()
@@ -291,14 +293,35 @@ private fun SectionHeader(
     }
 }
 
+/** Format a last-heard timestamp as a human-readable "active N ago" string. */
+private fun formatLastActive(lastHeardMs: Long, nowMs: Long): String {
+    if (lastHeardMs <= 0L) return "offline"
+    val ageMs = nowMs - lastHeardMs
+    return when {
+        ageMs < 5_000L    -> "active now"
+        ageMs < 60_000L   -> "active ${ageMs / 1000}s ago"
+        ageMs < 3_600_000L -> "active ${ageMs / 60_000}m ago"
+        else               -> "offline"
+    }
+}
+
 @Composable
 private fun UserCard(
     user: SassyTalkNative.UserInfo,
     presenceState: PresenceState = PresenceState.IDLE,
     rttMs: Int = -1,
+    lastHeardMs: Long = 0L,
     onToggleMute: () -> Unit,
     onToggleFavorite: () -> Unit
 ) {
+    // Tick every second so the "active Ns ago" label stays fresh
+    var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1_000L)
+            nowMs = System.currentTimeMillis()
+        }
+    }
     val isMuted = user.isMuted
 
     Card(
@@ -345,6 +368,12 @@ private fun UserCard(
                 } else {
                     Spacer(modifier = Modifier.height(2.dp))
                     PresenceChip(state = presenceState, rttMs = rttMs)
+                    val lastActiveText = formatLastActive(lastHeardMs, nowMs)
+                    Text(
+                        text = lastActiveText,
+                        fontSize = 11.sp,
+                        color = if (lastActiveText == "active now") Color(0xFF4CAF50) else TextMuted
+                    )
                 }
             }
 

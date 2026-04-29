@@ -11,16 +11,21 @@ export function ConnectionBadge({ peerId }: { peerId: string }) {
   const [q, setQ] = useState<Quality | null>(null);
 
   useEffect(() => {
+    let mounted = true;
     const id = setInterval(async () => {
       try {
         const all = await invoke<[string, string, number | null, string][]>("get_connection_quality");
+        if (!mounted) return;
         const mine = all.find(([id]) => id === peerId);
         if (mine) {
           setQ({ health: mine[1], rtt: mine[2] ?? undefined, transport: mine[3] });
         }
       } catch {}
     }, 1000);
-    return () => clearInterval(id);
+    return () => {
+      mounted = false;
+      clearInterval(id);
+    };
   }, [peerId]);
 
   if (!q) return null;

@@ -9,6 +9,7 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
@@ -16,6 +17,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import com.sassyconsulting.sassytalkie.service.BluetoothTransport
 
 /**
@@ -71,7 +73,27 @@ class WalkieService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(TAG, "Service started")
-        startForeground(NOTIFICATION_ID, buildNotification("Radio standby"))
+        try {
+            // On API 34+ the foreground service type must be passed explicitly or
+            // the system raises MissingForegroundServiceTypeException and kills us.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIFICATION_ID,
+                    buildNotification("Radio standby"),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, buildNotification("Radio standby"))
+            }
+        } catch (e: Exception) {
+            // Foreground promotion failed (denied permission, policy, etc). Stop
+            // the service cleanly rather than let the OS crash the whole app.
+            Log.e(TAG, "startForeground failed: ${e.message}", e)
+            stopSelf()
+            return START_NOT_STICKY
+        }
         return START_STICKY
     }
 
@@ -82,6 +104,13 @@ class WalkieService : Service() {
         shutdownBleTransport()
         releaseMulticastLock()
         releaseWakeLock()
+        // Explicitly remove the ongoing notification so it doesn't linger in the
+        // shade after the service itself is gone.
+        try {
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        } catch (e: Exception) {
+            Log.w(TAG, "stopForeground failed: ${e.message}")
+        }
         super.onDestroy()
     }
 

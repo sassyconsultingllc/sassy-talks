@@ -8,7 +8,7 @@ class ControlFrameTest {
     fun `legacy single byte opcode round trips`() {
         val encoded = ControlFrame.encodeLegacy(ControlFrame.OP_PTT_START)
         assertArrayEquals(byteArrayOf(0x01), encoded)
-        val decoded = ControlFrame.decode(encoded)
+        val decoded = ControlFrame.decode(encoded)!!
         assertEquals(ControlFrame.OP_PTT_START, decoded.opcode)
         assertEquals(0, decoded.payload.size)
     }
@@ -23,7 +23,7 @@ class ControlFrameTest {
             rttMs = 18,
         )
         assertEquals(0x10, hb[0].toInt())
-        val decoded = ControlFrame.decode(hb)
+        val decoded = ControlFrame.decode(hb)!!
         assertEquals(ControlFrame.OP_HEARTBEAT, decoded.opcode)
         val parsed = ControlFrame.parseHeartbeat(decoded.payload)
         assertEquals(42, parsed.seq)
@@ -35,7 +35,7 @@ class ControlFrameTest {
     @Test
     fun `recv ack round trips`() {
         val bytes = ControlFrame.encodeRecvAck(999L, 77, 5000L)
-        val decoded = ControlFrame.decode(bytes)
+        val decoded = ControlFrame.decode(bytes)!!
         assertEquals(ControlFrame.OP_RECV_ACK, decoded.opcode)
         val (epoch, seq, ts) = ControlFrame.parseRecvAck(decoded.payload)
         assertEquals(999L, epoch)
@@ -46,14 +46,14 @@ class ControlFrameTest {
     @Test
     fun `eot ack round trips`() {
         val bytes = ControlFrame.encodeEotAck(888L, 55)
-        val decoded = ControlFrame.decode(bytes)
+        val decoded = ControlFrame.decode(bytes)!!
         assertEquals(ControlFrame.OP_EOT_ACK, decoded.opcode)
     }
 
     @Test
     fun `partner offline round trips`() {
         val bytes = ControlFrame.encodePartnerOffline("alice-uuid-1234")
-        val decoded = ControlFrame.decode(bytes)
+        val decoded = ControlFrame.decode(bytes)!!
         assertEquals(ControlFrame.OP_PARTNER_OFFLINE, decoded.opcode)
         val len = decoded.payload[0].toInt() and 0xFF
         val id = String(decoded.payload, 1, len, Charsets.UTF_8)
@@ -64,8 +64,8 @@ class ControlFrameTest {
     fun `ptt v2 start and stop round trip`() {
         val start = ControlFrame.encodePttStartV2(123L, 1)
         val stop = ControlFrame.encodePttStopV2(123L, 50)
-        assertEquals(ControlFrame.OP_PTT_START_V2, ControlFrame.decode(start).opcode)
-        assertEquals(ControlFrame.OP_PTT_STOP_V2, ControlFrame.decode(stop).opcode)
+        assertEquals(ControlFrame.OP_PTT_START_V2, ControlFrame.decode(start)!!.opcode)
+        assertEquals(ControlFrame.OP_PTT_STOP_V2, ControlFrame.decode(stop)!!.opcode)
     }
 
     @Test
@@ -78,8 +78,21 @@ class ControlFrameTest {
     }
 
     @Test
-    fun `empty bytes decode safely`() {
-        val d = ControlFrame.decode(ByteArray(0))
-        assertEquals(0.toByte(), d.opcode)
+    fun `empty bytes decode returns null`() {
+        assertNull(ControlFrame.decode(ByteArray(0)))
+    }
+
+    @Test
+    fun `truncated TLV frame returns null`() {
+        // Build a TLV header claiming 100 bytes but only provide 5
+        val bytes = byteArrayOf(0x10, 100, 0, 1, 2)
+        assertNull(ControlFrame.decode(bytes))
+    }
+
+    @Test
+    fun `short TLV header returns null`() {
+        // Only opcode, no length bytes
+        assertNull(ControlFrame.decode(byteArrayOf(0x10)))
+        assertNull(ControlFrame.decode(byteArrayOf(0x10, 0x00)))
     }
 }

@@ -15,6 +15,7 @@ import androidx.core.content.ContextCompat
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 @Composable
@@ -25,11 +26,19 @@ fun QRScannerView(
     val lifecycleOwner = LocalLifecycleOwner.current
     var hasScanned by remember { mutableStateOf(false) }
 
+    // One executor per scanner instance, remembered across recompositions and
+    // shut down when the composable leaves composition. Creating it inside
+    // `factory` (as before) leaked a thread on every config change, because
+    // AndroidView's factory runs again and never shuts the old executor down.
+    val executor: ExecutorService = remember { Executors.newSingleThreadExecutor() }
+    DisposableEffect(executor) {
+        onDispose { executor.shutdown() }
+    }
+
     AndroidView(
         modifier = modifier,
         factory = { ctx ->
             val previewView = PreviewView(ctx)
-            val executor = Executors.newSingleThreadExecutor()
             val scanner = BarcodeScanning.getClient()
 
             val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)

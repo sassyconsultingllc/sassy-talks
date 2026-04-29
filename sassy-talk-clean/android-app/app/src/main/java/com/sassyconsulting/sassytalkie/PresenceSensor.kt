@@ -24,7 +24,7 @@ class PresenceSensor(private val ctx: Context) {
             notif.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL
         } catch (_: Exception) { false }
         val outputZero = try {
-            audio.getStreamVolume(AudioManager.STREAM_VOICE_CALL) == 0
+            audio.getStreamVolume(AudioManager.STREAM_MUSIC) == 0
         } catch (_: Exception) { false }
         val isBackground = lifecycle.isAtLeast(Lifecycle.State.STARTED) &&
                            !lifecycle.isAtLeast(Lifecycle.State.RESUMED)

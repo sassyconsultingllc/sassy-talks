@@ -141,35 +141,42 @@ impl AndroidAudioRecord {
         let vm = get_jvm()?;
         let mut env = vm.attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let jarray = env.new_short_array(buffer.len() as i32)
-            .map_err(|e| format!("Failed to create short array: {}", e))?;
-        
-        // Create JObject reference without consuming jarray
-        let jarray_obj = unsafe { JObject::from_raw(jarray.as_raw()) };
-        
-        let bytes_read = env.call_method(
-            self.recorder.as_obj(),
-            "read",
-            "([SII)I",
-            &[
-                JValue::Object(&jarray_obj),
-                JValue::Int(0),
-                JValue::Int(buffer.len() as i32),
-            ]
-        )
-        .map_err(|e| format!("Failed to read: {}", e))?
-        .i()
-        .map_err(|e| format!("Failed to convert result: {}", e))?;
-        
-        if bytes_read <= 0 {
-            return Ok(0);
-        }
-        
-        env.get_short_array_region(&jarray, 0, buffer)
-            .map_err(|e| format!("Failed to copy shorts: {}", e))?;
-        
-        Ok(bytes_read as usize)
+
+        // Push a local-ref frame so the short[] we allocate each call is freed
+        // on return. The audio thread stays attached for the life of the app,
+        // so without this the local-ref table overflows after thousands of frames.
+        env.push_local_frame(4)
+            .map_err(|e| format!("Failed to push local frame: {}", e))?;
+
+        let result: Result<usize, String> = (|| {
+            let jarray = env.new_short_array(buffer.len() as i32)
+                .map_err(|e| format!("Failed to create short array: {}", e))?;
+            let jarray_obj = unsafe { JObject::from_raw(jarray.as_raw()) };
+            let bytes_read = env.call_method(
+                self.recorder.as_obj(),
+                "read",
+                "([SII)I",
+                &[
+                    JValue::Object(&jarray_obj),
+                    JValue::Int(0),
+                    JValue::Int(buffer.len() as i32),
+                ]
+            )
+            .map_err(|e| format!("Failed to read: {}", e))?
+            .i()
+            .map_err(|e| format!("Failed to convert result: {}", e))?;
+
+            if bytes_read <= 0 {
+                return Ok(0);
+            }
+
+            env.get_short_array_region(&jarray, 0, buffer)
+                .map_err(|e| format!("Failed to copy shorts: {}", e))?;
+            Ok(bytes_read as usize)
+        })();
+
+        unsafe { let _ = env.pop_local_frame(&JObject::null()); }
+        result
     }
     
     /// Release resources
@@ -191,6 +198,31 @@ pub struct AndroidAudioTrack {
 }
 
 impl AndroidAudioTrack {
+    /// Minimum AudioTrack buffer size for the given format. AudioTrack has
+    /// different buffer-size requirements than AudioRecord, so we must query
+    /// the correct class — otherwise playback under-allocates and glitches.
+    pub fn get_min_buffer_size(sample_rate: i32, channel_config: i32, audio_format: i32) -> Result<i32, String> {
+        let vm = get_jvm()?;
+        let mut env = vm.attach_current_thread()
+            .map_err(|e| format!("Failed to attach thread: {}", e))?;
+        let track_class = env.find_class("android/media/AudioTrack")
+            .map_err(|e| format!("Failed to find AudioTrack class: {}", e))?;
+        let size = env.call_static_method(
+            track_class,
+            "getMinBufferSize",
+            "(III)I",
+            &[
+                JValue::Int(sample_rate),
+                JValue::Int(channel_config),
+                JValue::Int(audio_format),
+            ]
+        )
+        .map_err(|e| format!("Failed to get min buffer size: {}", e))?
+        .i()
+        .map_err(|e| format!("Failed to convert result: {}", e))?;
+        Ok(size)
+    }
+
     /// Create AudioTrack instance
     pub fn new(sample_rate: i32, channel_config: i32, audio_format: i32, buffer_size: i32) -> Result<Self, String> {
         let vm = get_jvm()?;
@@ -262,28 +294,37 @@ impl AndroidAudioTrack {
         let vm = get_jvm()?;
         let mut env = vm.attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let jarray = env.new_short_array(buffer.len() as i32)
-            .map_err(|e| format!("Failed to create short array: {}", e))?;
-        
-        env.set_short_array_region(&jarray, 0, buffer)
-            .map_err(|e| format!("Failed to copy shorts: {}", e))?;
-        
-        let bytes_written = env.call_method(
-            self.track.as_obj(),
-            "write",
-            "([SII)I",
-            &[
-                JValue::Object(&jarray.into()),
-                JValue::Int(0),
-                JValue::Int(buffer.len() as i32),
-            ]
-        )
-        .map_err(|e| format!("Failed to write: {}", e))?
-        .i()
-        .map_err(|e| format!("Failed to convert result: {}", e))?;
-        
-        Ok(bytes_written as usize)
+
+        // Bound local refs per call so the playback thread's ref table
+        // doesn't grow unbounded across every written audio frame.
+        env.push_local_frame(4)
+            .map_err(|e| format!("Failed to push local frame: {}", e))?;
+
+        let result: Result<usize, String> = (|| {
+            let jarray = env.new_short_array(buffer.len() as i32)
+                .map_err(|e| format!("Failed to create short array: {}", e))?;
+
+            env.set_short_array_region(&jarray, 0, buffer)
+                .map_err(|e| format!("Failed to copy shorts: {}", e))?;
+
+            let bytes_written = env.call_method(
+                self.track.as_obj(),
+                "write",
+                "([SII)I",
+                &[
+                    JValue::Object(&jarray.into()),
+                    JValue::Int(0),
+                    JValue::Int(buffer.len() as i32),
+                ]
+            )
+            .map_err(|e| format!("Failed to write: {}", e))?
+            .i()
+            .map_err(|e| format!("Failed to convert result: {}", e))?;
+            Ok(bytes_written as usize)
+        })();
+
+        unsafe { let _ = env.pop_local_frame(&JObject::null()); }
+        result
     }
     
     /// Release resources
@@ -467,7 +508,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         return;
     }
 
-    guard.ptt_pressed.store(true, Ordering::Relaxed);
+    guard.ptt_pressed.store(true, Ordering::SeqCst);
 
     if let Some(ref sm) = guard.state_machine {
         if let Err(e) = sm.on_ptt_press() {
@@ -492,7 +533,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let state = get_jni_state();
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    guard.ptt_pressed.store(false, Ordering::Relaxed);
+    guard.ptt_pressed.store(false, Ordering::SeqCst);
 
     // Stop BT mic capture if active
     if guard.bt_recording {
@@ -589,7 +630,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let state = get_jni_state();
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    guard.current_channel.store(ch, Ordering::Relaxed);
+    guard.current_channel.store(ch, Ordering::SeqCst);
 }
 
 /// JNI: Set subchannel (0=Main, 1=A, 2=B)
@@ -604,7 +645,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
     let state = get_jni_state();
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    guard.current_subchannel.store(sub, Ordering::Relaxed);
+    guard.current_subchannel.store(sub, Ordering::SeqCst);
 }
 
 /// JNI: Get current channel (for Kotlin BT transport to include in frames)
@@ -615,7 +656,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 ) -> jbyte {
     let state = get_jni_state();
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    guard.current_channel.load(Ordering::Relaxed) as jbyte
+    guard.current_channel.load(Ordering::SeqCst) as jbyte
 }
 
 /// JNI: Encode one audio frame for BT transmission.
@@ -678,8 +719,8 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btEn
     let compressed = guard.bt_encoder.encode(&pcm_buffer[..CODEC_FRAME_SIZE]);
 
     // Pack wire frame
-    let channel = guard.current_channel.load(Ordering::Relaxed);
-    let subchannel = guard.current_subchannel.load(Ordering::Relaxed);
+    let channel = guard.current_channel.load(Ordering::SeqCst);
+    let subchannel = guard.current_subchannel.load(Ordering::SeqCst);
     let (sender_id, device_name) = if let Some(ref sm) = guard.state_machine {
         (sm.get_local_sender_id(), sm.get_device_name())
     } else {
@@ -757,7 +798,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btDe
     };
 
     // Filter by channel
-    let my_channel = guard.current_channel.load(Ordering::Relaxed);
+    let my_channel = guard.current_channel.load(Ordering::SeqCst);
     if channel != my_channel {
         return JNI_FALSE;
     }
@@ -878,7 +919,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     // Legacy: generate for current channel with default name
     let state = get_jni_state();
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    let channel = guard.current_channel.load(std::sync::atomic::Ordering::Relaxed);
+    let channel = guard.current_channel.load(std::sync::atomic::Ordering::SeqCst);
     drop(guard);
 
     Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGenerateChannelQR(
@@ -965,7 +1006,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
                 }
             }
             // Auto-switch to the imported channel
-            guard.current_channel.store(channel, std::sync::atomic::Ordering::Relaxed);
+            guard.current_channel.store(channel, std::sync::atomic::Ordering::SeqCst);
             info!("JNI: Session imported successfully for ch{}", channel);
             JNI_TRUE
         }
@@ -2175,8 +2216,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let mut transport = sm.get_transport().lock().unwrap();
-        transport.on_bluetooth_connected();
+        sm.on_bluetooth_connected();
     }
 }
 
@@ -2192,8 +2232,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let mut transport = sm.get_transport().lock().unwrap();
-        transport.on_bluetooth_disconnected();
+        sm.on_bluetooth_disconnected();
     }
 }
 

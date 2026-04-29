@@ -2,6 +2,7 @@ package com.sassyconsulting.sassytalkie
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.random.Random
 
 enum class PresenceState(val byte: Byte) {
@@ -14,14 +15,14 @@ enum class PresenceState(val byte: Byte) {
 }
 
 object SessionEpoch {
-    @Volatile private var current: Long = 0
+    private val atomicCurrent = AtomicLong(0)
     fun generate(): Long {
         var v = Random.nextLong()
         while (v == 0L) v = Random.nextLong()
-        current = v
+        atomicCurrent.set(v)
         return v
     }
-    fun current(): Long = current
+    fun current(): Long = atomicCurrent.get()
 }
 
 data class DecodedFrame(val opcode: Byte, val payload: ByteArray) {
@@ -63,13 +64,14 @@ object ControlFrame {
         return buf.array()
     }
 
-    fun decode(bytes: ByteArray): DecodedFrame {
-        if (bytes.isEmpty()) return DecodedFrame(0, ByteArray(0))
+    fun decode(bytes: ByteArray): DecodedFrame? {
+        if (bytes.isEmpty()) return null
         val op = bytes[0]
         if (op.toInt() and 0xFF < 0x10) return DecodedFrame(op, ByteArray(0))
-        if (bytes.size < 3) return DecodedFrame(op, ByteArray(0))
+        if (bytes.size < 3) return null
         val len = ByteBuffer.wrap(bytes, 1, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
-        val payload = bytes.copyOfRange(3, minOf(3 + len, bytes.size))
+        if (3 + len > bytes.size) return null  // reject truncated frames
+        val payload = bytes.copyOfRange(3, 3 + len)
         return DecodedFrame(op, payload)
     }
 
@@ -109,6 +111,7 @@ object ControlFrame {
 
     fun encodePartnerOffline(peerId: String): ByteArray {
         val idBytes = peerId.toByteArray(Charsets.UTF_8)
+        require(idBytes.size <= 255) { "peer ID too long: ${idBytes.size} bytes" }
         val p = ByteArray(1 + idBytes.size)
         p[0] = idBytes.size.toByte()
         System.arraycopy(idBytes, 0, p, 1, idBytes.size)

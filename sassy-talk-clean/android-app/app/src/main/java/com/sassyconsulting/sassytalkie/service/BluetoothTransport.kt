@@ -82,6 +82,13 @@ class BluetoothTransport(private val context: Context) {
     private val txPumpRunning = AtomicBoolean(false)
     private val peerCount = AtomicInteger(0)
 
+    // TX epoch/seq bookkeeping for the PTT_STOP_V2 → EOT_ACK "Delivered" tick.
+    // The wire audio payload is encrypted (AES-GCM ciphertext) so we can't
+    // recover seq by decoding the frame on the way out. Track it locally
+    // instead — the seq only has to be monotonic and echoed by the receiver.
+    @Volatile private var txEpoch: Long = 0L
+    private val txSeqCounter = AtomicInteger(0)
+
     // Server socket for incoming connections
     private var serverSocket: BluetoothServerSocket? = null
 
@@ -97,6 +104,31 @@ class BluetoothTransport(private val context: Context) {
      * Used by PttCoordinator to track lastRxEpoch/lastRxSeq for RECV_ACK.
      */
     var audioFrameCallback: ((peerId: String, epoch: Long, seq: Int) -> Unit)? = null
+
+    /**
+     * Optional callback invoked whenever a V2 audio frame is received, with full decoded frame.
+     * Called on the RX thread with (peerId, decoded).
+     * Used by PttCoordinator for probe detection (Task 7.1).
+     */
+    var audioFrameV2Callback: ((peerId: String, decoded: com.sassyconsulting.sassytalkie.AudioV2Decoded) -> Unit)? = null
+
+    /**
+     * Optional callback invoked whenever a V2 audio frame is successfully transmitted.
+     * Called on the TX pump thread with (epoch, seq).
+     * Used by PttCoordinator to track lastTxSeq for PTT_STOP_V2 / EOT_ACK.
+     */
+    var txFrameCallback: ((epoch: Long, seq: Int) -> Unit)? = null
+
+    /**
+     * Set the session epoch used when reporting outbound audio frames via
+     * [txFrameCallback]. Called by PttCoordinator with its selfEpoch so the
+     * receiver's EOT_ACK (echoing our epoch+seq) can be matched on our side.
+     * Resets the seq counter — subsequent TX frames start at seq 0.
+     */
+    fun setTxEpoch(epoch: Long) {
+        txEpoch = epoch
+        txSeqCounter.set(0)
+    }
 
     /** Check if we have an active RFCOMM connection to a specific device */
     fun isConnectedTo(address: String): Boolean = connectedPeers.containsKey(address)
@@ -215,6 +247,12 @@ class BluetoothTransport(private val context: Context) {
             val peerCountAtStart = connectedPeers.size
             Log.i(TAG, "BT TX pump started ($peerCountAtStart peers)")
 
+            // Reuse a single 4-byte header buffer across the audio loop. At ~50
+            // frames/sec a per-frame ByteBuffer allocation is a steady GC source
+            // for a thread that runs for the full duration of every PTT press.
+            val headerArr = ByteArray(FRAME_HEADER_SIZE)
+            val headerBb = ByteBuffer.wrap(headerArr).order(ByteOrder.LITTLE_ENDIAN)
+
             while (txPumpRunning.get() && SassyTalkNative.isPttActive()) {
                 if (connectedPeers.isEmpty()) {
                     Log.w(TAG, "BT TX pump: no peers, stopping")
@@ -230,10 +268,9 @@ class BluetoothTransport(private val context: Context) {
                 }
 
                 // Write length-prefixed frame to all connected peers
-                val header = ByteBuffer.allocate(FRAME_HEADER_SIZE)
-                    .order(ByteOrder.LITTLE_ENDIAN)
-                    .putInt(frameData.size)
-                    .array()
+                headerBb.clear()
+                headerBb.putInt(frameData.size)
+                val header = headerArr
 
                 val deadPeers = mutableListOf<String>()
 
@@ -251,6 +288,14 @@ class BluetoothTransport(private val context: Context) {
                     }
                 }
 
+                // Report (epoch, seq) for PTT_STOP_V2 / EOT_ACK tracking. The
+                // audio payload itself is encrypted so we can't recover this
+                // by decoding the frame — maintain it as plaintext plumbing
+                // metadata instead. The seq is purely local and only has to
+                // round-trip through the receiver's echo intact.
+                val seq = txSeqCounter.getAndIncrement()
+                txFrameCallback?.invoke(txEpoch, seq)
+
                 // Cleanup dead peers
                 deadPeers.forEach { removePeer(it) }
             }
@@ -263,6 +308,28 @@ class BluetoothTransport(private val context: Context) {
     /** Stop the TX pump (called on PTT release) */
     fun stopTxPump() {
         txPumpRunning.set(false)
+    }
+
+    /**
+     * Send a raw byte array directly to all connected peers (no length prefix added).
+     * The caller is responsible for including any required framing.
+     * Used by probe/heartbeat paths that pre-build the full wire frame.
+     */
+    fun sendRaw(frame: ByteArray) {
+        val deadPeers = mutableListOf<String>()
+        for ((addr, peer) in connectedPeers) {
+            try {
+                synchronized(peer.output) {
+                    peer.output.write(frame)
+                    peer.output.flush()
+                }
+                peer.lastActivity = System.currentTimeMillis()
+            } catch (e: IOException) {
+                Log.w(TAG, "sendRaw write failed for ${peer.device.name}: ${e.message}")
+                deadPeers.add(addr)
+            }
+        }
+        deadPeers.forEach { removePeer(it) }
     }
 
     /** Disconnect all peers and stop */
@@ -379,16 +446,32 @@ class BluetoothTransport(private val context: Context) {
                         continue
                     }
 
-                    // Audio frame — pass to Rust for decoding and playback
-                    SassyTalkNative.btDecodeFrame(payload)
-
-                    // If it's a V2 frame, notify PttCoordinator for RECV_ACK tracking
-                    val cb = audioFrameCallback
-                    if (cb != null && AudioFrameV2.isV2(payload)) {
-                        AudioFrameV2.decode(payload)?.let { frame ->
-                            cb(peer.device.address, frame.epoch, frame.seq)
+                    // Probe frames are sent via sendRaw() as unencrypted V2-framed
+                    // bytes: the V2 length field IS the RFCOMM length header, so the
+                    // full V2 frame is `headerBuf + payload`. Regular audio frames
+                    // are AES-GCM ciphertext and will NOT have a real V2 epoch — so
+                    // we only treat a frame as V2 if the decoded epoch matches the
+                    // reserved probe-marker sentinel (-1L). Otherwise ciphertext
+                    // whose random leading bytes happen to parse as a valid V2
+                    // frame would pollute lastRxSeq/lastRxEpoch and trigger bogus
+                    // RECV_ACKs with garbage values.
+                    val fullFrame = ByteArray(FRAME_HEADER_SIZE + frameLen)
+                    System.arraycopy(headerBuf, 0, fullFrame, 0, FRAME_HEADER_SIZE)
+                    System.arraycopy(payload, 0, fullFrame, FRAME_HEADER_SIZE, frameLen)
+                    if (AudioFrameV2.isV2(fullFrame)) {
+                        val frame = AudioFrameV2.decode(fullFrame)
+                        if (frame != null && frame.epoch == -1L &&
+                            (frame.seq == -1 || frame.seq == -2)) {
+                            // Probe request or echo — fire V2 callbacks and skip
+                            // regular-audio playback path entirely.
+                            audioFrameV2Callback?.invoke(peer.device.address, frame)
+                            audioFrameCallback?.invoke(peer.device.address, frame.epoch, frame.seq)
+                            continue
                         }
                     }
+
+                    // Audio frame — pass to Rust for decoding and playback
+                    SassyTalkNative.btDecodeFrame(payload)
                 }
             } catch (e: IOException) {
                 if (running.get()) {

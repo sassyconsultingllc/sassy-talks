@@ -4,9 +4,14 @@
 /// Uses socket2 for multicast group management on Android.
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use log::info;
 use socket2::{Domain, Protocol, Socket, Type, SockAddr};
+
+/// Timeout after which a peer is considered gone if no discovery message has
+/// been seen. Set conservatively to 30s — discovery announces are sent far
+/// more often than that.
+const PEER_STALE_MS: u128 = 30_000;
 
 /// Multicast group address for SassyTalkie discovery + audio
 /// Unified across all platforms (Android, iOS, Desktop)
@@ -40,6 +45,8 @@ pub struct WifiPeer {
     pub address: Ipv4Addr,
     pub device_name: String,
     pub channel: u8,
+    /// Monotonic timestamp of the most recent discovery message from this peer.
+    pub last_seen: Instant,
 }
 
 /// WiFi multicast transport
@@ -212,24 +219,39 @@ impl WifiTransport {
                     {
                         if let std::net::SocketAddr::V4(v4) = addr {
                             let peer_ip = *v4.ip();
+                            let now = Instant::now();
 
-                            // Don't add duplicates
-                            if !self.peers.iter().any(|p| p.address == peer_ip) {
+                            // If we've already seen this peer, refresh its last_seen
+                            // timestamp; otherwise record a new entry.
+                            if let Some(existing) = self.peers.iter_mut().find(|p| p.address == peer_ip) {
+                                existing.last_seen = now;
+                                existing.channel = channel;
+                            } else {
                                 let peer = WifiPeer {
                                     address: peer_ip,
                                     device_name: name,
                                     channel,
+                                    last_seen: now,
                                 };
                                 info!("WiFi: discovered peer {} at {}", peer.device_name, peer.address);
                                 new_peers.push(peer.clone());
                                 self.peers.push(peer);
                             }
                         }
+                    } else if msg_type == DiscoveryMsgType::Goodbye as u8 {
+                        if let std::net::SocketAddr::V4(v4) = addr {
+                            let peer_ip = *v4.ip();
+                            self.peers.retain(|p| p.address != peer_ip);
+                        }
                     }
                 }
                 Err(_) => break, // No more messages
             }
         }
+
+        // Prune peers that haven't been heard from in PEER_STALE_MS.
+        let now = Instant::now();
+        self.peers.retain(|p| now.duration_since(p.last_seen).as_millis() < PEER_STALE_MS);
 
         new_peers
     }

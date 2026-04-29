@@ -351,7 +351,7 @@ class BleSignalingService(
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     peerGattClients[device.address] = gatt
                     connectedPeers[device.address] = device
-                    gatt.discoverServices()
+                    gatt.requestMtu(517)
 
                     Log.i(TAG, "GATT client connected to ${device.name ?: device.address}")
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
@@ -362,6 +362,11 @@ class BleSignalingService(
                     listener?.onPeerLost(device.address)
                     Log.i(TAG, "GATT client disconnected from ${device.address}")
                 }
+            }
+
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                Log.i(TAG, "MTU changed to $mtu for ${gatt.device.address} (status=$status)")
+                gatt.discoverServices()
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {

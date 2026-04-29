@@ -22,11 +22,33 @@ import { DurableObject } from "cloudflare:workers";
 
 const MAX_PEERS_PER_ROOM = 16;
 const MAX_DEVICE_NAME_LEN = 100;
+const HEARTBEAT_STALE_MS = 8_000;
+const SWEEP_INTERVAL_MS  = 2_000;
+
+/**
+ * Build a PARTNER_OFFLINE TLV binary frame for the given peerId.
+ * Frame layout:
+ *   [0]      opcode: u8  = 0x14
+ *   [1..2]   payload_len: u16 LE  = 1 + peer_id_bytes.length
+ *   [3]      peer_id_len: u8
+ *   [4..]    peer_id bytes (UTF-8)
+ */
+export function buildPartnerOfflineFrame(peerId) {
+  const idBytes = new TextEncoder().encode(peerId);
+  const len = 1 + idBytes.length; // peer_id_len:u8 + peer_id bytes
+  const out = new Uint8Array(3 + len);
+  out[0] = 0x14; // OP_PARTNER_OFFLINE
+  out[1] = len & 0xFF;
+  out[2] = (len >> 8) & 0xFF; // u16 LE payload length
+  out[3] = idBytes.length; // peer_id_len: u8
+  out.set(idBytes, 4);
+  return out;
+}
 
 export class PttRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
-    // Map<WebSocket, { id: string, device: string, joinedAt: number }>
+    // Map<WebSocket, { id: string, device: string, joinedAt: number, lastSeenMs: number }>
     // Restored from serialized attachments on wake-up
     this.sessions = new Map();
   }
@@ -56,7 +78,7 @@ export class PttRoom extends DurableObject {
     // Accept with hibernation — the DO can sleep between messages
     this.ctx.acceptWebSocket(server);
 
-    const clientId = url.searchParams.get("client_id") || crypto.randomUUID();
+    const clientId = crypto.randomUUID();
     const rawDevice = url.searchParams.get("device") || "Unknown";
     const device = decodeURIComponent(rawDevice).substring(0, MAX_DEVICE_NAME_LEN);
 
@@ -64,6 +86,7 @@ export class PttRoom extends DurableObject {
       id: clientId,
       device,
       joinedAt: Date.now(),
+      lastSeenMs: Date.now(),
     };
 
     // Persist session info so it survives hibernation
@@ -86,6 +109,11 @@ export class PttRoom extends DurableObject {
       peers: this.sessions.size,
     }));
 
+    // Start sweeper alarm if not already running
+    if (!(await this.ctx.storage.getAlarm())) {
+      await this.ctx.storage.setAlarm(Date.now() + SWEEP_INTERVAL_MS);
+    }
+
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -103,32 +131,92 @@ export class PttRoom extends DurableObject {
       }
     }
 
-    if (typeof message === "string") {
-      // Text control message
-      try {
-        const parsed = JSON.parse(message);
-        if (parsed.type === "ping") {
-          ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
+    if (typeof message !== "string") {
+      // Binary message
+      const bytes = message instanceof ArrayBuffer
+        ? new Uint8Array(message)
+        : new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
+
+      // Track heartbeat for liveness
+      // Verify this is a valid heartbeat TLV (opcode 0x10, payload exactly 23 bytes)
+      // to avoid collision with audio frames whose first length byte happens to be 0x10.
+      if (bytes.length >= 3 && bytes[0] === 0x10) {
+        const payloadLen = bytes[1] | (bytes[2] << 8);
+        if (payloadLen === 23 && bytes.length >= 26) {
+          const session = this.sessions.get(ws);
+          if (session) {
+            session.lastSeenMs = Date.now();
+            ws.serializeAttachment(session);
+          }
         }
-      } catch {
-        // Ignore malformed JSON
+      }
+
+      // Defensive: ensure the sweeper alarm is always armed while sockets are active
+      if (!(await this.ctx.storage.getAlarm())) {
+        await this.ctx.storage.setAlarm(Date.now() + SWEEP_INTERVAL_MS);
+      }
+
+      // Binary broadcast to all other peers
+      // This is the hot path — zero parsing, zero copying, just fan-out.
+      const sockets = this.ctx.getWebSockets();
+      for (const peer of sockets) {
+        if (peer !== ws) {
+          try {
+            peer.send(message);
+          } catch {
+            // Send failed — peer is dead. Force-close so it gets cleaned up.
+            try { peer.close(1011, "Send failed"); } catch { /* already closed */ }
+            this.sessions.delete(peer);
+          }
+        }
       }
       return;
     }
 
-    // Binary message = encrypted audio frame → broadcast to all OTHER peers
-    // This is the hot path — zero parsing, zero copying, just fan-out.
-    const sockets = this.ctx.getWebSockets();
-    for (const peer of sockets) {
-      if (peer !== ws) {
-        try {
-          peer.send(message);
-        } catch {
-          // Send failed — peer is dead. Force-close so it gets cleaned up.
-          try { peer.close(1011, "Send failed"); } catch { /* already closed */ }
-          this.sessions.delete(peer);
-        }
+    // Text control message
+    try {
+      const parsed = JSON.parse(message);
+      if (parsed.type === "ping") {
+        ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
       }
+    } catch {
+      // Ignore malformed JSON
+    }
+  }
+
+  /**
+   * Alarm-based sweeper: runs every SWEEP_INTERVAL_MS.
+   * Checks for stale peers (no heartbeat in HEARTBEAT_STALE_MS) and pushes
+   * PARTNER_OFFLINE TLV frames to remaining peers before closing the stale socket.
+   */
+  async alarm() {
+    const now = Date.now();
+    let liveCount = 0;
+
+    for (const ws of this.ctx.getWebSockets()) {
+      if (!this.sessions.has(ws)) {
+        const att = ws.deserializeAttachment();
+        if (att) this.sessions.set(ws, att);
+      }
+      const session = this.sessions.get(ws);
+      if (session && session.lastSeenMs && now - session.lastSeenMs > HEARTBEAT_STALE_MS) {
+        // Push PARTNER_OFFLINE to other peers
+        const frame = buildPartnerOfflineFrame(session.id || "unknown");
+        for (const peer of this.ctx.getWebSockets()) {
+          if (peer !== ws) {
+            try { peer.send(frame); } catch {}
+          }
+        }
+        try { ws.close(1001, "Heartbeat stale"); } catch {}
+        this.sessions.delete(ws);
+      } else {
+        liveCount++;
+      }
+    }
+    // Re-arm based on count of non-closed sockets observed during the sweep,
+    // because ws.close() may not remove the socket from getWebSockets() in the same tick.
+    if (liveCount > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + SWEEP_INTERVAL_MS);
     }
   }
 
@@ -140,22 +228,12 @@ export class PttRoom extends DurableObject {
     this.sessions.delete(ws);
     try { ws.close(code, reason); } catch { /* already closed */ }
 
-    // Notify remaining peers
-    const leaveMsg = JSON.stringify({
-      type: "peer_left",
-      client_id: session.id || "unknown",
-      device: session.device || "Unknown",
-      peers: this.ctx.getWebSockets().length,
-    });
-
     const sockets = this.ctx.getWebSockets();
+
+    // Push binary PARTNER_OFFLINE TLV to remaining peers
+    const offlineFrame = buildPartnerOfflineFrame(session.id || "unknown");
     for (const peer of sockets) {
-      try {
-        peer.send(leaveMsg);
-      } catch {
-        // Dead socket — will be cleaned up on next message or close
-        this.sessions.delete(peer);
-      }
+      try { peer.send(offlineFrame); } catch {}
     }
   }
 

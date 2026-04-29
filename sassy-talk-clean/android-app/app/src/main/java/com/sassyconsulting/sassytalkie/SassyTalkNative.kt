@@ -1,6 +1,9 @@
 package com.sassyconsulting.sassytalkie
 
+import android.content.SharedPreferences
 import android.util.Log
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -16,8 +19,36 @@ import org.json.JSONObject
 object SassyTalkNative {
 
     private const val TAG = "SassyTalkNative"
+    private const val SESSION_PREFS = "sassy_session"
     private var initialized = false
     var appContext: android.content.Context? = null
+
+    /**
+     * Open the session-prefs store backed by Android Keystore via
+     * EncryptedSharedPreferences. Falls back to cleartext SharedPreferences
+     * only if Keystore initialization fails (e.g., corrupted master key on
+     * some OEM builds) — better to keep the radio usable than to brick the
+     * app over a crypto-provider edge case. The fallback logs a warning so
+     * the regression is visible.
+     */
+    private fun sessionPrefs(): SharedPreferences? {
+        val ctx = appContext ?: return null
+        return try {
+            val masterKey = MasterKey.Builder(ctx)
+                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                .build()
+            EncryptedSharedPreferences.create(
+                ctx,
+                SESSION_PREFS,
+                masterKey,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "EncryptedSharedPreferences unavailable, falling back to plain prefs: ${e.message}")
+            ctx.getSharedPreferences(SESSION_PREFS, android.content.Context.MODE_PRIVATE)
+        }
+    }
 
     /** Transport type constants matching Rust enum */
     const val TRANSPORT_NONE = 0
@@ -185,7 +216,7 @@ object SassyTalkNative {
             val json = nativeGenerateSessionQR(durationHours)
             // Persist session so it survives app restart
             if (json.isNotEmpty()) {
-                appContext?.getSharedPreferences("sassy_session", android.content.Context.MODE_PRIVATE)
+                sessionPrefs()
                     ?.edit()?.putString("session_json", json)?.apply()
             }
             json
@@ -204,7 +235,7 @@ object SassyTalkNative {
                 val channel = try {
                     org.json.JSONObject(qrJson).optInt("channel", 1)
                 } catch (_: Exception) { 1 }
-                appContext?.getSharedPreferences("sassy_session", android.content.Context.MODE_PRIVATE)
+                sessionPrefs()
                     ?.edit()?.putString("session_ch_$channel", qrJson)?.apply()
             }
             ok
@@ -217,7 +248,7 @@ object SassyTalkNative {
     /** Restore all previously persisted per-channel sessions (call after nativeInit). */
     fun restoreSession(): Boolean {
         if (!initialized) return false
-        val prefs = appContext?.getSharedPreferences("sassy_session", android.content.Context.MODE_PRIVATE)
+        val prefs = sessionPrefs()
             ?: return false
 
         var anyRestored = false
@@ -336,7 +367,7 @@ object SassyTalkNative {
             }
         }
         // Clear all persisted sessions (per-channel + legacy)
-        appContext?.getSharedPreferences("sassy_session", android.content.Context.MODE_PRIVATE)
+        sessionPrefs()
             ?.edit()?.clear()?.apply()
     }
 
@@ -827,7 +858,7 @@ object SassyTalkNative {
         return try {
             val json = nativeGenerateChannelQR(channel, durationHours, groupName.ifEmpty { null })
             if (json.isNotEmpty()) {
-                appContext?.getSharedPreferences("sassy_session", android.content.Context.MODE_PRIVATE)
+                sessionPrefs()
                     ?.edit()?.putString("session_ch_$channel", json)?.apply()
             }
             json

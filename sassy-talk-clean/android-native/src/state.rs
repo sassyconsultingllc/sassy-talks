@@ -6,6 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::thread::JoinHandle;
 use log::{info, warn};
 
 use crate::audio::AudioEngine;
@@ -40,6 +41,11 @@ pub struct StateMachine {
     current_subchannel: Arc<AtomicU8>,
     tx_running: Arc<AtomicBool>,
     rx_running: Arc<AtomicBool>,
+    // Handles for the audio pipeline threads so we can join on shutdown instead
+    // of only signalling the flags (avoids races where threads outlive the
+    // resources they reference).
+    tx_handle: Mutex<Option<JoinHandle<()>>>,
+    rx_handle: Mutex<Option<JoinHandle<()>>>,
     device_name: String,
     local_sender_id: String,
 }
@@ -60,6 +66,8 @@ impl StateMachine {
             current_subchannel: subchannel,
             tx_running: Arc::new(AtomicBool::new(false)),
             rx_running: Arc::new(AtomicBool::new(false)),
+            tx_handle: Mutex::new(None),
+            rx_handle: Mutex::new(None),
             device_name,
             local_sender_id,
         }
@@ -95,7 +103,7 @@ impl StateMachine {
         self.tx_running.store(true, Ordering::SeqCst);
         self.rx_running.store(true, Ordering::SeqCst);
 
-        audio_pipeline::spawn_tx_thread(
+        let tx = audio_pipeline::spawn_tx_thread(
             Arc::clone(&self.tx_running),
             Arc::clone(&self.ptt_pressed),
             Arc::clone(&self.current_channel),
@@ -105,8 +113,9 @@ impl StateMachine {
             self.local_sender_id.clone(),
             self.device_name.clone(),
         );
+        *self.tx_handle.lock().unwrap() = Some(tx);
 
-        audio_pipeline::spawn_rx_thread(
+        let rx = audio_pipeline::spawn_rx_thread(
             Arc::clone(&self.rx_running),
             Arc::clone(&self.current_channel),
             Arc::clone(&self.current_subchannel),
@@ -116,16 +125,26 @@ impl StateMachine {
             Arc::clone(&self.user_registry),
             self.local_sender_id.clone(),
         );
+        *self.rx_handle.lock().unwrap() = Some(rx);
 
         info!("StateMachine: audio pipeline started");
     }
 
-    /// Stop TX and RX threads.
+    /// Stop TX and RX threads and wait for them to exit so the audio /
+    /// transport resources they reference can be safely dropped or released.
     fn stop_audio_threads(&self) {
         self.tx_running.store(false, Ordering::SeqCst);
         self.rx_running.store(false, Ordering::SeqCst);
-        // Threads will exit their loops on next iteration check
-        info!("StateMachine: audio pipeline stop signaled");
+
+        let tx = self.tx_handle.lock().unwrap().take();
+        let rx = self.rx_handle.lock().unwrap().take();
+        if let Some(h) = tx {
+            if let Err(e) = h.join() { warn!("TX thread join panicked: {:?}", e); }
+        }
+        if let Some(h) = rx {
+            if let Err(e) = h.join() { warn!("RX thread join panicked: {:?}", e); }
+        }
+        info!("StateMachine: audio pipeline stopped");
     }
 
     // ── WiFi Direct Connection (Android-to-Android, no router) ──
@@ -252,6 +271,39 @@ impl StateMachine {
     /// Get cellular stats JSON
     pub fn get_cellular_stats(&self) -> String {
         self.transport.lock().unwrap().get_cellular_stats()
+    }
+
+    // ── Bluetooth Connection ──
+
+    /// Called by Kotlin JNI when Bluetooth RFCOMM connects to a peer.
+    /// Starts audio pipeline just like WiFi Direct and Cellular do.
+    pub fn on_bluetooth_connected(&self) {
+        info!("StateMachine: Bluetooth RFCOMM connected");
+
+        {
+            let mut transport = self.transport.lock().unwrap();
+            transport.on_bluetooth_connected();
+        }
+
+        *self.state.lock().unwrap() = AppState::Connected;
+        self.start_audio_pipeline();
+        info!("StateMachine: Bluetooth connected, audio pipeline started");
+    }
+
+    /// Called by Kotlin JNI when Bluetooth RFCOMM disconnects.
+    pub fn on_bluetooth_disconnected(&self) {
+        info!("StateMachine: Bluetooth disconnected");
+        self.stop_audio_threads();
+
+        {
+            let mut transport = self.transport.lock().unwrap();
+            transport.on_bluetooth_disconnected();
+        }
+
+        let current = *self.state.lock().unwrap();
+        if current == AppState::Connected || current == AppState::Transmitting || current == AppState::Receiving {
+            *self.state.lock().unwrap() = AppState::Ready;
+        }
     }
 
     // ── Disconnect ──

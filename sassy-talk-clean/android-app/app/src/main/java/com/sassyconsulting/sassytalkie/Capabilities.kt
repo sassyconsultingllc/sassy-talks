@@ -27,6 +27,7 @@ data class Capabilities(
 
     companion object {
         fun parse(payload: ByteArray): Capabilities {
+            require(payload.size <= 4096) { "capabilities payload too large: ${payload.size} bytes" }
             val o = JSONObject(String(payload, Charsets.UTF_8))
             return Capabilities(
                 codec = o.optString("codec", "opus"),
@@ -40,7 +41,7 @@ data class Capabilities(
         }
 
         fun fromFrame(bytes: ByteArray): Capabilities? {
-            val f = ControlFrame.decode(bytes)
+            val f = ControlFrame.decode(bytes) ?: return null
             if (f.opcode != ControlFrame.OP_CAPABILITIES) return null
             return parse(f.payload)
         }

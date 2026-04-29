@@ -106,12 +106,12 @@ static PTT_BUFFER_MODE: AtomicBool = AtomicBool::new(true);
 
 /// Set PTT buffer mode. true = buffer and burst on release. false = live stream.
 pub fn set_ptt_buffer_mode(buffer: bool) {
-    PTT_BUFFER_MODE.store(buffer, Ordering::Relaxed);
+    PTT_BUFFER_MODE.store(buffer, Ordering::SeqCst);
     info!("TX: PTT buffer mode = {}", buffer);
 }
 
 pub fn get_ptt_buffer_mode() -> bool {
-    PTT_BUFFER_MODE.load(Ordering::Relaxed)
+    PTT_BUFFER_MODE.load(Ordering::SeqCst)
 }
 
 pub fn spawn_tx_thread(
@@ -142,8 +142,8 @@ pub fn spawn_tx_thread(
                 let silence = vec![0i16; CODEC_FRAME_SIZE];
                 let compressed = encoder.encode(&silence);
                 if !compressed.is_empty() {
-                    let channel = current_channel.load(Ordering::Relaxed);
-                    let subch = current_subchannel.load(Ordering::Relaxed);
+                    let channel = current_channel.load(Ordering::SeqCst);
+                    let subch = current_subchannel.load(Ordering::SeqCst);
                     let ts = now_ms();
                     let wire = pack_wire_frame(channel, subch, &local_sender_id, &local_device_name, ts, &compressed);
                     let mut tm = transport.lock().unwrap();
@@ -152,8 +152,8 @@ pub fn spawn_tx_thread(
                 }
             }
 
-            while tx_running.load(Ordering::Relaxed) {
-                if !ptt_pressed.load(Ordering::Relaxed) {
+            while tx_running.load(Ordering::SeqCst) {
+                if !ptt_pressed.load(Ordering::SeqCst) {
                     // Not transmitting
                     if was_transmitting {
                         // PTT released: stop recording
@@ -164,7 +164,7 @@ pub fn spawn_tx_thread(
 
                         // In buffer mode: flush all accumulated frames with pacing
                         // so the receiver can play them back without drops
-                        if PTT_BUFFER_MODE.load(Ordering::Relaxed) && !tx_frame_buffer.is_empty() {
+                        if PTT_BUFFER_MODE.load(Ordering::SeqCst) && !tx_frame_buffer.is_empty() {
                             let frame_count = tx_frame_buffer.len();
                             info!("TX: burst-sending {} buffered frames", frame_count);
                             for frame in tx_frame_buffer.drain(..) {
@@ -187,8 +187,8 @@ pub fn spawn_tx_thread(
                         let silence = vec![0i16; CODEC_FRAME_SIZE];
                         let compressed = encoder.encode(&silence);
                         if !compressed.is_empty() {
-                            let ch = current_channel.load(Ordering::Relaxed);
-                            let subch = current_subchannel.load(Ordering::Relaxed);
+                            let ch = current_channel.load(Ordering::SeqCst);
+                            let subch = current_subchannel.load(Ordering::SeqCst);
                             let ts = now_ms();
                             let wire = pack_wire_frame(ch, subch, &local_sender_id, &local_device_name, ts, &compressed);
                             let mut tm = transport.lock().unwrap();
@@ -238,12 +238,12 @@ pub fn spawn_tx_thread(
                 let compressed = encoder.encode(&pcm_buffer[..CODEC_FRAME_SIZE]);
 
                 // Pack wire frame (includes device name for receiver display)
-                let channel = current_channel.load(Ordering::Relaxed);
-                let subch = current_subchannel.load(Ordering::Relaxed);
+                let channel = current_channel.load(Ordering::SeqCst);
+                let subch = current_subchannel.load(Ordering::SeqCst);
                 let timestamp = now_ms();
                 let wire_data = pack_wire_frame(channel, subch, &local_sender_id, &local_device_name, timestamp, &compressed);
 
-                if PTT_BUFFER_MODE.load(Ordering::Relaxed) {
+                if PTT_BUFFER_MODE.load(Ordering::SeqCst) {
                     // Buffer mode: accumulate frames, burst-send on PTT release
                     tx_frame_buffer.push(wire_data);
                 } else {
@@ -287,7 +287,7 @@ pub fn spawn_rx_thread(
             let mut recv_buffer = vec![0u8; 2048]; // generous buffer for encrypted + wire header
             let mut playback_started = false;
 
-            while rx_running.load(Ordering::Relaxed) {
+            while rx_running.load(Ordering::SeqCst) {
                 // Receive from transport (decrypted inside TransportManager::receive)
                 let bytes_received = {
                     let mut tm = transport.lock().unwrap();
@@ -341,11 +341,11 @@ pub fn spawn_rx_thread(
                 }
 
                 // Filter by channel + subchannel
-                let my_channel = current_channel.load(Ordering::Relaxed);
+                let my_channel = current_channel.load(Ordering::SeqCst);
                 if channel != my_channel {
                     continue;
                 }
-                let my_subchannel = current_subchannel.load(Ordering::Relaxed);
+                let my_subchannel = current_subchannel.load(Ordering::SeqCst);
                 if subchannel != my_subchannel {
                     // Different subchannel — still register user (they're on same channel)
                     // but don't play audio
@@ -454,51 +454,51 @@ fn call_transcription_bridge(
         Err(_) => return,
     };
 
-    // Create JNI arguments
-    let j_sender_id = match env.new_string(sender_id) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let j_sender_name = match env.new_string(sender_name) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
+    // Bound the local-ref count: strings + short[] would otherwise accumulate
+    // across every received audio frame and overflow the local-ref table on
+    // the long-lived RX thread.
+    if env.push_local_frame(8).is_err() { return; }
 
-    // Create short array for PCM samples
-    let j_pcm = match env.new_short_array(pcm_samples.len() as i32) {
-        Ok(a) => a,
-        Err(_) => return,
-    };
-    if env.set_short_array_region(&j_pcm, 0, pcm_samples).is_err() {
-        return;
-    }
+    // Closure so we can always pop_local_frame before returning.
+    let _ = (|| -> Option<()> {
+        let j_sender_id = env.new_string(sender_id).ok()?;
+        let j_sender_name = env.new_string(sender_name).ok()?;
 
-    let j_fav = if is_favorite { JNI_TRUE } else { JNI_FALSE };
-    let j_muted = if is_muted { JNI_TRUE } else { JNI_FALSE };
+        let j_pcm = env.new_short_array(pcm_samples.len() as i32).ok()?;
+        if env.set_short_array_region(&j_pcm, 0, pcm_samples).is_err() {
+            return None;
+        }
 
-    // Call static method using cached GlobalRef (carries app classloader context)
-    // Safety: GlobalRef -> JObject -> JClass cast is valid for class references
-    let bridge_class = unsafe { JClass::from_raw(bridge_ref.as_obj().as_raw()) };
-    let result = env.call_static_method(
-        &bridge_class,
-        "onAudioReceived",
-        "(Ljava/lang/String;Ljava/lang/String;[SZZ)V",
-        &[
-            JValue::Object(&j_sender_id.into()),
-            JValue::Object(&j_sender_name.into()),
-            JValue::Object(&j_pcm.into()),
-            JValue::Bool(j_fav),
-            JValue::Bool(j_muted),
-        ],
-    );
+        let j_fav = if is_favorite { JNI_TRUE } else { JNI_FALSE };
+        let j_muted = if is_muted { JNI_TRUE } else { JNI_FALSE };
 
-    // Clear any pending exception so it doesn't crash the RX thread
-    if result.is_err() {
-        let _ = env.exception_describe();
-        let _ = env.exception_clear();
-    }
-    // Don't drop bridge_class - it's borrowed from the global ref, not owned
-    std::mem::forget(bridge_class);
+        // Call static method using cached GlobalRef (carries app classloader context)
+        // Safety: GlobalRef -> JObject -> JClass cast is valid for class references
+        let bridge_class = unsafe { JClass::from_raw(bridge_ref.as_obj().as_raw()) };
+        let result = env.call_static_method(
+            &bridge_class,
+            "onAudioReceived",
+            "(Ljava/lang/String;Ljava/lang/String;[SZZ)V",
+            &[
+                JValue::Object(&j_sender_id.into()),
+                JValue::Object(&j_sender_name.into()),
+                JValue::Object(&j_pcm.into()),
+                JValue::Bool(j_fav),
+                JValue::Bool(j_muted),
+            ],
+        );
+
+        // Clear any pending exception so it doesn't crash the RX thread
+        if result.is_err() {
+            let _ = env.exception_describe();
+            let _ = env.exception_clear();
+        }
+        // Don't drop bridge_class - it's borrowed from the global ref, not owned
+        std::mem::forget(bridge_class);
+        Some(())
+    })();
+
+    unsafe { let _ = env.pop_local_frame(&jni::objects::JObject::null()); }
 }
 
 #[cfg(test)]

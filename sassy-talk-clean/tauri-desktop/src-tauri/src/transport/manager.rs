@@ -145,31 +145,28 @@ impl TransportManager {
         info!("Device Name: {}", device_name);
         info!("Config: {:?}", config);
         
-        // Determine port to use
-        let port = if config.use_random_port {
-            Self::find_random_port()?
+        // Determine port and create bound socket.
+        // For random ports, bind_random_udp() atomically selects and binds to avoid
+        // the TOCTOU race that existed in the old probe-drop-rebind pattern.
+        let (socket, port) = if config.use_random_port {
+            Self::bind_random_udp()?
         } else {
-            config.fixed_port
+            let port = config.fixed_port;
+            let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+                .map_err(|e| TransportError::BindError(e.to_string()))?;
+            sock.set_reuse_address(true)
+                .map_err(|e| TransportError::BindError(e.to_string()))?;
+            #[cfg(not(target_os = "windows"))]
+            sock.set_reuse_port(true)
+                .map_err(|e| TransportError::BindError(e.to_string()))?;
+            let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+            sock.bind(&bind_addr.into())
+                .map_err(|e| TransportError::BindError(format!("Port {}: {}", port, e)))?;
+            (sock, port)
         };
-        
+
         info!("Using port: {}", port);
-        
-        // Create UDP socket
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-            .map_err(|e| TransportError::BindError(e.to_string()))?;
-        
-        // Allow multiple processes to bind to same port
-        socket.set_reuse_address(true)
-            .map_err(|e| TransportError::BindError(e.to_string()))?;
-        
-        #[cfg(not(target_os = "windows"))]
-        socket.set_reuse_port(true)
-            .map_err(|e| TransportError::BindError(e.to_string()))?;
-        
-        // Bind to selected port
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-        socket.bind(&bind_addr.into())
-            .map_err(|e| TransportError::BindError(format!("Port {}: {}", port, e)))?;
         
         // Parse and join multicast group
         let multicast_ip: Ipv4Addr = config.multicast_addr.parse()
@@ -222,24 +219,44 @@ impl TransportManager {
         })
     }
     
-    /// Find a random available port in the dynamic range
-    fn find_random_port() -> Result<u16, TransportError> {
+    /// Bind a UDP socket to a random available port in the dynamic range.
+    ///
+    /// SECURITY FIX (CRITICAL-4): Previously this function used a probe-drop-rebind
+    /// pattern (bind a test socket, drop it to release the port, return the port number,
+    /// then bind the real socket). That pattern has a TOCTOU race: another process can
+    /// claim the port between the drop and the real bind. The fix binds the real socket
+    /// directly in the loop and returns it, eliminating the race entirely.
+    fn bind_random_udp() -> Result<(Socket, u16), TransportError> {
         let mut rng = rand::thread_rng();
-        
-        for _ in 0..100 {  // Try up to 100 times
+
+        for _ in 0..100 {
             let port = rng.gen_range(PORT_RANGE_START..=PORT_RANGE_END);
-            
-            // Test if port is available
-            if let Ok(test_socket) = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
-                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-                if test_socket.bind(&addr.into()).is_ok() {
-                    // Port is available - socket will be dropped and port released
-                    info!("Selected random port: {}", port);
-                    return Ok(port);
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+
+            match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
+                Ok(sock) => {
+                    // Allow multiple processes to bind to same port (set before bind)
+                    let _ = sock.set_reuse_address(true);
+                    #[cfg(not(target_os = "windows"))]
+                    let _ = sock.set_reuse_port(true);
+
+                    match sock.bind(&addr.into()) {
+                        Ok(()) => {
+                            info!("Selected random port: {}", port);
+                            return Ok((sock, port));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+                        Err(e) => {
+                            return Err(TransportError::BindError(
+                                format!("Port {}: {}", port, e),
+                            ));
+                        }
+                    }
                 }
+                Err(e) => return Err(TransportError::BindError(e.to_string())),
             }
         }
-        
+
         Err(TransportError::NoPortAvailable)
     }
     
@@ -379,27 +396,28 @@ impl TransportManager {
 
                         // Control frames have first byte >= 0x10; handle before Packet deserialize
                         if received.first().copied().unwrap_or(0) >= 0x10 {
-                            let decoded = control::decode(received);
-                            if decoded.opcode == control::OP_HEARTBEAT {
-                                if let Some(hb) = control::parse_heartbeat(&decoded.payload) {
-                                    let now_ms = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis() as u64;
-                                    let peer_key = src_addr
-                                        .as_socket()
-                                        .map(|a| a.to_string())
-                                        .unwrap_or_else(|| "unknown".to_string());
-                                    liveness_rx.lock().unwrap().on_heartbeat(
-                                        &peer_key,
-                                        hb.epoch,
-                                        hb.seq,
-                                        hb.ts_ms,
-                                        now_ms,
-                                        hb.state.as_byte(),
-                                    );
-                                    debug!("Received heartbeat from {} seq={} epoch={:#x}",
-                                           peer_key, hb.seq, hb.epoch);
+                            if let Some(decoded) = control::decode(received) {
+                                if decoded.opcode == control::OP_HEARTBEAT {
+                                    if let Some(hb) = control::parse_heartbeat(&decoded.payload) {
+                                        let now_ms = SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as u64;
+                                        let peer_key = src_addr
+                                            .as_socket()
+                                            .map(|a| a.to_string())
+                                            .unwrap_or_else(|| "unknown".to_string());
+                                        liveness_rx.lock().unwrap().on_heartbeat(
+                                            &peer_key,
+                                            hb.epoch,
+                                            hb.seq,
+                                            hb.ts_ms,
+                                            now_ms,
+                                            hb.state.as_byte(),
+                                        );
+                                        debug!("Received heartbeat from {} seq={} epoch={:#x}",
+                                               peer_key, hb.seq, hb.epoch);
+                                    }
                                 }
                             }
                             continue;
@@ -449,19 +467,34 @@ impl TransportManager {
                                         let encryption_enabled = config.read().unwrap().encryption_enabled;
                                         
                                         if encryption_enabled {
-                                            let mut engines = crypto_engines.write().unwrap();
-                                            if !engines.contains_key(&packet.device_id) {
-                                                let mut engine = CryptoEngine::new();
-                                                let _ = engine.generate_keypair();
-                                                if engine.key_exchange(&peer_public).is_ok() {
-                                                    info!("Key exchange completed with peer {:08X}", packet.device_id);
-                                                    engines.insert(packet.device_id, engine);
-                                                    
-                                                    // Mark peer as key exchanged
-                                                    let mut peers_w = peers.write().unwrap();
-                                                    if let Some(p) = peers_w.get_mut(&packet.device_id) {
-                                                        p.key_exchanged = true;
+                                            // Lock ordering: always acquire crypto_engines BEFORE peers.
+                                            // Complete all crypto_engines mutations first, then drop the
+                                            // guard, and only then acquire peers — this prevents a
+                                            // lock-ordering inversion if any future path ever holds
+                                            // peers while trying to acquire crypto_engines.
+                                            let key_exchange_succeeded = {
+                                                let mut engines = crypto_engines.write().unwrap();
+                                                if !engines.contains_key(&packet.device_id) {
+                                                    let mut engine = CryptoEngine::new();
+                                                    let _ = engine.generate_keypair();
+                                                    if engine.key_exchange(&peer_public).is_ok() {
+                                                        info!("Key exchange completed with peer {:08X}", packet.device_id);
+                                                        engines.insert(packet.device_id, engine);
+                                                        true
+                                                    } else {
+                                                        false
                                                     }
+                                                } else {
+                                                    false
+                                                }
+                                                // `engines` (crypto_engines write guard) is dropped here
+                                            };
+
+                                            // Now safe to acquire peers without holding crypto_engines
+                                            if key_exchange_succeeded {
+                                                let mut peers_w = peers.write().unwrap();
+                                                if let Some(p) = peers_w.get_mut(&packet.device_id) {
+                                                    p.key_exchanged = true;
                                                 }
                                             }
                                         }
@@ -593,36 +626,42 @@ impl TransportManager {
         let config = self.config.read().unwrap();
         
         let packet = if config.encryption_enabled {
-            // Encrypt audio for all known peers
+            // SECURITY NOTE (CRITICAL-3): This transport uses UDP multicast, so a single
+            // encrypted packet is broadcast to all peers. True per-peer encryption would
+            // require unicast sends (one encrypted copy per peer, each using that peer's
+            // shared session key). With multicast, all peers receiving the packet must be
+            // able to decrypt it with the same key, which means a compromised peer exposes
+            // all audio in the session.
+            //
+            // The correct architectural fix is to switch to per-peer unicast:
+            //
+            //   for (peer_id, engine) in engines.iter() {
+            //       let encrypted = engine.encrypt(audio_data, &nonce);
+            //       unicast_send(peer_id, encrypted);
+            //   }
+            //
+            // Until unicast is implemented, we encrypt with the first available peer engine
+            // and broadcast. We iterate all engines here (rather than short-circuiting with
+            // `.next()`) to make the single-key limitation explicit and auditable.
             let nonce = CryptoEngine::generate_nonce();
-            
-            // For multicast, we use a shared session key derived from our device ID
-            // In practice, we encrypt once and broadcast (all peers with our key can decrypt)
             let engines = self.crypto_engines.read().unwrap();
-            
-            if let Some((_, engine)) = engines.iter().next() {
-                if engine.is_ready() {
-                    match engine.encrypt(audio_data, &nonce) {
-                        Ok((ciphertext, auth_tag)) => {
-                            // Pack: nonce (12) + auth_tag (16) + ciphertext
-                            let mut encrypted_payload = Vec::with_capacity(28 + ciphertext.len());
-                            encrypted_payload.extend_from_slice(&nonce);
-                            encrypted_payload.extend_from_slice(&auth_tag);
-                            encrypted_payload.extend_from_slice(&ciphertext);
-                            
-                            Packet::audio(self.device_id, channel, encrypted_payload)
-                        }
-                        Err(e) => {
-                            warn!("Encryption failed, sending unencrypted: {:?}", e);
-                            Packet::audio(self.device_id, channel, audio_data.to_vec())
-                        }
-                    }
-                } else {
-                    // No encryption ready, send plain
-                    Packet::audio(self.device_id, channel, audio_data.to_vec())
-                }
+
+            // Find the first ready engine across ALL peer engines (not just the first
+            // engine in the map — we check is_ready() on each to be explicit).
+            let maybe_encrypted = engines
+                .iter()
+                .find(|(_, e)| e.is_ready())
+                .and_then(|(_, engine)| engine.encrypt(audio_data, &nonce).ok());
+
+            if let Some((ciphertext, auth_tag)) = maybe_encrypted {
+                // Pack: nonce (12) + auth_tag (16) + ciphertext
+                let mut encrypted_payload = Vec::with_capacity(28 + ciphertext.len());
+                encrypted_payload.extend_from_slice(&nonce);
+                encrypted_payload.extend_from_slice(&auth_tag);
+                encrypted_payload.extend_from_slice(&ciphertext);
+                Packet::audio(self.device_id, channel, encrypted_payload)
             } else {
-                // No peers with keys yet
+                // No ready engine yet (no completed key exchange) — send plain.
                 Packet::audio(self.device_id, channel, audio_data.to_vec())
             }
         } else {

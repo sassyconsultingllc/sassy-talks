@@ -75,17 +75,22 @@ pub fn encode_tlv(op: u8, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-pub fn decode(bytes: &[u8]) -> Decoded {
+pub fn decode(bytes: &[u8]) -> Option<Decoded> {
     if bytes.is_empty() {
-        return Decoded { opcode: 0, payload: vec![] };
+        return None;
     }
     let op = bytes[0];
-    if op < 0x10 || bytes.len() < 3 {
-        return Decoded { opcode: op, payload: vec![] };
+    if op < 0x10 {
+        return Some(Decoded { opcode: op, payload: vec![] });
+    }
+    if bytes.len() < 3 {
+        return None;
     }
     let len = u16::from_le_bytes([bytes[1], bytes[2]]) as usize;
-    let end = (3 + len).min(bytes.len());
-    Decoded { opcode: op, payload: bytes[3..end].to_vec() }
+    if 3 + len > bytes.len() {
+        return None;  // reject truncated frames
+    }
+    Some(Decoded { opcode: op, payload: bytes[3..3 + len].to_vec() })
 }
 
 pub fn encode_heartbeat(epoch: u64, seq: u32, ts_ms: u64,
@@ -172,7 +177,7 @@ mod tests {
     fn legacy_byte_round_trips() {
         let bytes = encode_legacy(OP_PTT_START);
         assert_eq!(bytes, vec![0x01u8]);
-        let decoded = decode(&bytes);
+        let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.opcode, OP_PTT_START);
         assert!(decoded.payload.is_empty());
     }
@@ -182,7 +187,7 @@ mod tests {
         let hb = encode_heartbeat(0xCAFEBABEDEADBEEF, 42, 1_700_000_000_000,
                                   PresenceState::Listening, 18);
         assert_eq!(hb[0], 0x10);
-        let decoded = decode(&hb);
+        let decoded = decode(&hb).unwrap();
         assert_eq!(decoded.opcode, OP_HEARTBEAT);
         let p = parse_heartbeat(&decoded.payload).unwrap();
         assert_eq!(p.seq, 42);
@@ -194,7 +199,7 @@ mod tests {
     #[test]
     fn recv_ack_round_trips() {
         let bytes = encode_recv_ack(999, 77, 5000);
-        let decoded = decode(&bytes);
+        let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.opcode, OP_RECV_ACK);
         let p = parse_recv_ack(&decoded.payload).unwrap();
         assert_eq!(p.epoch, 999);
@@ -205,7 +210,7 @@ mod tests {
     #[test]
     fn partner_offline_round_trips() {
         let bytes = encode_partner_offline("alice-uuid");
-        let decoded = decode(&bytes);
+        let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.opcode, OP_PARTNER_OFFLINE);
         let len = decoded.payload[0] as usize;
         let id = std::str::from_utf8(&decoded.payload[1..1+len]).unwrap();
@@ -222,8 +227,14 @@ mod tests {
 
     #[test]
     fn empty_bytes_decode_safely() {
-        let d = decode(&[]);
-        assert_eq!(d.opcode, 0);
-        assert!(d.payload.is_empty());
+        assert!(decode(&[]).is_none());
+    }
+
+    #[test]
+    fn truncated_frame_rejected() {
+        // Heartbeat header says payload=23 bytes but we only provide 2
+        let mut bytes = encode_heartbeat(1, 1, 1, PresenceState::Idle, 0);
+        bytes.truncate(5); // keep opcode + len bytes + 2 payload bytes (need 23)
+        assert!(decode(&bytes).is_none());
     }
 }

@@ -17,13 +17,14 @@ import com.sassyconsulting.sassytalkie.service.BluetoothTransport
  * 2. Wait for READY_ACK from peers (200ms timeout)
  * 3. Native: start mic capture + ADPCM encode
  * 4. RFCOMM: TX pump reads encoded frames -> sends to peers
- * 5. On release: stop TX, BLE broadcastPttStop()
+ * 5. On release: stop TX, BLE broadcastPttStop() + PTT_STOP_V2
  *
  * RX Flow (receiver gets BLE signal):
  * 1. BleSignalingService.onPttStartReceived()
  * 2. Send READY_ACK via BLE
  * 3. RFCOMM RX is already running (started on connect)
  * 4. Audio will arrive and be decoded by the RX thread
+ * 5. On PTT_STOP_V2 received: wait 300ms, send EOT_ACK
  *
  * Cache-first RX (audio -> ring buffer -> drain thread -> AudioTrack)
  *
@@ -34,7 +35,14 @@ import com.sassyconsulting.sassytalkie.service.BluetoothTransport
  * - On HEARTBEAT rx: update LivenessTracker (RTT, health, presence)
  * - Epoch change detected → re-send Capabilities to that peer
  * - onControlFrame() dispatches all TLV opcodes
+ *
+ * EOT_ACK "delivered" tick (Task 4.3):
+ * - Sender emits PTT_STOP_V2 on release
+ * - Receiver waits 300ms (jitter buffer drain) then sends EOT_ACK
+ * - Sender sets deliveredState = Delivered, then resets to Idle after 3s
  */
+
+enum class DeliveryState { Idle, Sending, Delivered }
 class PttCoordinator(
     private val bleSignaling: BleSignalingService,
     private val btTransport: BluetoothTransport
@@ -69,11 +77,29 @@ class PttCoordinator(
         private const val HEARTBEAT_INTERVAL_MS = 2_000L
         private const val RECV_ACK_INTERVAL_MS = 500L
         private const val REACHING_PEER_TIMEOUT_MS = 1_000L
+
+        // Task 7.1 — Sub-audible audio path probe marker
+        const val PROBE_EPOCH    = -1L  // 0xFFFFFFFFFFFFFFFF as signed Long
+        const val PROBE_SEQ      = -1   // 0xFFFFFFFF as signed Int
+        const val PROBE_ECHO_SEQ = -2   // Echo response marker (PROBE_SEQ - 1)
     }
 
     private val transmitting = AtomicBoolean(false)
     private val readyAckCount = AtomicInteger(0)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // —— Delivery State (Task 4.3) — EOT_ACK "delivered" tick ——
+
+    val deliveredState = MutableStateFlow(DeliveryState.Idle)
+
+    /** Last transmitted audio frame seq (updated by txFrameCallback). */
+    @Volatile private var lastTxSeq: Int = 0
+    /** Last transmitted audio frame epoch (updated by txFrameCallback). */
+    @Volatile private var lastTxEpoch: Long = 0L
+    /** Timeout job: reset deliveredState to Idle if no EOT_ACK within 2s. */
+    private var eotTimeoutJob: Job? = null
+    /** Reset job: set deliveredState back to Idle 3s after Delivered. */
+    private var deliveredResetJob: Job? = null
 
     // —— Heartbeat / Liveness (Task 2.2) ——
 
@@ -81,6 +107,31 @@ class PttCoordinator(
     val selfEpoch: Long = SessionEpoch.generate()
     private var hbSeq = AtomicInteger(0)
     private var heartbeatJob: Job? = null
+    private var staleCheckJob: Job? = null
+
+    // —— Audio Path Probe (Task 7.1) ——
+
+    /** True when the last probe round-trip exceeded 400ms or timed out entirely. */
+    val audioPathDegraded = MutableStateFlow(false)
+
+    /** Timestamp (ms) when the probe frame was sent; 0 means no probe in-flight. */
+    @Volatile private var probeSentMs = 0L
+
+    /** Timeout job for in-flight probe — cancelled when echo arrives. */
+    private var probeTimeoutJob: Job? = null
+
+    // —— Stale-peer banner (Task 6.2) ——
+
+    /** True when at least one connected peer has health == STALE. */
+    val anyPeerStale = MutableStateFlow(false)
+
+    // —— Talk-over indicator (Task 6.2) ——
+
+    /** True while a peer is actively transmitting (OP_PTT_START / OP_PTT_START_V2 received). */
+    val peerSpeaking = MutableStateFlow(false)
+
+    /** Job that auto-clears peerSpeaking after 400ms of silence (no audio frames). */
+    private var peerSpeakingTimeoutJob: Job? = null
 
     // —— RECV_ACK (Task 4.2) — Receiver side ——
 
@@ -111,12 +162,55 @@ class PttCoordinator(
         bleSignaling.listener = this
         // Route raw control frames from BLE up to onControlFrame
         bleSignaling.controlFrameCallback = { peerId, bytes -> onControlFrame(peerId, bytes) }
-        // Track incoming audio frames for RECV_ACK (Task 4.2)
+        // Track incoming audio frames for RECV_ACK (Task 4.2) and probe detection (Task 7.1)
+        btTransport.audioFrameV2Callback = { peerId, decoded -> onAudioFrameV2(peerId, decoded) }
         btTransport.audioFrameCallback = { peerId, epoch, seq -> onAudioFrameReceived(peerId, epoch, seq) }
+        // Seed the BT transport's tx epoch so outbound-frame reports carry our
+        // session identity. The audio payload is encrypted and can't be decoded
+        // on the way out — BluetoothTransport maintains a local seq counter.
+        btTransport.setTxEpoch(selfEpoch)
+        // Track outgoing audio frames for PTT_STOP_V2 / EOT_ACK (Task 4.3)
+        btTransport.txFrameCallback = { epoch, seq ->
+            lastTxEpoch = epoch
+            lastTxSeq = seq
+        }
         startHeartbeat()
     }
 
     // —— TX Side (We press PTT) ——
+
+    /**
+     * Lightweight PTT-press notification from the UI — updates delivery state only.
+     * Audio and BLE signaling are handled separately by the direct SassyTalkNative calls in MainScreen.
+     */
+    fun notifyPttPressed() {
+        eotTimeoutJob?.cancel()
+        deliveredResetJob?.cancel()
+        deliveredState.value = DeliveryState.Sending
+        Log.d(TAG, "notifyPttPressed → deliveredState=Sending")
+    }
+
+    /**
+     * Lightweight PTT-release notification from the UI — emits PTT_STOP_V2 and starts EOT_ACK timeout.
+     * Audio stop is handled separately by the direct SassyTalkNative call in MainScreen.
+     */
+    fun notifyPttReleased() {
+        val stopEpoch = if (lastTxEpoch != 0L) lastTxEpoch else selfEpoch
+        val stopSeq = lastTxSeq
+        val pttStopV2 = ControlFrame.encodePttStopV2(stopEpoch, stopSeq)
+        bleSignaling.broadcastControl(pttStopV2)
+        cellularClient?.sendBinary(pttStopV2)
+        Log.d(TAG, "notifyPttReleased: PTT_STOP_V2 epoch=$stopEpoch seq=$stopSeq")
+
+        eotTimeoutJob?.cancel()
+        eotTimeoutJob = scope.launch {
+            delay(2_000L)
+            if (deliveredState.value == DeliveryState.Sending) {
+                deliveredState.value = DeliveryState.Idle
+                Log.d(TAG, "EOT_ACK timeout — deliveredState reset to Idle")
+            }
+        }
+    }
 
     fun onPttPressed() {
         if (transmitting.getAndSet(true)) return
@@ -132,10 +226,18 @@ class PttCoordinator(
             return
         }
 
+        // Task 7.1: send sub-audible audio path probe before real audio starts
+        sendAudioProbe()
+
         // Reset reaching-peer state on press
         _reachingPeer.value = false
         lastAckMs = 0L
         startWatchdog()
+
+        // Mark delivery as Sending (Task 4.3)
+        eotTimeoutJob?.cancel()
+        deliveredResetJob?.cancel()
+        deliveredState.value = DeliveryState.Sending
 
         // Step 1: BLE signal to all peers
         readyAckCount.set(0)
@@ -173,8 +275,92 @@ class PttCoordinator(
         // Stop RFCOMM TX
         btTransport.stopTxPump()
 
-        // BLE signal to peers
+        // BLE signal to peers (legacy)
         bleSignaling.broadcastPttStop()
+
+        // Emit PTT_STOP_V2 with epoch + lastTxSeq for EOT_ACK delivery tick (Task 4.3)
+        val stopEpoch = if (lastTxEpoch != 0L) lastTxEpoch else selfEpoch
+        val stopSeq = lastTxSeq
+        val pttStopV2 = ControlFrame.encodePttStopV2(stopEpoch, stopSeq)
+        bleSignaling.broadcastControl(pttStopV2)
+        cellularClient?.sendBinary(pttStopV2)
+        Log.d(TAG, "PTT_STOP_V2 epoch=$stopEpoch seq=$stopSeq broadcast")
+
+        // Start 2s timeout: if no EOT_ACK, reset to Idle
+        eotTimeoutJob?.cancel()
+        eotTimeoutJob = scope.launch {
+            delay(2_000L)
+            if (deliveredState.value == DeliveryState.Sending) {
+                deliveredState.value = DeliveryState.Idle
+                Log.d(TAG, "EOT_ACK timeout — deliveredState reset to Idle")
+            }
+        }
+    }
+
+    // —— Audio Path Probe (Task 7.1) ——
+
+    /**
+     * Send a sub-audible audio path probe BEFORE real audio starts.
+     * Uses a reserved epoch/seq marker so receivers can distinguish it from real audio.
+     * Measures round-trip time; sets audioPathDegraded if RTT > 400ms or timeout at 800ms.
+     */
+    fun sendAudioProbe() {
+        val silence = ByteArray(320) // 20ms at 16kHz 16-bit mono
+        val frame = AudioFrameV2.encode(PROBE_EPOCH, PROBE_SEQ, silence)
+        probeSentMs = System.currentTimeMillis()
+        audioPathDegraded.value = false
+        Log.d(TAG, "Probe sent at $probeSentMs")
+        // The probe must measure the RFCOMM audio path, so it goes over BT (not
+        // cellular). sendRaw writes directly to the RFCOMM socket without the
+        // length prefix startTxPump adds; the receiver picks it up by reading
+        // the V2 frame's own length field.
+        btTransport.sendRaw(frame)
+        // Timeout check: if no echo within 800ms, mark degraded
+        probeTimeoutJob?.cancel()
+        probeTimeoutJob = scope.launch {
+            delay(800)
+            if (probeSentMs > 0) {
+                audioPathDegraded.value = true
+                probeSentMs = 0
+                Log.w(TAG, "Probe timeout — audioPathDegraded=true")
+            }
+        }
+    }
+
+    /**
+     * Called by BluetoothTransport for every incoming V2 audio frame (full decoded).
+     * Handles probe marker detection:
+     *  - PROBE_EPOCH + PROBE_SEQ      → we are the receiver; echo it back
+     *  - PROBE_EPOCH + PROBE_ECHO_SEQ → we are the sender; measure RTT
+     * All other frames are handled by the normal RECV_ACK path.
+     */
+    fun onAudioFrameV2(peerId: String, decoded: AudioV2Decoded) {
+        when {
+            decoded.epoch == PROBE_EPOCH && decoded.seq == PROBE_SEQ -> {
+                // We are the receiver — echo back via RFCOMM (btTransport), NOT the relay
+                Log.d(TAG, "Probe received from $peerId — echoing back via RFCOMM")
+                val echoFrame = AudioFrameV2.encode(PROBE_EPOCH, PROBE_ECHO_SEQ, ByteArray(0))
+                btTransport.sendRaw(echoFrame)
+            }
+            decoded.epoch == PROBE_EPOCH && decoded.seq == PROBE_ECHO_SEQ -> {
+                // We are the sender — measure RTT (drop if no probe in flight)
+                if (probeSentMs == 0L) {
+                    Log.w(TAG, "Spurious probe echo from $peerId — no probe in flight, dropping")
+                    return
+                }
+                val rtt = System.currentTimeMillis() - probeSentMs
+                probeSentMs = 0
+                probeTimeoutJob?.cancel()
+                probeTimeoutJob = null
+                audioPathDegraded.value = rtt > 400
+                Log.d(TAG, "Probe echo RTT=${rtt}ms → degraded=${audioPathDegraded.value}")
+            }
+            else -> {
+                // Normal audio frame — update RECV_ACK tracking
+                lastRxSeq = decoded.seq
+                lastRxEpoch = decoded.epoch
+            }
+        }
     }
 
     // —— RX Side (Peer presses PTT, we receive) ——
@@ -185,13 +371,47 @@ class PttCoordinator(
         // Send READY_ACK back
         bleSignaling.sendReadyAck(deviceAddress)
 
+        // Mark peer as speaking (Task 6.2)
+        setPeerSpeaking(true)
+
         // RFCOMM RX is already running (started on connect)
         // Audio will arrive and be decoded by the RX thread
     }
 
     override fun onPttStopReceived(deviceAddress: String) {
         Log.i(TAG, "\u2190 PTT_STOP from $deviceAddress")
+        stopRecvAckJob()
+        // Clear peer speaking indicator (Task 6.2)
+        setPeerSpeaking(false)
         // TODO: Play roger beep
+    }
+
+    /** Set peerSpeaking = true and arm a 400ms auto-clear timeout. */
+    private fun setPeerSpeaking(speaking: Boolean) {
+        peerSpeaking.value = speaking
+        peerSpeakingTimeoutJob?.cancel()
+        if (speaking) {
+            peerSpeakingTimeoutJob = scope.launch {
+                delay(400L)
+                peerSpeaking.value = false
+                Log.d(TAG, "peerSpeaking auto-cleared after 400ms timeout")
+            }
+        } else {
+            peerSpeakingTimeoutJob = null
+        }
+    }
+
+    /** Called when a V2 audio frame arrives — resets the 400ms speaking timeout. */
+    fun onPeerAudioFrame() {
+        if (peerSpeaking.value) {
+            // Extend timeout — cancel and rearm
+            peerSpeakingTimeoutJob?.cancel()
+            peerSpeakingTimeoutJob = scope.launch {
+                delay(400L)
+                peerSpeaking.value = false
+                Log.d(TAG, "peerSpeaking auto-cleared after 400ms audio silence")
+            }
+        }
     }
 
     override fun onReadyAckReceived(deviceAddress: String) {
@@ -236,7 +456,23 @@ class PttCoordinator(
                 bleSignaling.broadcastControl(frame)
                 cellularClient?.sendBinary(frame)
                 Log.d(TAG, "HB seq=$seq broadcast to ${bleSignaling.blePeerCount} peers (relay=${cellularClient != null})")
+
+                // Poll stale status every 1s (heartbeat fires every 2s, check every tick)
+                val peerIds = liveness.peerIds()
+                val stale = peerIds.isNotEmpty() && peerIds.any { liveness.health(it, nowMs) == PeerHealth.STALE }
+                if (anyPeerStale.value != stale) anyPeerStale.value = stale
+
                 delay(HEARTBEAT_INTERVAL_MS)
+            }
+        }
+        // Also run a 1s stale-check loop independent of the 2s heartbeat
+        staleCheckJob = scope.launch {
+            while (true) {
+                delay(1_000L)
+                val nowMs = System.currentTimeMillis()
+                val peerIds = liveness.peerIds()
+                val stale = peerIds.isNotEmpty() && peerIds.any { liveness.health(it, nowMs) == PeerHealth.STALE }
+                if (anyPeerStale.value != stale) anyPeerStale.value = stale
             }
         }
     }
@@ -244,6 +480,8 @@ class PttCoordinator(
     fun stopHeartbeat() {
         heartbeatJob?.cancel()
         heartbeatJob = null
+        staleCheckJob?.cancel()
+        staleCheckJob = null
         Log.i(TAG, "Heartbeat loop stopped")
     }
 
@@ -260,7 +498,7 @@ class PttCoordinator(
      */
     fun onControlFrame(peerId: String, bytes: ByteArray) {
         if (bytes.isEmpty()) return
-        val frame = ControlFrame.decode(bytes)
+        val frame = ControlFrame.decode(bytes) ?: return
 
         when (frame.opcode) {
             // Legacy opcodes — delegate to existing handler methods (Listener contract preserved)
@@ -271,6 +509,10 @@ class PttCoordinator(
             ControlFrame.OP_PTT_STOP -> {
                 Log.d(TAG, "onControlFrame: PTT_STOP from $peerId")
                 onPttStopReceived(peerId)
+            }
+            ControlFrame.OP_PTT_START_V2 -> {
+                Log.d(TAG, "onControlFrame: PTT_START_V2 from $peerId")
+                setPeerSpeaking(true)
             }
             ControlFrame.OP_READY_ACK -> {
                 Log.d(TAG, "onControlFrame: READY_ACK from $peerId")
@@ -284,6 +526,8 @@ class PttCoordinator(
             ControlFrame.OP_HEARTBEAT -> handleHeartbeat(peerId, frame.payload)
             ControlFrame.OP_RECV_ACK -> handleRecvAck(peerId, frame.payload)
             ControlFrame.OP_CAPABILITIES -> handleCapabilities(peerId, frame.payload)
+            ControlFrame.OP_PTT_STOP_V2 -> handlePttStopV2(peerId, frame.payload)
+            ControlFrame.OP_EOT_ACK -> handleEotAck(peerId, frame.payload)
             ControlFrame.OP_PARTNER_OFFLINE -> {
                 if (frame.payload.isNotEmpty()) {
                     val idLen = frame.payload[0].toInt() and 0xFF
@@ -347,6 +591,8 @@ class PttCoordinator(
         lastRxEpoch = epoch
         lastRxSeq = seq
         lastRxPeerId = peerId
+        // Extend peer-speaking timeout on each incoming audio frame (Task 6.2)
+        onPeerAudioFrame()
         // Ensure the ACK loop is running
         if (recvAckJob?.isActive != true) {
             recvAckJob = scope.launch {
@@ -370,6 +616,61 @@ class PttCoordinator(
     private fun stopRecvAckJob() {
         recvAckJob?.cancel()
         recvAckJob = null
+    }
+
+    // —— PTT_STOP_V2 / EOT_ACK — Receiver + Sender (Task 4.3) ——
+
+    /**
+     * Receiver side: peer has released PTT and sent PTT_STOP_V2.
+     * Wait 300ms for jitter buffer to drain, then send EOT_ACK back.
+     */
+    private fun handlePttStopV2(peerId: String, payload: ByteArray) {
+        stopRecvAckJob()
+        if (payload.size < 12) {
+            Log.w(TAG, "PTT_STOP_V2 from $peerId: payload too short (${payload.size})")
+            return
+        }
+        val bb = java.nio.ByteBuffer.wrap(payload).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        val epoch = bb.long
+        val endSeq = bb.int
+        Log.d(TAG, "PTT_STOP_V2 from $peerId epoch=$epoch endSeq=$endSeq — will EOT_ACK in 300ms")
+        // Clear peer-speaking indicator (Task 6.2)
+        setPeerSpeaking(false)
+        scope.launch {
+            delay(300L) // jitter buffer drain
+            val ack = ControlFrame.encodeEotAck(epoch, endSeq)
+            bleSignaling.sendControl(peerId, ack)
+            cellularClient?.sendBinary(ack)
+            Log.d(TAG, "EOT_ACK sent to $peerId epoch=$epoch upToSeq=$endSeq")
+        }
+    }
+
+    /**
+     * Sender side: received EOT_ACK — the peer confirmed they got our audio.
+     * Set deliveredState = Delivered, then reset to Idle after 3s.
+     */
+    private fun handleEotAck(peerId: String, payload: ByteArray) {
+        if (payload.size < 12) {
+            Log.w(TAG, "EOT_ACK from $peerId: payload too short (${payload.size})")
+            return
+        }
+        val bb = java.nio.ByteBuffer.wrap(payload).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        val ackEpoch = bb.long
+        val ackSeq = bb.int
+        val expectedEpoch = if (lastTxEpoch != 0L) lastTxEpoch else selfEpoch
+        if (ackEpoch != expectedEpoch || ackSeq < lastTxSeq) {
+            Log.w(TAG, "Stale/spoofed EOT_ACK: epoch=$ackEpoch seq=$ackSeq, expected epoch=$expectedEpoch seq>=$lastTxSeq")
+            return
+        }
+        Log.d(TAG, "EOT_ACK from $peerId epoch=$ackEpoch upToSeq=$ackSeq → Delivered")
+        eotTimeoutJob?.cancel()
+        deliveredState.value = DeliveryState.Delivered
+        deliveredResetJob?.cancel()
+        deliveredResetJob = scope.launch {
+            delay(3_000L)
+            deliveredState.value = DeliveryState.Idle
+            Log.d(TAG, "deliveredState reset to Idle after 3s")
+        }
     }
 
     // —— Reaching-Peer Watchdog — Sender side (Task 4.2) ——
@@ -446,6 +747,13 @@ class PttCoordinator(
         stopRecvAckJob()
         stopWatchdog()
         _reachingPeer.value = false
+        audioPathDegraded.value = false
+        probeSentMs = 0
+        probeTimeoutJob?.cancel()
+        probeTimeoutJob = null
+        eotTimeoutJob?.cancel()
+        deliveredResetJob?.cancel()
+        deliveredState.value = DeliveryState.Idle
         scope.cancel()
         transmitting.set(false)
     }

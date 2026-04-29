@@ -14,6 +14,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.draw.scale
@@ -71,6 +72,22 @@ fun MainScreen(
 
     // Reaching-peer indicator (Task 4.2)
     val reachingPeer by (walkieService?.pttCoordinator?.reachingPeer
+        ?: kotlinx.coroutines.flow.MutableStateFlow(false)).collectAsState()
+
+    // Delivery state indicator (Task 4.3)
+    val deliveryState by (walkieService?.pttCoordinator?.deliveredState
+        ?: kotlinx.coroutines.flow.MutableStateFlow(com.sassyconsulting.sassytalkie.DeliveryState.Idle)).collectAsState()
+
+    // Audio path degraded indicator (Task 7.1)
+    val audioPathDegraded by (walkieService?.pttCoordinator?.audioPathDegraded
+        ?: kotlinx.coroutines.flow.MutableStateFlow(false)).collectAsState()
+
+    // Stale-peer banner (Task 6.2)
+    val anyPeerStale by (walkieService?.pttCoordinator?.anyPeerStale
+        ?: kotlinx.coroutines.flow.MutableStateFlow(false)).collectAsState()
+
+    // Talk-over indicator (Task 6.2)
+    val peerSpeaking by (walkieService?.pttCoordinator?.peerSpeaking
         ?: kotlinx.coroutines.flow.MutableStateFlow(false)).collectAsState()
 
     // Auto-connect and set cache to queue mode (cache-first)
@@ -271,6 +288,31 @@ fun MainScreen(
             }
         }
 
+        // Stale-peer banner (Task 6.2)
+        if (anyPeerStale) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF3D2E00)),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Icon(Icons.Default.Warning, contentDescription = null, tint = Color(0xFFFFB300), modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Reconnecting\u2026 peer out of contact",
+                        fontSize = 13.sp,
+                        color = Color(0xFFFFB300),
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+        }
+
         // Incoming audio indicator
         if (incomingAudio && !isTransmitting) {
             Spacer(modifier = Modifier.height(4.dp))
@@ -381,6 +423,7 @@ fun MainScreen(
             isTransmitting = isTransmitting,
             pulseScale = if (isTransmitting) pulseScale else 1f,
             enabled = pttEnabled,
+            dimmed = anyPeerStale,
             holdMode = pttHoldMode,
             onPressStart = {
                 if (!pttEnabled) return@PTTButton
@@ -391,11 +434,13 @@ fun MainScreen(
                     if (isTransmitting) {
                         isTransmitting = false
                         SassyTalkNative.pttStop()
+                        walkieService?.pttCoordinator?.notifyPttReleased()
                         walkieService?.updateNotification("Radio active \u2014 ${SassyTalkNative.getTransportName()}")
                     } else {
                         showEncryptionWarning = false
                         isTransmitting = true
                         SassyTalkNative.pttStart()
+                        walkieService?.pttCoordinator?.notifyPttPressed()
                         walkieService?.updateNotification("Transmitting on CH $currentChannel")
                     }
                 } else {
@@ -403,6 +448,7 @@ fun MainScreen(
                     showEncryptionWarning = false
                     isTransmitting = true
                     SassyTalkNative.pttStart()
+                    walkieService?.pttCoordinator?.notifyPttPressed()
                     walkieService?.updateNotification("Transmitting on CH $currentChannel")
                 }
             },
@@ -411,6 +457,7 @@ fun MainScreen(
                 if (!pttHoldMode && isTransmitting) {
                     isTransmitting = false
                     SassyTalkNative.pttStop()
+                    walkieService?.pttCoordinator?.notifyPttReleased()
                     walkieService?.updateNotification("Radio active \u2014 ${SassyTalkNative.getTransportName()}")
                 }
             }
@@ -436,6 +483,91 @@ fun MainScreen(
                     fontSize = 13.sp,
                     color = if (reachingPeer) Color(0xFF4CAF50) else Color(0xFFFF5252)
                 )
+            }
+        }
+
+        // Audio path degraded warning (Task 7.1) — shown when PTT held and probe RTT exceeded
+        if (isTransmitting && audioPathDegraded) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF3A2200)),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Icon(Icons.Default.Warning, contentDescription = null, tint = Color(0xFFFF9800), modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "\u26A0\uFE0F Audio path slow",
+                        fontSize = 13.sp,
+                        color = Color(0xFFFF9800),
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+        }
+
+        // Talk-over indicator (Task 6.2) — shown when we're transmitting and peer is also speaking
+        if (isTransmitting && peerSpeaking) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF3A1A00)),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Icon(Icons.Default.Mic, contentDescription = null, tint = Color(0xFFFF9800), modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "They are also talking",
+                        fontSize = 13.sp,
+                        color = Color(0xFFFF9800),
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+        }
+
+        // Delivery state indicator (Task 4.3) — shown after PTT release
+        if (!isTransmitting && deliveryState != com.sassyconsulting.sassytalkie.DeliveryState.Idle) {
+            Spacer(modifier = Modifier.height(12.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                when (deliveryState) {
+                    com.sassyconsulting.sassytalkie.DeliveryState.Sending -> {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(14.dp),
+                            strokeWidth = 2.dp,
+                            color = Color(0xFFFF9800)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Sending...",
+                            fontSize = 13.sp,
+                            color = Color(0xFFFF9800)
+                        )
+                    }
+                    com.sassyconsulting.sassytalkie.DeliveryState.Delivered -> {
+                        Text(
+                            text = "\u2713 Delivered",
+                            fontSize = 13.sp,
+                            color = Color(0xFF4CAF50),
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                    else -> {}
+                }
             }
         }
 
@@ -629,12 +761,13 @@ private fun PTTButton(
     isTransmitting: Boolean,
     pulseScale: Float,
     enabled: Boolean = true,
+    dimmed: Boolean = false,
     holdMode: Boolean = false,
     onPressStart: () -> Unit,
     onPressEnd: () -> Unit
 ) {
     val buttonColor = if (isTransmitting) Orange else SurfaceBg
-    val ringColor = if (isTransmitting) Orange else Cyan
+    val ringColor = if (isTransmitting) Orange else if (dimmed) TextMuted else Cyan
     val innerColor = if (isTransmitting) OrangeLight else CardBg
 
     Box(
@@ -642,6 +775,7 @@ private fun PTTButton(
         modifier = Modifier
             .size(280.dp)
             .scale(pulseScale)
+            .alpha(if (dimmed) 0.45f else 1f)
     ) {
         if (isTransmitting) {
             Box(

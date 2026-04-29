@@ -56,6 +56,14 @@ object TranscriptionBridge {
     /** Observable feed of timeline entries for Compose UI. */
     val entries: StateFlow<List<TranscriptionEntry>> = _entries.asStateFlow()
 
+    private val _incomingAudio = MutableStateFlow(false)
+    /** True while a remote speaker is actively speaking. */
+    val incomingAudio: StateFlow<Boolean> = _incomingAudio.asStateFlow()
+
+    private val _activeSpeakerName = MutableStateFlow("")
+    /** Display name of the currently active remote speaker. */
+    val activeSpeakerName: StateFlow<String> = _activeSpeakerName.asStateFlow()
+
     @Volatile
     private var enabled = false
 
@@ -242,6 +250,8 @@ object TranscriptionBridge {
             activeIsMuted = isMuted
             speechStartTime = System.currentTimeMillis()
             speechFrameCount = 0
+            _incomingAudio.value = true
+            _activeSpeakerName.value = senderName
         }
 
         speechFrameCount++
@@ -328,6 +338,8 @@ object TranscriptionBridge {
         speechStartTime = 0L
         silentFrameCount = 0
         speechFrameCount = 0
+        _incomingAudio.value = false
+        _activeSpeakerName.value = ""
     }
 
     /** Compute root-mean-square amplitude for a PCM sample buffer. */

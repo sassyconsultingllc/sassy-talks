@@ -91,10 +91,11 @@ impl AudioEngine {
     pub fn init_player(&self) -> Result<(), String> {
         info!("Initializing audio player");
 
-        // Calculate buffer size (same as recorder for consistency)
-        let buffer_size = match AndroidAudioRecord::get_min_buffer_size(
+        // Query AudioTrack's own min buffer size — AudioRecord's is not suitable
+        // for playback (can under-allocate and cause audible glitches / underruns).
+        let buffer_size = match AndroidAudioTrack::get_min_buffer_size(
             SAMPLE_RATE,
-            CHANNEL_CONFIG_MONO,
+            CHANNEL_CONFIG_OUT_MONO,
             AUDIO_FORMAT_PCM_16
         ) {
             Ok(size) => size,

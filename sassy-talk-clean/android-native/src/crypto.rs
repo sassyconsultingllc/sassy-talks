@@ -19,6 +19,10 @@ const NONCE_SIZE: usize = 12;
 pub struct CryptoSession {
     cipher: Aes256Gcm,
     nonce_counter: u64,
+    /// Per-session random prefix occupying the first 4 bytes of each nonce.
+    /// Without this, two devices sharing a PSK would both start their counter
+    /// at 0 and reuse nonces — fatal for AES-GCM confidentiality.
+    nonce_prefix: [u8; 4],
 }
 
 impl CryptoSession {
@@ -35,6 +39,7 @@ impl CryptoSession {
         Self {
             cipher,
             nonce_counter: 0,
+            nonce_prefix: random_nonce_prefix(),
         }
     }
 
@@ -46,6 +51,7 @@ impl CryptoSession {
         Self {
             cipher,
             nonce_counter: 0,
+            nonce_prefix: random_nonce_prefix(),
         }
     }
 
@@ -80,11 +86,20 @@ impl CryptoSession {
     }
 
     fn next_nonce(&mut self) -> [u8; NONCE_SIZE] {
-        self.nonce_counter += 1;
+        self.nonce_counter = self.nonce_counter
+            .checked_add(1)
+            .expect("nonce counter overflow — session must be re-keyed");
         let mut nonce = [0u8; NONCE_SIZE];
+        nonce[..4].copy_from_slice(&self.nonce_prefix);
         nonce[4..12].copy_from_slice(&self.nonce_counter.to_le_bytes());
         nonce
     }
+}
+
+fn random_nonce_prefix() -> [u8; 4] {
+    let mut prefix = [0u8; 4];
+    OsRng.fill_bytes(&mut prefix);
+    prefix
 }
 
 /// Key exchange helper

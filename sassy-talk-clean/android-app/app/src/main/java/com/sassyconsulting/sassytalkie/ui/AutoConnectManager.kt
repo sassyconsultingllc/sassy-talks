@@ -6,8 +6,10 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -46,6 +48,11 @@ class AutoConnectManager(private val context: Context) {
     private var walkieServiceRef: WalkieService? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var activeTransport: String = "none" // "wifi", "cellular", "none"
+
+    // Scope owned by this manager so that coroutines launched from the
+    // ConnectivityManager.NetworkCallback can be cancelled in disconnect().
+    // Using GlobalScope would leak the coroutines past the manager's lifetime.
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private fun hasWifi(): Boolean {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -208,7 +215,7 @@ class AutoConnectManager(private val context: Context) {
                     walkieServiceRef?.releaseMulticastLock()
                     _statusText.value = "Reconnecting..."
 
-                    GlobalScope.launch(Dispatchers.IO) {
+                    scope.launch {
                         val ok = connectCellular(walkieServiceRef)
                         if (!ok) {
                             Log.e(TAG, "Relay fallback failed after WiFi loss")
@@ -223,7 +230,7 @@ class AutoConnectManager(private val context: Context) {
                 Log.d(TAG, "Network available — activeTransport=$activeTransport")
                 // If we were relay-only and WiFi came back, reconnect multicast
                 if (activeTransport == "cellular" && hasWifi()) {
-                    GlobalScope.launch(Dispatchers.IO) {
+                    scope.launch {
                         walkieServiceRef?.acquireMulticastLock()
                         val wifiOk = SassyTalkNative.connectWifiMulticast()
                         if (wifiOk) {
@@ -286,5 +293,8 @@ class AutoConnectManager(private val context: Context) {
         activeTransport = "none"
         _relayReady.value = false
         _state.value = ConnectState.IDLE
+        // Cancel any in-flight failover coroutines but leave the scope alive
+        // so the manager can be reused for a future connect.
+        (scope.coroutineContext[Job] as? Job)?.children?.forEach { it.cancel() }
     }
 }
