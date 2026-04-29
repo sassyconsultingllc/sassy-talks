@@ -11,8 +11,8 @@ android {
         applicationId = "com.sassyconsulting.sassytalkie"
         minSdk = 24
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.0.0"
+        versionCode = 5
+        versionName = "2.3.0"
         
         // Feature flag: enable or disable cellular (relay) transport at build time
         buildConfigField("boolean", "ENABLE_CELLULAR_RELAY", "true")
@@ -25,12 +25,23 @@ android {
 
     signingConfigs {
         create("release") {
+            // Signing credentials come exclusively from the environment so no
+            // default password is ever baked into the build output. If the env
+            // vars are unset, this signingConfig is simply not wired up for the
+            // release buildType (we fall back to the debug keystore below).
             val ksFile = file("keystore/release.keystore")
-            if (ksFile.exists()) {
+            val envStorePw = System.getenv("RELEASE_STORE_PASSWORD")
+            val envAlias = System.getenv("RELEASE_KEY_ALIAS")
+            val envKeyPw = System.getenv("RELEASE_KEY_PASSWORD")
+            if (ksFile.exists() &&
+                !envStorePw.isNullOrBlank() &&
+                !envAlias.isNullOrBlank() &&
+                !envKeyPw.isNullOrBlank()
+            ) {
                 storeFile = ksFile
-                storePassword = System.getenv("RELEASE_STORE_PASSWORD") ?: "sassytalk2025"
-                keyAlias = System.getenv("RELEASE_KEY_ALIAS") ?: "sassytalkie"
-                keyPassword = System.getenv("RELEASE_KEY_PASSWORD") ?: "sassytalk2025"
+                storePassword = envStorePw
+                keyAlias = envAlias
+                keyPassword = envKeyPw
             }
         }
     }
@@ -43,10 +54,17 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            val releaseKs = file("keystore/release.keystore")
-            signingConfig = if (releaseKs.exists()) {
+            val hasReleaseCreds = file("keystore/release.keystore").exists() &&
+                !System.getenv("RELEASE_STORE_PASSWORD").isNullOrBlank() &&
+                !System.getenv("RELEASE_KEY_ALIAS").isNullOrBlank() &&
+                !System.getenv("RELEASE_KEY_PASSWORD").isNullOrBlank()
+            signingConfig = if (hasReleaseCreds) {
                 signingConfigs.getByName("release")
             } else {
+                // No release credentials in the environment — fall back to the
+                // debug keystore for local reproducibility. CI must set the
+                // env vars above to get a properly-signed release APK.
+                logger.warn("Release build without RELEASE_*_PASSWORD/ALIAS env vars — signing with debug keystore.")
                 signingConfigs.getByName("debug")
             }
         }
@@ -104,6 +122,11 @@ dependencies {
 
     // OkHttp for WebSocket (cellular relay transport)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Android Keystore-backed EncryptedSharedPreferences for session/key storage.
+    // Plain SharedPreferences is sandboxed to our UID but is cleartext on disk —
+    // any backup or rooted access would leak the session key.
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
     
     // AppCompat + Material + ConstraintLayout for legacy XML layouts
     implementation("androidx.appcompat:appcompat:1.6.1")
