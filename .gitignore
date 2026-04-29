@@ -53,3 +53,6 @@ npm-debug.log*
 
 # Cloudflare Wrangler local state (Miniflare R2/KV/DO emulator caches)
 **/.wrangler/
+
+# Holding pen for files staged for deletion (keep out of source tree, don't push)
+/delete/
