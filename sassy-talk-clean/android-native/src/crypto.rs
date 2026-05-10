@@ -2,18 +2,40 @@
 ///
 /// Handles key exchange (X25519 ECDH) and packet encryption/decryption.
 /// Each session generates a fresh ephemeral keypair.
+///
+/// Key hygiene: AES round keys live in `Aes256Gcm` which zeroizes on drop
+/// (via the `zeroize` feature of aes-gcm). The KDF intermediate buffer
+/// is held in `Zeroizing<[u8; 32]>` so it's wiped after the cipher is built.
+/// X25519 ephemerals zeroize on drop via x25519-dalek's `zeroize` feature.
 
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce,
 };
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
-use sha2::{Sha256, Digest};
+use hkdf::Hkdf;
+use sha2::Sha256;
 use rand::RngCore;
+use zeroize::Zeroizing;
 use log::info;
 
 /// Nonce size for AES-256-GCM (96 bits / 12 bytes)
 const NONCE_SIZE: usize = 12;
+
+/// HKDF domain-separation tag. Bumping this breaks interop with v1 SHA-256-KDF
+/// peers — but the active QR/PSK flow goes through `from_psk` and is unaffected.
+/// Only the X25519 ECDH path uses this KDF.
+const HKDF_INFO: &[u8] = b"sassytalkie-aead-v2";
+
+/// Derive a 32-byte AES-256 key from input keying material via HKDF-SHA256.
+/// Returns a Zeroizing wrapper so the caller can rely on automatic wipe.
+fn derive_aes_key(ikm: &[u8]) -> Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(None, ikm);
+    let mut out = Zeroizing::new([0u8; 32]);
+    hk.expand(HKDF_INFO, &mut *out)
+        .expect("HKDF expand of 32 bytes cannot fail");
+    out
+}
 
 /// Encryption session state
 pub struct CryptoSession {
@@ -26,15 +48,14 @@ pub struct CryptoSession {
 }
 
 impl CryptoSession {
-    /// Create session from shared secret (post key-exchange)
+    /// Create session from shared secret (post key-exchange).
+    /// Uses HKDF-SHA256 instead of plain SHA-256 for proper KDF hygiene.
     pub fn from_shared_secret(shared: &SharedSecret) -> Self {
-        // Derive 256-bit AES key from shared secret via SHA-256
-        let mut hasher = Sha256::new();
-        hasher.update(shared.as_bytes());
-        let key_bytes = hasher.finalize();
+        let key_bytes = derive_aes_key(shared.as_bytes());
 
-        let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        let cipher = Aes256Gcm::new_from_slice(&*key_bytes)
             .expect("AES-256-GCM key init failed");
+        // key_bytes drops here, zeroizing the intermediate buffer.
 
         Self {
             cipher,

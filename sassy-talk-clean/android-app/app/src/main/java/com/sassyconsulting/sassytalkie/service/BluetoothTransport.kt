@@ -470,8 +470,17 @@ class BluetoothTransport(private val context: Context) {
                         }
                     }
 
-                    // Audio frame — pass to Rust for decoding and playback
-                    SassyTalkNative.btDecodeFrame(payload)
+                    // Audio frame — pass to Rust for decoding and playback.
+                    // BT wire frames carry their own (sender_id, timestamp) metadata
+                    // but no V2 (epoch, seq); the encrypted payload can't be probed
+                    // for those without false positives (see comment above). Fire the
+                    // callback with sentinel 0/0 so the coordinator can still update
+                    // lastRxPeerId, kick the RECV_ACK loop, and re-arm the
+                    // peer-speaking UI timeout — handleRecvAck only uses receipt
+                    // (not the values) for the reachingPeer signal.
+                    if (SassyTalkNative.btDecodeFrame(payload)) {
+                        audioFrameCallback?.invoke(peer.device.address, 0L, 0)
+                    }
                 }
             } catch (e: IOException) {
                 if (running.get()) {

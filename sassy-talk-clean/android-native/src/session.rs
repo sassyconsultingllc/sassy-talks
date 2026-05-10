@@ -14,6 +14,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use log::info;
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::CryptoSession;
 
@@ -47,11 +48,32 @@ pub struct SessionKey {
 
 fn default_channel() -> u8 { 1 }
 
+/// Wipe the base64-encoded AES key (and other sensitive strings) when the
+/// SessionKey is dropped — i.e. when a channel is cleared, a session expires,
+/// or the SessionManager itself goes away. This is defense-in-depth against
+/// post-process memory inspection; it does NOT replace the on-disk hardening
+/// in SassyTalkNative.kt.
+impl Drop for SessionKey {
+    fn drop(&mut self) {
+        self.key.zeroize();
+        self.device.zeroize();
+        self.session_id.zeroize();
+        self.group_name.zeroize();
+    }
+}
+
 /// Per-channel session slot
 #[derive(Debug, Clone)]
 pub struct ChannelSession {
     pub key: SessionKey,
     pub group_name: String,
+}
+
+impl Drop for ChannelSession {
+    fn drop(&mut self) {
+        // SessionKey drops itself; just wipe our duplicate copy of the name.
+        self.group_name.zeroize();
+    }
 }
 
 /// Per-channel session registry (replaces the old single-session SessionManager)
@@ -137,16 +159,16 @@ impl SessionManager {
             return Err("Session duration exceeds maximum".to_string());
         }
 
-        let key_bytes = base64::Engine::decode(
+        let key_bytes = Zeroizing::new(base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
             &session.key,
-        ).map_err(|e| format!("Invalid key encoding: {}", e))?;
+        ).map_err(|e| format!("Invalid key encoding: {}", e))?);
 
         if key_bytes.len() != 32 {
             return Err(format!("Invalid key length: {} (expected 32)", key_bytes.len()));
         }
 
-        let mut key_array = [0u8; 32];
+        let mut key_array = Zeroizing::new([0u8; 32]);
         key_array.copy_from_slice(&key_bytes);
         let crypto = CryptoSession::from_psk(&key_array);
 
@@ -180,13 +202,13 @@ impl SessionManager {
             return None; // expired
         }
 
-        let key_bytes = base64::Engine::decode(
+        let key_bytes = Zeroizing::new(base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
             &cs.key.key,
-        ).ok()?;
+        ).ok()?);
 
         if key_bytes.len() != 32 { return None; }
-        let mut arr = [0u8; 32];
+        let mut arr = Zeroizing::new([0u8; 32]);
         arr.copy_from_slice(&key_bytes);
         Some(CryptoSession::from_psk(&arr))
     }

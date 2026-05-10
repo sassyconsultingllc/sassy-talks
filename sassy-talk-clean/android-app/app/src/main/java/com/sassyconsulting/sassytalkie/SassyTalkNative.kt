@@ -25,14 +25,21 @@ object SassyTalkNative {
 
     /**
      * Open the session-prefs store backed by Android Keystore via
-     * EncryptedSharedPreferences. Falls back to cleartext SharedPreferences
-     * only if Keystore initialization fails (e.g., corrupted master key on
-     * some OEM builds) — better to keep the radio usable than to brick the
-     * app over a crypto-provider edge case. The fallback logs a warning so
-     * the regression is visible.
+     * EncryptedSharedPreferences. If Keystore init fails, return null —
+     * sessions become in-memory-only for that launch, and the user must
+     * re-pair via QR. We deliberately do NOT fall back to cleartext
+     * SharedPreferences: writing AES session keys to disk in the clear
+     * would defeat the threat model (post-conversation device recovery).
+     *
+     * On the first call after an upgrade from a build that used the
+     * cleartext fallback, we also nuke the unencrypted prefs file so any
+     * keys left over there are gone.
      */
     private fun sessionPrefs(): SharedPreferences? {
         val ctx = appContext ?: return null
+        // One-shot: scrub any plaintext session prefs left behind by older
+        // builds that fell back to MODE_PRIVATE. Idempotent.
+        purgeLegacyPlaintextPrefs(ctx)
         return try {
             val masterKey = MasterKey.Builder(ctx)
                 .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
@@ -45,8 +52,31 @@ object SassyTalkNative {
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
             )
         } catch (e: Exception) {
-            Log.w(TAG, "EncryptedSharedPreferences unavailable, falling back to plain prefs: ${e.message}")
-            ctx.getSharedPreferences(SESSION_PREFS, android.content.Context.MODE_PRIVATE)
+            Log.w(TAG, "EncryptedSharedPreferences unavailable; session keys will be in-memory only this launch: ${e.message}")
+            null
+        }
+    }
+
+    @Volatile private var legacyPurged = false
+    private fun purgeLegacyPlaintextPrefs(ctx: android.content.Context) {
+        if (legacyPurged) return
+        legacyPurged = true
+        try {
+            // If the file exists and isn't an EncryptedSharedPreferences blob,
+            // it means an older build wrote plaintext keys here. Wipe it.
+            val f = java.io.File(ctx.applicationInfo.dataDir, "shared_prefs/$SESSION_PREFS.xml")
+            if (f.exists()) {
+                val sample = f.readText(Charsets.UTF_8).take(256)
+                val looksEncrypted = sample.contains("__androidx_security_crypto_encrypted_prefs_")
+                if (!looksEncrypted) {
+                    Log.w(TAG, "Wiping legacy plaintext session prefs at ${f.path}")
+                    ctx.getSharedPreferences(SESSION_PREFS, android.content.Context.MODE_PRIVATE)
+                        .edit().clear().commit()
+                    f.delete()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Legacy prefs purge skipped: ${e.message}")
         }
     }
 

@@ -25,10 +25,16 @@ pub enum AudioState {
     Error,
 }
 
-/// Audio engine for managing recording and playback
+/// Audio engine for managing recording and playback.
+///
+/// `recorder`/`player` are stored as `Arc<...>` inside the mutex so callers can
+/// clone the handle out, release the mutex, and then make the (potentially
+/// blocking) JNI call without serializing every audio op behind one lock.
+/// Holding the mutex across `read()`/`start_recording()`/`stop()` would
+/// deadlock the audio TX thread against any control-plane stop.
 pub struct AudioEngine {
-    recorder: Arc<Mutex<Option<AndroidAudioRecord>>>,
-    player: Arc<Mutex<Option<AndroidAudioTrack>>>,
+    recorder: Arc<Mutex<Option<Arc<AndroidAudioRecord>>>>,
+    player: Arc<Mutex<Option<Arc<AndroidAudioTrack>>>>,
     recording: Arc<AtomicBool>,
     playing: Arc<AtomicBool>,
     state: Arc<Mutex<AudioState>>,
@@ -52,27 +58,45 @@ impl AudioEngine {
     pub fn init_recorder(&self) -> Result<(), String> {
         info!("Initializing audio recorder");
 
-        // Get minimum buffer size
+        // Get minimum buffer size. AudioRecord.getMinBufferSize returns
+        // ERROR_BAD_VALUE (-2) or ERROR (-1) on failure; treating those as a
+        // valid size and feeding `size * 2` into AudioRecord::new produces a
+        // negative request that the JNI layer would either reject or — worse —
+        // sign-extend into an enormous allocation.
         let buffer_size = match AndroidAudioRecord::get_min_buffer_size(
             SAMPLE_RATE,
             CHANNEL_CONFIG_MONO,
             AUDIO_FORMAT_PCM_16
         ) {
-            Ok(size) => size,
+            Ok(size) if size > 0 => size,
+            Ok(bad) => {
+                *self.state.lock().unwrap() = AudioState::Error;
+                return Err(format!(
+                    "AudioRecord.getMinBufferSize returned non-positive value {} \
+                     (sample_rate={}, channel={}, format={}) — unsupported config",
+                    bad, SAMPLE_RATE, CHANNEL_CONFIG_MONO, AUDIO_FORMAT_PCM_16
+                ));
+            }
             Err(e) => {
                 *self.state.lock().unwrap() = AudioState::Error;
                 return Err(e);
             }
         };
 
-        info!("Recorder buffer size: {} bytes", buffer_size);
+        // Guard the doubling against i32 overflow on absurd device returns.
+        let alloc_size = buffer_size.checked_mul(2).ok_or_else(|| {
+            *self.state.lock().unwrap() = AudioState::Error;
+            format!("Recorder buffer size {} would overflow i32 when doubled", buffer_size)
+        })?;
+
+        info!("Recorder buffer size: {} bytes (doubled to {})", buffer_size, alloc_size);
 
         // Create recorder
         let recorder = match AndroidAudioRecord::new(
             SAMPLE_RATE,
             CHANNEL_CONFIG_MONO,
             AUDIO_FORMAT_PCM_16,
-            buffer_size * 2  // Double buffer for safety
+            alloc_size
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -81,7 +105,7 @@ impl AudioEngine {
             }
         };
 
-        *self.recorder.lock().unwrap() = Some(recorder);
+        *self.recorder.lock().unwrap() = Some(Arc::new(recorder));
         info!("✓ Audio recorder initialized");
 
         Ok(())
@@ -93,26 +117,41 @@ impl AudioEngine {
 
         // Query AudioTrack's own min buffer size — AudioRecord's is not suitable
         // for playback (can under-allocate and cause audible glitches / underruns).
+        // Same negative-return guard as init_recorder: AudioTrack returns
+        // ERROR(-1) / ERROR_BAD_VALUE(-2) for unsupported configs.
         let buffer_size = match AndroidAudioTrack::get_min_buffer_size(
             SAMPLE_RATE,
             CHANNEL_CONFIG_OUT_MONO,
             AUDIO_FORMAT_PCM_16
         ) {
-            Ok(size) => size,
+            Ok(size) if size > 0 => size,
+            Ok(bad) => {
+                *self.state.lock().unwrap() = AudioState::Error;
+                return Err(format!(
+                    "AudioTrack.getMinBufferSize returned non-positive value {} \
+                     (sample_rate={}, channel={}, format={}) — unsupported config",
+                    bad, SAMPLE_RATE, CHANNEL_CONFIG_OUT_MONO, AUDIO_FORMAT_PCM_16
+                ));
+            }
             Err(e) => {
                 *self.state.lock().unwrap() = AudioState::Error;
                 return Err(e);
             }
         };
 
-        info!("Player buffer size: {} bytes", buffer_size);
+        let alloc_size = buffer_size.checked_mul(2).ok_or_else(|| {
+            *self.state.lock().unwrap() = AudioState::Error;
+            format!("Player buffer size {} would overflow i32 when doubled", buffer_size)
+        })?;
+
+        info!("Player buffer size: {} bytes (doubled to {})", buffer_size, alloc_size);
 
         // Create player
         let player = match AndroidAudioTrack::new(
             SAMPLE_RATE,
             CHANNEL_CONFIG_OUT_MONO,
             AUDIO_FORMAT_PCM_16,
-            buffer_size * 2
+            alloc_size
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -121,7 +160,7 @@ impl AudioEngine {
             }
         };
 
-        *self.player.lock().unwrap() = Some(player);
+        *self.player.lock().unwrap() = Some(Arc::new(player));
         info!("✓ Audio player initialized");
 
         Ok(())
@@ -130,99 +169,107 @@ impl AudioEngine {
     /// Start recording audio
     pub fn start_recording(&self) -> Result<(), String> {
         info!("Starting audio recording");
-        
+
         // Ensure recorder is initialized
         if self.recorder.lock().unwrap().is_none() {
             self.init_recorder()?;
         }
-        
-        let recorder = self.recorder.lock().unwrap();
-        if let Some(rec) = recorder.as_ref() {
-            rec.start_recording()?;
-            self.recording.store(true, Ordering::Relaxed);
-            *self.state.lock().unwrap() = AudioState::Recording;
-            info!("✓ Recording started");
-            Ok(())
-        } else {
-            Err("Recorder not initialized".to_string())
-        }
+
+        // Clone the Arc out of the lock so the (potentially blocking) JNI call
+        // does not serialize against read_audio() / stop_recording().
+        let rec = match self.recorder.lock().unwrap().as_ref() {
+            Some(r) => Arc::clone(r),
+            None => return Err("Recorder not initialized".to_string()),
+        };
+
+        rec.start_recording()?;
+        self.recording.store(true, Ordering::Relaxed);
+        *self.state.lock().unwrap() = AudioState::Recording;
+        info!("✓ Recording started");
+        Ok(())
     }
 
     /// Stop recording audio
     pub fn stop_recording(&self) -> Result<(), String> {
         info!("Stopping audio recording");
-        
+
         self.recording.store(false, Ordering::Relaxed);
-        
-        let recorder = self.recorder.lock().unwrap();
-        if let Some(rec) = recorder.as_ref() {
-            rec.stop()?;
-            *self.state.lock().unwrap() = AudioState::Idle;
-            info!("✓ Recording stopped");
-            Ok(())
-        } else {
-            warn!("Recorder not initialized");
-            Ok(())
+
+        let rec = self.recorder.lock().unwrap().as_ref().map(Arc::clone);
+        match rec {
+            Some(rec) => {
+                rec.stop()?;
+                *self.state.lock().unwrap() = AudioState::Idle;
+                info!("✓ Recording stopped");
+                Ok(())
+            }
+            None => {
+                warn!("Recorder not initialized");
+                Ok(())
+            }
         }
     }
 
     /// Read recorded audio data
     pub fn read_audio(&self, buffer: &mut [i16]) -> Result<usize, String> {
-        let recorder = self.recorder.lock().unwrap();
-        if let Some(rec) = recorder.as_ref() {
-            rec.read(buffer)
-        } else {
-            Err("Recorder not initialized".to_string())
-        }
+        // Clone-out-then-call: read() blocks waiting for samples; holding the
+        // mutex across that call would block stop_recording() indefinitely.
+        let rec = match self.recorder.lock().unwrap().as_ref() {
+            Some(r) => Arc::clone(r),
+            None => return Err("Recorder not initialized".to_string()),
+        };
+        rec.read(buffer)
     }
 
     /// Start playing audio
     pub fn start_playing(&self) -> Result<(), String> {
         info!("Starting audio playback");
-        
+
         // Ensure player is initialized
         if self.player.lock().unwrap().is_none() {
             self.init_player()?;
         }
-        
-        let player = self.player.lock().unwrap();
-        if let Some(play) = player.as_ref() {
-            play.play()?;
-            self.playing.store(true, Ordering::Relaxed);
-            *self.state.lock().unwrap() = AudioState::Playing;
-            info!("✓ Playback started");
-            Ok(())
-        } else {
-            Err("Player not initialized".to_string())
-        }
+
+        let play = match self.player.lock().unwrap().as_ref() {
+            Some(p) => Arc::clone(p),
+            None => return Err("Player not initialized".to_string()),
+        };
+
+        play.play()?;
+        self.playing.store(true, Ordering::Relaxed);
+        *self.state.lock().unwrap() = AudioState::Playing;
+        info!("✓ Playback started");
+        Ok(())
     }
 
     /// Stop playing audio
     pub fn stop_playing(&self) -> Result<(), String> {
         info!("Stopping audio playback");
-        
+
         self.playing.store(false, Ordering::Relaxed);
-        
-        let player = self.player.lock().unwrap();
-        if let Some(play) = player.as_ref() {
-            play.stop()?;
-            *self.state.lock().unwrap() = AudioState::Idle;
-            info!("✓ Playback stopped");
-            Ok(())
-        } else {
-            warn!("Player not initialized");
-            Ok(())
+
+        let play = self.player.lock().unwrap().as_ref().map(Arc::clone);
+        match play {
+            Some(play) => {
+                play.stop()?;
+                *self.state.lock().unwrap() = AudioState::Idle;
+                info!("✓ Playback stopped");
+                Ok(())
+            }
+            None => {
+                warn!("Player not initialized");
+                Ok(())
+            }
         }
     }
 
     /// Write audio data for playback
     pub fn write_audio(&self, buffer: &[i16]) -> Result<usize, String> {
-        let player = self.player.lock().unwrap();
-        if let Some(play) = player.as_ref() {
-            play.write(buffer)
-        } else {
-            Err("Player not initialized".to_string())
-        }
+        let play = match self.player.lock().unwrap().as_ref() {
+            Some(p) => Arc::clone(p),
+            None => return Err("Player not initialized".to_string()),
+        };
+        play.write(buffer)
     }
 
     /// Check if currently recording
@@ -243,31 +290,32 @@ impl AudioEngine {
     /// Release audio resources
     pub fn release(&self) -> Result<(), String> {
         info!("Releasing audio resources");
-        
+
         // Stop recording if active
         if self.is_recording() {
             self.stop_recording()?;
         }
-        
+
         // Stop playing if active
         if self.is_playing() {
             self.stop_playing()?;
         }
-        
-        // Release recorder
-        if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
+
+        // Take the handles out of the mutex first so the JNI release() calls
+        // run without the lock held — same deadlock concern as the start/stop
+        // path above.
+        let rec = self.recorder.lock().unwrap().take();
+        let play = self.player.lock().unwrap().take();
+
+        if let Some(rec) = rec {
             rec.release()?;
         }
-        
-        // Release player
-        if let Some(play) = self.player.lock().unwrap().as_ref() {
+        if let Some(play) = play {
             play.release()?;
         }
-        
-        *self.recorder.lock().unwrap() = None;
-        *self.player.lock().unwrap() = None;
+
         *self.state.lock().unwrap() = AudioState::Idle;
-        
+
         info!("✓ Audio resources released");
         Ok(())
     }

@@ -952,15 +952,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
     let json = match guard.session_manager.generate_session_qr(ch, duration_hours as u32, &name) {
         Ok(qr_json) => {
-            // Set crypto for this channel + legacy field on the transport
+            // Install the active session for this channel on the transport.
             if let Some(ref sm) = guard.state_machine {
                 let mut tm = sm.get_transport().lock().unwrap();
                 if let Some(crypto) = guard.session_manager.get_crypto_for_channel(ch) {
-                    tm.set_channel_crypto(ch, crypto);
-                }
-                // Also set legacy crypto for send()/receive() compat
-                if let Some(crypto2) = guard.session_manager.get_crypto_for_channel(ch) {
-                    tm.set_crypto(crypto2);
+                    tm.set_crypto(crypto);
                 }
             }
             qr_json
@@ -999,11 +995,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         Ok((channel, crypto)) => {
             if let Some(ref sm) = guard.state_machine {
                 let mut tm = sm.get_transport().lock().unwrap();
-                tm.set_channel_crypto(channel, crypto);
-                // Also set legacy crypto for send()/receive() compat
-                if let Some(crypto2) = guard.session_manager.get_crypto_for_channel(channel) {
-                    tm.set_crypto(crypto2);
-                }
+                tm.set_crypto(crypto);
             }
             // Auto-switch to the imported channel
             guard.current_channel.store(channel, std::sync::atomic::Ordering::SeqCst);
