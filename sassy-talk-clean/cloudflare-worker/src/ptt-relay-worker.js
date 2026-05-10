@@ -14,6 +14,13 @@ const TOKEN_TTL_SEC = 300;
 // Allowed clock skew between worker and client when verifying token.exp.
 const CLOCK_SKEW_SEC = 30;
 
+// Short-link targets. Keep the right-hand-side updated whenever the underlying
+// R2 path or marketing-site download route changes — the public short URL
+// stays stable (it is what gets baked into QR codes, posters, etc.).
+const SHORT_LINKS = {
+  "/dl/apk": "https://sassyconsultingllc.com/download/sassy-talk/android/sassytalkie.apk",
+};
+
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -54,6 +61,21 @@ export default {
       const expSec = Math.floor(Date.now() / 1000) + TOKEN_TTL_SEC;
       const token = await signToken(roomId, expSec, env.AUTH_SECRET);
       return jsonResponse({ token, expires_at: expSec, ttl: TOKEN_TTL_SEC });
+    }
+
+    // Short-link redirects. 302 (not 301) so we can re-point later without
+    // browsers and link unfurlers permanently caching the old destination.
+    if (SHORT_LINKS[path]) {
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: SHORT_LINKS[path],
+          // 5-minute redirect cache — small enough to roll a fix quickly,
+          // large enough that QR-scan stampedes don't hammer the worker.
+          "Cache-Control": "public, max-age=300",
+          ...CORS_HEADERS,
+        },
+      });
     }
 
     // WebSocket relay
