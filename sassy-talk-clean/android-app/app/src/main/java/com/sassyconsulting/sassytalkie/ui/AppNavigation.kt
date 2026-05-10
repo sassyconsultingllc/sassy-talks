@@ -142,6 +142,7 @@ fun AppNavigation(
 
                 // Initialize the activity bridge for incoming-audio detection + notifications
                 TranscriptionBridge.initialize(context)
+                TranscriptionBridge.setEnabled(true)
             } else {
                 initFailed = true
             }

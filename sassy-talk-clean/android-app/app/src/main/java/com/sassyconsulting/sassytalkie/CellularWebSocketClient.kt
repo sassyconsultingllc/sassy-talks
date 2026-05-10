@@ -2,7 +2,9 @@ package com.sassyconsulting.sassytalkie
 
 import android.util.Log
 import okhttp3.*
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okio.ByteString
+import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
@@ -84,13 +86,25 @@ class CellularWebSocketClient {
             // If BuildConfig is not available for any reason, proceed normally
         }
 
-        val wsUrl = SassyTalkNative.cellularGetWsUrl()
-        if (wsUrl.isBlank()) {
+        val baseWsUrl = SassyTalkNative.cellularGetWsUrl()
+        if (baseWsUrl.isBlank()) {
             Log.e(TAG, "No WS URL — set room first")
             return false
         }
 
-        Log.i(TAG, "Connecting to $wsUrl")
+        // Fetch a short-lived capability token from the relay's /auth endpoint
+        // before opening the WebSocket. Without this the relay returns 401 and
+        // we never instantiate a Durable Object — the goal is to prevent
+        // unauthenticated clients from causing DO billing.
+        val wsUrl = try {
+            authorizeWsUrl(baseWsUrl)
+        } catch (e: Exception) {
+            Log.e(TAG, "Auth fetch failed: ${e.message}")
+            SassyTalkNative.cellularOnError("auth: ${e.message}")
+            return false
+        }
+
+        Log.i(TAG, "Connecting to relay (authenticated)")
 
         val request = Request.Builder()
             .url(wsUrl)
@@ -250,5 +264,58 @@ class CellularWebSocketClient {
     /** Send a heartbeat ping to the relay (JSON control message) */
     fun sendPing() {
         webSocket?.send("""{"type":"ping"}""")
+    }
+
+    /**
+     * Fetch an HMAC-signed capability token from the relay's /auth endpoint
+     * and return [baseWsUrl] with a `token=…` query param appended. The token
+     * is bound to the same roomId already encoded in [baseWsUrl] and is valid
+     * for ~5 minutes — comfortably longer than any single PTT session.
+     *
+     * Throws on any HTTP / parsing failure so callers can fall back instead of
+     * connecting unauthenticated.
+     */
+    private fun authorizeWsUrl(baseWsUrl: String): String {
+        val httpUrl = toHttpScheme(baseWsUrl).toHttpUrlOrNull()
+            ?: throw IllegalStateException("Invalid WS URL: $baseWsUrl")
+        val room = httpUrl.queryParameter("room")
+            ?: throw IllegalStateException("WS URL missing room param: $baseWsUrl")
+
+        val authUrl = httpUrl.newBuilder()
+            .encodedPath("/auth")
+            .build()
+            .newBuilder()
+            .setQueryParameter("room", room)
+            .build()
+
+        val req = Request.Builder().url(authUrl).get().build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) {
+                throw IllegalStateException("auth http ${resp.code}")
+            }
+            val bodyText = resp.body?.string()
+                ?: throw IllegalStateException("auth empty body")
+            val token = JSONObject(bodyText).optString("token")
+            if (token.isBlank()) throw IllegalStateException("auth token missing")
+            return toHttpScheme(baseWsUrl).toHttpUrlOrNull()!!
+                .newBuilder()
+                .setQueryParameter("token", token)
+                .build()
+                .toString()
+                .let { toWsScheme(it) }
+        }
+    }
+
+    /** OkHttp's HttpUrl parser rejects ws://, so swap to http:// for parsing only. */
+    private fun toHttpScheme(url: String): String = when {
+        url.startsWith("wss://") -> "https://" + url.removePrefix("wss://")
+        url.startsWith("ws://")  -> "http://"  + url.removePrefix("ws://")
+        else -> url
+    }
+
+    private fun toWsScheme(url: String): String = when {
+        url.startsWith("https://") -> "wss://" + url.removePrefix("https://")
+        url.startsWith("http://")  -> "ws://"  + url.removePrefix("http://")
+        else -> url
     }
 }

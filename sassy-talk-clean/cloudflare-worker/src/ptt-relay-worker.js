@@ -7,38 +7,71 @@
 
 export { PttRoom } from "./ptt-relay.js";
 
+// Token lifetime in seconds. Short enough to limit replay risk, long enough
+// that flaky cellular reconnects within the same session don't need a refresh.
+const TOKEN_TTL_SEC = 300;
+
+// Allowed clock skew between worker and client when verifying token.exp.
+const CLOCK_SKEW_SEC = 30;
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // CORS
     if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type",
-        },
-      });
+      return new Response(null, { headers: CORS_HEADERS });
     }
 
     // Health check
     if (path === "/" || path === "/health") {
-      return new Response(JSON.stringify({
+      return jsonResponse({
         service: "sassytalk-relay",
         status: "ok",
         max_peers_per_room: 16,
-      }), {
-        headers: { "Content-Type": "application/json" },
       });
+    }
+
+    // Issue an HMAC-signed token bound to (roomId, expiry). Client hits this
+    // before opening the WebSocket. No PII required — the token is purely a
+    // capability grant, and the audio payload itself is end-to-end encrypted.
+    if (path === "/auth") {
+      const roomId = url.searchParams.get("room");
+      if (!isValidRoomId(roomId)) {
+        return jsonResponse({ error: "Missing or invalid room ID" }, 400);
+      }
+      if (!env.AUTH_SECRET) {
+        // Surface a clear error rather than silently issuing tokens with a
+        // weak/empty key. Operator must `wrangler secret put AUTH_SECRET`.
+        return jsonResponse({ error: "AUTH_SECRET not configured" }, 500);
+      }
+      const expSec = Math.floor(Date.now() / 1000) + TOKEN_TTL_SEC;
+      const token = await signToken(roomId, expSec, env.AUTH_SECRET);
+      return jsonResponse({ token, expires_at: expSec, ttl: TOKEN_TTL_SEC });
     }
 
     // WebSocket relay
     if (path === "/ws" || path === "/api/ptt/ws") {
       const roomId = url.searchParams.get("room");
-      if (!roomId || roomId.length < 8 || roomId.length > 64) {
+      if (!isValidRoomId(roomId)) {
         return new Response("Missing or invalid room ID", { status: 400 });
+      }
+
+      // Token verification. We do this in the worker so an attacker can't
+      // even cause a DO to be instantiated (which costs $) without a valid
+      // capability for that specific room.
+      if (env.AUTH_SECRET) {
+        const token = url.searchParams.get("token");
+        const tokenError = await verifyToken(token, roomId, env.AUTH_SECRET);
+        if (tokenError) {
+          return new Response(tokenError, { status: 401 });
+        }
       }
 
       const doId = env.PTT_RELAY.idFromName(roomId);
@@ -49,3 +82,65 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 };
+
+function isValidRoomId(id) {
+  return typeof id === "string" && id.length >= 8 && id.length <= 64;
+}
+
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+  });
+}
+
+/**
+ * Token format: "<expSec>.<hexSig>" where hexSig = HMAC-SHA256(roomId + "." + expSec, secret).
+ * Compact, query-param-safe, no JSON parsing needed on either end.
+ */
+async function signToken(roomId, expSec, secret) {
+  const sig = await hmacSha256Hex(`${roomId}.${expSec}`, secret);
+  return `${expSec}.${sig}`;
+}
+
+async function verifyToken(token, roomId, secret) {
+  if (!token || typeof token !== "string") return "Missing token";
+  const dot = token.indexOf(".");
+  if (dot <= 0) return "Malformed token";
+  const expSec = Number.parseInt(token.slice(0, dot), 10);
+  const sig = token.slice(dot + 1);
+  if (!Number.isFinite(expSec) || !sig) return "Malformed token";
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (expSec + CLOCK_SKEW_SEC < nowSec) return "Token expired";
+
+  const expected = await hmacSha256Hex(`${roomId}.${expSec}`, secret);
+  // Constant-time compare to avoid leaking byte-level timing.
+  if (!timingSafeEqualHex(sig, expected)) return "Invalid token signature";
+  return null;
+}
+
+async function hmacSha256Hex(data, secret) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
+  const bytes = new Uint8Array(sig);
+  let hex = "";
+  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+  return hex;
+}
+
+function timingSafeEqualHex(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}

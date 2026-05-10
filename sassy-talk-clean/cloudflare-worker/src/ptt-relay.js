@@ -25,6 +25,13 @@ const MAX_DEVICE_NAME_LEN = 100;
 const HEARTBEAT_STALE_MS = 8_000;
 const SWEEP_INTERVAL_MS  = 2_000;
 
+// Per-socket rate limit. Normal PTT traffic is ~25 frames/sec (40 ms Opus
+// frames). 120 messages/sec is ~5x headroom for bursts (e.g. recovery after
+// brief network stall) but cuts off a runaway client well below the rate that
+// could meaningfully spike DO billing.
+const MAX_MESSAGES_PER_SEC = 120;
+const RATE_WINDOW_MS = 1_000;
+
 /**
  * Build a PARTNER_OFFLINE TLV binary frame for the given peerId.
  * Frame layout:
@@ -87,6 +94,11 @@ export class PttRoom extends DurableObject {
       device,
       joinedAt: Date.now(),
       lastSeenMs: Date.now(),
+      // Per-socket sliding-window rate limit state. Re-initialised on every
+      // restore from hibernation attachment (window has clearly elapsed if we
+      // were hibernating), so we don't bother persisting these fields.
+      windowStartMs: Date.now(),
+      msgCount: 0,
     };
 
     // Persist session info so it survives hibernation
@@ -127,7 +139,28 @@ export class PttRoom extends DurableObject {
     if (!this.sessions.has(ws)) {
       const attachment = ws.deserializeAttachment();
       if (attachment) {
+        // Reset rate-limit window on wake — by definition we've been idle.
+        attachment.windowStartMs = Date.now();
+        attachment.msgCount = 0;
         this.sessions.set(ws, attachment);
+      }
+    }
+
+    // Per-socket rate limit. Anyone exceeding MAX_MESSAGES_PER_SEC is closed
+    // immediately; a healthy client never approaches this rate even during
+    // recovery bursts.
+    const rlSession = this.sessions.get(ws);
+    if (rlSession) {
+      const now = Date.now();
+      if (now - rlSession.windowStartMs >= RATE_WINDOW_MS) {
+        rlSession.windowStartMs = now;
+        rlSession.msgCount = 0;
+      }
+      rlSession.msgCount++;
+      if (rlSession.msgCount > MAX_MESSAGES_PER_SEC) {
+        try { ws.close(1008, "Rate limit exceeded"); } catch {}
+        this.sessions.delete(ws);
+        return;
       }
     }
 
