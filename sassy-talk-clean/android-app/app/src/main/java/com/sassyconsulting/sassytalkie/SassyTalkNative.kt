@@ -35,6 +35,23 @@ object SassyTalkNative {
      * cleartext fallback, we also nuke the unencrypted prefs file so any
      * keys left over there are gone.
      */
+    /**
+     * Read the encrypted per-channel session JSON written by joinChannel /
+     * createChannel paths. Returns the empty string when no session exists
+     * (or the keystore is unavailable). The UI used to read directly from
+     * MODE_PRIVATE SharedPreferences, but those are now both unwritten and
+     * actively purged on launch — hence "No active session" in the QR dialog
+     * even when one was just created. Always go through this accessor.
+     */
+    fun getChannelSessionJson(channel: Int): String {
+        return try {
+            sessionPrefs()?.getString("session_ch_$channel", null) ?: ""
+        } catch (e: Exception) {
+            Log.w(TAG, "getChannelSessionJson failed: ${e.message}")
+            ""
+        }
+    }
+
     private fun sessionPrefs(): SharedPreferences? {
         val ctx = appContext ?: return null
         // One-shot: scrub any plaintext session prefs left behind by older
@@ -209,7 +226,7 @@ object SassyTalkNative {
         return when (getTransport()) {
             TRANSPORT_WIFI -> "WiFi"
             TRANSPORT_WIFI_DIRECT -> "P2P"
-            TRANSPORT_CELLULAR -> "Cell"
+            TRANSPORT_CELLULAR -> "Cloudflare"
             TRANSPORT_BLUETOOTH -> "BT"
             else -> "---"
         }

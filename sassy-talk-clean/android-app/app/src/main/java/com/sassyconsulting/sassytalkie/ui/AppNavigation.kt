@@ -236,10 +236,7 @@ fun AppNavigation(
                 SassyTalkNative.pttStop()
                 autoConnect.disconnect()
                 walkieService?.releaseMulticastLock()
-                SassyTalkNative.clearSession()
-                // Clear all per-channel sessions from prefs
-                context.getSharedPreferences("sassy_session", Context.MODE_PRIVATE)
-                    .edit().clear().apply()
+                SassyTalkNative.clearSession() // also clears encrypted per-channel session prefs
                 SassyTalkNative.clearAudioCache()
                 TranscriptionBridge.clearEntries()
                 currentScreen = Screen.Auth

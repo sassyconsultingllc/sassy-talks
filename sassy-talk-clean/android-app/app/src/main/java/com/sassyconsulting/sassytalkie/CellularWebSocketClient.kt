@@ -92,18 +92,26 @@ class CellularWebSocketClient {
             return false
         }
 
-        // Fetch a short-lived capability token from the relay's /auth endpoint
-        // before opening the WebSocket. Without this the relay returns 401 and
-        // we never instantiate a Durable Object — the goal is to prevent
-        // unauthenticated clients from causing DO billing.
-        val wsUrl = try {
-            authorizeWsUrl(baseWsUrl)
-        } catch (e: Exception) {
-            Log.e(TAG, "Auth fetch failed: ${e.message}")
-            SassyTalkNative.cellularOnError("auth: ${e.message}")
-            return false
+        // Fetch the capability token asynchronously. Doing this synchronously
+        // here would block the calling thread (typically Dispatchers.Main via
+        // AutoConnectManager.scope.launch) and throw NetworkOnMainThreadException,
+        // which manifested as the cell transport flipping CONNECTED→---→CONNECTED
+        // every reconnect cycle. enqueue() runs on the OkHttp dispatcher.
+        Log.i(TAG, "Fetching relay auth token…")
+        authorizeWsUrlAsync(baseWsUrl) { wsUrl, err ->
+            if (err != null || wsUrl == null) {
+                Log.e(TAG, "Auth fetch failed: ${err?.message}")
+                SassyTalkNative.cellularOnError("auth: ${err?.message ?: "unknown"}")
+                scheduleReconnect("auth failure: ${err?.message}")
+                return@authorizeWsUrlAsync
+            }
+            openWebSocketAuthenticated(wsUrl)
         }
 
+        return true // Connection is async; status comes via onOpen
+    }
+
+    private fun openWebSocketAuthenticated(wsUrl: String) {
         Log.i(TAG, "Connecting to relay (authenticated)")
 
         val request = Request.Builder()
@@ -169,8 +177,6 @@ class CellularWebSocketClient {
                 scheduleReconnect("failure: ${t.message}")
             }
         })
-
-        return true // Connection is async; actual status comes via onOpen
     }
 
     /** Disconnect from the relay */
@@ -268,18 +274,25 @@ class CellularWebSocketClient {
 
     /**
      * Fetch an HMAC-signed capability token from the relay's /auth endpoint
-     * and return [baseWsUrl] with a `token=…` query param appended. The token
-     * is bound to the same roomId already encoded in [baseWsUrl] and is valid
-     * for ~5 minutes — comfortably longer than any single PTT session.
+     * (async, off the calling thread), then invoke [onResult] with the WS URL
+     * carrying the appended token. On failure, [onResult] is called with
+     * (null, exception).
      *
-     * Throws on any HTTP / parsing failure so callers can fall back instead of
-     * connecting unauthenticated.
+     * MUST be async — the caller (CellularWebSocketClient.connect) is invoked
+     * from the AutoConnectManager coroutine on Dispatchers.Main, so a blocking
+     * execute() throws NetworkOnMainThreadException.
      */
-    private fun authorizeWsUrl(baseWsUrl: String): String {
+    private fun authorizeWsUrlAsync(baseWsUrl: String, onResult: (String?, Throwable?) -> Unit) {
         val httpUrl = toHttpScheme(baseWsUrl).toHttpUrlOrNull()
-            ?: throw IllegalStateException("Invalid WS URL: $baseWsUrl")
+        if (httpUrl == null) {
+            onResult(null, IllegalStateException("Invalid WS URL: $baseWsUrl"))
+            return
+        }
         val room = httpUrl.queryParameter("room")
-            ?: throw IllegalStateException("WS URL missing room param: $baseWsUrl")
+        if (room.isNullOrBlank()) {
+            onResult(null, IllegalStateException("WS URL missing room param"))
+            return
+        }
 
         val authUrl = httpUrl.newBuilder()
             .encodedPath("/auth")
@@ -289,21 +302,41 @@ class CellularWebSocketClient {
             .build()
 
         val req = Request.Builder().url(authUrl).get().build()
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) {
-                throw IllegalStateException("auth http ${resp.code}")
+        client.newCall(req).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: java.io.IOException) {
+                onResult(null, e)
             }
-            val bodyText = resp.body?.string()
-                ?: throw IllegalStateException("auth empty body")
-            val token = JSONObject(bodyText).optString("token")
-            if (token.isBlank()) throw IllegalStateException("auth token missing")
-            return toHttpScheme(baseWsUrl).toHttpUrlOrNull()!!
-                .newBuilder()
-                .setQueryParameter("token", token)
-                .build()
-                .toString()
-                .let { toWsScheme(it) }
-        }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use { resp ->
+                    try {
+                        if (!resp.isSuccessful) {
+                            onResult(null, IllegalStateException("auth http ${resp.code}"))
+                            return
+                        }
+                        val bodyText = resp.body?.string()
+                        if (bodyText.isNullOrEmpty()) {
+                            onResult(null, IllegalStateException("auth empty body"))
+                            return
+                        }
+                        val token = JSONObject(bodyText).optString("token")
+                        if (token.isBlank()) {
+                            onResult(null, IllegalStateException("auth token missing"))
+                            return
+                        }
+                        val authedUrl = toHttpScheme(baseWsUrl).toHttpUrlOrNull()!!
+                            .newBuilder()
+                            .setQueryParameter("token", token)
+                            .build()
+                            .toString()
+                            .let { toWsScheme(it) }
+                        onResult(authedUrl, null)
+                    } catch (t: Throwable) {
+                        onResult(null, t)
+                    }
+                }
+            }
+        })
     }
 
     /** OkHttp's HttpUrl parser rejects ws://, so swap to http:// for parsing only. */

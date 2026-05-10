@@ -598,11 +598,12 @@ fun MainScreen(
         val sessionId = remember { SassyTalkNative.getSessionId() ?: "" }
         val channelInfo = remember { SassyTalkNative.getChannelInfo() }
 
-        // Find the current channel's session JSON from SharedPreferences
-        val context = LocalContext.current
-        val sessionJson = remember {
-            context.getSharedPreferences("sassy_session", android.content.Context.MODE_PRIVATE)
-                .getString("session_ch_$currentChannel", null) ?: ""
+        // Read the per-channel session JSON via the encrypted accessor —
+        // bypassing it (e.g. by reading MODE_PRIVATE prefs directly) returns
+        // empty because writes go to EncryptedSharedPreferences and the
+        // cleartext file is purged on launch.
+        val sessionJson = remember(currentChannel) {
+            SassyTalkNative.getChannelSessionJson(currentChannel)
         }
 
         AlertDialog(
