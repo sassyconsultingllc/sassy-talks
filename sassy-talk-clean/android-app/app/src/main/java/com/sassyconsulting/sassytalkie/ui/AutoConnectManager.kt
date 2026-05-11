@@ -132,6 +132,12 @@ class AutoConnectManager(private val context: Context) {
         SassyTalkNative.cellularSetRoom(sessionId)
         val client = CellularWebSocketClient()
         client.onRelayReady = { onRelayReady() }
+        // Wire bidirectional refs so PttCoordinator can push HEARTBEAT/PTT_STOP_V2/RECV_ACK
+        // frames over the relay, and inbound control frames from the relay reach the
+        // coordinator. Without this the DO sweeper closes the WS after 8s of silence.
+        val coord = walkieService?.pttCoordinator
+        client.pttCoordinator = coord
+        coord?.cellularClient = client
         cellularClient = client
         client.connect()
 
@@ -164,6 +170,12 @@ class AutoConnectManager(private val context: Context) {
         SassyTalkNative.cellularSetRoom(sessionId)
         val client = CellularWebSocketClient()
         client.onRelayReady = { onRelayReady() }
+        // Wire bidirectional refs so PttCoordinator can push HEARTBEAT/PTT_STOP_V2/RECV_ACK
+        // frames over the relay, and inbound control frames from the relay reach the
+        // coordinator. Without this the DO sweeper closes the WS after 8s of silence.
+        val coord = walkieService?.pttCoordinator
+        client.pttCoordinator = coord
+        coord?.cellularClient = client
         cellularClient = client
         client.connect()
 
@@ -288,6 +300,7 @@ class AutoConnectManager(private val context: Context) {
 
     fun disconnect() {
         unregisterNetworkCallback()
+        walkieServiceRef?.pttCoordinator?.cellularClient = null
         cellularClient?.disconnect()
         cellularClient = null
         activeTransport = "none"

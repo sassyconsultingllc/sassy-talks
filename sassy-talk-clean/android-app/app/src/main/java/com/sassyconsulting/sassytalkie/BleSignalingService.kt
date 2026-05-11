@@ -192,8 +192,13 @@ class BleSignalingService(
             .setTimeout(0) // Advertise indefinitely
             .build()
 
+        // The 31-byte legacy BLE advert packet cannot hold a 128-bit service UUID
+        // (16B + 2B header) AND the device name; advertising with both set fails
+        // with ADVERTISE_FAILED_DATA_TOO_LARGE (errorCode=1), so the service UUID
+        // is never broadcast and no peer ever matches our scan filter. Drop the
+        // device name from the primary advert — the peer can read it after GATT
+        // connect via standard GAP queries.
         val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(true)
             .addServiceUuid(ParcelUuid(SERVICE_UUID))
             .build()
 
