@@ -23,7 +23,7 @@ const MAX_QUEUE_SIZE: usize = 128;
 const MAX_PACKET_SIZE: usize = 1500;
 
 /// Relay server base URL
-pub const RELAY_URL: &str = "wss://relay.sassy-consults.com/ws";
+pub const RELAY_URL: &str = "wss://relay.sassyconsultingllc.com/ws";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CellularState {

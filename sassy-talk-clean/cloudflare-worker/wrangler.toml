@@ -5,7 +5,7 @@ compatibility_date = "2024-12-01"
 
 # Custom domain
 routes = [
-  { pattern = "relay.sassy-consults.com/*", zone_name = "sassy-consults.com" }
+  { pattern = "relay.sassyconsultingllc.com/*", zone_name = "sassyconsultingllc.com" }
 ]
 
 # ── Durable Objects ──

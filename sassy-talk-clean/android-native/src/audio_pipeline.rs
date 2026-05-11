@@ -101,8 +101,12 @@ pub fn now_ms() -> u64 {
 /// The thread runs in a loop while `tx_running` is true. It only captures+sends when
 /// `ptt_pressed` is true.
 /// Whether PTT should buffer audio and burst-send on release (true)
-/// or stream live frame-by-frame (false). Default: true (buffer mode).
-static PTT_BUFFER_MODE: AtomicBool = AtomicBool::new(true);
+/// or stream live frame-by-frame (false). Default: false (live mode) — a
+/// walkie-talkie must be heard the moment PTT is pressed; the prior `true`
+/// default produced "audio only flows when both peers press at the same
+/// time" because the buffer was only flushed on release, often after the
+/// relay socket had already cycled.
+static PTT_BUFFER_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Set PTT buffer mode. true = buffer and burst on release. false = live stream.
 pub fn set_ptt_buffer_mode(buffer: bool) {

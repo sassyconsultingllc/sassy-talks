@@ -148,7 +148,7 @@ fun AboutScreen(
                     icon = Icons.Default.Email,
                     label = "Contact Support",
                     onClick = {
-                        val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:support@sassyconsulting.com"))
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://sassyconsultingllc.com/app-testers/#tab-btn-already"))
                         context.startActivity(intent)
                     }
                 )
