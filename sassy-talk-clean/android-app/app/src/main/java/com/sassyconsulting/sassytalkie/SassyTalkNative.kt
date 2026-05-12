@@ -282,8 +282,8 @@ object SassyTalkNative {
                 val channel = try {
                     org.json.JSONObject(qrJson).optInt("channel", 1)
                 } catch (_: Exception) { 1 }
-                sessionPrefs()
-                    ?.edit()?.putString("session_ch_$channel", qrJson)?.apply()
+                sessionPrefs()?.edit()?.putString("session_ch_$channel", qrJson)?.apply()
+                saveCohortHistoryBlob()
             }
             ok
         } catch (e: Exception) {
@@ -413,9 +413,12 @@ object SassyTalkNative {
                 Log.e(TAG, "clearSession failed: ${e.message}")
             }
         }
-        // Clear all persisted sessions (per-channel + legacy)
-        sessionPrefs()
-            ?.edit()?.clear()?.apply()
+        // Clear per-channel sessions and legacy session_json, but preserve cohort_history_v1.
+        val prefs = sessionPrefs() ?: return
+        val editor = prefs.edit()
+        for (ch in 1..8) editor.remove("session_ch_$ch")
+        editor.remove("session_json")
+        editor.apply()
     }
 
     // ── User Registration ──
@@ -890,7 +893,15 @@ object SassyTalkNative {
 
     // ── Per-channel session management ──
 
-    @JvmStatic private external fun nativeGenerateChannelQR(channel: Int, durationHours: Int, groupName: String?): String
+    @JvmStatic private external fun nativeGenerateChannelQR(
+        channel: Int, durationHours: Int, groupName: String?, cohortId: String?,
+    ): String
+    @JvmStatic private external fun nativeGetCohortHistory(): String
+    @JvmStatic private external fun nativeLoadCohortHistory(blob: String)
+    @JvmStatic private external fun nativeRemoveCohort(cohortId: String)
+    @JvmStatic private external fun nativeClearCohortHistory()
+    @JvmStatic private external fun nativeGetActiveCohortId(channel: Int): String
+    @JvmStatic private external fun nativeSnapshotCohortParticipants(channel: Int, participantsJson: String)
     @JvmStatic private external fun nativeSetSubchannel(subchannel: Byte)
     @JvmStatic private external fun nativeGetChannelInfo(): String
 
@@ -900,13 +911,82 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeSetGroupName(channel: Int, name: String)
     @JvmStatic private external fun nativeGetGroupName(channel: Int): String
 
-    fun generateChannelQR(channel: Int, durationHours: Int = 24, groupName: String = ""): String {
+    private const val COHORT_HISTORY_PREF_KEY = "cohort_history_v1"
+
+    fun getCohortHistory(): String {
+        if (!initialized) return "[]"
+        return try { nativeGetCohortHistory() } catch (_: Exception) { "[]" }
+    }
+
+    fun removeCohort(cohortId: String) {
+        if (!initialized) return
+        try {
+            nativeRemoveCohort(cohortId)
+            saveCohortHistoryBlob()
+        } catch (e: Exception) {
+            Log.e(TAG, "removeCohort failed: ${e.message}")
+        }
+    }
+
+    fun clearCohortHistory() {
+        if (!initialized) return
+        try {
+            nativeClearCohortHistory()
+            sessionPrefs()?.edit()?.remove(COHORT_HISTORY_PREF_KEY)?.apply()
+        } catch (e: Exception) {
+            Log.e(TAG, "clearCohortHistory failed: ${e.message}")
+        }
+    }
+
+    fun getActiveCohortId(channel: Int): String {
+        if (!initialized) return ""
+        return try { nativeGetActiveCohortId(channel) } catch (_: Exception) { "" }
+    }
+
+    fun snapshotCohortParticipants(channel: Int, participantsJson: String) {
+        if (!initialized) return
+        try {
+            nativeSnapshotCohortParticipants(channel, participantsJson)
+            saveCohortHistoryBlob()
+        } catch (e: Exception) {
+            Log.w(TAG, "snapshotCohortParticipants failed: ${e.message}")
+        }
+    }
+
+    private fun saveCohortHistoryBlob() {
+        try {
+            val blob = nativeGetCohortHistory()
+            sessionPrefs()?.edit()?.putString(COHORT_HISTORY_PREF_KEY, blob)?.apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "saveCohortHistoryBlob failed: ${e.message}")
+        }
+    }
+
+    /** Call once after nativeInit succeeds — restores history from prefs into Rust. */
+    fun restoreCohortHistory() {
+        if (!initialized) return
+        try {
+            val blob = sessionPrefs()?.getString(COHORT_HISTORY_PREF_KEY, null) ?: "[]"
+            nativeLoadCohortHistory(blob)
+        } catch (e: Exception) {
+            Log.w(TAG, "restoreCohortHistory failed: ${e.message}")
+        }
+    }
+
+    fun generateChannelQR(
+        channel: Int,
+        durationHours: Int = 24,
+        groupName: String = "",
+        cohortId: String? = null,
+    ): String {
         if (!initialized) return ""
         return try {
-            val json = nativeGenerateChannelQR(channel, durationHours, groupName.ifEmpty { null })
+            val json = nativeGenerateChannelQR(
+                channel, durationHours, groupName.ifEmpty { null }, cohortId?.ifEmpty { null },
+            )
             if (json.isNotEmpty()) {
-                sessionPrefs()
-                    ?.edit()?.putString("session_ch_$channel", json)?.apply()
+                sessionPrefs()?.edit()?.putString("session_ch_$channel", json)?.apply()
+                saveCohortHistoryBlob()
             }
             json
         } catch (e: Exception) {

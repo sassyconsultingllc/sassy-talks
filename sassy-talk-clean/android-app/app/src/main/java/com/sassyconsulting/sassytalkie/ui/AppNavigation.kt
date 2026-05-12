@@ -116,7 +116,9 @@ fun AppNavigation(
             if (success) {
                 // Restore persisted session (survives app restart)
                 val sessionRestored = withContext(Dispatchers.IO) {
-                    SassyTalkNative.restoreSession()
+                    val restored = SassyTalkNative.restoreSession()
+                    SassyTalkNative.restoreCohortHistory()
+                    restored
                 }
 
                 // Determine starting screen: profile setup on first launch

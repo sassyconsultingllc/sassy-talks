@@ -98,6 +98,7 @@ fun MainScreen(
         }
         withContext(Dispatchers.IO) {
             SassyTalkNative.restoreSession()
+            SassyTalkNative.restoreCohortHistory()
             // Default to queue mode so incoming audio caches until user is done speaking
             SassyTalkNative.setCacheMode(SassyTalkNative.CACHE_MODE_QUEUE)
         }
