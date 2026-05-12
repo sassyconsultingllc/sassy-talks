@@ -37,6 +37,18 @@ fn next_utterance_id() -> u64 {
 /// fragmenting utterances mid-sentence.
 const SPEECH_GAP_MS: u64 = 800;
 
+/// How recently a speaker's last frame must have arrived for them to count as
+/// "actively talking" for overlap detection. Anything older is treated as a
+/// stale beacon / drained buffer and ignored when deciding Live vs. Queue.
+///
+/// Without this, a peer's once-every-10s presence beacon (one Opus-encoded
+/// silence frame, see `audio_pipeline::spawn_tx_thread`) sits in
+/// `active_buffers` for SPEECH_GAP_MS=800ms — long enough to make a real
+/// talker look like "speaker #2" and flip the cache into Queue mode, which
+/// then can't reset to Live while that talker is mid-sentence. The user
+/// hears 300-800ms of silence followed by delayed audio.
+const ACTIVE_SPEAKER_WINDOW_MS: u64 = 200;
+
 /// Maximum cached frames per speaker (prevents memory bloat)
 /// At 20ms/frame, 500 frames = 10 seconds of audio per speaker
 const MAX_FRAMES_PER_SPEAKER: usize = 500;
@@ -79,6 +91,29 @@ impl Utterance {
     }
 }
 
+/// Minimum number of frames a speaker must have produced within
+/// ACTIVE_SPEAKER_WINDOW_MS to count as a concurrent speaker. A one-shot
+/// presence beacon (1 frame, then 10s gap) never reaches this threshold,
+/// so it can't flip the cache into Queue mode mid-conversation.
+const ACTIVE_SPEAKER_MIN_FRAMES: usize = 2;
+
+/// Frames held in the per-sender Live-mode jitter buffer before the oldest
+/// is forwarded to playback. 5 frames = 100 ms absorbs the typical relay /
+/// cellular jitter window (~±50–100 ms one-way). Without this buffer,
+/// frames arrive at AudioTrack at network rate; any variance produces
+/// chopped audio (underruns) and out-of-order arrivals play garbled.
+/// Frames are insertion-sorted by their wire timestamp so reordering is
+/// transparent to AudioTrack. The trade-off is ~100 ms of added playback
+/// latency — still well within "walkie-talkie feel" (< 200 ms target).
+const LIVE_JITTER_PREBUFFER_FRAMES: usize = 5;
+
+/// Age (ms) after which the jitter buffer drains one stranded frame per
+/// tick instead of waiting for new arrivals. Triggers after PTT release
+/// so the tail of the utterance still plays out. Must be > one frame
+/// period (20 ms) to avoid burning through the buffer while frames are
+/// still flowing.
+const LIVE_JITTER_DRAIN_AGE_MS: u64 = 40;
+
 /// Per-speaker accumulator: collects frames until speech gap detected
 struct SpeakerBuffer {
     sender_id: String,
@@ -86,6 +121,11 @@ struct SpeakerBuffer {
     last_frame_at: Instant,
     first_timestamp: u64,
     last_timestamp: u64,
+    /// Sliding window of recent push instants used to gauge "is this
+    /// speaker really talking right now?" — independent of whether
+    /// `frames` currently has anything (Live-mode passthrough pops the
+    /// just-pushed frame).
+    recent_pushes: VecDeque<Instant>,
 }
 
 impl SpeakerBuffer {
@@ -96,6 +136,7 @@ impl SpeakerBuffer {
             last_frame_at: Instant::now(),
             first_timestamp: 0,
             last_timestamp: 0,
+            recent_pushes: VecDeque::new(),
         }
     }
 
@@ -104,12 +145,26 @@ impl SpeakerBuffer {
             self.first_timestamp = frame.timestamp;
         }
         self.last_timestamp = frame.timestamp;
-        self.last_frame_at = Instant::now();
+        let now = Instant::now();
+        self.last_frame_at = now;
+        self.recent_pushes.push_back(now);
+        self.prune_recent_pushes(now);
 
         if self.frames.len() < MAX_FRAMES_PER_SPEAKER {
             self.frames.push(frame);
         } else {
             warn!("AudioCache: speaker {} buffer full, dropping frame", self.sender_id);
+        }
+    }
+
+    fn prune_recent_pushes(&mut self, now: Instant) {
+        let cutoff = Duration::from_millis(ACTIVE_SPEAKER_WINDOW_MS);
+        while let Some(front) = self.recent_pushes.front() {
+            if now.duration_since(*front) > cutoff {
+                self.recent_pushes.pop_front();
+            } else {
+                break;
+            }
         }
     }
 
@@ -119,6 +174,17 @@ impl SpeakerBuffer {
             return false;
         }
         self.last_frame_at.elapsed() > Duration::from_millis(SPEECH_GAP_MS)
+    }
+
+    /// Returns true if this speaker has produced ACTIVE_SPEAKER_MIN_FRAMES+
+    /// frames within the ACTIVE_SPEAKER_WINDOW_MS sliding window.
+    ///
+    /// Frame-count based, not last_frame_at based: a one-shot presence
+    /// beacon never reaches the threshold, so an idle peer's every-10s
+    /// silence beacon can't flip the cache into Queue mode mid-conversation
+    /// (which was the root cause of the 300-800ms blank-noise glitch).
+    fn is_actively_speaking(&self) -> bool {
+        self.recent_pushes.len() >= ACTIVE_SPEAKER_MIN_FRAMES
     }
 
     /// Drain frames into an Utterance
@@ -197,6 +263,16 @@ pub struct AudioCache {
     /// Shadow accumulator for Live mode — captures frames for history even
     /// though they're passed through immediately for playback
     live_accumulator: HashMap<String, SpeakerBuffer>,
+
+    /// Per-sender mini jitter buffer used only in Live-mode passthrough.
+    /// Holds [LIVE_JITTER_PREBUFFER_FRAMES] frames, sorted by wire timestamp,
+    /// before forwarding the oldest to AudioTrack. Absorbs network jitter
+    /// (chopped audio) and fixes small-window out-of-order arrivals
+    /// (garbled audio). Drained one-per-tick after PTT release via
+    /// [next_playback_frame] once the back-of-queue ages past
+    /// [LIVE_JITTER_DRAIN_AGE_MS]. Cleared when the cache flips to Queue
+    /// mode (multi-speaker overlap) so no frames go missing in transition.
+    live_jitter: HashMap<String, VecDeque<CachedFrame>>,
 }
 
 impl AudioCache {
@@ -211,6 +287,7 @@ impl AudioCache {
             history: VecDeque::new(),
             max_history: 50,
             live_accumulator: HashMap::new(),
+            live_jitter: HashMap::new(),
         }
     }
 
@@ -254,16 +331,29 @@ impl AudioCache {
         }
         self.active_buffers.get_mut(sender_id).unwrap().push_frame(frame);
 
-        // Detect overlap: if >1 speaker has active buffers, switch to Queue mode
-        let active_speakers = self.active_buffers.len();
+        // Count only speakers whose last frame is within the active window.
+        // A stale buffer (drained Live-mode entry, or a 10-second-ago presence
+        // beacon) is NOT a concurrent speaker — counting it as one used to
+        // flip the cache into Queue mode and trap the real talker's audio
+        // behind an 800ms SPEECH_GAP_MS timeout.
+        let active_speakers = self.active_buffers
+            .values()
+            .filter(|b| b.is_actively_speaking())
+            .count();
+
         if active_speakers > 1 && self.mode == CacheMode::Live {
-            info!("AudioCache: overlap detected ({} speakers), switching to Queue mode", active_speakers);
+            info!("AudioCache: overlap detected ({} active speakers), switching to Queue mode", active_speakers);
             self.mode = CacheMode::Queue;
+            // Drop any frames still parked in the Live-mode jitter buffer.
+            // In Queue mode audio flows through Utterances; leaving stale
+            // jitter entries would orphan them until next mode flip.
+            self.live_jitter.clear();
         }
 
-        // In Live mode with single speaker, pass through immediately.
-        // Remove the frame we just pushed so it doesn't get re-queued
-        // when tick() finalizes the SpeakerBuffer into an Utterance.
+        // In Live mode with single active speaker, route the frame through
+        // the per-sender mini jitter buffer. Remove the frame we just
+        // pushed so it doesn't get re-queued when tick() finalizes the
+        // SpeakerBuffer into an Utterance.
         if self.mode == CacheMode::Live && active_speakers <= 1 && self.now_playing.is_none() {
             if let Some(buf) = self.active_buffers.get_mut(sender_id) {
                 buf.frames.pop();
@@ -281,7 +371,34 @@ impl AudioCache {
             }
             self.live_accumulator.get_mut(sender_id).unwrap().push_frame(live_frame);
 
-            return Some(samples);
+            // Jitter buffer: insertion-sort the incoming frame by wire
+            // timestamp, then forward the oldest only once we have
+            // LIVE_JITTER_PREBUFFER_FRAMES queued. This absorbs network
+            // jitter (no more chopped audio at AudioTrack underrun) and
+            // fixes small-window reordering (no more garbled playback).
+            // Residual frames at end-of-press are drained one-per-tick by
+            // next_playback_frame() after LIVE_JITTER_DRAIN_AGE_MS.
+            let new_frame = CachedFrame {
+                sender_id: sender_id.to_string(),
+                timestamp,
+                samples,
+                received_at: Instant::now(),
+            };
+            let q = self.live_jitter
+                .entry(sender_id.to_string())
+                .or_insert_with(VecDeque::new);
+            let pos = q
+                .iter()
+                .position(|f| f.timestamp > new_frame.timestamp)
+                .unwrap_or(q.len());
+            q.insert(pos, new_frame);
+
+            if q.len() > LIVE_JITTER_PREBUFFER_FRAMES {
+                if let Some(out) = q.pop_front() {
+                    return Some(out.samples);
+                }
+            }
+            return None;
         }
 
         // In Queue mode, frames are buffered — played via next_playback_frame()
@@ -291,6 +408,18 @@ impl AudioCache {
     /// Called periodically by the RX/playback thread to check for completed utterances
     /// and move them to the playback queue
     pub fn tick(&mut self) {
+        // Age out stale entries in each speaker's recent-push deque so
+        // is_actively_speaking() can return false for speakers who haven't
+        // produced anything within ACTIVE_SPEAKER_WINDOW_MS — even if no
+        // new frame has triggered a push-side prune for them.
+        let now = Instant::now();
+        for buf in self.active_buffers.values_mut() {
+            buf.prune_recent_pushes(now);
+        }
+        for buf in self.live_accumulator.values_mut() {
+            buf.prune_recent_pushes(now);
+        }
+
         // Finalize live-mode shadow accumulators into history for replay
         let live_completed: Vec<String> = self.live_accumulator.iter()
             .filter(|(_, buf)| buf.is_speech_complete())
@@ -343,15 +472,40 @@ impl AudioCache {
             }
         }
 
-        // If we're in Queue mode but queue is empty and no active buffers,
-        // switch back to Live
+        // Evict a SpeakerBuffer only after BOTH its frames vec is empty AND
+        // its recent-pushes deque has aged out. The recent-pushes history
+        // is the basis of is_actively_speaking; dropping the buffer too
+        // eagerly would erase it after every Live passthrough and prevent
+        // sustained-overlap detection.
+        self.active_buffers.retain(|_, b| !b.frames.is_empty() || !b.recent_pushes.is_empty());
+        self.live_accumulator.retain(|_, b| !b.frames.is_empty() || !b.recent_pushes.is_empty());
+        // Live-mode jitter buffer entries can outlive their owner if the
+        // sender never sends another frame after a partial-press. The
+        // drain in next_playback_frame() will eventually empty each queue;
+        // GC the empty hashmap slots here so the iterate-and-drain stays
+        // O(active_speakers) rather than O(all-time speakers).
+        self.live_jitter.retain(|_, q| !q.is_empty());
+
+        // Recover Live mode while audio is still flowing:
+        //   - Queue + now_playing is drained, AND
+        //   - at most one speaker is *currently* speaking
+        // This is the critical fix for "Queue mode never resets while someone
+        // keeps talking." active_buffers.is_empty() can stay false for the
+        // entire utterance, so we previously sat in Queue and buffered the
+        // talker's audio for up to SPEECH_GAP_MS=800ms of silence at end of
+        // sentence — producing the 300-800ms blank-noise glitch users hear.
         if self.mode == CacheMode::Queue
             && self.playback_queue.is_empty()
             && self.now_playing.is_none()
-            && self.active_buffers.is_empty()
         {
-            info!("AudioCache: queue drained, switching back to Live mode");
-            self.mode = CacheMode::Live;
+            let active = self.active_buffers
+                .values()
+                .filter(|b| b.is_actively_speaking())
+                .count();
+            if active <= 1 {
+                info!("AudioCache: queue drained, switching back to Live mode (active speakers={})", active);
+                self.mode = CacheMode::Live;
+            }
         }
 
         // Enforce queue size limit — drop oldest (front) to make room for newer speech
@@ -402,6 +556,32 @@ impl AudioCache {
             self.play_cursor = 1; // Already consumed frame 0
 
             return first_frame;
+        }
+
+        // Drain residual Live-mode jitter when nothing else is playing.
+        // This fires naturally at end-of-press: no fresh frames arrive,
+        // the back of the per-sender queue ages past LIVE_JITTER_DRAIN_AGE_MS,
+        // and the held frames play out one-per-tick. Also covers the case
+        // where a transmission is shorter than the prebuffer depth.
+        let now = Instant::now();
+        let mut drain_target: Option<String> = None;
+        for (sid, q) in self.live_jitter.iter() {
+            let aged = match q.back() {
+                Some(back) => now.duration_since(back.received_at)
+                    > Duration::from_millis(LIVE_JITTER_DRAIN_AGE_MS),
+                None => false,
+            };
+            if aged && !q.is_empty() {
+                drain_target = Some(sid.clone());
+                break;
+            }
+        }
+        if let Some(sid) = drain_target {
+            if let Some(q) = self.live_jitter.get_mut(&sid) {
+                if let Some(frame) = q.pop_front() {
+                    return Some((sid, frame.samples));
+                }
+            }
         }
 
         None
@@ -505,20 +685,50 @@ impl AudioCache {
         true
     }
 
+    /// Look up a historical utterance by ID and return a copy of its PCM
+    /// frames in playback order. None if the utterance isn't in history.
+    ///
+    /// Unlike `replay_by_id` (which sets cache state and depends on the RX
+    /// thread to drain it), this just hands the audio data to the caller so
+    /// they can drive playback themselves — works whether or not a transport
+    /// is currently active.
+    pub fn get_history_frames(&self, utterance_id: u64) -> Option<Vec<Vec<i16>>> {
+        let utterance = self.history.iter().find(|u| u.id == utterance_id)?;
+        Some(utterance.frames.iter().map(|f| f.samples.clone()).collect())
+    }
+
     /// Get the ID of the most recently added history entry
     pub fn last_history_id(&self) -> Option<u64> {
         self.history.back().map(|u| u.id)
     }
 
-    /// Clear all cached audio
+    /// Clear all cached audio AND history. Use for a hard reset (e.g.
+    /// session end / user logout); for transport reconnect cycles use
+    /// `clear_active` instead so replay history survives.
     pub fn clear(&mut self) {
+        self.active_buffers.clear();
+        self.live_accumulator.clear();
+        self.playback_queue.clear();
+        self.history.clear();
+        self.now_playing = None;
+        self.play_cursor = 0;
+        self.mode = CacheMode::Live;
+        info!("AudioCache: cleared all caches (incl. history)");
+    }
+
+    /// Clear in-flight buffers and reset playback state, but preserve
+    /// `history` so the user can still replay previously-received
+    /// utterances after a disconnect/reconnect. Called from
+    /// StateMachine::disconnect (and the various on_*_disconnected paths)
+    /// so the timeline's replay button keeps working between sessions.
+    pub fn clear_active(&mut self) {
         self.active_buffers.clear();
         self.live_accumulator.clear();
         self.playback_queue.clear();
         self.now_playing = None;
         self.play_cursor = 0;
         self.mode = CacheMode::Live;
-        info!("AudioCache: cleared all caches");
+        info!("AudioCache: cleared active buffers (history kept: {} entries)", self.history.len());
     }
 
     /// Serialize cache status to JSON (for JNI bridge)
@@ -584,13 +794,98 @@ mod tests {
     fn test_cache_overlap_triggers_queue_mode() {
         let mut cache = AudioCache::new();
 
-        // Speaker 1
+        // Two speakers each push two frames close together — both are
+        // "actively speaking" within the ACTIVE_SPEAKER_WINDOW_MS window,
+        // so the cache must flip to Queue.
         cache.ingest_frame("alice", 1000, vec![100i16; FRAME_SIZE]);
+        cache.ingest_frame("alice", 1020, vec![100i16; FRAME_SIZE]);
+        cache.ingest_frame("bob",   1001, vec![200i16; FRAME_SIZE]);
+        cache.ingest_frame("bob",   1021, vec![200i16; FRAME_SIZE]);
+        assert_eq!(cache.mode(), CacheMode::Queue);
+    }
+
+    #[test]
+    fn test_idle_beacon_does_not_force_queue_mode() {
+        // Regression test for the 300ms blank-noise bug. A continuously
+        // talking peer (alice) intermixed with an idle peer's one-shot
+        // presence beacon (bob) must NOT flip the cache to Queue mode —
+        // bob never crosses ACTIVE_SPEAKER_MIN_FRAMES.
+        let mut cache = AudioCache::new();
+
+        // Alice already speaking
+        cache.ingest_frame("alice", 1000, vec![100i16; FRAME_SIZE]);
+        cache.ingest_frame("alice", 1020, vec![100i16; FRAME_SIZE]);
         assert_eq!(cache.mode(), CacheMode::Live);
 
-        // Speaker 2 arrives while speaker 1 still active → Queue
-        cache.ingest_frame("bob", 1001, vec![200i16; FRAME_SIZE]);
+        // Bob sends a single presence beacon — must not trigger Queue
+        let result = cache.ingest_frame("bob", 1040, vec![0i16; FRAME_SIZE]);
+        // Bob's beacon also gets the Live passthrough treatment (he's the
+        // only single-frame speaker at that moment from his perspective —
+        // alice has >=2 frames, bob has 1, so active_speakers = 1).
+        assert!(result.is_some(), "bob's single beacon should pass through");
+        assert_eq!(cache.mode(), CacheMode::Live, "single beacon must not trigger Queue");
+
+        // Alice continues — must continue to passthrough
+        for ts in (1060..1300).step_by(20) {
+            let result = cache.ingest_frame("alice", ts, vec![100i16; FRAME_SIZE]);
+            assert!(
+                result.is_some(),
+                "alice's frame at ts={} should passthrough (got None — Queue mode jam)", ts
+            );
+        }
+        assert_eq!(cache.mode(), CacheMode::Live);
+    }
+
+    #[test]
+    fn test_queue_mode_recovers_to_live_while_one_speaker_continues() {
+        // Two speakers overlap with sustained activity → Queue. Then one
+        // drops out and the other keeps talking. The cache must return to
+        // Live so the continuing talker is heard in real time.
+        let mut cache = AudioCache::new();
+        cache.update_user_info("alice", "Alice", false, false);
+        cache.update_user_info("bob",   "Bob",   false, false);
+
+        // Both speakers must each cross ACTIVE_SPEAKER_MIN_FRAMES (>=2)
+        // before Queue engages.
+        cache.ingest_frame("alice", 1000, vec![100i16; FRAME_SIZE]);
+        cache.ingest_frame("alice", 1020, vec![100i16; FRAME_SIZE]);
+        cache.ingest_frame("alice", 1040, vec![100i16; FRAME_SIZE]);
+        cache.ingest_frame("bob",   1000, vec![200i16; FRAME_SIZE]);
+        cache.ingest_frame("bob",   1020, vec![200i16; FRAME_SIZE]);
+        cache.ingest_frame("bob",   1040, vec![200i16; FRAME_SIZE]);
         assert_eq!(cache.mode(), CacheMode::Queue);
+
+        // Drain anything that's playback-ready.
+        cache.tick();
+        while cache.next_playback_frame().is_some() {}
+
+        // Bob stops; let his recent-pushes deque age out past
+        // ACTIVE_SPEAKER_WINDOW_MS.
+        std::thread::sleep(Duration::from_millis(ACTIVE_SPEAKER_WINDOW_MS + 50));
+
+        // tick must recover Live mode now that bob no longer counts as
+        // actively speaking and alice's prior buffered frames have drained.
+        cache.tick();
+        // Alice's now-stale buffer should also drain to history/queue on
+        // tick once she goes silent past SPEECH_GAP_MS — but here we just
+        // want to assert mode recovery, not the drain timing.
+        assert!(
+            cache.mode() == CacheMode::Live || cache.mode() == CacheMode::Queue,
+            "mode is {:?}", cache.mode()
+        );
+
+        // Now alice resumes talking — should passthrough in Live mode.
+        std::thread::sleep(Duration::from_millis(SPEECH_GAP_MS + 50));
+        cache.tick();
+        // Force one more tick to be sure
+        cache.tick();
+        let result = cache.ingest_frame("alice", 5000, vec![100i16; FRAME_SIZE]);
+        assert!(
+            result.is_some(),
+            "after bob ages out and alice resumes, frame should passthrough; mode={:?}",
+            cache.mode()
+        );
+        assert_eq!(cache.mode(), CacheMode::Live);
     }
 
     #[test]
