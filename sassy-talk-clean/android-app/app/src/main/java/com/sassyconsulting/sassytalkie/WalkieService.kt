@@ -79,6 +79,10 @@ class WalkieService : Service() {
         super.onCreate()
         Log.i(TAG, "Service created")
         createNotificationChannel()
+        // Snapshotter is keyed to service lifetime, not multicast. The inner
+        // getActiveCohortId() guard makes it a no-op when no channel has an
+        // active session — so it's safe to run regardless of transport.
+        startCohortSnapshotter()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -241,9 +245,6 @@ class WalkieService : Service() {
 
         // Update notification
         updateNotification("Radio active")
-
-        // Start snapshotting active cohort participants every 30 s
-        startCohortSnapshotter()
     }
 
     /**
@@ -251,7 +252,6 @@ class WalkieService : Service() {
      * leaves the walkie-talkie screen.
      */
     fun releaseMulticastLock() {
-        stopCohortSnapshotter()
         multicastLock?.let {
             if (it.isHeld) {
                 it.release()
