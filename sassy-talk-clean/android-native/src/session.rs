@@ -44,6 +44,10 @@ pub struct SessionKey {
     /// User-facing group name. Defaults to "Channel N".
     #[serde(default)]
     pub group_name: String,
+    /// Stable cohort identifier across key rotations. Empty/missing in
+    /// legacy QRs — the importer mints one locally in that case.
+    #[serde(default)]
+    pub cohort_id: String,
 }
 
 fn default_channel() -> u8 { 1 }
@@ -59,6 +63,7 @@ impl Drop for SessionKey {
         self.device.zeroize();
         self.session_id.zeroize();
         self.group_name.zeroize();
+        self.cohort_id.zeroize();
     }
 }
 
@@ -90,12 +95,24 @@ impl SessionManager {
         }
     }
 
-    /// Generate a new session QR for a specific channel.
+    /// Generate a new session QR for a specific channel, minting a fresh cohort_id.
     pub fn generate_session_qr(
         &mut self,
         channel: u8,
         duration_hours: u32,
         group_name: &str,
+    ) -> Result<String, String> {
+        self.generate_session_qr_with_cohort(channel, duration_hours, group_name, None)
+    }
+
+    /// Generate a session QR, optionally reusing a previously-known cohort_id
+    /// (used by the "Rejoin" flow so a regenerated session inherits cohort identity).
+    pub fn generate_session_qr_with_cohort(
+        &mut self,
+        channel: u8,
+        duration_hours: u32,
+        group_name: &str,
+        cohort_id: Option<&str>,
     ) -> Result<String, String> {
         let ch_idx = validate_channel(channel)?;
         let hours = if duration_hours == 0 { DEFAULT_SESSION_HOURS } else { duration_hours };
@@ -110,6 +127,11 @@ impl SessionManager {
         );
 
         let session_id = uuid::Uuid::new_v4().to_string();
+        let cohort = cohort_id
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
         let name = if group_name.is_empty() {
             format!("Channel {}", channel)
         } else {
@@ -124,6 +146,7 @@ impl SessionManager {
             session_id: session_id.clone(),
             channel,
             group_name: name.clone(),
+            cohort_id: cohort.clone(),
         };
 
         let json = serde_json::to_string(&session)
@@ -134,8 +157,8 @@ impl SessionManager {
             group_name: name.clone(),
         });
 
-        info!("Session generated for ch{} '{}': {} (expires in {}h)",
-            channel, name, session_id, duration);
+        info!("Session generated for ch{} '{}' cohort {}: {} (expires in {}h)",
+            channel, name, cohort, session_id, duration);
 
         Ok(json)
     }
@@ -449,5 +472,27 @@ mod tests {
         let info = mgr.get_channel_info();
         assert!(info.contains("\"Ops\""));
         assert!(info.contains("\"channel\":2"));
+    }
+
+    #[test]
+    fn test_session_includes_cohort_id_field() {
+        let mut host = SessionManager::new("Host");
+        let qr_json = host.generate_session_qr(1, 24, "Alpha Team").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&qr_json).unwrap();
+        let cohort_id = parsed.get("cohort_id").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(!cohort_id.is_empty(), "cohort_id must be present and non-empty");
+        assert_eq!(cohort_id.len(), 36, "cohort_id must be a UUID");
+    }
+
+    #[test]
+    fn test_generate_with_reused_cohort_id_preserves_it() {
+        let mut host = SessionManager::new("Host");
+        let qr1 = host.generate_session_qr_with_cohort(1, 24, "Alpha", None).unwrap();
+        let cid: String = serde_json::from_str::<serde_json::Value>(&qr1).unwrap()
+            ["cohort_id"].as_str().unwrap().to_string();
+        let qr2 = host.generate_session_qr_with_cohort(1, 24, "Alpha", Some(&cid)).unwrap();
+        let cid2: String = serde_json::from_str::<serde_json::Value>(&qr2).unwrap()
+            ["cohort_id"].as_str().unwrap().to_string();
+        assert_eq!(cid, cid2, "supplied cohort_id must round-trip");
     }
 }
