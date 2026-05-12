@@ -19,6 +19,13 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.sassyconsulting.sassytalkie.service.BluetoothTransport
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 /**
  * Foreground service that keeps SassyTalkie alive while in use.
@@ -53,6 +60,9 @@ class WalkieService : Service() {
 
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+
+    private val serviceScope = CoroutineScope(Dispatchers.Default)
+    private var cohortSnapshotJob: Job? = null
 
     // BLE + RFCOMM
     var bleSignaling: BleSignalingService? = null
@@ -101,6 +111,8 @@ class WalkieService : Service() {
 
     override fun onDestroy() {
         Log.i(TAG, "Service destroyed")
+        stopCohortSnapshotter()
+        serviceScope.cancel()
         shutdownBleTransport()
         releaseMulticastLock()
         releaseWakeLock()
@@ -170,6 +182,43 @@ class WalkieService : Service() {
         Log.i(TAG, "BLE + RFCOMM transport shut down")
     }
 
+    // ── Cohort participant snapshotter ──
+
+    private fun startCohortSnapshotter() {
+        if (cohortSnapshotJob?.isActive == true) return
+        cohortSnapshotJob = serviceScope.launch {
+            while (isActive) {
+                try {
+                    val users = SassyTalkNative.getUsers()
+                    if (users.isNotEmpty()) {
+                        val arr = org.json.JSONArray()
+                        for (u in users) {
+                            val o = org.json.JSONObject()
+                            o.put("id", u.id)
+                            o.put("name", u.name)
+                            arr.put(o)
+                        }
+                        val payload = arr.toString()
+                        for (ch in 1..8) {
+                            val cid = SassyTalkNative.getActiveCohortId(ch)
+                            if (cid.isNotEmpty()) {
+                                SassyTalkNative.snapshotCohortParticipants(ch, payload)
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "cohort snapshot failed: ${e.message}")
+                }
+                delay(30_000)
+            }
+        }
+    }
+
+    private fun stopCohortSnapshotter() {
+        cohortSnapshotJob?.cancel()
+        cohortSnapshotJob = null
+    }
+
     // ── Multicast lock ──
 
     /**
@@ -192,6 +241,9 @@ class WalkieService : Service() {
 
         // Update notification
         updateNotification("Radio active")
+
+        // Start snapshotting active cohort participants every 30 s
+        startCohortSnapshotter()
     }
 
     /**
@@ -199,6 +251,7 @@ class WalkieService : Service() {
      * leaves the walkie-talkie screen.
      */
     fun releaseMulticastLock() {
+        stopCohortSnapshotter()
         multicastLock?.let {
             if (it.isHeld) {
                 it.release()
