@@ -71,8 +71,9 @@ class CohortHistoryInstrumentedTest {
         assertEquals("Joined", rec.getString("role"))
         assertEquals("Legacy Host", rec.getString("host_device"))
         val cid = rec.getString("cohort_id")
-        assertTrue(cid.isNotEmpty())
-        assertEquals("minted cohort_id must be a UUID", 36, cid.length)
+        assertTrue("minted cohort_id must be non-empty", cid.isNotEmpty())
+        // throws IllegalArgumentException on malformed UUID, failing the test
+        java.util.UUID.fromString(cid)
     }
 
     @Test

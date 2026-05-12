@@ -501,7 +501,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&qr_json).unwrap();
         let cohort_id = parsed.get("cohort_id").and_then(|v| v.as_str()).unwrap_or("");
         assert!(!cohort_id.is_empty(), "cohort_id must be present and non-empty");
-        assert_eq!(cohort_id.len(), 36, "cohort_id must be a UUID");
+        assert!(uuid::Uuid::parse_str(cohort_id).is_ok(), "cohort_id must be a valid UUID: {}", cohort_id);
     }
 
     #[test]
@@ -541,6 +541,6 @@ mod tests {
         let mut joiner = SessionManager::new("Joiner");
         let (_ch, _crypto, cid) = joiner.import_session(&legacy).unwrap();
         assert!(!cid.is_empty(), "legacy QR must yield a locally-minted cohort_id");
-        assert_eq!(cid.len(), 36, "minted cohort_id must be a UUID");
+        assert!(uuid::Uuid::parse_str(&cid).is_ok(), "minted cohort_id must be a valid UUID: {}", cid);
     }
 }
