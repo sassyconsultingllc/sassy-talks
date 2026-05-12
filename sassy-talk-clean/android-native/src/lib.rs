@@ -23,6 +23,7 @@ pub mod opus_ffi;
 pub mod codec;
 pub mod audio_pipeline;
 pub mod cellular_transport;
+pub mod cohort_history;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
