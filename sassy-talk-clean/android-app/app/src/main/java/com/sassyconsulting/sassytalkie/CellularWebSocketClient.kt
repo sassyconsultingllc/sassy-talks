@@ -137,7 +137,14 @@ class CellularWebSocketClient {
                     if (op in 0x10..0x1F) {
                         val payloadLen = (raw[1].toInt() and 0xFF) or ((raw[2].toInt() and 0xFF) shl 8)
                         if (raw.size == 3 + payloadLen) {
-                            pttCoordinator?.onControlFrame("relay", raw)
+                            // Derive a per-peer routing key from the TLV payload
+                            // when possible. Using a constant "relay" key
+                            // collapsed every cellular peer into one entry in
+                            // PttCoordinator's LivenessTracker, so the Users
+                            // tab showed N real peers as a single pseudo-peer
+                            // and presence/health was meaningless.
+                            val peerId = relayPeerIdFromFrame(raw) ?: "relay"
+                            pttCoordinator?.onControlFrame(peerId, raw)
                             return
                         }
                     }
@@ -350,5 +357,38 @@ class CellularWebSocketClient {
         url.startsWith("https://") -> "wss://" + url.removePrefix("https://")
         url.startsWith("http://")  -> "ws://"  + url.removePrefix("http://")
         else -> url
+    }
+
+    /**
+     * Extract a stable per-peer routing key from a TLV control frame. The
+     * relay broadcasts frames from N peers down a single WebSocket, so we
+     * can't use a per-connection identity; we have to look inside the
+     * frame. Five of the seven epoch-bearing opcodes (HEARTBEAT, RECV_ACK,
+     * EOT_ACK, PTT_START_V2, PTT_STOP_V2) start their payload with the
+     * sender's `epoch:i64` (little-endian) — a 64-bit random session id
+     * generated once per app start. That's unique enough to use as a
+     * LivenessTracker key.
+     *
+     * Returns "relay:<epoch>" for the five epoch-prefixed ops, or null for
+     * frames whose payload does NOT start with epoch (CAPABILITIES, which
+     * uses JSON; PARTNER_OFFLINE, which starts with a length byte). Callers
+     * fall back to the legacy constant "relay" key in those cases — the
+     * tracker entry is just slightly less precise for two infrequent ops.
+     */
+    private fun relayPeerIdFromFrame(raw: ByteArray): String? {
+        if (raw.size < 3 + 8) return null
+        val op = raw[0].toInt() and 0xFF
+        // 0x10 HEARTBEAT, 0x11 RECV_ACK, 0x12 EOT_ACK, 0x15 PTT_START_V2,
+        // 0x16 PTT_STOP_V2 all share the {epoch:i64,...} payload prefix.
+        // 0x13 CAPABILITIES (JSON) and 0x14 PARTNER_OFFLINE (length-prefixed
+        // peerId) do not — bail and let the caller use the constant key.
+        if (op !in setOf(0x10, 0x11, 0x12, 0x15, 0x16)) return null
+        val bb = java.nio.ByteBuffer.wrap(raw, 3, 8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        val epoch = bb.long
+        // SessionEpoch.generate() never produces 0; treat 0 as "absent" and
+        // fall through to the constant key rather than collapse onto a
+        // confusing pseudo-id.
+        if (epoch == 0L) return null
+        return "relay:$epoch"
     }
 }
