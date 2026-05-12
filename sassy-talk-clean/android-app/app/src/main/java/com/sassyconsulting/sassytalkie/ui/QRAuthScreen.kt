@@ -111,6 +111,11 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
                 onClick = { selectedTab = 2 },
                 text = { Text("Enter Code", color = if (selectedTab == 2) Orange else TextGray, fontSize = 13.sp) }
             )
+            Tab(
+                selected = selectedTab == 3,
+                onClick = { selectedTab = 3 },
+                text = { Text("My Cohorts", color = if (selectedTab == 3) Orange else TextGray, fontSize = 13.sp) }
+            )
         }
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -160,6 +165,24 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
                     hasExistingSession.value = true
                     onAuthenticated()
                 }
+            )
+            3 -> MyCohortsTab(
+                onRejoinHost = { channel, gName, cohortId ->
+                    selectedChannel = channel
+                    groupName = gName
+                    val qr = SassyTalkNative.generateChannelQR(channel, durationHours, gName, cohortId)
+                    if (qr.isNotEmpty()) {
+                        lastGeneratedJson = qr
+                        qrBitmap = generateQRBitmap(qr, 600)
+                        hasExistingSession.value = true
+                        selectedTab = 0
+                    }
+                },
+                onRejoinJoiner = { hostDevice ->
+                    scanResult = if (hostDevice != null) "Ask $hostDevice to show their QR" else null
+                    showScanner = false
+                    selectedTab = 1
+                },
             )
         }
     }
