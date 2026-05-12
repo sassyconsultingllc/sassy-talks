@@ -361,6 +361,7 @@ struct JniAppState {
     state_machine: Option<StateMachine>,
     session_manager: SessionManager,
     user_registry: UserRegistry,
+    cohort_history: crate::cohort_history::CohortHistory,
     ptt_pressed: Arc<AtomicBool>,
     current_channel: Arc<AtomicU8>,
     current_subchannel: Arc<AtomicU8>,
@@ -384,6 +385,9 @@ impl JniAppState {
             state_machine: None,
             session_manager: SessionManager::new("SassyTalkie"),
             user_registry: UserRegistry::new(),
+            cohort_history: crate::cohort_history::CohortHistory::new(
+                crate::cohort_history::DEFAULT_HISTORY_CAP,
+            ),
             ptt_pressed,
             current_channel,
             current_subchannel,
@@ -1023,10 +1027,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGenerateChannelQR(
         env, _class, channel as jni::sys::jint, duration_hours,
         std::ptr::null_mut(), // null group_name = use default
+        std::ptr::null_mut(), // null cohort_id = mint fresh
     )
 }
 
-/// JNI: Generate session QR for a specific channel with optional group name
+/// JNI: Generate session QR for a specific channel with optional group name + cohort_id
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGenerateChannelQR<'local>(
     mut env: JNIEnv<'local>,
@@ -1034,6 +1039,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     channel: jni::sys::jint,
     duration_hours: jni::sys::jint,
     group_name: jni::sys::jstring,
+    cohort_id: jni::sys::jstring,
 ) -> JObject<'local> {
     let ch = channel as u8;
     let name: String = if !group_name.is_null() {
@@ -1042,32 +1048,53 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     } else {
         String::new()
     };
+    let cohort: Option<String> = if !cohort_id.is_null() {
+        let j_cid = unsafe { JString::from_raw(cohort_id) };
+        env.get_string(&j_cid).ok().map(|s| s.into())
+    } else {
+        None
+    };
 
-    info!("JNI: Generate session QR ch{} '{}' ({}h)", ch, name, duration_hours);
+    info!("JNI: Generate session QR ch{} '{}' cohort={:?} ({}h)", ch, name, cohort, duration_hours);
 
     let state = get_jni_state();
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    let json = match guard.session_manager.generate_session_qr(ch, duration_hours as u32, &name) {
-        Ok(qr_json) => {
-            // Install the active session for this channel on the transport.
-            if let Some(ref sm) = guard.state_machine {
-                let mut tm = sm.get_transport().lock().unwrap();
-                if let Some(crypto) = guard.session_manager.get_crypto_for_channel(ch) {
-                    tm.set_crypto(crypto);
-                }
-            }
-            qr_json
-        }
+    let qr_json = match guard.session_manager.generate_session_qr_with_cohort(
+        ch, duration_hours as u32, &name, cohort.as_deref(),
+    ) {
+        Ok(json) => json,
         Err(e) => {
             error!("JNI: Generate QR failed: {}", e);
-            String::new()
+            return env.new_string("").map(|s| s.into()).unwrap_or_else(|_| JObject::null());
         }
     };
 
+    let (sid, cid) = match serde_json::from_str::<serde_json::Value>(&qr_json) {
+        Ok(v) => (
+            v["session_id"].as_str().unwrap_or("").to_string(),
+            v["cohort_id"].as_str().unwrap_or("").to_string(),
+        ),
+        Err(_) => (String::new(), String::new()),
+    };
+
+    if !cid.is_empty() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs()).unwrap_or(0);
+        guard.cohort_history.upsert_host(ch, &name, Some(&cid), &sid, now);
+    }
+
+    if let Some(ref sm) = guard.state_machine {
+        let mut tm = sm.get_transport().lock().unwrap();
+        if let Some(crypto) = guard.session_manager.get_crypto_for_channel(ch) {
+            tm.set_crypto(crypto);
+        }
+    }
+
     drop(guard);
 
-    env.new_string(&json)
+    env.new_string(&qr_json)
         .map(|s| s.into())
         .unwrap_or_else(|_| JObject::null())
 }
@@ -1090,14 +1117,28 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     match guard.session_manager.import_session(&json) {
-        Ok((channel, crypto, _cohort_id)) => {
+        Ok((channel, crypto, cohort_id)) => {
             if let Some(ref sm) = guard.state_machine {
                 let mut tm = sm.get_transport().lock().unwrap();
                 tm.set_crypto(crypto);
             }
-            // Auto-switch to the imported channel
             guard.current_channel.store(channel, std::sync::atomic::Ordering::SeqCst);
-            info!("JNI: Session imported successfully for ch{}", channel);
+
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json) {
+                let host_dev = parsed["device"].as_str().unwrap_or("").to_string();
+                let sid = parsed["session_id"].as_str().unwrap_or("").to_string();
+                let gname = parsed["group_name"].as_str()
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| format!("Channel {}", channel));
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs()).unwrap_or(0);
+                guard.cohort_history.upsert_joiner(channel, &gname, Some(&cohort_id),
+                                                   &host_dev, &sid, now);
+            }
+
+            info!("JNI: Session imported successfully for ch{} cohort {}", channel, cohort_id);
             JNI_TRUE
         }
         Err(e) => {
