@@ -54,10 +54,19 @@ fn main() {
     let target = env::var("TARGET").unwrap_or_default();
 
     // Only compile libopus when targeting Android or Linux.
-    // On Windows host builds (e.g. unit tests that run natively) we skip this.
+    // On non-Android/non-Linux host builds (typically Windows MSVC for
+    // `cargo test`), compile a stub object that resolves the opus FFI
+    // symbols so the test binary links. Calling any stub at runtime
+    // aborts with a diagnostic — codec.rs paths must not run on host.
     let is_android = target.contains("android");
     let is_linux   = target.contains("linux");
     if !is_android && !is_linux {
+        cc::Build::new()
+            .file("src/opus_stub.c")
+            .flag_if_supported("-w")
+            .compile("opus");
+        println!("cargo:rustc-link-lib=static=opus");
+        println!("cargo:rerun-if-changed=src/opus_stub.c");
         return;
     }
 
