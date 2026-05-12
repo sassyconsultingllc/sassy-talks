@@ -1181,6 +1181,101 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         .unwrap_or_else(|_| JObject::null())
 }
 
+/// JNI: Get cohort history as JSON array
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetCohortHistory<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> JObject<'local> {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let json = guard.cohort_history.to_json();
+    drop(guard);
+    env.new_string(&json).map(|s| s.into()).unwrap_or_else(|_| JObject::null())
+}
+
+/// JNI: Load cohort history from a previously-saved blob (called once on init)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeLoadCohortHistory<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    blob: JString<'local>,
+) {
+    let json: String = match env.get_string(&blob) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    guard.cohort_history = crate::cohort_history::CohortHistory::load_from_json(
+        &json, crate::cohort_history::DEFAULT_HISTORY_CAP,
+    );
+}
+
+/// JNI: Remove a single cohort by id
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeRemoveCohort<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    cohort_id: JString<'local>,
+) {
+    let id: String = match env.get_string(&cohort_id) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    guard.cohort_history.remove(&id);
+}
+
+/// JNI: Clear all cohort history
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeClearCohortHistory(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    guard.cohort_history.clear();
+}
+
+/// JNI: Get the active cohort_id for a channel (empty string if no active session there)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetActiveCohortId<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    channel: jni::sys::jint,
+) -> JObject<'local> {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let cid = guard.session_manager.get_active_cohort_id(channel as u8).unwrap_or_default();
+    drop(guard);
+    env.new_string(&cid).map(|s| s.into()).unwrap_or_else(|_| JObject::null())
+}
+
+/// JNI: Snapshot participants for the active cohort on a given channel.
+/// Called by Kotlin every ~30s while a session is active.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSnapshotCohortParticipants<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    channel: jni::sys::jint,
+    participants_json: JString<'local>,
+) {
+    let json: String = match env.get_string(&participants_json) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+    let participants: Vec<crate::cohort_history::ParticipantSnapshot> =
+        serde_json::from_str(&json).unwrap_or_default();
+
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cid) = guard.session_manager.get_active_cohort_id(channel as u8) {
+        guard.cohort_history.snapshot_participants(&cid, participants);
+    }
+}
+
 //==============================================================================
 // USER MANAGEMENT JNI EXPORTS (MUTE / FAVORITES)
 //==============================================================================

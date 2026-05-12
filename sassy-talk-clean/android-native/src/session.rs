@@ -296,6 +296,16 @@ impl SessionManager {
         }).next()
     }
 
+    /// Get the cohort_id of the currently active session on a channel, if any.
+    /// Returns None if the channel has no session or the session has expired.
+    pub fn get_active_cohort_id(&self, channel: u8) -> Option<String> {
+        let ch_idx = validate_channel(channel).ok()?;
+        let cs = self.channels[ch_idx].as_ref()?;
+        let now = current_unix_time().ok()?;
+        if now > cs.key.expires_at { return None; }
+        Some(cs.key.cohort_id.clone())
+    }
+
     /// Get session status as JSON (for UI display).
     pub fn get_session_status(&self) -> String {
         let now = current_unix_time().unwrap_or(0);
