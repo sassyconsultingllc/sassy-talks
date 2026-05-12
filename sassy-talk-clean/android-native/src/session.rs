@@ -407,6 +407,20 @@ fn current_unix_time() -> Result<u64, String> {
 mod tests {
     use super::*;
 
+    /// Pull a string field out of a QR JSON payload, panicking with a clear
+    /// message if the field is missing or malformed. Tests use this instead
+    /// of stacked `.unwrap()`s so a regression in the QR schema produces a
+    /// readable failure rather than a generic "called `Option::unwrap()` on
+    /// a `None` value" message.
+    fn qr_field(qr_json: &str, field: &str) -> String {
+        let v: serde_json::Value = serde_json::from_str(qr_json)
+            .unwrap_or_else(|e| panic!("QR JSON failed to parse: {}\n{}", e, qr_json));
+        v.get(field)
+            .and_then(|x| x.as_str())
+            .unwrap_or_else(|| panic!("QR JSON missing string field '{}': {}", field, qr_json))
+            .to_string()
+    }
+
     #[test]
     fn test_session_generate_and_import() {
         let mut host = SessionManager::new("Host");
@@ -498,21 +512,18 @@ mod tests {
     fn test_session_includes_cohort_id_field() {
         let mut host = SessionManager::new("Host");
         let qr_json = host.generate_session_qr(1, 24, "Alpha Team").unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&qr_json).unwrap();
-        let cohort_id = parsed.get("cohort_id").and_then(|v| v.as_str()).unwrap_or("");
+        let cohort_id = qr_field(&qr_json, "cohort_id");
         assert!(!cohort_id.is_empty(), "cohort_id must be present and non-empty");
-        assert!(uuid::Uuid::parse_str(cohort_id).is_ok(), "cohort_id must be a valid UUID: {}", cohort_id);
+        assert!(uuid::Uuid::parse_str(&cohort_id).is_ok(), "cohort_id must be a valid UUID: {}", cohort_id);
     }
 
     #[test]
     fn test_generate_with_reused_cohort_id_preserves_it() {
         let mut host = SessionManager::new("Host");
         let qr1 = host.generate_session_qr_with_cohort(1, 24, "Alpha", None).unwrap();
-        let cid: String = serde_json::from_str::<serde_json::Value>(&qr1).unwrap()
-            ["cohort_id"].as_str().unwrap().to_string();
+        let cid = qr_field(&qr1, "cohort_id");
         let qr2 = host.generate_session_qr_with_cohort(1, 24, "Alpha", Some(&cid)).unwrap();
-        let cid2: String = serde_json::from_str::<serde_json::Value>(&qr2).unwrap()
-            ["cohort_id"].as_str().unwrap().to_string();
+        let cid2 = qr_field(&qr2, "cohort_id");
         assert_eq!(cid, cid2, "supplied cohort_id must round-trip");
     }
 
@@ -520,8 +531,7 @@ mod tests {
     fn test_import_returns_cohort_id() {
         let mut host = SessionManager::new("Host");
         let qr = host.generate_session_qr(1, 24, "Alpha").unwrap();
-        let expected_cid = serde_json::from_str::<serde_json::Value>(&qr).unwrap()
-            ["cohort_id"].as_str().unwrap().to_string();
+        let expected_cid = qr_field(&qr, "cohort_id");
 
         let mut joiner = SessionManager::new("Joiner");
         let (ch, _crypto, cid) = joiner.import_session(&qr).unwrap();
