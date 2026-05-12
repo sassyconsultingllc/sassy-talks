@@ -61,6 +61,9 @@ audiopus_sys = { version = "0.2.2", optional = true }
 [build-dependencies]
 cc = "1"
 
+[dev-dependencies]
+regex = "1"
+
 [profile.release]
 opt-level = "z"
 lto = true
