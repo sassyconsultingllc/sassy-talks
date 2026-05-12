@@ -164,9 +164,12 @@ impl SessionManager {
     }
 
     /// Import a session from a scanned QR code JSON payload.
-    /// Returns (channel, CryptoSession) so the caller can set the active channel.
-    pub fn import_session(&mut self, qr_json: &str) -> Result<(u8, CryptoSession), String> {
-        let session: SessionKey = serde_json::from_str(qr_json)
+    /// Returns (channel, CryptoSession, cohort_id).
+    /// If the QR lacks a cohort_id (legacy), a fresh UUID is minted locally
+    /// and written into the stored ChannelSession so the joiner can match it
+    /// against later regenerations from the same host.
+    pub fn import_session(&mut self, qr_json: &str) -> Result<(u8, CryptoSession, String), String> {
+        let mut session: SessionKey = serde_json::from_str(qr_json)
             .map_err(|e| format!("Invalid QR data: {}", e))?;
 
         let channel = session.channel;
@@ -195,21 +198,28 @@ impl SessionManager {
         key_array.copy_from_slice(&key_bytes);
         let crypto = CryptoSession::from_psk(&key_array);
 
+        if session.cohort_id.is_empty() {
+            session.cohort_id = uuid::Uuid::new_v4().to_string();
+            info!("Legacy QR: minted local cohort_id {} for ch{}", session.cohort_id, channel);
+        }
+
         let name = if session.group_name.is_empty() {
             format!("Channel {}", channel)
         } else {
             session.group_name.clone()
         };
 
-        info!("Session imported for ch{} '{}' from {}: {}",
-            channel, name, session.device, session.session_id);
+        let cohort_id = session.cohort_id.clone();
+
+        info!("Session imported for ch{} '{}' cohort {} from {}: {}",
+            channel, name, cohort_id, session.device, session.session_id);
 
         self.channels[ch_idx] = Some(ChannelSession {
             key: session,
             group_name: name,
         });
 
-        Ok((channel, crypto))
+        Ok((channel, crypto, cohort_id))
     }
 
     /// Get the CryptoSession for a specific channel (if it has a valid key).
@@ -393,7 +403,7 @@ mod tests {
         let qr_json = host.generate_session_qr(1, 24, "Alpha Team").unwrap();
 
         let mut joiner = SessionManager::new("Joiner");
-        let (ch, mut crypto) = joiner.import_session(&qr_json).unwrap();
+        let (ch, mut crypto, _cid) = joiner.import_session(&qr_json).unwrap();
 
         assert_eq!(ch, 1);
         assert!(host.is_authenticated());
@@ -443,7 +453,7 @@ mod tests {
         let legacy_json = serde_json::to_string(&parsed).unwrap();
 
         let mut joiner = SessionManager::new("Joiner");
-        let (ch, _) = joiner.import_session(&legacy_json).unwrap();
+        let (ch, _, _cid) = joiner.import_session(&legacy_json).unwrap();
         assert_eq!(ch, 1); // defaults to channel 1
     }
 
@@ -494,5 +504,33 @@ mod tests {
         let cid2: String = serde_json::from_str::<serde_json::Value>(&qr2).unwrap()
             ["cohort_id"].as_str().unwrap().to_string();
         assert_eq!(cid, cid2, "supplied cohort_id must round-trip");
+    }
+
+    #[test]
+    fn test_import_returns_cohort_id() {
+        let mut host = SessionManager::new("Host");
+        let qr = host.generate_session_qr(1, 24, "Alpha").unwrap();
+        let expected_cid = serde_json::from_str::<serde_json::Value>(&qr).unwrap()
+            ["cohort_id"].as_str().unwrap().to_string();
+
+        let mut joiner = SessionManager::new("Joiner");
+        let (ch, _crypto, cid) = joiner.import_session(&qr).unwrap();
+        assert_eq!(ch, 1);
+        assert_eq!(cid, expected_cid);
+    }
+
+    #[test]
+    fn test_import_legacy_qr_mints_local_cohort_id() {
+        let mut host = SessionManager::new("Host");
+        let qr = host.generate_session_qr(1, 24, "Alpha").unwrap();
+        // Strip cohort_id to simulate a legacy QR
+        let mut parsed: serde_json::Value = serde_json::from_str(&qr).unwrap();
+        parsed.as_object_mut().unwrap().remove("cohort_id");
+        let legacy = serde_json::to_string(&parsed).unwrap();
+
+        let mut joiner = SessionManager::new("Joiner");
+        let (_ch, _crypto, cid) = joiner.import_session(&legacy).unwrap();
+        assert!(!cid.is_empty(), "legacy QR must yield a locally-minted cohort_id");
+        assert_eq!(cid.len(), 36, "minted cohort_id must be a UUID");
     }
 }

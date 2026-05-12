@@ -577,7 +577,29 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     if crate::audio_pipeline::get_ptt_buffer_mode() { 1 } else { 0 }
 }
 
-/// JNI: Replay utterance by unique ID (preferred over index-based replay)
+/// JNI: Enable/disable the per-frame TranscriptionBridge callback.
+///
+/// Off by default — the callback allocates a Java short[960] + attaches a
+/// JNI thread per 20 ms audio frame, which produces enough GC pressure
+/// to cause ~50-300 ms AudioTrack underruns on the RX path. Kotlin's
+/// TranscriptionBridge.setEnabled() should call this so the JVM hop is
+/// only paid when the feature is actually on.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetTranscriptionBridgeEnabled(
+    _env: JNIEnv,
+    _class: JClass,
+    enabled: jboolean,
+) {
+    crate::audio_pipeline::set_transcription_bridge_enabled(enabled != 0);
+}
+
+/// JNI: Replay utterance by unique ID.
+///
+/// Spawns a one-shot playback thread that drives AudioTrack directly. This
+/// is independent of the RX thread (which only runs while a transport is
+/// connected) — the old implementation set `audio_cache.now_playing` and
+/// relied on the RX thread to drain it, so a user replaying after a
+/// session ended would hear nothing.
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeReplayById(
     _env: JNIEnv,
@@ -587,17 +609,60 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let state = get_jni_state();
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    if let Some(ref sm) = guard.state_machine {
-        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
-        if cache.replay_by_id(utterance_id as u64) {
-            info!("JNI: Replaying utterance id={}", utterance_id);
-            JNI_TRUE
-        } else {
-            JNI_FALSE
+    let sm = match guard.state_machine.as_ref() {
+        Some(sm) => sm,
+        None => return JNI_FALSE,
+    };
+
+    // Snapshot the frames out of the cache; we don't want to hold the cache
+    // lock across the playback thread's lifetime.
+    let frames = {
+        let cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        match cache.get_history_frames(utterance_id as u64) {
+            Some(f) if !f.is_empty() => f,
+            _ => {
+                warn!("JNI: replay id={} not in history", utterance_id);
+                return JNI_FALSE;
+            }
         }
-    } else {
-        JNI_FALSE
-    }
+    };
+
+    // Drop the JNI guard before spawning the playback thread so subsequent
+    // JNI calls (clear, etc.) aren't blocked behind it. Clone the Arc so
+    // the thread holds its own handle to the audio engine.
+    let audio = Arc::clone(sm.get_audio());
+    drop(guard);
+
+    info!("JNI: Replaying utterance id={} ({} frames)", utterance_id, frames.len());
+
+    std::thread::Builder::new()
+        .name(format!("sassy-replay-{}", utterance_id))
+        .spawn(move || {
+            // AudioTrack.write() blocks when the internal buffer is full, so
+            // the loop paces itself to real time without an explicit sleep.
+            // Start playback if it isn't already running; harmless if it is.
+            if let Ok(eng) = audio.lock() {
+                let _ = eng.start_playing();
+            }
+            for samples in frames {
+                let eng = match audio.lock() {
+                    Ok(e) => e,
+                    Err(e) => {
+                        warn!("Replay: audio lock poisoned: {}", e);
+                        break;
+                    }
+                };
+                if let Err(e) = eng.write_audio(&samples) {
+                    warn!("Replay: write_audio failed: {}", e);
+                    break;
+                }
+                drop(eng);
+            }
+            info!("Replay thread for utterance complete");
+        })
+        .expect("failed to spawn replay thread");
+
+    JNI_TRUE
 }
 
 /// JNI: Get the ID of the most recently added history utterance
@@ -729,19 +794,37 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btEn
     let timestamp = audio_pipeline::now_ms();
     let wire_data = audio_pipeline::pack_wire_frame(channel, subchannel, &sender_id, &device_name, timestamp, &compressed);
 
-    // Encrypt through the same AES-256-GCM path as WiFi/cellular
-    let encrypted = if let Some(ref sm) = guard.state_machine {
-        let transport = sm.get_transport();
-        if let Ok(mut tm) = transport.lock() {
+    // Encrypt through the same AES-256-GCM path as WiFi/cellular.
+    //
+    // SECURITY + ROBUSTNESS: if there is no active crypto session, REFUSE to
+    // transmit. The old behaviour was to fall back to sending plaintext —
+    // which when paired with the matching "fallback to plaintext on decrypt
+    // failure" on the receive side meant any peer with a mismatched key
+    // (or no key) would receive AES-GCM ciphertext, feed it to the Opus
+    // decoder as if it were a wire frame, and emit garbled noise. That is
+    // the actual cause of the BT "garbled audio" symptom.
+    let encrypted = match guard.state_machine.as_ref() {
+        Some(sm) => {
+            let transport = sm.get_transport();
+            let mut tm = match transport.lock() {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("BT TX: transport lock poisoned: {}", e);
+                    return std::ptr::null_mut();
+                }
+            };
             match tm.encrypt_raw(&wire_data) {
                 Ok(enc) => enc,
-                Err(_) => wire_data.clone(), // fallback to unencrypted if no session
+                Err(e) => {
+                    // No crypto session — drop the frame rather than leak
+                    // plaintext over BT. UI should surface "authenticate
+                    // via QR" if no session is established.
+                    warn!("BT TX: encrypt failed ({}), dropping frame", e);
+                    return std::ptr::null_mut();
+                }
             }
-        } else {
-            wire_data.clone()
         }
-    } else {
-        wire_data.clone()
+        None => return std::ptr::null_mut(),
     };
 
     // Return as byte array
@@ -773,19 +856,34 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btDe
     let state = get_jni_state();
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Decrypt through the same AES-256-GCM path as WiFi/cellular
-    let decrypted = if let Some(ref sm) = guard.state_machine {
-        let transport = sm.get_transport();
-        if let Ok(mut tm) = transport.lock() {
+    // Decrypt through the same AES-256-GCM path as WiFi/cellular.
+    //
+    // SECURITY + ROBUSTNESS: if decryption fails (no session, wrong key,
+    // tampered packet, mismatched paring), DROP the frame. The old fallback
+    // treated the ciphertext as plaintext, then handed those random-looking
+    // bytes to unpack_wire_frame + the Opus decoder. The decoder happily
+    // produced ~960 samples of garbled noise, which is the BT "garbled
+    // mess" symptom users have been hearing. Match the WiFi/cellular path
+    // which silently drops on decrypt failure (transport.rs:271-281).
+    let decrypted = match guard.state_machine.as_ref() {
+        Some(sm) => {
+            let transport = sm.get_transport();
+            let tm = match transport.lock() {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("BT RX: transport lock poisoned: {}", e);
+                    return JNI_FALSE;
+                }
+            };
             match tm.decrypt_raw(&raw_bytes) {
                 Ok(dec) => dec,
-                Err(_) => raw_bytes.clone(), // fallback if no crypto session
+                Err(e) => {
+                    warn!("BT RX: decrypt failed ({}), dropping packet", e);
+                    return JNI_FALSE;
+                }
             }
-        } else {
-            raw_bytes.clone()
         }
-    } else {
-        raw_bytes.clone()
+        None => return JNI_FALSE,
     };
 
     // Unpack wire frame (now decrypted)
@@ -992,7 +1090,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     match guard.session_manager.import_session(&json) {
-        Ok((channel, crypto)) => {
+        Ok((channel, crypto, _cohort_id)) => {
             if let Some(ref sm) = guard.state_machine {
                 let mut tm = sm.get_transport().lock().unwrap();
                 tm.set_crypto(crypto);
