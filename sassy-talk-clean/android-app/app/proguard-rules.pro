@@ -52,6 +52,14 @@
 # PttCoordinator — central coordinator with flows collected by Compose
 -keep class com.sassyconsulting.sassytalkie.PttCoordinator { *; }
 
+# FCM wake-push service — declared in manifest, kept here so R8 doesn't strip
+# the dispatch path R8 can't trace through Firebase's reflection.
+-keep class com.sassyconsulting.sassytalkie.SassyTalkFcmService { *; }
+-keep class com.sassyconsulting.sassytalkie.PresenceClient { *; }
+-keep class com.sassyconsulting.sassytalkie.SessionShareLink { *; }
+-keep class com.sassyconsulting.sassytalkie.InstallId { *; }
+-dontwarn com.google.firebase.**
+
 # --- Kotlin coroutines ---
 -dontwarn kotlinx.coroutines.**
 -keepnames class kotlinx.coroutines.internal.MainDispatcherFactory {}
@@ -67,11 +75,21 @@
 -dontwarn org.openjsse.**
 
 # --- ML Kit barcode scanning ---
--keep class com.google.mlkit.** { *; }
+# Rely on ML Kit's bundled consumer-rules ProGuard config (ships with the
+# AAR). The previous blanket `-keep class com.google.mlkit.** { *; }` kept
+# every internal class including ones the app never references, blocking
+# R8 dead-code elimination. Only suppress the dontwarn — that's harmless.
 -dontwarn com.google.mlkit.**
 
-# --- Compose: keep @Composable lambdas and state ---
--keep class androidx.compose.** { *; }
+# --- Compose: keep only the runtime types R8 has trouble with on its own ---
+# The previous blanket `-keep class androidx.compose.** { *; }` defeated
+# ~30 % of R8's dead-code elimination because it kept every internal tooling
+# class. Compose ships its own consumer-rules that handle @Composable
+# preservation correctly; we only need to keep the runtime-state types
+# referenced via reflection by Compose itself.
+-keep class androidx.compose.runtime.snapshots.** { *; }
+-keep class androidx.compose.runtime.MutableState { *; }
+-keep class androidx.compose.runtime.SnapshotMutationPolicy { *; }
 -dontwarn androidx.compose.**
 
 # --- R8 full mode: keep enum values for when() exhaustiveness ---

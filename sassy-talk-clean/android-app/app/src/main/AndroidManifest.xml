@@ -3,6 +3,8 @@
 
     <!-- Audio -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Required for AudioOutputRouter (MODE_IN_COMMUNICATION + speakerphone) -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
     <!-- Camera (QR scanning) -->
     <uses-permission android:name="android.permission.CAMERA" />
@@ -30,11 +32,17 @@
     <!-- Foreground service for BLE connected device -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
 
+    <!-- Foreground service for mic capture (API 34+). On Android 14+ the system
+         requires this declared permission AND the matching foregroundServiceType
+         on the service before AudioRecord stays alive in the background. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
     <!-- Android 13+ notification permission -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -45,19 +53,53 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:screenOrientation="portrait"
             android:theme="@style/Theme.SassyTalk">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- App-link from https://relay.sassyconsultingllc.com/v/* so tapping
+                 a share URL on a phone with the app routes here instead of opening
+                 the browser. autoVerify enables Android App Links once the
+                 .well-known/assetlinks.json is published on the worker. The
+                 ciphertext + one-shot token model means even a leaked URL can
+                 only resolve to a session that was deliberately shared by the
+                 sender — there's no unauthenticated cleartext-payload variant
+                 (the prior sassytalk://join custom-scheme filter was removed
+                 because its fragment-as-session-JSON shape was a phishing
+                 vector: any web page could one-tap force-join an attacker's
+                 room). -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https"
+                      android:host="relay.sassyconsultingllc.com"
+                      android:pathPrefix="/v/" />
+            </intent-filter>
         </activity>
 
-        <!-- Foreground service for multicast lock + wake lock + BLE -->
+        <!-- Foreground service for multicast lock + wake lock + BLE + mic capture.
+             `microphone` is required on API 34+ for AudioRecord to keep capturing
+             when the screen is off or the activity is backgrounded. -->
         <service
             android:name=".WalkieService"
             android:exported="false"
-            android:foregroundServiceType="mediaPlayback|connectedDevice" />
+            android:foregroundServiceType="mediaPlayback|connectedDevice|microphone" />
+
+        <!-- FCM wake-push receiver. Activates only when google-services.json is
+             present in the app module (the Google Services plugin no-ops without
+             it), so a build without Firebase credentials still compiles. -->
+        <service
+            android:name=".SassyTalkFcmService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
 
     </application>
 

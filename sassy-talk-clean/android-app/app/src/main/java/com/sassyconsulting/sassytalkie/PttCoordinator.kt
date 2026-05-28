@@ -75,8 +75,22 @@ class PttCoordinator(
         private const val TAG = "PTT.Coord"
         private const val READY_ACK_TIMEOUT_MS = 200L
         private const val HEARTBEAT_INTERVAL_MS = 2_000L
-        private const val RECV_ACK_INTERVAL_MS = 500L
-        private const val REACHING_PEER_TIMEOUT_MS = 1_000L
+        /** Min gap between successive OP_WAKE broadcasts. Cheap frame, but
+         *  emitting on every key-down would still be wasteful on a hot mic. */
+        private const val WAKE_COOLDOWN_MS = 2_000L
+        /** Extra delay before starting audio when we just emitted a wake — gives
+         *  woken peers a beat to re-handshake / fire their first HB back so the
+         *  initial talk burst isn't dropped on stale transports. */
+        private const val WAKE_PRE_AUDIO_DELAY_MS = 350L
+        // Send RECV_ACK once per ~1.5s instead of every 500ms. The ACK
+        // shares the Bluetooth controller with RFCOMM audio; firing every
+        // 500ms while audio is in flight caused 50-200ms RFCOMM stalls on
+        // most chipsets (audible as garble/dropouts during BT fallback).
+        private const val RECV_ACK_INTERVAL_MS = 1_500L
+        // Bumped from 1s to 2.5s so one missed ACK at the new 1.5s interval
+        // doesn't continuously flag reachingPeer=false. With the slower
+        // ACK cadence we need at most one missed packet of slack.
+        private const val REACHING_PEER_TIMEOUT_MS = 2_500L
 
         // Task 7.1 — Sub-audible audio path probe marker
         const val PROBE_EPOCH    = -1L  // 0xFFFFFFFFFFFFFFFF as signed Long
@@ -108,6 +122,9 @@ class PttCoordinator(
     private var hbSeq = AtomicInteger(0)
     private var heartbeatJob: Job? = null
     private var staleCheckJob: Job? = null
+
+    // —— Wake beacon ——
+    @Volatile private var lastWakeSentMs: Long = 0L
 
     // —— Audio Path Probe (Task 7.1) ——
 
@@ -141,7 +158,10 @@ class PttCoordinator(
     @Volatile private var lastRxSeq: Int = 0
     /** Peer that sent the most recent audio frame. */
     @Volatile private var lastRxPeerId: String? = null
-    /** Coroutine job that sends RECV_ACK every 500ms while audio is arriving. */
+    /** Wall-clock time of the last received audio frame; used to terminate
+     *  the RECV_ACK loop when the peer goes silent without a clean PTT_STOP. */
+    @Volatile private var lastRxFrameMs: Long = 0L
+    /** Coroutine job that sends RECV_ACK while audio is arriving. */
     private var recvAckJob: Job? = null
 
     // —— Reaching-Peer indicator (Task 4.2) — Sender side ——
@@ -239,15 +259,26 @@ class PttCoordinator(
         deliveredResetJob?.cancel()
         deliveredState.value = DeliveryState.Sending
 
+        // Wake beacon: if any tracked peer's liveness has gone STALE, broadcast
+        // an OP_WAKE so they re-emit a heartbeat and re-warm their socket before
+        // audio frames start arriving. Cooldown'd so a chatty operator can't
+        // turn the relay into a wake spammer.
+        val wakeEmitted = maybeWakeStalePeers()
+
         // Step 1: BLE signal to all peers
         readyAckCount.set(0)
         bleSignaling.broadcastPttStart()
 
         // Step 2: Brief wait for ACKs, then start audio regardless
         scope.launch {
-            delay(READY_ACK_TIMEOUT_MS)
+            val preAudioDelay = if (wakeEmitted) {
+                READY_ACK_TIMEOUT_MS + WAKE_PRE_AUDIO_DELAY_MS
+            } else {
+                READY_ACK_TIMEOUT_MS
+            }
+            delay(preAudioDelay)
             val acks = readyAckCount.get()
-            Log.i(TAG, "Got $acks/$blePeers READY_ACKs, proceeding")
+            Log.i(TAG, "Got $acks/$blePeers READY_ACKs, proceeding (delay=${preAudioDelay}ms)")
 
             // Step 3: Start native audio (mic -> ADPCM -> transport)
             SassyTalkNative.pttStart()
@@ -258,6 +289,30 @@ class PttCoordinator(
                 btTransport.startTxPump()
             }
         }
+    }
+
+    /**
+     * Broadcast an OP_WAKE on both BLE and the cellular relay if any tracked
+     * peer is STALE (no heartbeat in >8s). Returns true if a wake was sent —
+     * the caller uses this to extend the pre-audio delay so woken peers have
+     * a beat to fire a fresh heartbeat and re-warm their socket.
+     */
+    private fun maybeWakeStalePeers(): Boolean {
+        val now = System.currentTimeMillis()
+        val stalePeers = liveness.peerIds().filter {
+            liveness.health(it, now) == PeerHealth.STALE
+        }
+        if (stalePeers.isEmpty()) return false
+        if (now - lastWakeSentMs < WAKE_COOLDOWN_MS) {
+            Log.d(TAG, "WAKE suppressed by cooldown (last=${now - lastWakeSentMs}ms ago)")
+            return false
+        }
+        lastWakeSentMs = now
+        val wake = ControlFrame.encodeWake(selfEpoch, now)
+        bleSignaling.broadcastControl(wake)
+        cellularClient?.sendBinary(wake)
+        Log.i(TAG, "WAKE broadcast — stale peers: ${stalePeers.size}/${liveness.peerIds().size}")
+        return true
     }
 
     fun onPttReleased() {
@@ -465,9 +520,13 @@ class PttCoordinator(
                 delay(HEARTBEAT_INTERVAL_MS)
             }
         }
-        // Also run a 1s stale-check loop independent of the 2s heartbeat
+        // Also run a 1s stale-check loop independent of the 2s heartbeat.
+        // Use `isActive` rather than `while(true)` so the loop terminates
+        // cleanly on cancellation even if a caller higher up swallows
+        // CancellationException (e.g. catch(Throwable)). Matches the
+        // heartbeatJob loop above.
         staleCheckJob = scope.launch {
-            while (true) {
+            while (isActive) {
                 delay(1_000L)
                 val nowMs = System.currentTimeMillis()
                 val peerIds = liveness.peerIds()
@@ -528,6 +587,7 @@ class PttCoordinator(
             ControlFrame.OP_CAPABILITIES -> handleCapabilities(peerId, frame.payload)
             ControlFrame.OP_PTT_STOP_V2 -> handlePttStopV2(peerId, frame.payload)
             ControlFrame.OP_EOT_ACK -> handleEotAck(peerId, frame.payload)
+            ControlFrame.OP_WAKE -> handleWake(peerId, frame.payload)
             ControlFrame.OP_PARTNER_OFFLINE -> {
                 if (frame.payload.isNotEmpty()) {
                     val idLen = frame.payload[0].toInt() and 0xFF
@@ -581,6 +641,43 @@ class PttCoordinator(
         bleSignaling.sendControl(peerId, echo)
     }
 
+    /**
+     * OP_WAKE received: the sender is about to transmit and our liveness with
+     * them was stale. Fire an unscheduled heartbeat on every transport so they
+     * see us as HEALTHY before the audio starts, and refresh our view of their
+     * epoch in case they restarted while we weren't watching.
+     *
+     * No-op if the wake's epoch matches what we already knew — there's nothing
+     * to recover from. Cheap (~25 bytes on the wire).
+     */
+    private fun handleWake(peerId: String, payload: ByteArray) {
+        if (payload.size < 16) {
+            Log.w(TAG, "WAKE from $peerId: payload too short (${payload.size})")
+            return
+        }
+        val (senderEpoch, senderTsMs) = ControlFrame.parseWake(payload)
+        val nowMs = System.currentTimeMillis()
+        val epochFlipped = liveness.epochChanged(peerId, senderEpoch)
+        Log.i(TAG, "WAKE from $peerId epoch=$senderEpoch dt=${nowMs - senderTsMs}ms epochFlip=$epochFlipped")
+
+        // Immediate outbound HB on every transport — bypass the normal cadence.
+        val hb = ControlFrame.encodeHeartbeat(
+            epoch = selfEpoch,
+            seq   = hbSeq.getAndIncrement(),
+            tsMs  = nowMs,
+            state = currentPresenceState(),
+            rttMs = liveness.rttMs(peerId).coerceAtLeast(0),
+        )
+        bleSignaling.broadcastControl(hb)
+        cellularClient?.sendBinary(hb)
+
+        // If the sender restarted (epoch flip), re-share our capabilities so
+        // they don't drop our audio for codec-mismatch reasons.
+        if (epochFlipped) {
+            scope.launch { sendCapabilitiesToPeer(peerId) }
+        }
+    }
+
     // —— RECV_ACK — Receiver side (Task 4.2) ——
 
     /**
@@ -591,6 +688,7 @@ class PttCoordinator(
         lastRxEpoch = epoch
         lastRxSeq = seq
         lastRxPeerId = peerId
+        lastRxFrameMs = System.currentTimeMillis()
         // Extend peer-speaking timeout on each incoming audio frame (Task 6.2)
         onPeerAudioFrame()
         // Ensure the ACK loop is running
@@ -598,6 +696,15 @@ class PttCoordinator(
             recvAckJob = scope.launch {
                 Log.d(TAG, "RECV_ACK loop started for $peerId epoch=$epoch")
                 while (isActive) {
+                    // Stop if the peer's audio dried up and no clean PTT_STOP
+                    // arrived. Without this, the loop pumps BLE control
+                    // frames forever after a dropped session, contending
+                    // with future RFCOMM audio.
+                    val silence = System.currentTimeMillis() - lastRxFrameMs
+                    if (silence > RECV_ACK_INTERVAL_MS * 3) {
+                        Log.d(TAG, "RECV_ACK loop stopping: ${silence}ms since last frame")
+                        break
+                    }
                     val ackEpoch = lastRxEpoch
                     val ackSeq = lastRxSeq
                     val ackPeer = lastRxPeerId ?: break
@@ -724,17 +831,33 @@ class PttCoordinator(
     }
 
     private fun sendCapabilitiesToPeer(peerId: String) {
+        // Advertise what we actually transmit. The Rust pipeline encodes
+        // mono 48kHz PCM with Opus (see codec.rs); the previous "adpcm/8000"
+        // stub was a leftover from an early prototype and would mislead
+        // any cross-platform peer that read capabilities to pick a codec.
         val caps = Capabilities(
-            codec      = "adpcm",
-            sampleRate = 8000,
+            codec      = "opus",
+            sampleRate = 48000,
             mute       = false,
             vol        = 100,
             battery    = -1,
             audioV2    = false,
             epoch      = selfEpoch,
         )
-        bleSignaling.sendControl(peerId, caps.toFrame())
-        Log.d(TAG, "Sent Capabilities to $peerId")
+        val frame = caps.toFrame()
+        // Cellular peers carry IDs of the form "relay:<epoch>" or the legacy
+        // constant "relay" — those don't exist as a BLE device address, so
+        // sendControl would silently drop. Route via the cellular WS instead;
+        // the relay's blind fan-out delivers to all attached peers (including
+        // the one that just restarted), which is what we need on an epoch
+        // flip recovery.
+        if (peerId.startsWith("relay")) {
+            cellularClient?.sendBinary(frame)
+            Log.d(TAG, "Sent Capabilities to cellular peer $peerId")
+        } else {
+            bleSignaling.sendControl(peerId, frame)
+            Log.d(TAG, "Sent Capabilities to BLE peer $peerId")
+        }
     }
 
     /** Retrieve cached Capabilities for a peer, or null if not yet received. */

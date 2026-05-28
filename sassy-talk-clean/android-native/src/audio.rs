@@ -4,10 +4,12 @@
 /// Uses Android AudioRecord/AudioTrack through JNI bridge
 
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use log::{info, warn};
 
 use crate::jni_bridge::{AndroidAudioRecord, AndroidAudioTrack};
+use crate::audio_effects::AppliedEffects;
 
 /// Audio configuration constants
 pub const SAMPLE_RATE: i32 = 48000;  // 48kHz high quality
@@ -15,6 +17,15 @@ pub const CHANNEL_CONFIG_MONO: i32 = 16;  // AudioFormat.CHANNEL_IN_MONO
 pub const CHANNEL_CONFIG_OUT_MONO: i32 = 4;  // AudioFormat.CHANNEL_OUT_MONO
 pub const AUDIO_FORMAT_PCM_16: i32 = 2;  // AudioFormat.ENCODING_PCM_16BIT
 pub const FRAME_SIZE: usize = 960;  // 20ms at 48kHz
+
+/// Hard-floor recorder buffer multiplier when no quirks profile applies.
+/// Per-device profiles (`device_quirks::Profile.record_buffer_multiplier`)
+/// override this. 4× is the safe default; Moto bumps to 6× because the
+/// HAL stalls for tens of ms under load.
+const RECORDER_BUFFER_FALLBACK: i32 = 4;
+
+/// Hard-floor player buffer multiplier. Same rationale as the recorder.
+const PLAYER_BUFFER_FALLBACK: i32 = 4;
 
 /// Audio state
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -38,31 +49,106 @@ pub struct AudioEngine {
     recording: Arc<AtomicBool>,
     playing: Arc<AtomicBool>,
     state: Arc<Mutex<AudioState>>,
+    /// Hardware effects (AEC/NS/AGC) attached to the recorder. Held in
+    /// place so they stay alive for the recorder's lifetime; dropped on
+    /// `release` so the driver tears them down.
+    effects: Arc<Mutex<Option<AppliedEffects>>>,
+    /// Wall-clock timestamp (ms since UNIX_EPOCH) of the last `write_audio`
+    /// that touched the AudioTrack. Used by the replay-thread's
+    /// `wait_for_playback_idle` loop to detect "live audio is hot, back off".
+    /// Zero means "never written".
+    last_write_at_ms: Arc<AtomicU64>,
+
+    /// Monotonic write counter — incremented by EVERY successful `write_audio`.
+    /// The replay thread uses this (NOT the wall-clock timestamp) to detect
+    /// RX intrusion mid-loop: it records its own post-write seq, then before
+    /// each next frame re-reads — if the value differs by more than the
+    /// expected 1 (its own bump), an RX writer slipped in.
+    ///
+    /// Why counter not timestamp: two writes within the same millisecond
+    /// (common at 25 fps on fast hardware) collapse to the same wall-clock
+    /// value, defeating the comparison. A counter is granular per-call.
+    /// Wraparound is irrelevant — at 50 fps × 2 producers, u64 wraps in
+    /// ~6 billion years.
+    write_seq: Arc<AtomicU64>,
+
+    /// Single-owner playback session lock.
+    ///
+    /// Held for the duration of one continuous playback (one queue utterance
+    /// or one replay) so the AudioTrack only ever has ONE producer at a
+    /// time. Callers acquire via [acquire_playback]:
+    ///   - RX `try_acquire` per frame; on contention, drops the frame.
+    ///     Acceptable: short replay interrupts live; the cellular jitter
+    ///     buffer absorbs sub-200 ms gaps, longer ones are perceived as a
+    ///     deliberate user-initiated scrub.
+    ///   - Replay `acquire` and HOLD for its entire frame loop. While held,
+    ///     RX defers; once released, RX resumes immediately.
+    /// Combined with [last_write_at_ms] this gives the replay thread a way
+    /// to wait for live audio to QUIET DOWN (poll the timestamp) BEFORE it
+    /// acquires the lock — no thrashing.
+    playback_lock: Arc<Mutex<()>>,
 }
 
 impl AudioEngine {
     /// Create new audio engine
     pub fn new() -> Result<Self, String> {
         info!("Initializing audio engine");
-        
+
         Ok(Self {
             recorder: Arc::new(Mutex::new(None)),
             player: Arc::new(Mutex::new(None)),
             recording: Arc::new(AtomicBool::new(false)),
             playing: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(AudioState::Idle)),
+            effects: Arc::new(Mutex::new(None)),
+            last_write_at_ms: Arc::new(AtomicU64::new(0)),
+            write_seq: Arc::new(AtomicU64::new(0)),
+            playback_lock: Arc::new(Mutex::new(())),
         })
     }
 
-    /// Initialize audio recorder
+    /// Cheap clone of the monotonic write-sequence counter. Replay uses
+    /// this to detect RX intrusion at per-call granularity — see
+    /// [write_seq] field doc.
+    pub fn write_seq_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.write_seq)
+    }
+
+    /// Cheap clone of the last-write atomic so callers can poll the gate
+    /// without contending the engine mutex. Used by the replay thread to
+    /// detect "live audio is currently flowing — wait it out".
+    pub fn write_clock(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.last_write_at_ms)
+    }
+
+    /// Cheap clone of the single-owner session lock. Replay acquires this
+    /// for its entire frame loop; RX try-acquires per frame and drops on
+    /// contention. See [playback_lock] doc for full semantics.
+    pub fn playback_lock_handle(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.playback_lock)
+    }
+
+    /// Milliseconds since the last `write_audio` succeeded. Returns
+    /// `u64::MAX` if nothing has ever been written.
+    pub fn last_write_idle_ms(&self) -> u64 {
+        playback_idle_ms(&self.last_write_at_ms)
+    }
+
+    /// Initialize audio recorder.
+    ///
+    /// Picks the recording source from the active `DeviceQuirks` profile's
+    /// `source_fallback_chain` (defaults to `VOICE_RECOGNITION → MIC → DEFAULT`).
+    /// `VOICE_RECOGNITION` bypasses the OEM modem-side processing that mangles
+    /// voice on many devices; some OEMs reject it, so we fall back. Buffer
+    /// size is `getMinBufferSize × profile.record_buffer_multiplier` (4× by
+    /// default, 6× on Moto).
     pub fn init_recorder(&self) -> Result<(), String> {
         info!("Initializing audio recorder");
 
-        // Get minimum buffer size. AudioRecord.getMinBufferSize returns
-        // ERROR_BAD_VALUE (-2) or ERROR (-1) on failure; treating those as a
-        // valid size and feeding `size * 2` into AudioRecord::new produces a
-        // negative request that the JNI layer would either reject or — worse —
-        // sign-extend into an enormous allocation.
+        let quirks = crate::device_quirks::current();
+        let multiplier = quirks.record_buffer_multiplier.max(RECORDER_BUFFER_FALLBACK);
+
+        // getMinBufferSize() — negative returns mean unsupported config.
         let buffer_size = match AndroidAudioRecord::get_min_buffer_size(
             SAMPLE_RATE,
             CHANNEL_CONFIG_MONO,
@@ -83,27 +169,52 @@ impl AudioEngine {
             }
         };
 
-        // Guard the doubling against i32 overflow on absurd device returns.
-        let alloc_size = buffer_size.checked_mul(2).ok_or_else(|| {
+        let alloc_size = buffer_size.checked_mul(multiplier).ok_or_else(|| {
             *self.state.lock().unwrap() = AudioState::Error;
-            format!("Recorder buffer size {} would overflow i32 when doubled", buffer_size)
+            format!("Recorder buffer size {} would overflow i32 when scaled by {}", buffer_size, multiplier)
         })?;
 
-        info!("Recorder buffer size: {} bytes (doubled to {})", buffer_size, alloc_size);
+        info!(
+            "Recorder buffer size: {} bytes (x{} = {}); sources to try: {:?}",
+            buffer_size, multiplier, alloc_size, quirks.source_fallback_chain
+        );
 
-        // Create recorder
-        let recorder = match AndroidAudioRecord::new(
-            SAMPLE_RATE,
-            CHANNEL_CONFIG_MONO,
-            AUDIO_FORMAT_PCM_16,
-            alloc_size
-        ) {
-            Ok(r) => r,
-            Err(e) => {
+        // Try sources in order until one yields STATE_INITIALIZED.
+        let mut last_err = String::from("no sources to try");
+        let mut recorder_opt: Option<AndroidAudioRecord> = None;
+        let mut chosen_source: i32 = -1;
+        for src in &quirks.source_fallback_chain {
+            match AndroidAudioRecord::new_with_source(*src, SAMPLE_RATE, CHANNEL_CONFIG_MONO, AUDIO_FORMAT_PCM_16, alloc_size) {
+                Ok(r) => {
+                    chosen_source = *src;
+                    recorder_opt = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    warn!("AudioRecord source={} rejected: {}", src, e);
+                    last_err = e;
+                }
+            }
+        }
+        let recorder = match recorder_opt {
+            Some(r) => r,
+            None => {
                 *self.state.lock().unwrap() = AudioState::Error;
-                return Err(e);
+                return Err(format!("All AudioRecord sources rejected — last error: {}", last_err));
             }
         };
+
+        // Attach hardware effects to this session per the quirks profile
+        // (AEC/NS off by default — Android OEM versions mangle voice).
+        let session_id = recorder.audio_session_id().unwrap_or(-1);
+        info!(
+            "AudioRecord initialized: source={} sessionId={}",
+            chosen_source, session_id
+        );
+        if session_id > 0 {
+            let applied = crate::audio_effects::apply(session_id, &quirks.effects);
+            *self.effects.lock().unwrap() = Some(applied);
+        }
 
         *self.recorder.lock().unwrap() = Some(Arc::new(recorder));
         info!("✓ Audio recorder initialized");
@@ -139,12 +250,14 @@ impl AudioEngine {
             }
         };
 
-        let alloc_size = buffer_size.checked_mul(2).ok_or_else(|| {
+        let quirks = crate::device_quirks::current();
+        let multiplier = quirks.player_buffer_multiplier.max(PLAYER_BUFFER_FALLBACK);
+        let alloc_size = buffer_size.checked_mul(multiplier).ok_or_else(|| {
             *self.state.lock().unwrap() = AudioState::Error;
-            format!("Player buffer size {} would overflow i32 when doubled", buffer_size)
+            format!("Player buffer size {} would overflow i32 when scaled by {}", buffer_size, multiplier)
         })?;
 
-        info!("Player buffer size: {} bytes (doubled to {})", buffer_size, alloc_size);
+        info!("Player buffer size: {} bytes (x{} = {})", buffer_size, multiplier, alloc_size);
 
         // Create player
         let player = match AndroidAudioTrack::new(
@@ -221,7 +334,10 @@ impl AudioEngine {
         rec.read(buffer)
     }
 
-    /// Start playing audio
+    /// Start playing audio. Also engages `AudioManager.MODE_IN_COMMUNICATION`
+    /// + force speakerphone if the active `DeviceQuirks` profile flags
+    /// `output_force_comm_mode` — bypasses OEM media post-processing for
+    /// devices that mangle voice (Moto, Xiaomi).
     pub fn start_playing(&self) -> Result<(), String> {
         info!("Starting audio playback");
 
@@ -238,11 +354,21 @@ impl AudioEngine {
         play.play()?;
         self.playing.store(true, Ordering::Relaxed);
         *self.state.lock().unwrap() = AudioState::Playing;
+
+        // Engage comm-mode routing if the active quirk profile wants it.
+        // Failure here is non-fatal — playback works either way; we just
+        // log so the field complaint matches a missing context.
+        let quirks = crate::device_quirks::current();
+        if quirks.output_force_comm_mode {
+            if let Err(e) = crate::audio_routing::engage_comm_mode(true) {
+                warn!("audio_routing engage failed (continuing anyway): {}", e);
+            }
+        }
         info!("✓ Playback started");
         Ok(())
     }
 
-    /// Stop playing audio
+    /// Stop playing audio. Releases comm-mode routing if it was engaged.
     pub fn stop_playing(&self) -> Result<(), String> {
         info!("Stopping audio playback");
 
@@ -253,6 +379,10 @@ impl AudioEngine {
             Some(play) => {
                 play.stop()?;
                 *self.state.lock().unwrap() = AudioState::Idle;
+                // Restore the system audio mode + speakerphone state we
+                // saved when we engaged. Safe to call even if we didn't
+                // engage; it's a no-op when inactive.
+                crate::audio_routing::release();
                 info!("✓ Playback stopped");
                 Ok(())
             }
@@ -263,13 +393,25 @@ impl AudioEngine {
         }
     }
 
-    /// Write audio data for playback
+    /// Write audio data for playback.
+    ///
+    /// On success, bumps BOTH:
+    ///   - `last_write_at_ms` (wall-clock) — for the "is RX hot?" idle
+    ///     check used at replay startup.
+    ///   - `write_seq` (monotonic counter) — for replay's per-call
+    ///     intrusion detection. Counter is granular per-call so two writes
+    ///     in the same ms are still distinguishable.
     pub fn write_audio(&self, buffer: &[i16]) -> Result<usize, String> {
         let play = match self.player.lock().unwrap().as_ref() {
             Some(p) => Arc::clone(p),
             None => return Err("Player not initialized".to_string()),
         };
-        play.write(buffer)
+        let result = play.write(buffer);
+        if result.is_ok() {
+            self.last_write_at_ms.store(now_ms(), Ordering::Relaxed);
+            self.write_seq.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     /// Check if currently recording
@@ -306,6 +448,10 @@ impl AudioEngine {
         // path above.
         let rec = self.recorder.lock().unwrap().take();
         let play = self.player.lock().unwrap().take();
+        // Drop the AppliedEffects so AEC/NS/AGC are torn down before the
+        // recorder they're attached to is released — otherwise some HALs
+        // log warnings about effect handles outliving their parent.
+        let _ = self.effects.lock().unwrap().take();
 
         if let Some(rec) = rec {
             rec.release()?;
@@ -324,6 +470,112 @@ impl AudioEngine {
 impl Drop for AudioEngine {
     fn drop(&mut self) {
         let _ = self.release();
+    }
+}
+
+// ── Playback gate helpers ─────────────────────────────────────────────────
+// Free-standing so the replay thread can poll a cheap `Arc<AtomicU64>`
+// snapshot without holding the engine mutex (which the live RX thread is
+// frequently inside). The clock is monotonic-ish wall-clock ms since epoch;
+// the exact value doesn't matter, only the delta.
+
+#[inline]
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Milliseconds since the playback clock was last bumped. `u64::MAX` if
+/// the clock has never been written (i.e. AudioEngine just initialized).
+pub fn playback_idle_ms(clock: &Arc<AtomicU64>) -> u64 {
+    let last = clock.load(Ordering::Relaxed);
+    if last == 0 { return u64::MAX; }
+    now_ms().saturating_sub(last)
+}
+
+/// Block (sleep-poll) until the playback clock has been idle for at least
+/// `min_idle_ms`, OR until `max_wait_ms` total has elapsed. Returns true if
+/// the gate was acquired (idle long enough), false if we timed out and the
+/// caller should bail. Caller is expected to call this BEFORE each batch of
+/// frames it's about to write — RX activity in the meantime will reset the
+/// idle window and force another wait.
+pub fn wait_for_playback_idle(
+    clock: &Arc<AtomicU64>,
+    min_idle_ms: u64,
+    max_wait_ms: u64,
+) -> bool {
+    use std::thread::sleep;
+    use std::time::Duration;
+    const POLL_INTERVAL_MS: u64 = 25;
+    let mut waited: u64 = 0;
+    loop {
+        if playback_idle_ms(clock) >= min_idle_ms {
+            return true;
+        }
+        if waited >= max_wait_ms {
+            return false;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        waited += POLL_INTERVAL_MS;
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    #[test]
+    fn playback_idle_returns_max_until_first_write() {
+        let clock = Arc::new(AtomicU64::new(0));
+        assert_eq!(playback_idle_ms(&clock), u64::MAX);
+    }
+
+    #[test]
+    fn playback_idle_grows_after_write_stops() {
+        let clock = Arc::new(AtomicU64::new(now_ms()));
+        sleep(Duration::from_millis(80));
+        let idle = playback_idle_ms(&clock);
+        // Allow some slop for scheduler — the test is "did time pass at all?"
+        assert!(idle >= 50, "expected idle >= 50, got {}", idle);
+        assert!(idle < 5000, "expected idle < 5000, got {}", idle);
+    }
+
+    #[test]
+    fn wait_for_playback_idle_succeeds_when_already_cold() {
+        let clock = Arc::new(AtomicU64::new(0));  // never written = u64::MAX idle
+        assert!(wait_for_playback_idle(&clock, 100, 500));
+    }
+
+    #[test]
+    fn wait_for_playback_idle_succeeds_after_quiescence() {
+        let clock = Arc::new(AtomicU64::new(now_ms()));
+        // Don't bump the clock — let it go cold. The waiter should return true
+        // once idle has crossed min_idle_ms.
+        let acquired = wait_for_playback_idle(&clock, 100, 1000);
+        assert!(acquired, "expected acquisition after quiescence");
+    }
+
+    #[test]
+    fn wait_for_playback_idle_times_out_when_clock_keeps_bumping() {
+        let clock = Arc::new(AtomicU64::new(now_ms()));
+        let clock_for_thread = Arc::clone(&clock);
+        // Continuously bump the clock so idle never crosses 100 ms.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let bumper = std::thread::spawn(move || {
+            while !stop_for_thread.load(Ordering::Relaxed) {
+                clock_for_thread.store(now_ms(), Ordering::Relaxed);
+                sleep(Duration::from_millis(10));
+            }
+        });
+        let acquired = wait_for_playback_idle(&clock, 100, 300);
+        stop.store(true, Ordering::Relaxed);
+        let _ = bumper.join();
+        assert!(!acquired, "expected timeout when clock keeps bumping");
     }
 }
 

@@ -22,9 +22,11 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import com.sassyconsulting.sassytalkie.SassyTalkNative
+import com.sassyconsulting.sassytalkie.SessionShareLink
 import com.sassyconsulting.sassytalkie.TranscriptionBridge
 import com.sassyconsulting.sassytalkie.WalkieService
 import com.sassyconsulting.sassytalkie.ui.theme.*
+import android.widget.Toast
 
 enum class Screen {
     Profile,
@@ -52,7 +54,9 @@ enum class Screen {
 fun AppNavigation(
     permissionsGranted: Boolean,
     walkieService: WalkieService?,
-    onRequestPermissions: () -> Unit
+    onRequestPermissions: () -> Unit,
+    pendingShareUri: android.net.Uri? = null,
+    onShareConsumed: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var currentScreen by remember { mutableStateOf(Screen.Auth) }
@@ -107,11 +111,18 @@ fun AppNavigation(
         if (permissionsGranted && !nativeReady) {
             val success = withContext(Dispatchers.IO) {
                 SassyTalkNative.appContext = context.applicationContext
-                if (!SassyTalkNative.isInitialized()) {
+                val initOk = if (!SassyTalkNative.isInitialized()) {
                     SassyTalkNative.init()
                 } else {
                     true
                 }
+                // Hand a Context down to the native layer so audio routing
+                // (MODE_IN_COMMUNICATION + speakerphone override) can obtain
+                // AudioManager. Safe to call even if already initialized.
+                if (initOk) {
+                    try { SassyTalkNative.initContext(context.applicationContext) } catch (_: Throwable) {}
+                }
+                initOk
             }
             if (success) {
                 // Restore persisted session (survives app restart)
@@ -145,9 +156,51 @@ fun AppNavigation(
                 // Initialize the activity bridge for incoming-audio detection + notifications
                 TranscriptionBridge.initialize(context)
                 TranscriptionBridge.setEnabled(true)
+
+                // Restore persisted mic settings (gain + squelch). Defaults
+                // are unity/disabled so first-run behavior is unchanged.
+                val micPrefs = context.getSharedPreferences("sassy_settings", android.content.Context.MODE_PRIVATE)
+                SassyTalkNative.setMicGain(micPrefs.getFloat("mic_gain", 1.0f))
+                SassyTalkNative.setSquelchDbfs(micPrefs.getInt("squelch_dbfs", 0))
+                // Restore group-mix preference. Default false preserves the
+                // classic walkie-talkie behavior for users who never opt in.
+                SassyTalkNative.setMixModeEnabled(micPrefs.getBoolean("enable_mix_mode", false))
             } else {
                 initFailed = true
             }
+        }
+    }
+
+    // Process an incoming share-link URI once the native side is ready.
+    // Fires for both initial launch (cold start via VIEW intent) and warm
+    // re-entry (onNewIntent → pendingShareUri changes while running).
+    LaunchedEffect(nativeReady, pendingShareUri) {
+        val uri = pendingShareUri
+        if (nativeReady && uri != null) {
+            val result = withContext(Dispatchers.IO) {
+                SessionShareLink.importFromShareUri(uri)
+            }
+            when (result) {
+                is SessionShareLink.Result.Ok -> {
+                    val imported = withContext(Dispatchers.IO) {
+                        SassyTalkNative.importSessionFromQR(result.json)
+                    }
+                    if (imported) {
+                        Toast.makeText(context, "Joined session", Toast.LENGTH_SHORT).show()
+                        currentScreen = Screen.Main
+                    } else {
+                        Toast.makeText(
+                            context,
+                            "Invite was decrypted but session import failed",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }
+                is SessionShareLink.Result.Err -> {
+                    Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
+                }
+            }
+            onShareConsumed()
         }
     }
 
@@ -221,7 +274,13 @@ fun AppNavigation(
             showBackButton = false
         )
         Screen.Auth -> QRAuthScreen(
-            onAuthenticated = { currentScreen = Screen.Main }
+            onAuthenticated = {
+                // Tear down the relay WS so MainScreen's auto-connect re-runs
+                // with the just-imported session_id. Without this, importing
+                // a new session leaves the WS bound to the previous room.
+                autoConnect.disconnect()
+                currentScreen = Screen.Main
+            }
         )
         Screen.Main -> MainScreen(
             onDisconnect = {
@@ -259,7 +318,13 @@ fun AppNavigation(
             onBack = { currentScreen = Screen.Main }
         )
         Screen.Settings -> SettingsScreen(
-            onBack = { currentScreen = Screen.Main }
+            onBack = { currentScreen = Screen.Main },
+            onTransportPrefsChanged = {
+                // Tear the active transports down so MainScreen's auto-connect
+                // re-evaluates with the new toggle state. The connection
+                // status badge will briefly flicker through DETECTING.
+                autoConnect.disconnect()
+            }
         )
     }
 }

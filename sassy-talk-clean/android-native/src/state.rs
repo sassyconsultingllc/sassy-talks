@@ -103,7 +103,12 @@ impl StateMachine {
         self.tx_running.store(true, Ordering::SeqCst);
         self.rx_running.store(true, Ordering::SeqCst);
 
-        let tx = audio_pipeline::spawn_tx_thread(
+        // spawn_*_thread now returns io::Result. Thread-spawn failure
+        // (OOM, ulimit) shouldn't abort the entire process — log, leave
+        // the corresponding atomic in "running" state so a future
+        // start_pipeline() can try again, and let the upper layer cope
+        // with the degraded state.
+        match audio_pipeline::spawn_tx_thread(
             Arc::clone(&self.tx_running),
             Arc::clone(&self.ptt_pressed),
             Arc::clone(&self.current_channel),
@@ -112,10 +117,15 @@ impl StateMachine {
             Arc::clone(&self.transport),
             self.local_sender_id.clone(),
             self.device_name.clone(),
-        );
-        *self.tx_handle.lock().unwrap() = Some(tx);
+        ) {
+            Ok(tx) => { *self.tx_handle.lock().unwrap() = Some(tx); }
+            Err(e) => {
+                warn!("StateMachine: failed to spawn TX thread: {}", e);
+                self.tx_running.store(false, Ordering::SeqCst);
+            }
+        }
 
-        let rx = audio_pipeline::spawn_rx_thread(
+        match audio_pipeline::spawn_rx_thread(
             Arc::clone(&self.rx_running),
             Arc::clone(&self.current_channel),
             Arc::clone(&self.current_subchannel),
@@ -124,8 +134,13 @@ impl StateMachine {
             Arc::clone(&self.audio_cache),
             Arc::clone(&self.user_registry),
             self.local_sender_id.clone(),
-        );
-        *self.rx_handle.lock().unwrap() = Some(rx);
+        ) {
+            Ok(rx) => { *self.rx_handle.lock().unwrap() = Some(rx); }
+            Err(e) => {
+                warn!("StateMachine: failed to spawn RX thread: {}", e);
+                self.rx_running.store(false, Ordering::SeqCst);
+            }
+        }
 
         info!("StateMachine: audio pipeline started");
     }
@@ -313,7 +328,10 @@ impl StateMachine {
         *self.state.lock().unwrap() = AppState::Disconnecting;
 
         self.stop_audio_threads();
-        self.audio_cache.lock().unwrap().clear();
+        // Preserve history so the timeline's replay button still works after
+        // a disconnect. `clear()` wipes history too — use it only for hard
+        // resets (logout, etc.). See AudioCache::clear vs clear_active.
+        self.audio_cache.lock().unwrap().clear_active();
 
         let mut transport = self.transport.lock().unwrap();
         transport.disconnect()?;

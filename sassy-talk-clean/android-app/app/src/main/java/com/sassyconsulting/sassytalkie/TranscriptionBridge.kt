@@ -6,7 +6,10 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.Lifecycle
@@ -45,6 +48,14 @@ object TranscriptionBridge {
      * AudioCache SPEECH_GAP_MS for consistent utterance boundaries.
      */
     private const val SILENCE_FRAMES_TO_END = 40
+    /**
+     * Audio duration of a single Opus frame, in ms. Must stay in sync with
+     * the encoder's `frame_size` (currently 960 samples at 48 kHz = 20 ms).
+     * Used by `finalizeSpeechSegment` to derive the "spoke for X" duration
+     * from frame count instead of wall-clock — see the comment there for
+     * why wall-clock produced phantom durations during network gaps.
+     */
+    private const val FRAME_DURATION_MS = 20L
 
     /** Maximum number of entries kept in the feed to bound memory usage. */
     private const val MAX_ENTRIES = 200
@@ -162,6 +173,12 @@ object TranscriptionBridge {
 
     fun setEnabled(enabled: Boolean) {
         this.enabled = enabled
+        // Mirror the flag into Rust so the RX thread skips the per-frame JNI
+        // dispatch + short[] allocation when the timeline feature is off.
+        // Without this, the callback's allocation cost causes intermittent
+        // AudioTrack underruns whether or not anyone is listening for it.
+        try { SassyTalkNative.nativeSetTranscriptionBridgeEnabled(enabled) }
+        catch (_: Throwable) { /* JNI may be unavailable in tests */ }
         Log.d(TAG, "Timeline enabled=$enabled")
     }
 
@@ -188,40 +205,122 @@ object TranscriptionBridge {
         val rms = computeRms(pcmSamples)
         val isSpeech = rms >= SILENCE_THRESHOLD
 
+        // Hold `lock` ONLY for the state mutation; do any UI side-effects
+        // outside so we don't deadlock the main thread on a re-entrant
+        // TranscriptionBridge call (e.g. clearEntries while a Toast is
+        // pending). `startedSegment` is the signal.
+        var startedSegment = false
         synchronized(lock) {
             if (isSpeech) {
-                handleSpeechFrame(senderId, senderName, isFavorite, isMuted)
+                startedSegment = handleSpeechFrame(senderId, senderName, isFavorite, isMuted)
             } else {
                 handleSilenceFrame()
             }
         }
+        if (startedSegment) {
+            onSpeechSegmentStarted(senderName, isMuted)
+        }
     }
+
+    /**
+     * Called from the Rust RX thread the moment an utterance is committed
+     * to the audio cache history. Replaces the previous best-effort
+     * `lastHistoryId()` poll which raced against the 800 ms cache commit
+     * timer and silently captured the wrong (or no) ID — the root cause
+     * of "timeline play button does nothing."
+     *
+     * Behavior:
+     *  - If a timeline entry for this sender already exists with
+     *    `utteranceId == -1L` (Kotlin VAD finalized first), patch it in
+     *    place so the replay button wires up correctly.
+     *  - Otherwise stash the ID in `latestCommittedId` so the next
+     *    `finalizeSpeechSegment` call for this sender can pick it up.
+     */
+    @JvmStatic
+    fun onUtteranceCommitted(
+        senderId: String,
+        senderName: String,
+        utteranceId: Long,
+        durationMs: Long,
+    ) {
+        if (utteranceId < 0) return
+
+        // All `_entries.value` mutations MUST happen under `lock`. Previously
+        // this path mutated the StateFlow from the RX thread without holding
+        // `lock`, while `addEntry` (from finalizeSpeechSegment) held it.
+        // Concurrent read-modify-write on the backing list was possible.
+        var patchedAny = false
+        synchronized(lock) {
+            val current = _entries.value
+            val patched = current.toMutableList()
+            // Patch the OLDEST un-tagged entry for this sender, not the most
+            // recent. Previously the reversed-scan broke on the first match,
+            // so two rapid un-tagged entries for the same sender would leave
+            // the older one permanently stuck at utteranceId=-1. Now we walk
+            // oldest-first AND only patch one — Rust commits arrive in the
+            // same order they were finalized, so the oldest -1 entry is the
+            // one that this commit corresponds to.
+            for (i in patched.indices) {
+                val e = patched[i]
+                if (e.senderId == senderId && e.utteranceId < 0) {
+                    patched[i] = e.copy(utteranceId = utteranceId)
+                    patchedAny = true
+                    break
+                }
+            }
+            if (patchedAny) _entries.value = patched
+        }
+        if (patchedAny) {
+            Log.d(TAG, "onUtteranceCommitted: patched existing entry sender=$senderId id=$utteranceId")
+            return
+        }
+
+        // Otherwise stash so the next finalize for this sender picks it up.
+        synchronized(latestCommittedLock) {
+            latestCommittedId[senderId] = utteranceId
+        }
+        Log.d(TAG, "onUtteranceCommitted: stashed sender=$senderId id=$utteranceId (duration=${durationMs}ms)")
+    }
+
+    /** Most recently Rust-committed utterance ID per sender. Drained by `finalizeSpeechSegment`. */
+    private val latestCommittedId = HashMap<String, Long>()
+    private val latestCommittedLock = Any()
 
     // ── User status ──
 
     fun updateUserStatus(senderId: String, isFavorite: Boolean, isMuted: Boolean) {
-        val current = _entries.value
-        val updated = current.map { entry ->
-            if (entry.senderId == senderId) {
-                entry.copy(isFavorite = isFavorite, isMuted = isMuted)
-            } else {
-                entry
+        // Hold `lock` for the read-modify-write. Without this, concurrent
+        // onUtteranceCommitted patches could be overwritten.
+        synchronized(lock) {
+            val current = _entries.value
+            val updated = current.map { entry ->
+                if (entry.senderId == senderId) {
+                    entry.copy(isFavorite = isFavorite, isMuted = isMuted)
+                } else {
+                    entry
+                }
             }
+            _entries.value = updated
         }
-        _entries.value = updated
     }
 
-    @Volatile
-    private var clearing = false
+    private val clearing = java.util.concurrent.atomic.AtomicBoolean(false)
 
     fun clearEntries() {
-        if (clearing) return
-        clearing = true
-        _entries.value = emptyList()
-        synchronized(lock) { resetSpeechState() }
-        try { SassyTalkNative.clearAudioCache() } catch (_: Exception) {}
-        clearing = false
-        Log.d(TAG, "Entries cleared")
+        // CAS instead of check-then-act. The previous @Volatile + read+write
+        // pattern was a TOCTOU — two simultaneous callers could both pass
+        // the guard and both run the clear. CAS gives exactly-once semantics.
+        if (!clearing.compareAndSet(false, true)) return
+        try {
+            synchronized(lock) {
+                _entries.value = emptyList()
+                resetSpeechState()
+            }
+            try { SassyTalkNative.clearAudioCache() } catch (_: Exception) {}
+            Log.d(TAG, "Entries cleared")
+        } finally {
+            clearing.set(false)
+        }
     }
 
     fun release() {
@@ -233,16 +332,22 @@ object TranscriptionBridge {
 
     // ── Internal helpers ──
 
+    /**
+     * Called from inside `synchronized(lock)` in `onAudioReceived`.
+     * Returns `true` if this frame STARTED a new speech segment — caller
+     * should perform any side-effects (Toast notification) AFTER releasing
+     * the lock, to avoid blocking the main thread on `lock` if it tries to
+     * call back into TranscriptionBridge while we hold it.
+     */
     private fun handleSpeechFrame(
         senderId: String,
         senderName: String,
         isFavorite: Boolean,
         isMuted: Boolean,
-    ) {
+    ): Boolean {
         silentFrameCount = 0
 
         if (!inSpeech) {
-            // New speech segment begins
             inSpeech = true
             activeSenderId = senderId
             activeSenderName = senderName
@@ -252,9 +357,30 @@ object TranscriptionBridge {
             speechFrameCount = 0
             _incomingAudio.value = true
             _activeSpeakerName.value = senderName
+            speechFrameCount++
+            return true  // signal "new segment started, surface UX outside lock"
         }
 
         speechFrameCount++
+        return false
+    }
+
+    /**
+     * Side-effects deferred from `handleSpeechFrame`. Called from
+     * `onAudioReceived` AFTER the `synchronized(lock)` block exits.
+     * Posts the speaker-name Toast to the main thread; main never has
+     * to wait on `lock` to do it.
+     */
+    private fun onSpeechSegmentStarted(senderName: String, isMuted: Boolean) {
+        val ctx = appContext
+        if (ctx == null || isMuted) return
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(
+                ctx,
+                "$senderName is speaking on sassy-talk",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
     }
 
     private fun handleSilenceFrame() {
@@ -270,22 +396,45 @@ object TranscriptionBridge {
     private fun finalizeSpeechSegment() {
         val id = activeSenderId ?: return
         val name = activeSenderName ?: return
-        val durationMs = System.currentTimeMillis() - speechStartTime
         val isFav = activeIsFavorite
         val isMuted = activeIsMuted
         val ts = speechStartTime
         val frames = speechFrameCount
+        // Duration MUST be derived from frame count, not wall-clock.
+        //
+        // The wall-clock version (`currentTimeMillis() - speechStartTime`)
+        // produced phantom durations whenever a sender kept transmitting
+        // through a network gap: receiver's VAD silence-detector finalised
+        // mid-press, the wall-clock had accumulated, and the timeline showed
+        // "spoke for 31s" / "spoke for 3 minutes" while the sender never
+        // actually paused. Frame count is the ground truth — each frame is
+        // exactly FRAME_DURATION_MS of audio the receiver actually played
+        // (or buffered for play). Dropped frames are correctly EXCLUDED.
+        val durationMs = (frames.toLong() * FRAME_DURATION_MS)
 
         resetSpeechState()
 
         if (frames < 2) return // skip sub-40ms blips
 
-        // Get utterance ID for replay linkage — non-blocking, no sleep needed
-        val utteranceId = try {
-            SassyTalkNative.lastHistoryId()
-        } catch (_: Exception) {
-            -1L
-        }
+        // Get utterance ID for replay linkage. Single source of truth:
+        // the Rust commit callback (`onUtteranceCommitted`). Two paths,
+        // ONE outcome — no race, no wrong-sender attribution:
+        //
+        //   - If commit fired BEFORE this finalize: utteranceId is in
+        //     the per-sender stash, we consume it here.
+        //   - If commit fires AFTER this finalize: leave the entry's
+        //     utteranceId = -1; `onUtteranceCommitted` will patch it
+        //     in place the moment Rust dispatches the commit.
+        //
+        // The previous fallback to `SassyTalkNative.lastHistoryId()` was
+        // a wrong-sender hazard: that returns the GLOBAL most-recent ID,
+        // not per-sender. If Bob's utterance committed just before
+        // Alice's finalize, Alice's entry could be tagged with Bob's
+        // utteranceId and tapping replay would play Bob's audio.
+        // Removed deliberately.
+        val utteranceId = synchronized(latestCommittedLock) {
+            latestCommittedId.remove(id)
+        } ?: -1L
 
         // Format duration for display
         val durationText = formatDuration(durationMs)

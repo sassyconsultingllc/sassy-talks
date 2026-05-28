@@ -7,8 +7,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Binder
@@ -18,6 +20,7 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import com.sassyconsulting.sassytalkie.debug.AudioTelemetry
 import com.sassyconsulting.sassytalkie.service.BluetoothTransport
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -50,6 +53,10 @@ class WalkieService : Service() {
         private const val TAG = "WalkieService"
         private const val CHANNEL_ID = "sassytalkie_radio"
         private const val NOTIFICATION_ID = 1
+        const val ACTION_TOGGLE_PTT = "com.sassyconsulting.sassytalkie.action.TOGGLE_PTT"
+        /** Sent by [SassyTalkFcmService] when an inbound wake push arrives. */
+        const val ACTION_WAKE = "com.sassyconsulting.sassytalkie.action.WAKE"
+        const val EXTRA_ROOM = "room"
     }
 
     inner class LocalBinder : Binder() {
@@ -61,8 +68,19 @@ class WalkieService : Service() {
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
-    private val serviceScope = CoroutineScope(Dispatchers.Default)
+    // SupervisorJob so a failure in one child (cohort snapshotter, telemetry
+    // bridge, kickCellularReconnect) doesn't cascade-cancel the others.
+    // Without it, a single uncaught exception silently kills every long-
+    // lived coroutine in this service.
+    private val serviceScope = CoroutineScope(Dispatchers.Default + kotlinx.coroutines.SupervisorJob())
     private var cohortSnapshotJob: Job? = null
+    private var telemetryBridgeJob: Job? = null
+
+    // Tracks the toggle state for the notification's PTT action — flipped only
+    // when the action button is tapped from the shade, NOT for in-app PTT.
+    @Volatile
+    private var notificationPttActive = false
+    private var pttToggleReceiver: BroadcastReceiver? = null
 
     // BLE + RFCOMM
     var bleSignaling: BleSignalingService? = null
@@ -79,18 +97,48 @@ class WalkieService : Service() {
         super.onCreate()
         Log.i(TAG, "Service created")
         createNotificationChannel()
+        registerPttToggleReceiver()
         // Snapshotter is keyed to service lifetime, not multicast. The inner
         // getActiveCohortId() guard makes it a no-op when no channel has an
         // active session — so it's safe to run regardless of transport.
         startCohortSnapshotter()
+        startTelemetryBridge()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.i(TAG, "Service started")
+        Log.i(TAG, "Service started action=${intent?.action}")
+
+        // Wake-intent fast path: skip the foreground promotion entirely.
+        // startForeground with FOREGROUND_SERVICE_TYPE_MICROPHONE from a
+        // background-launched service throws on Android 14+ (BackgroundService
+        // StartNotAllowedException). The MainActivity launch fired alongside
+        // the wake handles real foreground promotion via the standard
+        // onStart path; this branch just runs the reconnect work.
+        if (intent?.action == ACTION_WAKE) {
+            val room = intent.getStringExtra(EXTRA_ROOM)
+            Log.i(TAG, "WAKE intent received room=$room")
+            serviceScope.launch { kickCellularReconnect() }
+            return START_NOT_STICKY
+        }
+
         try {
             // On API 34+ the foreground service type must be passed explicitly or
             // the system raises MissingForegroundServiceTypeException and kills us.
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            //
+            // FOREGROUND_SERVICE_TYPE_MICROPHONE is OR'd in for API 34+ so the new
+            // PttAudioPipeline (com.sassyconsulting.sassytalkie.audio) can keep
+            // AudioRecord alive in the background. The Rust pipeline historically
+            // captured under mediaPlayback, which API 34 deprecates for mic input.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIFICATION_ID,
+                    buildNotification("Radio standby"),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                )
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 ServiceCompat.startForeground(
                     this,
                     NOTIFICATION_ID,
@@ -108,7 +156,39 @@ class WalkieService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+
         return START_STICKY
+    }
+
+    /**
+     * Force the cellular relay client to reconnect if it's disconnected.
+     * Safe to call from any thread — guards against double-connect.
+     *
+     * On a cold-start triggered BY an FCM wake push (process killed, FCM
+     * delivery spawns WalkieService), PttCoordinator + CellularWebSocketClient
+     * haven't been wired yet — they're set up by AppNavigation after
+     * MainActivity launches. Polling for up to 15s gives the normal startup
+     * a chance to bring them up so the wake actually re-attaches the relay.
+     */
+    private suspend fun kickCellularReconnect() {
+        val deadline = System.currentTimeMillis() + 15_000L
+        while (System.currentTimeMillis() < deadline) {
+            val coord = pttCoordinator
+            val client = coord?.cellularClient
+            if (client != null) {
+                if (client.isConnected()) {
+                    Log.d(TAG, "kickCellularReconnect: already connected, skipping")
+                    return
+                }
+                Log.i(TAG, "kickCellularReconnect: triggering connect()")
+                try { client.connect() } catch (t: Throwable) {
+                    Log.w(TAG, "cellular connect() threw: ${t.message}")
+                }
+                return
+            }
+            kotlinx.coroutines.delay(500)
+        }
+        Log.w(TAG, "kickCellularReconnect: gave up waiting for PttCoordinator after 15s")
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -116,10 +196,12 @@ class WalkieService : Service() {
     override fun onDestroy() {
         Log.i(TAG, "Service destroyed")
         stopCohortSnapshotter()
+        stopTelemetryBridge()
         serviceScope.cancel()
         shutdownBleTransport()
         releaseMulticastLock()
         releaseWakeLock()
+        unregisterPttToggleReceiver()
         // Explicitly remove the ongoing notification so it doesn't linger in the
         // shade after the service itself is gone.
         try {
@@ -128,6 +210,58 @@ class WalkieService : Service() {
             Log.w(TAG, "stopForeground failed: ${e.message}")
         }
         super.onDestroy()
+    }
+
+    // ── Notification PTT toggle receiver ──
+
+    /**
+     * Lets the user start/stop a transmission from the notification shade
+     * without opening the app. Required by the FOREGROUND_SERVICE_MICROPHONE
+     * demo: the user must be able to acknowledge and act on the foreground
+     * service from the notification itself.
+     */
+    private fun registerPttToggleReceiver() {
+        if (pttToggleReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action != ACTION_TOGGLE_PTT) return
+                handleNotificationPttToggle()
+            }
+        }
+        val filter = IntentFilter(ACTION_TOGGLE_PTT)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(receiver, filter)
+        }
+        pttToggleReceiver = receiver
+    }
+
+    private fun unregisterPttToggleReceiver() {
+        pttToggleReceiver?.let {
+            try { unregisterReceiver(it) } catch (_: Exception) {}
+        }
+        pttToggleReceiver = null
+        notificationPttActive = false
+    }
+
+    private fun handleNotificationPttToggle() {
+        try {
+            if (notificationPttActive) {
+                SassyTalkNative.pttStop()
+                notificationPttActive = false
+                updateNotification("Radio standby")
+            } else {
+                SassyTalkNative.pttStart()
+                notificationPttActive = true
+                updateNotification("Transmitting…")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Notification PTT toggle failed: ${e.message}")
+            notificationPttActive = false
+            updateNotification("Radio standby")
+        }
     }
 
     // ── BLE + RFCOMM init ──
@@ -221,6 +355,39 @@ class WalkieService : Service() {
     private fun stopCohortSnapshotter() {
         cohortSnapshotJob?.cancel()
         cohortSnapshotJob = null
+    }
+
+    // ── AudioTelemetry network bridge ──
+    //
+    // The new debug overlay (com.sassyconsulting.sassytalkie.debug.DebugOverlay)
+    // surfaces transport state in its NET section. The Rust pipeline owns the
+    // canonical transport, so we poll SassyTalkNative once per second and push
+    // into the telemetry singleton. Cheap (a few JNI string calls); only runs
+    // for service lifetime. If/when PttAudioPipeline takes over capture, this
+    // keeps working unchanged.
+
+    private fun startTelemetryBridge() {
+        if (telemetryBridgeJob?.isActive == true) return
+        telemetryBridgeJob = serviceScope.launch {
+            while (isActive) {
+                try {
+                    val path = SassyTalkNative.getTransportName().ifBlank { "offline" }
+                    val wsState = if (SassyTalkNative.isConnected()) "connected" else "idle"
+                    AudioTelemetry.updateNetwork(
+                        path = path,
+                        wsState = wsState,
+                        rttMs = null,
+                        hbAgoMs = null,
+                    )
+                } catch (_: Throwable) { /* native not yet initialized */ }
+                delay(1_000)
+            }
+        }
+    }
+
+    private fun stopTelemetryBridge() {
+        telemetryBridgeJob?.cancel()
+        telemetryBridgeJob = null
     }
 
     // ── Multicast lock ──
@@ -336,7 +503,23 @@ class WalkieService : Service() {
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
 
-        // Add PTT action if lock screen PTT is enabled
+        // Quick-send PTT action — toggles transmit directly from the shade so
+        // the user never has to reopen the app. State is local to the
+        // notification's tap cycle and reflected in the label/icon.
+        val toggleIntent = Intent(ACTION_TOGGLE_PTT).setPackage(packageName)
+        val togglePendingIntent = PendingIntent.getBroadcast(
+            this, 2, toggleIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val toggleLabel = if (notificationPttActive) "Stop" else "Push to talk"
+        builder.addAction(
+            android.R.drawable.ic_btn_speak_now,
+            toggleLabel,
+            togglePendingIntent
+        )
+
+        // Legacy "Open PTT" action — kept behind the existing preference for
+        // users who explicitly want the in-app PTT experience from lock screen.
         if (showPttAction) {
             val pttIntent = Intent(this, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_SINGLE_TOP

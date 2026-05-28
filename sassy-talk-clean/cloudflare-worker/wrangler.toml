@@ -1,5 +1,8 @@
 name = "sassytalk-relay"
-account_id = "d5ccd0d80780f2d0ab72ab12b15244e2"
+# account_id supplied via CLOUDFLARE_ACCOUNT_ID env var (or wrangler oauth
+# profile). Removed from the committed file so the same wrangler.toml works
+# across multiple Cloudflare accounts and so a shared repo doesn't leak
+# account-routing metadata.
 main = "src/ptt-relay-worker.js"
 compatibility_date = "2024-12-01"
 
@@ -7,6 +10,24 @@ compatibility_date = "2024-12-01"
 routes = [
   { pattern = "relay.sassyconsultingllc.com/*", zone_name = "sassyconsultingllc.com" }
 ]
+
+# Observability — capture worker logs in the Cloudflare dashboard for
+# debugging relay traffic (DO welcome, peer_joined, audio frames). Required
+# before `wrangler tail` will stream events from production.
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
 
 # ── Durable Objects ──
 [[durable_objects.bindings]]
@@ -16,3 +37,9 @@ class_name = "PttRoom"
 [[migrations]]
 tag = "v1_pttroom"
 new_sqlite_classes = ["PttRoom"]
+
+# ── KV: encrypted session-share blobs + FCM presence rows ──
+[[kv_namespaces]]
+binding = "SHARES"
+id = "3bd58157c52d43ffafa609502a98d64b"
+preview_id = "dec463c8f86549e2a9d4f00b616dbfec"

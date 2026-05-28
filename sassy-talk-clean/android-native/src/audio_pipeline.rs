@@ -8,7 +8,7 @@
 ///
 /// Also handles the TranscriptionBridge callback to Kotlin for speech-to-text.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -19,6 +19,115 @@ use crate::codec::{VoiceEncoder, VoiceDecoder, CODEC_FRAME_SIZE};
 use crate::transport::TransportManager;
 use crate::audio_cache::AudioCache;
 use crate::users::UserRegistry;
+
+/// Whether the Kotlin TranscriptionBridge.onAudioReceived callback should
+/// be invoked for every RX audio frame. Defaults off — the feature is
+/// opt-in (see TranscriptionBridge.setEnabled). When disabled, skipping
+/// the call eliminates ~1.9 KB of short[] allocation, a JVM thread
+/// attach, and a static method dispatch *per 20 ms frame* (50 Hz), all
+/// of which sum to enough GC pressure to cause intermittent ~50-300 ms
+/// AudioTrack underruns on the RX path.
+static TRANSCRIPTION_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Toggle whether the RX thread invokes the Kotlin TranscriptionBridge.
+/// Called from Kotlin via JNI (see jni_bridge.rs `nativeSetTranscriptionBridgeEnabled`).
+pub fn set_transcription_bridge_enabled(enabled: bool) {
+    TRANSCRIPTION_BRIDGE_ENABLED.store(enabled, Ordering::Relaxed);
+    info!("Transcription bridge callback enabled = {}", enabled);
+}
+
+pub fn is_transcription_bridge_enabled() -> bool {
+    TRANSCRIPTION_BRIDGE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Mic input gain, stored as `gain × 100` so the value is an atomic i32.
+/// 100 = 1.0× (unity, no change), 50 = 0.5×, 200 = 2.0×, etc.
+/// Clamped to [25, 400] in the setter (~ -12 dB to +12 dB).
+static MIC_GAIN_X100: AtomicI32 = AtomicI32::new(100);
+
+/// Squelch threshold in dBFS, integer. 0 = squelch disabled (transmit every
+/// frame above silence). Otherwise a negative value like -40 means "drop any
+/// frame whose RMS is below -40 dBFS". Useful for noisy environments.
+static SQUELCH_DBFS: AtomicI32 = AtomicI32::new(0);
+
+/// Set mic input gain. Input is `gain × 100` (so 100 = 1.0×). Clamped to [25, 400].
+pub fn set_mic_gain_x100(g: i32) {
+    let clamped = g.clamp(25, 400);
+    MIC_GAIN_X100.store(clamped, Ordering::Relaxed);
+    info!("Mic gain set to {:.2}x", clamped as f32 / 100.0);
+}
+
+pub fn get_mic_gain_x100() -> i32 {
+    MIC_GAIN_X100.load(Ordering::Relaxed)
+}
+
+/// Set squelch threshold in dBFS. 0 disables squelch. Otherwise expects a
+/// negative integer in [-60, -10]; values outside that range are clamped.
+pub fn set_squelch_dbfs(threshold: i32) {
+    let clamped = if threshold == 0 { 0 } else { threshold.clamp(-60, -10) };
+    SQUELCH_DBFS.store(clamped, Ordering::Relaxed);
+    if clamped == 0 {
+        info!("Squelch disabled");
+    } else {
+        info!("Squelch threshold set to {} dBFS", clamped);
+    }
+}
+
+pub fn get_squelch_dbfs() -> i32 {
+    SQUELCH_DBFS.load(Ordering::Relaxed)
+}
+
+/// Apply mic gain to a PCM frame in place, clipping to i16 range.
+fn apply_mic_gain(pcm: &mut [i16], gain_x100: i32) {
+    if gain_x100 == 100 { return; } // unity — fast path
+    let g = gain_x100 as f32 / 100.0;
+    for s in pcm.iter_mut() {
+        let scaled = (*s as f32 * g).clamp(i16::MIN as f32, i16::MAX as f32);
+        *s = scaled as i16;
+    }
+}
+
+/// Compute RMS dBFS for a PCM frame. Returns a very negative number for silence.
+fn frame_dbfs(pcm: &[i16]) -> f32 {
+    if pcm.is_empty() { return -120.0; }
+    let mut sum_sq: f64 = 0.0;
+    for s in pcm {
+        let v = *s as f64 / 32768.0;
+        sum_sq += v * v;
+    }
+    let rms = (sum_sq / pcm.len() as f64).sqrt();
+    if rms <= 1e-9 { -120.0 } else { (20.0 * rms.log10()) as f32 }
+}
+
+// ── Public helpers used by the BT TX path in jni_bridge.rs so both pipelines
+//    apply the same gain, squelch, and activity-log behavior. ──────────────
+
+/// Apply the current user-configured mic gain to a PCM frame in place.
+pub fn apply_mic_gain_public(pcm: &mut [i16]) {
+    apply_mic_gain(pcm, MIC_GAIN_X100.load(Ordering::Relaxed));
+}
+
+/// Returns true if the user-configured squelch threshold says this frame
+/// should be dropped. Returns false when squelch is disabled or the frame
+/// is loud enough to transmit.
+pub fn squelch_drops_frame(pcm: &[i16]) -> bool {
+    let squelch = SQUELCH_DBFS.load(Ordering::Relaxed);
+    if squelch == 0 { return false; }
+    frame_dbfs(pcm) < squelch as f32
+}
+
+/// Invoke the activity-log bridge with the given PCM frame and per-sender
+/// favorite/muted flags. The bridge ignores the call cheaply when
+/// transcription is disabled.
+pub fn call_transcription_bridge_public(
+    sender_id: &str,
+    device_name: &str,
+    pcm: &[i16],
+    is_favorite: bool,
+    is_muted: bool,
+) {
+    call_transcription_bridge(sender_id, device_name, pcm, is_favorite, is_muted);
+}
 
 /// Maximum sender ID length on the wire
 const MAX_SENDER_ID_LEN: usize = 32;
@@ -127,7 +236,7 @@ pub fn spawn_tx_thread(
     transport: Arc<Mutex<TransportManager>>,
     local_sender_id: String,
     local_device_name: String,
-) -> thread::JoinHandle<()> {
+) -> std::io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("sassy-tx".into())
         .spawn(move || {
@@ -220,23 +329,65 @@ pub fn spawn_tx_thread(
                     }
                 }
 
-                // Read one frame from mic
-                let samples_read = {
-                    let eng = audio.lock().unwrap();
-                    match eng.read_audio(&mut pcm_buffer) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            warn!("TX: read_audio failed: {}", e);
-                            0
+                // Read one full frame from the mic — accumulate partial reads.
+                //
+                // The previous version threw away the buffer on a short read,
+                // which on Qualcomm HALs (Moto, Xiaomi) that deliver in
+                // multiples of 480 samples meant every other read returned 0
+                // useful samples — producing alternating real-frame/silence
+                // output, which decoded on the receiver as the textbook
+                // "robotic" artifact. Accumulate into the buffer until a full
+                // CODEC_FRAME_SIZE (960 samples / 20 ms) is captured.
+                let mut filled: usize = 0;
+                let mut read_attempts: u32 = 0;
+                const MAX_READ_ATTEMPTS_PER_FRAME: u32 = 25; // ~50 ms cap; avoids hang on broken HAL
+                while filled < CODEC_FRAME_SIZE && read_attempts < MAX_READ_ATTEMPTS_PER_FRAME {
+                    read_attempts += 1;
+                    let n = {
+                        let eng = audio.lock().unwrap();
+                        match eng.read_audio(&mut pcm_buffer[filled..CODEC_FRAME_SIZE]) {
+                            Ok(n) => n,
+                            Err(e) => { warn!("TX: read_audio failed: {}", e); 0 }
                         }
+                    };
+                    if n == 0 {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
                     }
-                };
-
-                if samples_read < CODEC_FRAME_SIZE {
-                    // Incomplete frame, wait for more data
-                    thread::sleep(Duration::from_millis(2));
+                    filled += n;
+                }
+                if filled < CODEC_FRAME_SIZE {
+                    warn!("TX: partial frame after {} attempts (filled={}/{}); dropping", read_attempts, filled, CODEC_FRAME_SIZE);
                     continue;
                 }
+
+                // Apply user-configured mic gain in place (unity by default).
+                // For clogged-mic users this lifts a weak signal up; for
+                // headset users with hot mics, a fractional gain attenuates.
+                apply_mic_gain(&mut pcm_buffer[..CODEC_FRAME_SIZE], MIC_GAIN_X100.load(Ordering::Relaxed));
+
+                // Squelch: if user enabled a dBFS threshold, drop frames
+                // below it so background noise isn't transmitted. 0 = off
+                // (default) — every frame goes through.
+                let squelch = SQUELCH_DBFS.load(Ordering::Relaxed);
+                if squelch != 0 {
+                    let d = frame_dbfs(&pcm_buffer[..CODEC_FRAME_SIZE]);
+                    if d < squelch as f32 {
+                        continue;
+                    }
+                }
+
+                // Feed self-PCM into the timeline bridge so the activity log
+                // records "you spoke for Xs" on PTT release. Same VAD/finalize
+                // path as RX-side speakers, so self entries also serve as a
+                // smoke test that the bridge wiring is healthy.
+                call_transcription_bridge(
+                    &local_sender_id,
+                    &local_device_name,
+                    &pcm_buffer[..CODEC_FRAME_SIZE],
+                    false,
+                    false,
+                );
 
                 // Encode with Opus
                 let compressed = encoder.encode(&pcm_buffer[..CODEC_FRAME_SIZE]);
@@ -266,7 +417,6 @@ pub fn spawn_tx_thread(
             }
             info!("TX thread stopped");
         })
-        .expect("Failed to spawn TX thread")
 }
 
 /// Spawn the RX thread: receives, decrypts, decodes, feeds into AudioCache, and plays back.
@@ -281,15 +431,32 @@ pub fn spawn_rx_thread(
     audio_cache: Arc<Mutex<AudioCache>>,
     user_registry: Arc<Mutex<UserRegistry>>,
     local_sender_id: String,
-) -> thread::JoinHandle<()> {
+) -> std::io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("sassy-rx".into())
         .spawn(move || {
             info!("RX thread started");
 
-            let mut decoder = VoiceDecoder::new();
-            let mut recv_buffer = vec![0u8; 2048]; // generous buffer for encrypted + wire header
+            // Per-sender state. Opus decoder is stateful (range encoder
+            // state + frame history for PLC/FEC) so mixing two senders'
+            // bitstreams through one decoder produces glitches. One
+            // decoder per sender_id; lazily created on first packet.
+            let mut decoders: std::collections::HashMap<String, VoiceDecoder> = std::collections::HashMap::new();
+            // Per-sender last wire timestamp (ms). Used to detect frame
+            // gaps without changing the wire format — each frame's
+            // timestamp is a u64 epoch-ms, and Opus frames are 20 ms, so
+            // `(now - prev) / 20 - 1` is the lost-frame count.
+            let mut last_ts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+
+            let mut recv_buffer = vec![0u8; 2048];
             let mut playback_started = false;
+
+            // Frame period in ms — must match codec.rs CODEC_FRAME_SIZE / CODEC_SAMPLE_RATE.
+            const FRAME_PERIOD_MS: u64 = 20;
+            // Cap PLC fill: more than this means the gap is too big to
+            // paper over usefully; reset the decoder so its state doesn't
+            // drift further from what the sender now has.
+            const MAX_PLC_FRAMES: u64 = 4;
 
             while rx_running.load(Ordering::SeqCst) {
                 // Receive from transport (decrypted inside TransportManager::receive)
@@ -309,12 +476,17 @@ pub fn spawn_rx_thread(
                 if bytes_received == 0 {
                     // No data available. Tick the audio cache to check for completed utterances
                     // and drain playback queue.
-                    let mut cache = audio_cache.lock().unwrap();
-                    cache.tick();
+                    let commits;
+                    let maybe_frame;
+                    {
+                        let mut cache = audio_cache.lock().unwrap();
+                        cache.tick();
+                        commits = cache.take_newly_committed_ids();
+                        maybe_frame = cache.next_playback_frame();
+                    }
+                    dispatch_committed_utterances(&commits);
 
-                    // If we're in Queue mode, try to play the next frame from cache
-                    if let Some((_sender, samples)) = cache.next_playback_frame() {
-                        drop(cache);
+                    if let Some((_sender, samples)) = maybe_frame {
                         if !playback_started {
                             let eng = audio.lock().unwrap();
                             let _ = eng.start_playing();
@@ -322,8 +494,6 @@ pub fn spawn_rx_thread(
                         }
                         let eng = audio.lock().unwrap();
                         let _ = eng.write_audio(&samples);
-                    } else {
-                        drop(cache);
                     }
 
                     thread::sleep(Duration::from_millis(5));
@@ -380,22 +550,59 @@ pub fn spawn_rx_thread(
                     cache.update_user_info(&sender_id, &device_name, is_fav, is_muted);
                 }
 
-                // Decode Opus
-                let pcm_samples = decoder.decode(&compressed);
-
-                // Feed into audio cache
-                let mut cache = audio_cache.lock().unwrap();
-                let passthrough = cache.ingest_frame(&sender_id, timestamp, pcm_samples.clone());
-                cache.tick();
-
-                // Play audio: either passthrough (Live mode) or from queue
-                let samples_to_play = if let Some(direct) = passthrough {
-                    Some(direct)
-                } else {
-                    cache.next_playback_frame().map(|(_, s)| s)
+                // Per-sender decoder + gap detection. `prev_ts` is the
+                // sender's last wire timestamp; the difference / 20 ms
+                // gives the lost-frame count between then and now.
+                let prev_ts = last_ts.get(&sender_id).copied();
+                let decoder = decoders.entry(sender_id.clone()).or_insert_with(VoiceDecoder::new);
+                let gap_frames: u64 = match prev_ts {
+                    Some(p) if timestamp > p + FRAME_PERIOD_MS => {
+                        ((timestamp - p) / FRAME_PERIOD_MS).saturating_sub(1)
+                    }
+                    _ => 0,
                 };
 
-                drop(cache);
+                // Repair the gap before decoding the current frame.
+                if gap_frames == 1 {
+                    // Single lost frame — Opus in-band FEC can rebuild it from
+                    // the current (successor) packet's redundancy data.
+                    let fec_pcm = decoder.decode_fec_from_next(&compressed);
+                    let synth_ts = prev_ts.unwrap() + FRAME_PERIOD_MS;
+                    let mut cache = audio_cache.lock().unwrap();
+                    let _ = cache.ingest_frame(&sender_id, synth_ts, fec_pcm);
+                } else if gap_frames >= 2 && gap_frames <= MAX_PLC_FRAMES {
+                    // Multi-frame gap — pure PLC for each missing slot.
+                    for i in 1..=gap_frames {
+                        let plc_pcm = decoder.decode_plc();
+                        let synth_ts = prev_ts.unwrap() + FRAME_PERIOD_MS * i;
+                        let mut cache = audio_cache.lock().unwrap();
+                        let _ = cache.ingest_frame(&sender_id, synth_ts, plc_pcm);
+                    }
+                } else if gap_frames > MAX_PLC_FRAMES {
+                    // Gap too big — don't pollute with stale-history PLC.
+                    // Reset the decoder so it doesn't carry forward stale
+                    // state into the next frame's decode.
+                    decoder.reset();
+                    info!("RX: large gap of {} frames from {}; decoder reset", gap_frames, sender_id);
+                }
+
+                // Decode the current real frame and update last-ts.
+                let pcm_samples = decoder.decode(&compressed);
+                last_ts.insert(sender_id.clone(), timestamp);
+
+                // Feed into audio cache (multi-speaker mixer / live jitter buffer)
+                let (passthrough, commits, maybe_queue_frame) = {
+                    let mut cache = audio_cache.lock().unwrap();
+                    let pass = cache.ingest_frame(&sender_id, timestamp, pcm_samples.clone());
+                    cache.tick();
+                    let commits = cache.take_newly_committed_ids();
+                    let qframe = cache.next_playback_frame().map(|(_, s)| s);
+                    (pass, commits, qframe)
+                };
+                dispatch_committed_utterances(&commits);
+
+                // Play audio: either passthrough (Live mode) or from queue
+                let samples_to_play = passthrough.or(maybe_queue_frame);
 
                 if let Some(samples) = samples_to_play {
                     if !playback_started {
@@ -423,7 +630,62 @@ pub fn spawn_rx_thread(
             }
             info!("RX thread stopped");
         })
-        .expect("Failed to spawn RX thread")
+}
+
+/// Forward a batch of just-committed utterance IDs to Kotlin so the
+/// timeline UI can wire its replay button to the correct ID. Replaces
+/// the previous best-effort `lastHistoryId()` poll which raced against
+/// the cache's commit timer and silently captured the wrong (or no) ID.
+///
+/// Calls `TranscriptionBridge.onUtteranceCommitted(senderId, senderName, utteranceId, durationMs)`
+/// once per commit. Failures are logged and swallowed — the timeline UI
+/// degrades to "no replay button" rather than crashing the RX thread.
+fn dispatch_committed_utterances(commits: &[(u64, String, String, u64)]) {
+    if commits.is_empty() {
+        return;
+    }
+    use jni::objects::{JValue, JClass, GlobalRef};
+
+    let bridge_ref: &GlobalRef = match crate::jni_bridge::get_transcription_bridge_class() {
+        Some(r) => r,
+        None => return,
+    };
+    let vm = match crate::jni_bridge::get_jvm() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let mut env = match vm.attach_current_thread() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    if env.push_local_frame(8).is_err() { return; }
+
+    for (id, sender_id, sender_name, duration_ms) in commits {
+        let _ = (|| -> Option<()> {
+            let j_sender_id = env.new_string(sender_id).ok()?;
+            let j_sender_name = env.new_string(sender_name).ok()?;
+            let bridge_class = unsafe { JClass::from_raw(bridge_ref.as_obj().as_raw()) };
+            let result = env.call_static_method(
+                &bridge_class,
+                "onUtteranceCommitted",
+                "(Ljava/lang/String;Ljava/lang/String;JJ)V",
+                &[
+                    JValue::Object(&j_sender_id.into()),
+                    JValue::Object(&j_sender_name.into()),
+                    JValue::Long(*id as i64),
+                    JValue::Long(*duration_ms as i64),
+                ],
+            );
+            if result.is_err() {
+                let _ = env.exception_describe();
+                let _ = env.exception_clear();
+            }
+            std::mem::forget(bridge_class);
+            Some(())
+        })();
+    }
+
+    unsafe { let _ = env.pop_local_frame(&jni::objects::JObject::null()); }
 }
 
 /// Call the Kotlin TranscriptionBridge.onAudioReceived callback via JNI.
@@ -439,6 +701,13 @@ fn call_transcription_bridge(
     is_favorite: bool,
     is_muted: bool,
 ) {
+    // Fast path: feature disabled → return without touching JNI. Avoids
+    // attaching a JNI thread + allocating a short[] every 20 ms when
+    // transcription is off (the default).
+    if !TRANSCRIPTION_BRIDGE_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+
     use jni::objects::{JValue, JClass, GlobalRef};
     use jni::sys::{JNI_TRUE, JNI_FALSE};
 

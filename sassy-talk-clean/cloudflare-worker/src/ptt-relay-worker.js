@@ -6,6 +6,8 @@
  */
 
 export { PttRoom } from "./ptt-relay.js";
+import { handleShareRoute } from "./share.js";
+import { handlePresenceRoute } from "./presence.js";
 
 // Token lifetime in seconds. Short enough to limit replay risk, long enough
 // that flaky cellular reconnects within the same session don't need a refresh.
@@ -35,6 +37,16 @@ export default {
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: CORS_HEADERS });
     }
+
+    // Encrypted session-share endpoints. End-to-end: the worker never sees
+    // plaintext or the key (key lives in the recipient URL's #fragment).
+    const shareResp = await handleShareRoute(request, env, url);
+    if (shareResp) return shareResp;
+
+    // Presence: map (room, peer) → FCM token so audio for an offline peer
+    // can trigger a wake push.
+    const presenceResp = await handlePresenceRoute(request, env, url);
+    if (presenceResp) return presenceResp;
 
     // Health check
     if (path === "/" || path === "/health") {

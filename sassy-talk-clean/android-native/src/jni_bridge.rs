@@ -50,28 +50,33 @@ pub struct AndroidAudioRecord {
 }
 
 impl AndroidAudioRecord {
-    /// Create AudioRecord instance
-    pub fn new(sample_rate: i32, channel_config: i32, audio_format: i32, buffer_size: i32) -> Result<Self, String> {
+    /// Get the integer value of a `MediaRecorder.AudioSource` constant by name.
+    /// Returns None if the field doesn't exist on this SDK level.
+    pub fn audio_source_id(name: &str) -> Option<i32> {
+        let vm = get_jvm().ok()?;
+        let mut env = vm.attach_current_thread().ok()?;
+        let source_class = env.find_class("android/media/MediaRecorder$AudioSource").ok()?;
+        let val = env.get_static_field(&source_class, name, "I").ok()?.i().ok()?;
+        Some(val)
+    }
+
+    /// Create AudioRecord instance with an explicit audio source (e.g.
+    /// `MediaRecorder.AudioSource.VOICE_RECOGNITION`). Caller picks the
+    /// source from `DeviceQuirks::current().source_fallback_chain` and
+    /// retries with the next on `STATE_UNINITIALIZED`.
+    pub fn new_with_source(audio_source: i32, sample_rate: i32, channel_config: i32, audio_format: i32, buffer_size: i32) -> Result<Self, String> {
         let vm = get_jvm()?;
         let mut env = vm.attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
+
         let recorder_class = env.find_class("android/media/AudioRecord")
             .map_err(|e| format!("Failed to find AudioRecord class: {}", e))?;
-        
-        let source_class = env.find_class("android/media/MediaRecorder$AudioSource")
-            .map_err(|e| format!("Failed to find AudioSource class: {}", e))?;
-        
-        let mic_field = env.get_static_field(&source_class, "MIC", "I")
-            .map_err(|e| format!("Failed to get MIC field: {}", e))?
-            .i()
-            .map_err(|e| format!("Failed to convert field: {}", e))?;
-        
+
         let recorder = env.new_object(
             &recorder_class,
             "(IIIII)V",
             &[
-                JValue::Int(mic_field),
+                JValue::Int(audio_source),
                 JValue::Int(sample_rate),
                 JValue::Int(channel_config),
                 JValue::Int(audio_format),
@@ -79,11 +84,45 @@ impl AndroidAudioRecord {
             ]
         )
         .map_err(|e| format!("Failed to create AudioRecord: {}", e))?;
-        
+
+        // Verify the recorder actually initialized (some OEM HALs reject
+        // certain sources silently — STATE_UNINITIALIZED = 0).
+        let state_initialized = env.get_static_field(&recorder_class, "STATE_INITIALIZED", "I")
+            .map_err(|e| format!("Failed to get STATE_INITIALIZED: {}", e))?
+            .i()
+            .map_err(|e| format!("Failed to convert STATE_INITIALIZED: {}", e))?;
+        let state = env.call_method(&recorder, "getState", "()I", &[])
+            .map_err(|e| format!("Failed to call getState: {}", e))?
+            .i()
+            .map_err(|e| format!("Failed to convert getState: {}", e))?;
+        if state != state_initialized {
+            let _ = env.call_method(&recorder, "release", "()V", &[]);
+            return Err(format!("AudioRecord state={} (not STATE_INITIALIZED) for source={}", state, audio_source));
+        }
+
         let global_ref = env.new_global_ref(&recorder)
             .map_err(|e| format!("Failed to create global ref: {}", e))?;
-        
+
         Ok(Self { recorder: global_ref })
+    }
+
+    /// Get the AudioRecord's session ID — needed to attach AEC/NS/AGC
+    /// effects to this specific recording chain.
+    pub fn audio_session_id(&self) -> Result<i32, String> {
+        let vm = get_jvm()?;
+        let mut env = vm.attach_current_thread()
+            .map_err(|e| format!("Failed to attach thread: {}", e))?;
+        env.call_method(self.recorder.as_obj(), "getAudioSessionId", "()I", &[])
+            .map_err(|e| format!("Failed getAudioSessionId: {}", e))?
+            .i()
+            .map_err(|e| format!("Failed to convert sessionId: {}", e))
+    }
+
+    /// Legacy constructor — defaults to MIC. Prefer `new_with_source` so
+    /// per-device fallback chains pick the right source.
+    pub fn new(sample_rate: i32, channel_config: i32, audio_format: i32, buffer_size: i32) -> Result<Self, String> {
+        let mic = Self::audio_source_id("MIC").unwrap_or(1);
+        Self::new_with_source(mic, sample_rate, channel_config, audio_format, buffer_size)
     }
     
     /// Get minimum buffer size
@@ -223,45 +262,141 @@ impl AndroidAudioTrack {
         Ok(size)
     }
 
-    /// Create AudioTrack instance
+    /// Create AudioTrack instance.
+    ///
+    /// Uses the modern `AudioAttributes` + `AudioFormat` builder constructor
+    /// with `USAGE_VOICE_COMMUNICATION` + `CONTENT_TYPE_SPEECH`. This
+    /// intentionally bypasses the OEM media post-processing chain (Dolby
+    /// Atmos on Motorola, Adapt Sound on Samsung, MIUI Sound Enhance on
+    /// Xiaomi) which spectrally mangles 20 ms VoIP voice frames into the
+    /// "robotic / slowed-down" artifact users hear. The legacy
+    /// `STREAM_MUSIC, MODE_STREAM` constructor we used before routed audio
+    /// through that chain by default and was the single biggest contributor
+    /// to bad voice quality.
     pub fn new(sample_rate: i32, channel_config: i32, audio_format: i32, buffer_size: i32) -> Result<Self, String> {
         let vm = get_jvm()?;
         let mut env = vm.attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
+
         let track_class = env.find_class("android/media/AudioTrack")
             .map_err(|e| format!("Failed to find AudioTrack class: {}", e))?;
-        
-        let manager_class = env.find_class("android/media/AudioManager")
-            .map_err(|e| format!("Failed to find AudioManager class: {}", e))?;
-        
-        let stream_music = env.get_static_field(&manager_class, "STREAM_MUSIC", "I")
-            .map_err(|e| format!("Failed to get STREAM_MUSIC field: {}", e))?
+        let attrs_class = env.find_class("android/media/AudioAttributes")
+            .map_err(|e| format!("Failed to find AudioAttributes class: {}", e))?;
+        let attrs_builder_class = env.find_class("android/media/AudioAttributes$Builder")
+            .map_err(|e| format!("Failed to find AudioAttributes.Builder class: {}", e))?;
+        let _format_class = env.find_class("android/media/AudioFormat")
+            .map_err(|e| format!("Failed to find AudioFormat class: {}", e))?;
+        let format_builder_class = env.find_class("android/media/AudioFormat$Builder")
+            .map_err(|e| format!("Failed to find AudioFormat.Builder class: {}", e))?;
+
+        let usage_voice_comm = env.get_static_field(&attrs_class, "USAGE_VOICE_COMMUNICATION", "I")
+            .map_err(|e| format!("Failed to get USAGE_VOICE_COMMUNICATION: {}", e))?
             .i()
             .map_err(|e| format!("Failed to convert field: {}", e))?;
-        
+        let content_speech = env.get_static_field(&attrs_class, "CONTENT_TYPE_SPEECH", "I")
+            .map_err(|e| format!("Failed to get CONTENT_TYPE_SPEECH: {}", e))?
+            .i()
+            .map_err(|e| format!("Failed to convert field: {}", e))?;
+
         let mode_stream = env.get_static_field(&track_class, "MODE_STREAM", "I")
             .map_err(|e| format!("Failed to get MODE_STREAM field: {}", e))?
             .i()
             .map_err(|e| format!("Failed to convert field: {}", e))?;
-        
+        // `AUDIO_SESSION_ID_GENERATE` lives on `AudioManager`, not
+        // `AudioTrack` — looking it up on AudioTrack throws
+        // NoSuchFieldError and crashes audio init. Value is 0, documented
+        // public API since L (API 21).
+        let session_id_none: i32 = 0;
+
+        // Build AudioAttributes(usage=VOICE_COMMUNICATION, contentType=SPEECH)
+        let attrs_builder = env.new_object(&attrs_builder_class, "()V", &[])
+            .map_err(|e| format!("Failed to create AudioAttributes.Builder: {}", e))?;
+        let attrs_builder = env.call_method(
+            &attrs_builder,
+            "setUsage",
+            "(I)Landroid/media/AudioAttributes$Builder;",
+            &[JValue::Int(usage_voice_comm)],
+        )
+            .map_err(|e| format!("Failed setUsage: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed setUsage return: {}", e))?;
+        let attrs_builder = env.call_method(
+            &attrs_builder,
+            "setContentType",
+            "(I)Landroid/media/AudioAttributes$Builder;",
+            &[JValue::Int(content_speech)],
+        )
+            .map_err(|e| format!("Failed setContentType: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed setContentType return: {}", e))?;
+        let audio_attrs = env.call_method(
+            &attrs_builder,
+            "build",
+            "()Landroid/media/AudioAttributes;",
+            &[],
+        )
+            .map_err(|e| format!("Failed AudioAttributes.build: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed AudioAttributes.build return: {}", e))?;
+
+        // Build AudioFormat(encoding=PCM_16, sampleRate, channelMask=channel_config)
+        let format_builder = env.new_object(&format_builder_class, "()V", &[])
+            .map_err(|e| format!("Failed to create AudioFormat.Builder: {}", e))?;
+        let format_builder = env.call_method(
+            &format_builder,
+            "setEncoding",
+            "(I)Landroid/media/AudioFormat$Builder;",
+            &[JValue::Int(audio_format)],
+        )
+            .map_err(|e| format!("Failed setEncoding: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed setEncoding return: {}", e))?;
+        let format_builder = env.call_method(
+            &format_builder,
+            "setSampleRate",
+            "(I)Landroid/media/AudioFormat$Builder;",
+            &[JValue::Int(sample_rate)],
+        )
+            .map_err(|e| format!("Failed setSampleRate: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed setSampleRate return: {}", e))?;
+        let format_builder = env.call_method(
+            &format_builder,
+            "setChannelMask",
+            "(I)Landroid/media/AudioFormat$Builder;",
+            &[JValue::Int(channel_config)],
+        )
+            .map_err(|e| format!("Failed setChannelMask: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed setChannelMask return: {}", e))?;
+        let audio_format_obj = env.call_method(
+            &format_builder,
+            "build",
+            "()Landroid/media/AudioFormat;",
+            &[],
+        )
+            .map_err(|e| format!("Failed AudioFormat.build: {}", e))?
+            .l()
+            .map_err(|e| format!("Failed AudioFormat.build return: {}", e))?;
+
+        // AudioTrack(AudioAttributes, AudioFormat, bufferSizeInBytes, mode, sessionId)
         let track = env.new_object(
             &track_class,
-            "(IIIIII)V",
+            "(Landroid/media/AudioAttributes;Landroid/media/AudioFormat;III)V",
             &[
-                JValue::Int(stream_music),
-                JValue::Int(sample_rate),
-                JValue::Int(channel_config),
-                JValue::Int(audio_format),
+                JValue::Object(&audio_attrs),
+                JValue::Object(&audio_format_obj),
                 JValue::Int(buffer_size),
                 JValue::Int(mode_stream),
-            ]
+                JValue::Int(session_id_none),
+            ],
         )
-        .map_err(|e| format!("Failed to create AudioTrack: {}", e))?;
-        
+        .map_err(|e| format!("Failed to create AudioTrack (voice): {}", e))?;
+
         let global_ref = env.new_global_ref(&track)
             .map_err(|e| format!("Failed to create global ref: {}", e))?;
-        
+
+        info!("AudioTrack created with USAGE_VOICE_COMMUNICATION + CONTENT_TYPE_SPEECH (bypasses OEM media post-processing)");
         Ok(Self { track: global_ref })
     }
     
@@ -476,11 +611,40 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     // Initialize app state
     let state = get_jni_state();
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    
+
     if guard.initialize() {
+        // Warm up the per-OEM quirks profile so the first PTT doesn't pay the
+        // JNI Build.* read latency.
+        let _ = crate::device_quirks::current();
         JNI_TRUE
     } else {
         JNI_FALSE
+    }
+}
+
+/// JNI: Cache the application Context. Called from Kotlin in
+/// WalkieService.onCreate. Required by `audio_routing::engage_comm_mode`
+/// to obtain `AudioManager` via `getSystemService`. Safe to call multiple
+/// times — only the first call sticks.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeInitContext(
+    mut env: JNIEnv,
+    _class: JClass,
+    context: JObject,
+) -> jboolean {
+    if context.is_null() {
+        warn!("nativeInitContext: null Context, ignoring");
+        return JNI_FALSE;
+    }
+    match env.new_global_ref(&context) {
+        Ok(global) => {
+            crate::audio_routing::init_context(global);
+            JNI_TRUE
+        }
+        Err(e) => {
+            warn!("nativeInitContext: new_global_ref failed: {}", e);
+            JNI_FALSE
+        }
     }
 }
 
@@ -597,6 +761,44 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     crate::audio_pipeline::set_transcription_bridge_enabled(enabled != 0);
 }
 
+/// JNI: Set mic input gain (gain × 100 — 100 = 1.0×, 200 = 2.0×). Clamped [25, 400].
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetMicGainX100(
+    _env: JNIEnv,
+    _class: JClass,
+    gain_x100: jni::sys::jint,
+) {
+    crate::audio_pipeline::set_mic_gain_x100(gain_x100);
+}
+
+/// JNI: Get the current mic input gain × 100.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetMicGainX100(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jint {
+    crate::audio_pipeline::get_mic_gain_x100()
+}
+
+/// JNI: Set squelch threshold in dBFS. 0 disables. Otherwise clamped to [-60, -10].
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetSquelchDbfs(
+    _env: JNIEnv,
+    _class: JClass,
+    threshold: jni::sys::jint,
+) {
+    crate::audio_pipeline::set_squelch_dbfs(threshold);
+}
+
+/// JNI: Get the current squelch threshold (0 = disabled).
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetSquelchDbfs(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jint {
+    crate::audio_pipeline::get_squelch_dbfs()
+}
+
 /// JNI: Replay utterance by unique ID.
 ///
 /// Spawns a one-shot playback thread that drives AudioTrack directly. This
@@ -635,20 +837,105 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     // JNI calls (clear, etc.) aren't blocked behind it. Clone the Arc so
     // the thread holds its own handle to the audio engine.
     let audio = Arc::clone(sm.get_audio());
+    // Snapshot all three gate handles. All are cheap Arc clones; the
+    // replay loop polls them without holding the engine mutex.
+    //   - gate_clock: wall-clock ms of last write — used at startup to
+    //     wait for "live RX has been quiet long enough"
+    //   - write_seq: monotonic per-call counter — used inside the frame
+    //     loop to detect RX intrusion (granular regardless of wall-clock
+    //     resolution; two writes in the same ms still distinguishable)
+    //   - playback_lock: self-exclusion so two replays can't overlap
+    let (gate_clock, write_seq, playback_lock) = match audio.lock() {
+        Ok(eng) => (eng.write_clock(), eng.write_seq_handle(), eng.playback_lock_handle()),
+        Err(e) => {
+            warn!("Replay: failed to snapshot gate handles: {}", e);
+            return JNI_FALSE;
+        }
+    };
+
+    // Pre-check the self-exclusion lock BEFORE spawning. Previously we
+    // returned JNI_TRUE even when the spawned thread immediately bailed
+    // because another replay held the lock — UI saw "Replaying X" but
+    // nothing happened. Now we refuse synchronously and the snackbar
+    // accurately reports the failure.
+    if playback_lock.try_lock().is_err() {
+        warn!("Replay {}: another replay is already running, declining", utterance_id);
+        return JNI_FALSE;
+    }
     drop(guard);
 
     info!("JNI: Replaying utterance id={} ({} frames)", utterance_id, frames.len());
 
-    std::thread::Builder::new()
+    let spawn_result = std::thread::Builder::new()
         .name(format!("sassy-replay-{}", utterance_id))
         .spawn(move || {
-            // AudioTrack.write() blocks when the internal buffer is full, so
-            // the loop paces itself to real time without an explicit sleep.
+            // ── Single-owner playback gate ───────────────────────────
+            // Replay MUST defer to live RX traffic. Polls `gate_clock`:
+            //   - If RX wrote in the last GATE_MIN_IDLE_MS → wait + retry.
+            //   - If we've been waiting more than GATE_MAX_WAIT_MS total
+            //     → give up. (User can re-tap once the channel quiets.)
+            // RX never needs to know about replay — RX writes immediately
+            // and bumps the clock; the replay thread sees that and yields.
+            // This is the walkie-talkie convention: incoming traffic is
+            // never preempted by a manual scrub action.
+            const GATE_MIN_IDLE_MS: u64 = 200;
+            const GATE_MAX_WAIT_MS: u64 = 3_000;
+
+            // Re-acquire the self-exclusion lock inside the spawned thread.
+            // The pre-spawn check already proved it was free; if something
+            // else grabbed it in the microsecond between, we bail rather
+            // than block (preserves the synchronous JNI return value).
+            let _replay_guard = match playback_lock.try_lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    warn!("Replay {}: lost race for replay lock after spawn", utterance_id);
+                    return;
+                }
+            };
+
+            // Wait for live RX to quiet down before starting. Polls the
+            // wall-clock idle; if RX is hot, we wait up to 3 s and bail
+            // if it never quiets.
+            if !crate::audio::wait_for_playback_idle(&gate_clock, GATE_MIN_IDLE_MS, GATE_MAX_WAIT_MS) {
+                warn!(
+                    "Replay {}: gave up after {}ms — live audio still active",
+                    utterance_id, GATE_MAX_WAIT_MS
+                );
+                return;
+            }
+
             // Start playback if it isn't already running; harmless if it is.
             if let Ok(eng) = audio.lock() {
                 let _ = eng.start_playing();
             }
+
+            // Frame loop with RX-intrusion detection via MONOTONIC SEQ.
+            //
+            // The atomic `write_seq` is incremented by EVERY successful
+            // write — ours and RX's. After each of OUR writes we record
+            // the resulting seq value (`last_self_seq`). Before the next
+            // write, we re-read: if it advanced by more than the 1 our
+            // own write contributed, someone else wrote between calls.
+            // Granular per-call regardless of wall-clock resolution —
+            // two writes within the same ms are still distinguishable
+            // (the wall-clock approach used previously collapsed them).
+            //
+            // Result: live RX always wins (lock-free, unimpeded), and
+            // replay never interleaves a single frame with live audio.
+            // Either replay completes uninterrupted, or it bails the
+            // instant RX takes over.
+            let mut last_self_seq: u64 = 0;
             for samples in frames {
+                if last_self_seq != 0 {
+                    let now_seq = write_seq.load(std::sync::atomic::Ordering::Relaxed);
+                    if now_seq != last_self_seq {
+                        info!(
+                            "Replay {}: yielding — RX wrote (seq {} -> {})",
+                            utterance_id, last_self_seq, now_seq
+                        );
+                        break;
+                    }
+                }
                 let eng = match audio.lock() {
                     Ok(e) => e,
                     Err(e) => {
@@ -661,12 +948,26 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
                     break;
                 }
                 drop(eng);
+                // After our write, write_seq advanced by exactly 1. Capture
+                // that value — any further advance before our next iteration
+                // means an RX writer slipped in.
+                last_self_seq = write_seq.load(std::sync::atomic::Ordering::Relaxed);
             }
-            info!("Replay thread for utterance complete");
+            info!("Replay {} complete", utterance_id);
+            // _replay_guard drops here → another replay can run.
         })
-        .expect("failed to spawn replay thread");
+        ;
 
-    JNI_TRUE
+    // Thread spawn failure (rare — OOM, ulimit) shouldn't panic inside
+    // a JNI call. Translate to a JNI_FALSE return so the UI snackbar
+    // reflects reality instead of saying "Replaying X" silently.
+    match spawn_result {
+        Ok(_) => JNI_TRUE,
+        Err(e) => {
+            warn!("Replay {}: failed to spawn thread: {}", utterance_id, e);
+            JNI_FALSE
+        }
+    }
 }
 
 /// JNI: Get the ID of the most recently added history utterance
@@ -733,7 +1034,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 /// Reads mic → Opus encode → pack wire frame → return byte[] for Kotlin to send via RFCOMM.
 /// Returns null if no audio data available.
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btEncodeFrame<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeBtEncodeFrame<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jni::sys::jbyteArray {
@@ -784,8 +1085,34 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btEn
         return std::ptr::null_mut(); // Incomplete frame, caller should retry
     }
 
+    // Apply mic gain + squelch + activity-log feed symmetrically with the
+    // unified pipeline so BT users get the same Settings controls. If the
+    // squelch threshold drops this frame, we return null and Kotlin will
+    // simply not transmit it over RFCOMM.
+    audio_pipeline::apply_mic_gain_public(&mut pcm_buffer[..CODEC_FRAME_SIZE]);
+    if audio_pipeline::squelch_drops_frame(&pcm_buffer[..CODEC_FRAME_SIZE]) {
+        return std::ptr::null_mut();
+    }
+
     // Encode with Opus
     let compressed = guard.bt_encoder.encode(&pcm_buffer[..CODEC_FRAME_SIZE]);
+
+    // Mirror the unified-pipeline activity-log feed so BT speakers also
+    // appear in the timeline.
+    let bridge_sender_id;
+    let bridge_device_name;
+    {
+        let sm_for_bridge = guard.state_machine.as_ref();
+        bridge_sender_id = sm_for_bridge.map(|s| s.get_local_sender_id()).unwrap_or_default();
+        bridge_device_name = sm_for_bridge.map(|s| s.get_device_name()).unwrap_or_default();
+    }
+    audio_pipeline::call_transcription_bridge_public(
+        &bridge_sender_id,
+        &bridge_device_name,
+        &pcm_buffer[..CODEC_FRAME_SIZE],
+        false,
+        false,
+    );
 
     // Pack wire frame
     let channel = guard.current_channel.load(Ordering::SeqCst);
@@ -843,7 +1170,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btEn
 /// Kotlin passes raw bytes received from RFCOMM → unpack wire frame → ADPCM decode → play.
 /// Returns true if frame was accepted, false if rejected (wrong channel, malformed, etc.)
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btDecodeFrame<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeBtDecodeFrame<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     data: jni::sys::jbyteArray,
@@ -917,11 +1244,25 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_btDe
     // Decode ADPCM
     let pcm_samples = guard.bt_decoder.decode(&compressed);
 
+    // Mirror the unified RX path's activity-log feed so BT-received audio
+    // also surfaces in the timeline.
+    let (is_favorite, is_muted) = (
+        guard.user_registry.is_favorite(&sender_id),
+        guard.user_registry.is_muted(&sender_id),
+    );
+    audio_pipeline::call_transcription_bridge_public(
+        &sender_id,
+        &device_name,
+        &pcm_samples,
+        is_favorite,
+        is_muted,
+    );
+
     // Feed into audio cache and play
     if let Some(ref sm) = guard.state_machine {
         // Feed audio cache
         let cache = sm.get_audio_cache();
-        let mut cache_lock = cache.lock().unwrap();
+        let mut cache_lock = cache.lock().unwrap_or_else(|e| e.into_inner());
         let passthrough = cache_lock.ingest_frame(&sender_id, timestamp, pcm_samples.clone());
         cache_lock.tick();
 
@@ -1086,7 +1427,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     }
 
     if let Some(ref sm) = guard.state_machine {
-        let mut tm = sm.get_transport().lock().unwrap();
+        let mut tm = sm.get_transport().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(crypto) = guard.session_manager.get_crypto_for_channel(ch) {
             tm.set_crypto(crypto);
         }
@@ -1119,14 +1460,16 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     match guard.session_manager.import_session(&json) {
         Ok((channel, crypto, cohort_id)) => {
             if let Some(ref sm) = guard.state_machine {
-                let mut tm = sm.get_transport().lock().unwrap();
+                let mut tm = sm.get_transport().lock().unwrap_or_else(|e| e.into_inner());
                 tm.set_crypto(crypto);
             }
             guard.current_channel.store(channel, std::sync::atomic::Ordering::SeqCst);
 
+            let mut imported_sid = String::new();
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json) {
                 let host_dev = parsed["device"].as_str().unwrap_or("").to_string();
                 let sid = parsed["session_id"].as_str().unwrap_or("").to_string();
+                imported_sid = sid.clone();
                 let gname = parsed["group_name"].as_str()
                     .map(|s| s.to_string())
                     .filter(|s| !s.is_empty())
@@ -1136,6 +1479,18 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
                     .map(|d| d.as_secs()).unwrap_or(0);
                 guard.cohort_history.upsert_joiner(channel, &gname, Some(&cohort_id),
                                                    &host_dev, &sid, now);
+            }
+
+            // Sync the cellular relay room to the imported session_id so the
+            // joiner targets the host's room on the next WS connect. Without
+            // this, an already-connected WS stays bound to a stale room and
+            // peers never see each other — Kotlin must still tear down and
+            // re-establish the WS for the new room to take effect.
+            if !imported_sid.is_empty() {
+                if let Some(ref sm) = guard.state_machine {
+                    sm.set_cellular_room(imported_sid.clone());
+                    info!("JNI: Cellular room synced to imported session_id {}", imported_sid);
+                }
             }
 
             info!("JNI: Session imported successfully for ch{} cohort {}", channel, cohort_id);
@@ -1292,7 +1647,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     // Read from the StateMachine's registry (where RX thread registers users),
     // NOT from JniState.user_registry which is a separate instance.
     let json = if let Some(ref sm) = guard.state_machine {
-        let reg = sm.get_user_registry().lock().unwrap();
+        let reg = sm.get_user_registry().lock().unwrap_or_else(|e| e.into_inner());
         reg.to_json()
     } else {
         guard.user_registry.to_json()
@@ -1322,7 +1677,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
     // Write to StateMachine's registry (where RX thread reads), not JniState's copy
     if let Some(ref sm) = guard.state_machine {
-        let mut reg = sm.get_user_registry().lock().unwrap();
+        let mut reg = sm.get_user_registry().lock().unwrap_or_else(|e| e.into_inner());
         reg.set_muted(&id, muted == JNI_TRUE);
     } else {
         drop(guard);
@@ -1349,7 +1704,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
     // Write to StateMachine's registry (where RX thread reads), not JniState's copy
     if let Some(ref sm) = guard.state_machine {
-        let mut reg = sm.get_user_registry().lock().unwrap();
+        let mut reg = sm.get_user_registry().lock().unwrap_or_else(|e| e.into_inner());
         reg.set_favorite(&id, favorite == JNI_TRUE);
     } else {
         drop(guard);
@@ -1959,6 +2314,43 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     if let Some(ref sm) = guard.state_machine {
         let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
         cache.clear();
+    }
+}
+
+/// JNI: Enable or disable client-side PCM mixing for 2..=6 concurrent
+/// speakers. When disabled (default) the cache flips Live→Queue on overlap;
+/// when enabled it flips Live→Mix and serializes only when the speaker count
+/// exceeds MIX_MAX_SPEAKERS (6).
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetMixModeEnabled(
+    _env: JNIEnv,
+    _class: JClass,
+    enabled: jni::sys::jboolean,
+) {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        cache.set_mix_mode_enabled(enabled != 0);
+    }
+}
+
+/// JNI: Returns true if mix mode is currently enabled. Used by the Settings
+/// screen to render the initial toggle state.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeIsMixModeEnabled(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jboolean {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        let cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if cache.is_mix_mode_enabled() { 1 } else { 0 }
+    } else {
+        0
     }
 }
 

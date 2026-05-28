@@ -20,6 +20,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.ui.theme.*
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -51,6 +54,29 @@ private fun userColor(userId: String): Color {
     return userColors[hash % userColors.size]
 }
 
+/**
+ * Snapshot of cache state for the header chip. Reflects the native
+ * `AudioCache::status_json()` shape — see audio_cache.rs::status_json.
+ */
+private data class CacheStatusSnapshot(
+    val mode: String = "Live",
+    val queuedUtterances: Int = 0,
+    val queuedDurationMs: Long = 0L,
+    val currentSpeakerName: String? = null,
+    val historyCount: Int = 0,
+)
+
+private fun pollCacheStatus(): CacheStatusSnapshot {
+    val json = SassyTalkNative.getCacheStatus() ?: return CacheStatusSnapshot()
+    return CacheStatusSnapshot(
+        mode = json.optString("mode", "Live"),
+        queuedUtterances = json.optInt("queued_utterances", 0),
+        queuedDurationMs = json.optLong("queued_duration_ms", 0L),
+        currentSpeakerName = json.optString("current_speaker_name", "").ifEmpty { null },
+        historyCount = json.optInt("history_count", 0),
+    )
+}
+
 @Composable
 fun TranscriptionFeedScreen(
     entries: List<TranscriptionEntry>,
@@ -62,9 +88,31 @@ fun TranscriptionFeedScreen(
     val others = entries.filter { !it.isFavorite && !it.isMuted }
     val timeFormatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
 
+    // ── Cache status polling ──
+    // Polled at 2 Hz while this screen is in the composition. Cheap (one JNI
+    // call → ~10 µs lock + JSON build), and the user is actively watching the
+    // timeline so anything slower than 500 ms feels laggy when a queued
+    // utterance finishes and the next one starts.
+    var cacheStatus by remember { mutableStateOf(CacheStatusSnapshot()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            cacheStatus = pollCacheStatus()
+            delay(500L)
+        }
+    }
+
+    val snackbarHost = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+
+    Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHost) },
+        containerColor = DarkBg,
+        modifier = modifier.fillMaxSize(),
+    ) { padding ->
     Column(
-        modifier = modifier
+        modifier = Modifier
             .fillMaxSize()
+            .padding(padding)
             .background(DarkBg)
             .padding(16.dp)
     ) {
@@ -87,6 +135,25 @@ fun TranscriptionFeedScreen(
 
             Spacer(modifier = Modifier.width(48.dp)) // balance the back button
         }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // Cache status chip — surfaces mode + queue depth + current speaker,
+        // plus a Skip button when something is mid-playback. Without this the
+        // user has no way to tell that "this entry is queued waiting on the
+        // current one to finish" or that the replay they just tapped is
+        // actually running.
+        CacheStatusBar(
+            status = cacheStatus,
+            onSkip = {
+                SassyTalkNative.skipCurrentUtterance()
+                scope.launch { snackbarHost.showSnackbar("Skipped") }
+            },
+            onClearCache = {
+                SassyTalkNative.clearAudioCache()
+                scope.launch { snackbarHost.showSnackbar("Cache cleared") }
+            },
+        )
 
         Spacer(modifier = Modifier.height(12.dp))
 
@@ -139,7 +206,7 @@ fun TranscriptionFeedScreen(
                     }
 
                     items(favorites) { entry ->
-                        TranscriptionBubble(entry, timeFormatter)
+                        TranscriptionBubble(entry, timeFormatter, snackbarHost, scope)
                     }
 
                     item { Spacer(modifier = Modifier.height(4.dp)) }
@@ -168,9 +235,97 @@ fun TranscriptionFeedScreen(
                     }
 
                     items(others) { entry ->
-                        TranscriptionBubble(entry, timeFormatter)
+                        TranscriptionBubble(entry, timeFormatter, snackbarHost, scope)
                     }
                 }
+            }
+        }
+    }
+    } // close Scaffold content
+}
+
+/**
+ * Cache status bar — fixed-height chip just under the screen header.
+ * Shows current speaker / queue depth / mode, with Skip and Clear actions.
+ * Hides itself entirely when the cache is idle and history is empty
+ * (avoids visual noise on first launch).
+ */
+@Composable
+private fun CacheStatusBar(
+    status: CacheStatusSnapshot,
+    onSkip: () -> Unit,
+    onClearCache: () -> Unit,
+) {
+    val isIdle = status.currentSpeakerName == null &&
+        status.queuedUtterances == 0 &&
+        status.historyCount == 0
+    if (isIdle) return
+
+    val activeColor = when (status.mode) {
+        "Queue" -> Orange
+        "Mix"   -> Cyan
+        "Replay"-> OrangeLight
+        else    -> TextMuted   // Live mode
+    }
+
+    Surface(
+        color = SurfaceBg,
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // Mode pip
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(activeColor)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+
+            // Status text — what's happening right now
+            val label = when {
+                status.currentSpeakerName != null ->
+                    "Playing ${status.currentSpeakerName}" +
+                        if (status.queuedUtterances > 0) " · ${status.queuedUtterances} queued" else ""
+                status.queuedUtterances > 0 ->
+                    "${status.queuedUtterances} queued (${status.queuedDurationMs / 1000}s)"
+                else ->
+                    "${status.mode} · ${status.historyCount} in history"
+            }
+            Text(
+                text = label,
+                fontSize = 12.sp,
+                color = TextGray,
+                modifier = Modifier.weight(1f),
+            )
+
+            // Skip — only useful when something is currently playing or
+            // queued. Tapping skips the in-flight utterance and advances
+            // to the next queued one.
+            if (status.currentSpeakerName != null || status.queuedUtterances > 0) {
+                IconButton(onClick = onSkip, modifier = Modifier.size(28.dp)) {
+                    Icon(
+                        Icons.Default.SkipNext,
+                        contentDescription = "Skip current",
+                        tint = Cyan,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+            }
+
+            // Clear — empties active buffers and queue, keeps history so
+            // replay buttons still work after a "reset playback" gesture.
+            IconButton(onClick = onClearCache, modifier = Modifier.size(28.dp)) {
+                Icon(
+                    Icons.Default.Clear,
+                    contentDescription = "Clear queue",
+                    tint = TextMuted,
+                    modifier = Modifier.size(16.dp),
+                )
             }
         }
     }
@@ -179,7 +334,9 @@ fun TranscriptionFeedScreen(
 @Composable
 private fun TranscriptionBubble(
     entry: TranscriptionEntry,
-    timeFormatter: SimpleDateFormat
+    timeFormatter: SimpleDateFormat,
+    snackbarHost: SnackbarHostState,
+    scope: kotlinx.coroutines.CoroutineScope,
 ) {
     val color = userColor(entry.senderId)
 
@@ -232,19 +389,39 @@ private fun TranscriptionBubble(
             )
         }
 
-        // Replay button — only shown if audio is still in cache
-        if (entry.utteranceId >= 0) {
-            IconButton(
-                onClick = { SassyTalkNative.replayById(entry.utteranceId) },
-                modifier = Modifier.size(32.dp)
-            ) {
-                Icon(
-                    Icons.Default.PlayArrow,
-                    contentDescription = "Replay",
-                    tint = Cyan,
-                    modifier = Modifier.size(20.dp)
-                )
-            }
+        // Replay button — always rendered so the row layout is consistent;
+        // disabled (grey) and shows an explanatory snackbar on tap when this
+        // entry's audio isn't in the cache (utteranceId < 0). Hiding the
+        // button entirely was the previous behavior, and it made the feature
+        // feel broken — users tapped where they expected a button and got
+        // nothing.
+        val cached = entry.utteranceId >= 0
+        IconButton(
+            onClick = {
+                if (cached) {
+                    val started = SassyTalkNative.replayById(entry.utteranceId)
+                    scope.launch {
+                        snackbarHost.showSnackbar(
+                            if (started) "Replaying ${entry.senderName}"
+                            else         "Audio expired from cache"
+                        )
+                    }
+                } else {
+                    scope.launch {
+                        snackbarHost.showSnackbar(
+                            "No cached audio — older entries aren't replayable"
+                        )
+                    }
+                }
+            },
+            modifier = Modifier.size(32.dp),
+        ) {
+            Icon(
+                Icons.Default.PlayArrow,
+                contentDescription = if (cached) "Replay" else "Replay unavailable",
+                tint = if (cached) Cyan else TextMuted.copy(alpha = 0.4f),
+                modifier = Modifier.size(20.dp),
+            )
         }
     }
 }

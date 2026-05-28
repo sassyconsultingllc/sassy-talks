@@ -128,6 +128,24 @@ object SassyTalkNative {
         }
     }
 
+    /**
+     * Pass an Android Context down to the native layer so audio routing
+     * (MODE_IN_COMMUNICATION + speakerphone override on Moto/Xiaomi) can
+     * obtain `AudioManager` via `getSystemService`. Idempotent — only the
+     * first non-null Context sticks. Call from `WalkieService.onCreate`
+     * once the foreground service is up.
+     */
+    fun initContext(context: android.content.Context): Boolean {
+        return try {
+            val ok = nativeInitContext(context.applicationContext)
+            Log.i(TAG, "Native initContext: $ok")
+            ok
+        } catch (e: Exception) {
+            Log.e(TAG, "initContext failed: ${e.message}")
+            false
+        }
+    }
+
     /** Set the device display name (sent with audio so peers see who's talking) */
     fun setDeviceName(name: String) {
         if (initialized && name.isNotBlank()) {
@@ -408,6 +426,13 @@ object SassyTalkNative {
     // ── Session Management ──
 
     fun clearSession() {
+        // Capture the currently-active room id BEFORE we wipe the session,
+        // so we can DELETE the /presence row that ties this install's FCM
+        // token to that room. Otherwise the relay keeps firing wake pushes
+        // to this token for the room we just left, until the FCM-side error
+        // eventually evicts the row 30 days later.
+        val activeRoom = try { getSessionId() } catch (_: Exception) { null }
+
         if (initialized) {
             try { nativeClearSession() } catch (e: Exception) {
                 Log.e(TAG, "clearSession failed: ${e.message}")
@@ -419,6 +444,19 @@ object SassyTalkNative {
         for (ch in 1..8) editor.remove("session_ch_$ch")
         editor.remove("session_json")
         editor.apply()
+
+        // Fire-and-forget presence DELETE on a worker thread — must not block
+        // the UI thread typically driving clearSession, and we don't want a
+        // network hiccup to leave the local clear half-done.
+        if (!activeRoom.isNullOrBlank()) {
+            val ctx = appContext
+            if (ctx != null) {
+                Thread {
+                    try { PresenceClient.remove(ctx, activeRoom) }
+                    catch (t: Throwable) { Log.w(TAG, "presence DELETE on clearSession: ${t.message}") }
+                }.apply { name = "presence-remove"; isDaemon = true }.start()
+            }
+        }
     }
 
     // ── User Registration ──
@@ -579,6 +617,43 @@ object SassyTalkNative {
         }
     }
 
+    // ── Mic gain & squelch ──
+    //
+    // Gain is stored on the native side as `gain × 100` (so 100 = 1.0×).
+    // Squelch is an integer dBFS threshold; 0 means disabled. Both default
+    // to a no-op (gain 1.0, squelch off) so the existing user experience is
+    // unchanged until the user opts into Settings adjustments.
+
+    /** Set mic input gain (1.0 = no change). Clamped to [0.25, 4.0]. */
+    fun setMicGain(gain: Float) {
+        if (!initialized) return
+        val x100 = (gain * 100f).toInt().coerceIn(25, 400)
+        try { nativeSetMicGainX100(x100) } catch (e: Exception) {
+            Log.e(TAG, "setMicGain failed: ${e.message}")
+        }
+    }
+
+    /** Current mic input gain (1.0 = unity). */
+    fun getMicGain(): Float {
+        if (!initialized) return 1.0f
+        return try { nativeGetMicGainX100() / 100f } catch (_: Exception) { 1.0f }
+    }
+
+    /** Set squelch threshold in dBFS. 0 disables squelch. Otherwise clamped to [-60, -10]. */
+    fun setSquelchDbfs(dbfs: Int) {
+        if (!initialized) return
+        val clamped = if (dbfs == 0) 0 else dbfs.coerceIn(-60, -10)
+        try { nativeSetSquelchDbfs(clamped) } catch (e: Exception) {
+            Log.e(TAG, "setSquelchDbfs failed: ${e.message}")
+        }
+    }
+
+    /** Current squelch threshold (0 = disabled). */
+    fun getSquelchDbfs(): Int {
+        if (!initialized) return 0
+        return try { nativeGetSquelchDbfs() } catch (_: Exception) { 0 }
+    }
+
     /** Clear all cached audio, reset to Live mode */
     fun clearAudioCache() {
         if (initialized) {
@@ -586,6 +661,26 @@ object SassyTalkNative {
                 Log.e(TAG, "clearAudioCache failed: ${e.message}")
             }
         }
+    }
+
+    /**
+     * Enable or disable client-side PCM mixing of 2..=6 concurrent speakers.
+     * Disabled by default — overlap flips the cache to Queue (sequential
+     * utterances, classic walkie-talkie). Enabled — overlap flips to Mix
+     * (real-time summed audio with AGC + soft clip). Falls back to Queue
+     * automatically above 6 simultaneous talkers.
+     */
+    fun setMixModeEnabled(enabled: Boolean) {
+        if (!initialized) return
+        try { nativeSetMixModeEnabled(enabled) } catch (e: Exception) {
+            Log.e(TAG, "setMixModeEnabled failed: ${e.message}")
+        }
+    }
+
+    /** Returns true if mix mode is currently engaged on the native side. */
+    fun isMixModeEnabled(): Boolean {
+        if (!initialized) return false
+        return try { nativeIsMixModeEnabled() } catch (_: Exception) { false }
     }
 
     /** Replay a previous utterance from history by index (legacy) */
@@ -814,6 +909,7 @@ object SassyTalkNative {
 
     // Lifecycle
     @JvmStatic private external fun nativeInit(): Boolean
+    @JvmStatic private external fun nativeInitContext(ctx: android.content.Context): Boolean
     @JvmStatic private external fun nativeShutdown()
 
     // PTT
@@ -824,6 +920,20 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeReplayById(utteranceId: Long): Boolean
     @JvmStatic private external fun nativeLastHistoryId(): Long
     @JvmStatic private external fun nativeSetChannel(channel: Byte)
+
+    /**
+     * Toggle whether the native RX thread invokes TranscriptionBridge.onAudioReceived
+     * for every audio frame. Off by default — paying ~1.9KB short[] allocation +
+     * JNI thread attach per 20ms frame is the difference between clean playback
+     * and intermittent ~50-300ms underrun glitches when transcription is off.
+     */
+    @JvmStatic external fun nativeSetTranscriptionBridgeEnabled(enabled: Boolean)
+
+    // Mic gain & squelch
+    @JvmStatic private external fun nativeSetMicGainX100(gainX100: Int)
+    @JvmStatic private external fun nativeGetMicGainX100(): Int
+    @JvmStatic private external fun nativeSetSquelchDbfs(dbfs: Int)
+    @JvmStatic private external fun nativeGetSquelchDbfs(): Int
 
     // Transport
     @JvmStatic private external fun nativeGetTransport(): Byte
@@ -873,6 +983,8 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeClearAudioCache()
     @JvmStatic private external fun nativeReplayUtterance(index: Int): Boolean
     @JvmStatic private external fun nativeSyncCacheUserInfo()
+    @JvmStatic private external fun nativeSetMixModeEnabled(enabled: Boolean)
+    @JvmStatic private external fun nativeIsMixModeEnabled(): Boolean
 
     // Cellular Transport (WebSocket relay)
     @JvmStatic private external fun nativeCellularSetRoom(roomId: String)

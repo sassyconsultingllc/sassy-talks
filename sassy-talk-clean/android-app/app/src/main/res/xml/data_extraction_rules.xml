@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Backup / cloud-extraction policy for SassyTalkie.
+
+    Excludes EVERYTHING under SharedPreferences, files/, databases/, and
+    cache/ so session keys (held in EncryptedSharedPreferences) never reach
+    Google's Auto Backup or device-transfer destinations. We already set
+    android:allowBackup="false" on the application; on API 31+ the system
+    needs an explicit `dataExtractionRules` reference too, otherwise the
+    default policy permits cloud-backup extraction of app-private data
+    despite the legacy flag.
+
+    Cloud-backup (Auto Backup to Google Drive) AND device-to-device
+    transfer (Quick Setup) are both covered.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root"        />
+        <exclude domain="file"        />
+        <exclude domain="database"    />
+        <exclude domain="sharedpref"  />
+        <exclude domain="external"    />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root"        />
+        <exclude domain="file"        />
+        <exclude domain="database"    />
+        <exclude domain="sharedpref"  />
+        <exclude domain="external"    />
+    </device-transfer>
+</data-extraction-rules>

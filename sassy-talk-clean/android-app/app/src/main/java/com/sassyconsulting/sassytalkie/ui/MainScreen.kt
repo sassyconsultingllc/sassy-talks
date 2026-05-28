@@ -70,25 +70,31 @@ fun MainScreen(
     // Relay readiness
     val relayReady by autoConnect.relayReady.collectAsState()
 
+    // Per-screen fallback flows. `remember`d once so the same Flow instance
+    // is reused across recompositions — otherwise every recompose builds a
+    // brand-new MutableStateFlow and triggers a re-subscribe + coroutine
+    // churn on collectAsState. (Previously: when pttCoordinator was null,
+    // each recompose allocated a new flow → new subscription → cancel old →
+    // launch new → repeat at every state change. Wasteful.)
+    val falseFallback = remember { kotlinx.coroutines.flow.MutableStateFlow(false) }
+    val idleDeliveryFallback = remember {
+        kotlinx.coroutines.flow.MutableStateFlow(com.sassyconsulting.sassytalkie.DeliveryState.Idle)
+    }
+
     // Reaching-peer indicator (Task 4.2)
-    val reachingPeer by (walkieService?.pttCoordinator?.reachingPeer
-        ?: kotlinx.coroutines.flow.MutableStateFlow(false)).collectAsState()
+    val reachingPeer by (walkieService?.pttCoordinator?.reachingPeer ?: falseFallback).collectAsState()
 
     // Delivery state indicator (Task 4.3)
-    val deliveryState by (walkieService?.pttCoordinator?.deliveredState
-        ?: kotlinx.coroutines.flow.MutableStateFlow(com.sassyconsulting.sassytalkie.DeliveryState.Idle)).collectAsState()
+    val deliveryState by (walkieService?.pttCoordinator?.deliveredState ?: idleDeliveryFallback).collectAsState()
 
     // Audio path degraded indicator (Task 7.1)
-    val audioPathDegraded by (walkieService?.pttCoordinator?.audioPathDegraded
-        ?: kotlinx.coroutines.flow.MutableStateFlow(false)).collectAsState()
+    val audioPathDegraded by (walkieService?.pttCoordinator?.audioPathDegraded ?: falseFallback).collectAsState()
 
     // Stale-peer banner (Task 6.2)
-    val anyPeerStale by (walkieService?.pttCoordinator?.anyPeerStale
-        ?: kotlinx.coroutines.flow.MutableStateFlow(false)).collectAsState()
+    val anyPeerStale by (walkieService?.pttCoordinator?.anyPeerStale ?: falseFallback).collectAsState()
 
     // Talk-over indicator (Task 6.2)
-    val peerSpeaking by (walkieService?.pttCoordinator?.peerSpeaking
-        ?: kotlinx.coroutines.flow.MutableStateFlow(false)).collectAsState()
+    val peerSpeaking by (walkieService?.pttCoordinator?.peerSpeaking ?: falseFallback).collectAsState()
 
     // Auto-connect and set cache to queue mode (cache-first)
     LaunchedEffect(Unit) {

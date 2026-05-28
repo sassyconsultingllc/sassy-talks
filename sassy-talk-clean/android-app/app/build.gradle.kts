@@ -1,6 +1,15 @@
-﻿plugins {
+﻿import java.util.Properties
+import java.io.FileInputStream
+
+plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+}
+
+// Apply Google Services plugin only when google-services.json is checked in,
+// so devs without Firebase access can still build. Activates FCM glue.
+if (file("google-services.json").exists()) {
+    apply(plugin = "com.google.gms.google-services")
 }
 
 android {
@@ -11,11 +20,15 @@ android {
         applicationId = "com.sassyconsulting.sassytalkie"
         minSdk = 24
         targetSdk = 35
-        versionCode = 15
-        versionName = "2.3.9"
+        versionCode = 34
+        versionName = "2.6.7"
         
         // Feature flag: enable or disable cellular (relay) transport at build time
         buildConfigField("boolean", "ENABLE_CELLULAR_RELAY", "true")
+        // Debug builds allow screen capture so we can show off the UI / take
+        // screenshots; release overrides this to true (FLAG_SECURE engaged)
+        // so production builds can't be screen-recorded or screenshotted.
+        // Override per-buildType is in the buildTypes blocks below.
         buildConfigField("boolean", "NO_SCREENSHOTS", "false")
 
         ndk {
@@ -23,25 +36,43 @@ android {
         }
     }
 
+    // CMake builds libsassytalkie_opus.so for the new audio.OpusEncoder.
+    // Falls back to a stub library when libopus prebuilts aren't vendored —
+    // see src/main/cpp/CMakeLists.txt for details.
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
     signingConfigs {
         create("release") {
-            // Signing credentials come exclusively from the environment so no
-            // default password is ever baked into the build output. If the env
-            // vars are unset, this signingConfig is simply not wired up for the
-            // release buildType (we fall back to the debug keystore below).
+            // Credentials come from one of two places. CI uses env vars (which
+            // the GitHub Actions runner injects from secrets); local devs use
+            // app/keystore.properties (gitignored). Either path keeps the
+            // password out of the committed source tree.
             val ksFile = file("keystore/release.keystore")
-            val envStorePw = System.getenv("RELEASE_STORE_PASSWORD")
-            val envAlias = System.getenv("RELEASE_KEY_ALIAS")
-            val envKeyPw = System.getenv("RELEASE_KEY_PASSWORD")
-            if (ksFile.exists() &&
-                !envStorePw.isNullOrBlank() &&
-                !envAlias.isNullOrBlank() &&
-                !envKeyPw.isNullOrBlank()
-            ) {
+            val ksPropsFile = file("keystore.properties")
+            val ksProps = Properties()
+            if (ksPropsFile.exists()) {
+                FileInputStream(ksPropsFile).use { input -> ksProps.load(input) }
+            }
+            fun cred(envKey: String, propKey: String): String? {
+                val fromEnv = System.getenv(envKey)
+                if (!fromEnv.isNullOrBlank()) return fromEnv
+                val fromFile = ksProps.getProperty(propKey)
+                return if (!fromFile.isNullOrBlank()) fromFile else null
+            }
+
+            val storePw = cred("RELEASE_STORE_PASSWORD", "storePassword")
+            val alias   = cred("RELEASE_KEY_ALIAS",      "keyAlias")
+            val keyPw   = cred("RELEASE_KEY_PASSWORD",   "keyPassword")
+            if (ksFile.exists() && storePw != null && alias != null && keyPw != null) {
                 storeFile = ksFile
-                storePassword = envStorePw
-                keyAlias = envAlias
-                keyPassword = envKeyPw
+                storePassword = storePw
+                keyAlias = alias
+                keyPassword = keyPw
             }
         }
     }
@@ -50,35 +81,54 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            // Production builds enforce FLAG_SECURE → screenshots and screen
+            // recording are blocked. The default in defaultConfig is false so
+            // debug builds can be captured for marketing / bug reports.
+            buildConfigField("boolean", "NO_SCREENSHOTS", "true")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Mirror the same env-OR-keystore.properties logic the signingConfig uses.
+            val ksPropsForCheck = Properties()
+            val ksPropsForCheckFile = file("keystore.properties")
+            if (ksPropsForCheckFile.exists()) {
+                FileInputStream(ksPropsForCheckFile).use { input -> ksPropsForCheck.load(input) }
+            }
+            fun hasCred(envKey: String, propKey: String): Boolean =
+                !System.getenv(envKey).isNullOrBlank() ||
+                !ksPropsForCheck.getProperty(propKey).isNullOrBlank()
             val hasReleaseCreds = file("keystore/release.keystore").exists() &&
-                !System.getenv("RELEASE_STORE_PASSWORD").isNullOrBlank() &&
-                !System.getenv("RELEASE_KEY_ALIAS").isNullOrBlank() &&
-                !System.getenv("RELEASE_KEY_PASSWORD").isNullOrBlank()
+                hasCred("RELEASE_STORE_PASSWORD", "storePassword") &&
+                hasCred("RELEASE_KEY_ALIAS",      "keyAlias") &&
+                hasCred("RELEASE_KEY_PASSWORD",   "keyPassword")
             // Allow local devs to opt into a debug-signed release build with
             // ALLOW_DEBUG_SIGNED_RELEASE=1, but never silently — and never on CI.
             val allowDebugSigned = System.getenv("ALLOW_DEBUG_SIGNED_RELEASE") == "1"
             val onCi = System.getenv("CI") == "true" || !System.getenv("GITHUB_ACTIONS").isNullOrBlank()
+            // Only enforce credential checks if a release-producing task was actually requested.
+            // Otherwise `clean`, `assembleDebug`, IDE syncs, etc. would fail configuration.
+            val requestedTasks = gradle.startParameter.taskNames.joinToString(" ").lowercase()
+            val isReleaseRequested = listOf("assemblerelease", "bundlerelease", "installrelease", "packagerelease")
+                .any { requestedTasks.contains(it) }
             signingConfig = when {
                 hasReleaseCreds -> signingConfigs.getByName("release")
-                onCi -> error(
-                    "Release build on CI without release signing credentials. " +
-                    "Set RELEASE_KEYSTORE_BASE64 / RELEASE_STORE_PASSWORD / " +
-                    "RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD secrets and re-run."
-                )
                 allowDebugSigned -> {
                     logger.warn("ALLOW_DEBUG_SIGNED_RELEASE=1 — signing release with the DEBUG keystore. NEVER upload this AAB.")
                     signingConfigs.getByName("debug")
                 }
-                else -> error(
+                isReleaseRequested && onCi -> error(
+                    "Release build on CI without release signing credentials. " +
+                    "Set RELEASE_KEYSTORE_BASE64 / RELEASE_STORE_PASSWORD / " +
+                    "RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD secrets and re-run."
+                )
+                isReleaseRequested -> error(
                     "Release build without signing credentials. Set RELEASE_STORE_PASSWORD / " +
                     "RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD env vars (and ensure " +
                     "app/keystore/release.keystore exists), or set ALLOW_DEBUG_SIGNED_RELEASE=1 " +
                     "for a throwaway debug-signed local build."
                 )
+                else -> signingConfigs.getByName("debug")  // safe default for non-release tasks
             }
         }
     }
@@ -135,6 +185,12 @@ dependencies {
 
     // OkHttp for WebSocket (cellular relay transport)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Firebase Cloud Messaging — wake-push fallback when the relay sees a
+    // session-room peer with no active WS at PTT-start. Pinned to a BoM so
+    // all firebase-* libs share a tested version set.
+    implementation(platform("com.google.firebase:firebase-bom:33.5.1"))
+    implementation("com.google.firebase:firebase-messaging-ktx")
 
     // Android Keystore-backed EncryptedSharedPreferences for session/key storage.
     // Plain SharedPreferences is sandboxed to our UID but is cleartext on disk —

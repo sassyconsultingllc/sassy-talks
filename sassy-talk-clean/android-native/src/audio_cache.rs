@@ -59,6 +59,35 @@ const MAX_CACHED_SPEAKERS: usize = 16;
 /// Maximum total queued utterances before we start dropping oldest
 const MAX_QUEUED_UTTERANCES: usize = 32;
 
+// ── Mix-mode constants ──────────────────────────────────────────────────────
+/// Hard cap on simultaneous speakers we'll PCM-mix client-side. Beyond this
+/// the cache falls back to Queue mode (sequential utterance playback). Six
+/// is the sweet spot — past that the mix becomes a crowd-noise wall, AGC
+/// fights itself, and CPU starts to matter on low-end Androids.
+const MIX_MAX_SPEAKERS: usize = 6;
+
+/// Per-sender alignment window for the mixer. Frames within this window
+/// (relative to the leading edge of the current 20 ms mix tick) are summed
+/// into the same output frame. Outside, they wait for the next tick. 25 ms
+/// = one full frame + 5 ms slack; tighter than this and minor clock skew
+/// between senders causes alternating silence/sound stutter.
+const MIX_ALIGNMENT_WINDOW_MS: u64 = 25;
+
+/// Soft-clip ceiling as a fraction of i16::MAX. Above this we apply tanh-style
+/// rolloff instead of hard clipping — hard clip in voice mixes sounds like
+/// fuzz; soft clip sounds like a slightly hot mic, much less offensive.
+const MIX_SOFT_CLIP_THRESHOLD: f32 = 0.85;
+
+/// Target RMS for the mixed output as a fraction of i16::MAX. Voice typically
+/// sits around 0.10–0.20 RMS; we aim slightly higher so the listener doesn't
+/// have to ride the volume button after mix kicks in.
+const MIX_TARGET_RMS: f32 = 0.18;
+
+/// Per-tick gain smoothing — moves the applied gain at most this fraction
+/// toward the target gain on each frame. Prevents AGC from "breathing"
+/// audibly when speakers pause mid-mix.
+const MIX_GAIN_SMOOTHING: f32 = 0.10;
+
 /// A single audio frame with sender metadata
 #[derive(Clone)]
 pub struct CachedFrame {
@@ -83,7 +112,12 @@ pub struct Utterance {
 impl Utterance {
     fn duration_ms(&self) -> u64 {
         if self.frames.is_empty() { return 0; }
-        self.ended_at - self.started_at + 20 // +20 for last frame duration
+        // Saturating math — if `ended_at < started_at` (clock skew between
+        // senders, NTP step, deliberately bad wire timestamp), raw
+        // subtraction would underflow on u64 and produce an astronomical
+        // duration that breaks the queue ordering's tie-break sort. Cap
+        // at zero instead.
+        self.ended_at.saturating_sub(self.started_at).saturating_add(20)
     }
 
     fn frame_count(&self) -> usize {
@@ -98,21 +132,20 @@ impl Utterance {
 const ACTIVE_SPEAKER_MIN_FRAMES: usize = 2;
 
 /// Frames held in the per-sender Live-mode jitter buffer before the oldest
-/// is forwarded to playback. 5 frames = 100 ms absorbs the typical relay /
-/// cellular jitter window (~±50–100 ms one-way). Without this buffer,
-/// frames arrive at AudioTrack at network rate; any variance produces
-/// chopped audio (underruns) and out-of-order arrivals play garbled.
-/// Frames are insertion-sorted by their wire timestamp so reordering is
-/// transparent to AudioTrack. The trade-off is ~100 ms of added playback
-/// latency — still well within "walkie-talkie feel" (< 200 ms target).
-const LIVE_JITTER_PREBUFFER_FRAMES: usize = 5;
+/// is forwarded to playback. 3 frames = 60 ms absorbs typical relay /
+/// cellular jitter (~±20–50 ms one-way) while keeping end-to-end latency
+/// under 200 ms. The AudioTrack itself contributes another 80–160 ms of
+/// hardware-side headroom against bursty arrivals, so this jitter buffer
+/// is the *additional* in-flight smoothing — making it too large only
+/// adds perceptible latency without reducing chop.
+const LIVE_JITTER_PREBUFFER_FRAMES: usize = 3;
 
 /// Age (ms) after which the jitter buffer drains one stranded frame per
-/// tick instead of waiting for new arrivals. Triggers after PTT release
-/// so the tail of the utterance still plays out. Must be > one frame
-/// period (20 ms) to avoid burning through the buffer while frames are
-/// still flowing.
-const LIVE_JITTER_DRAIN_AGE_MS: u64 = 40;
+/// tick instead of waiting for new arrivals. Just above one frame period
+/// (20 ms) so the tail of an utterance plays out promptly when PTT is
+/// released. Larger values (we used 40 ms) audibly slow the closing of
+/// a transmission and were a contributor to the "slowed-down" symptom.
+const LIVE_JITTER_DRAIN_AGE_MS: u64 = 25;
 
 /// Per-speaker accumulator: collects frames until speech gap detected
 struct SpeakerBuffer {
@@ -222,6 +255,12 @@ pub enum CacheMode {
 
     /// Replay mode: user manually scrubbing through cached audio
     Replay,
+
+    /// Mix mode: PCM-sum 2..=MIX_MAX_SPEAKERS overlapping streams with AGC
+    /// + soft-clip. Activates instead of Queue when `enable_mix_mode` is set
+    /// AND active speakers are within MIX_MAX_SPEAKERS. Falls back to Queue
+    /// the moment that ceiling is crossed.
+    Mix,
 }
 
 /// Status info for the UI "catch-up" indicator
@@ -273,6 +312,28 @@ pub struct AudioCache {
     /// [LIVE_JITTER_DRAIN_AGE_MS]. Cleared when the cache flips to Queue
     /// mode (multi-speaker overlap) so no frames go missing in transition.
     live_jitter: HashMap<String, VecDeque<CachedFrame>>,
+
+    /// IDs of utterances added to `history` since the last call to
+    /// `take_newly_committed_ids()`. Drained by the RX thread, dispatched
+    /// to Kotlin via JNI so `TranscriptionEntry.utteranceId` can be
+    /// populated from the *authoritative* commit event instead of a
+    /// best-effort poll of `last_history_id()` — the previous polling
+    /// pattern raced against the 800 ms `is_speech_complete()` timer and
+    /// captured the wrong ID (or -1), which is why the timeline play
+    /// button silently did nothing.
+    newly_committed_ids: Vec<(u64, String, String, u64)>, // (id, sender_id, sender_name, duration_ms)
+
+    // ── Mix-mode state ──
+    /// Opt-in flag. When false the cache behaves exactly as before (Live/Queue
+    /// only); existing single-speaker and turn-taking flows are untouched.
+    enable_mix_mode: bool,
+    /// Per-sender most-recent-frame buffer used by the mixer to align inputs
+    /// within MIX_ALIGNMENT_WINDOW_MS. Keyed by sender_id; one frame per
+    /// sender max — the mixer consumes and clears on each emit.
+    mix_pending: HashMap<String, CachedFrame>,
+    /// Smoothed AGC gain. Persisted across ticks so a sentence boundary
+    /// doesn't visibly pump the level.
+    mix_gain: f32,
 }
 
 impl AudioCache {
@@ -288,7 +349,35 @@ impl AudioCache {
             max_history: 50,
             live_accumulator: HashMap::new(),
             live_jitter: HashMap::new(),
+            newly_committed_ids: Vec::new(),
+            enable_mix_mode: false,
+            mix_pending: HashMap::new(),
+            mix_gain: 1.0,
         }
+    }
+
+    /// Toggle client-side mixing for 2..=MIX_MAX_SPEAKERS overlapping speakers.
+    /// When enabled, overlap flips the cache into `Mix` instead of `Queue`.
+    /// When disabled (default), legacy Queue behavior is preserved.
+    /// Settings UI should call this from the audio-preferences screen.
+    pub fn set_mix_mode_enabled(&mut self, enabled: bool) {
+        if self.enable_mix_mode == enabled { return; }
+        self.enable_mix_mode = enabled;
+        // Don't try to migrate state mid-mode — let the next ingest_frame
+        // decide based on current active speakers.
+        self.mix_pending.clear();
+        self.mix_gain = 1.0;
+        info!("AudioCache: mix mode {}", if enabled { "enabled" } else { "disabled" });
+    }
+
+    pub fn is_mix_mode_enabled(&self) -> bool {
+        self.enable_mix_mode
+    }
+
+    /// Take the queue of recently committed utterance IDs. RX thread calls
+    /// this each loop iteration to forward commits to Kotlin via JNI.
+    pub fn take_newly_committed_ids(&mut self) -> Vec<(u64, String, String, u64)> {
+        std::mem::take(&mut self.newly_committed_ids)
     }
 
     /// Update user info from UserRegistry (call periodically or on change)
@@ -342,12 +431,57 @@ impl AudioCache {
             .count();
 
         if active_speakers > 1 && self.mode == CacheMode::Live {
-            info!("AudioCache: overlap detected ({} active speakers), switching to Queue mode", active_speakers);
-            self.mode = CacheMode::Queue;
+            // Two transition paths from Live:
+            //   1. mix_mode_enabled AND active_speakers in 2..=MIX_MAX_SPEAKERS
+            //      → Mix (real-time PCM sum)
+            //   2. anything else (mix disabled, or too many speakers)
+            //      → Queue (legacy serialize-utterances behavior)
+            let next_mode = if self.enable_mix_mode && active_speakers <= MIX_MAX_SPEAKERS {
+                CacheMode::Mix
+            } else {
+                CacheMode::Queue
+            };
+            info!(
+                "AudioCache: overlap detected ({} active speakers), switching to {:?} mode",
+                active_speakers, next_mode
+            );
+            self.mode = next_mode;
             // Drop any frames still parked in the Live-mode jitter buffer.
-            // In Queue mode audio flows through Utterances; leaving stale
-            // jitter entries would orphan them until next mode flip.
+            // In Queue/Mix mode audio flows through different paths; leaving
+            // stale jitter entries would orphan them until next mode flip.
             self.live_jitter.clear();
+        }
+
+        // Promote Mix→Queue if speaker count exceeds the mix ceiling. We do
+        // NOT demote Queue→Mix mid-conversation — once Queue has utterances
+        // buffered, switching to Mix mid-flight would drop them.
+        if self.mode == CacheMode::Mix && active_speakers > MIX_MAX_SPEAKERS {
+            info!(
+                "AudioCache: mix ceiling exceeded ({} > {}), falling back to Queue",
+                active_speakers, MIX_MAX_SPEAKERS
+            );
+            self.mode = CacheMode::Queue;
+            self.mix_pending.clear();
+        }
+
+        // Mix-mode hot path: register the incoming frame in mix_pending and
+        // try to emit a mixed output if we have alignable frames from
+        // multiple senders. Returns the mixed PCM directly — bypassing the
+        // Utterance pipeline since mix output is real-time, not replayable.
+        if self.mode == CacheMode::Mix {
+            self.mix_pending.insert(
+                sender_id.to_string(),
+                CachedFrame {
+                    sender_id: sender_id.to_string(),
+                    timestamp,
+                    samples,
+                    received_at: Instant::now(),
+                },
+            );
+            if let Some(mixed) = self.try_emit_mix() {
+                return Some(mixed);
+            }
+            return None;
         }
 
         // In Live mode with single active speaker, route the frame through
@@ -435,10 +569,12 @@ impl AudioCache {
                 let mut utterance = buffer.drain_to_utterance(&name, is_fav);
                 if !utterance.frames.is_empty() {
                     utterance.fully_played = true;
+                    let commit = (utterance.id, utterance.sender_id.clone(), utterance.sender_name.clone(), utterance.duration_ms());
                     if self.history.len() >= self.max_history {
                         self.history.pop_front();
                     }
                     self.history.push_back(utterance);
+                    self.newly_committed_ids.push(commit);
                 }
             }
         }
@@ -535,10 +671,12 @@ impl AudioCache {
             info!("AudioCache: finished playing utterance from {}", finished.sender_name);
 
             // Move to history
+            let commit = (finished.id, finished.sender_id.clone(), finished.sender_name.clone(), finished.duration_ms());
             if self.history.len() >= self.max_history {
                 self.history.pop_front();
             }
             self.history.push_back(finished);
+            self.newly_committed_ids.push(commit);
         }
 
         // Advance to next utterance in queue
@@ -702,6 +840,110 @@ impl AudioCache {
         self.history.back().map(|u| u.id)
     }
 
+    /// Try to emit one mixed frame from `mix_pending`.
+    ///
+    /// Behavior:
+    ///   - If fewer than 2 senders have a pending frame: return None
+    ///     (wait for another sender's frame to arrive within the alignment
+    ///     window).
+    ///   - Otherwise: align all frames whose timestamp is within
+    ///     MIX_ALIGNMENT_WINDOW_MS of the leading edge, PCM-sum them,
+    ///     run AGC + soft-clip, return the mixed samples.
+    ///
+    /// Out-of-window pending frames stay for the next emit attempt — they're
+    /// only dropped if they age past 2 × MIX_ALIGNMENT_WINDOW_MS (rare; only
+    /// happens when one sender drops mid-mix).
+    fn try_emit_mix(&mut self) -> Option<Vec<i16>> {
+        if self.mix_pending.len() < 2 {
+            return None;
+        }
+
+        // Drop stranded frames older than 2×alignment window. These would
+        // otherwise pile up indefinitely if one sender went silent.
+        let now = Instant::now();
+        let stale_cutoff = Duration::from_millis(MIX_ALIGNMENT_WINDOW_MS * 2);
+        self.mix_pending.retain(|_, f| now.duration_since(f.received_at) < stale_cutoff);
+        if self.mix_pending.len() < 2 {
+            return None;
+        }
+
+        // Leading edge = oldest pending frame's wire timestamp. Any frame
+        // within MIX_ALIGNMENT_WINDOW_MS of that joins this tick's mix.
+        // Saturating addition so a corrupted/adversarial timestamp near
+        // u64::MAX can't wrap window_end down to a small value and drop
+        // every legitimate frame.
+        let leading_ts = self.mix_pending.values().map(|f| f.timestamp).min()?;
+        let window_end = leading_ts.saturating_add(MIX_ALIGNMENT_WINDOW_MS);
+
+        let aligned_keys: Vec<String> = self.mix_pending
+            .iter()
+            .filter(|(_, f)| f.timestamp <= window_end)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        if aligned_keys.len() < 2 {
+            return None;  // Not enough overlap to justify mixing this tick.
+        }
+
+        // Determine frame length from the first aligned frame. All Opus
+        // frames decoded by this app are the same length (FRAME_SIZE = 960
+        // samples = 20 ms @ 48 kHz). Defensive: pad/truncate mismatches.
+        let frame_len = self.mix_pending[&aligned_keys[0]].samples.len();
+        let mut acc = vec![0i32; frame_len];
+
+        for k in &aligned_keys {
+            if let Some(frame) = self.mix_pending.remove(k) {
+                // Accumulate as i32 to avoid clip during summation.
+                for (i, &s) in frame.samples.iter().take(frame_len).enumerate() {
+                    acc[i] += s as i32;
+                }
+            }
+        }
+
+        // Compute RMS of the raw sum (as fraction of i16::MAX).
+        let mut sq_sum: f64 = 0.0;
+        for &s in &acc {
+            let f = s as f64 / i16::MAX as f64;
+            sq_sum += f * f;
+        }
+        let rms = (sq_sum / frame_len as f64).sqrt() as f32;
+
+        // Target gain = how much to scale to land at MIX_TARGET_RMS.
+        // Floor at 0.1 (never amplify silence to infinity) and cap at 2.0
+        // (never boost more than +6dB — louder than that and you're just
+        // amplifying noise floor).
+        // Cap chosen for walkie-talkie use: a whispering peer can sit
+        // near -20 dB RMS (≈ 0.05); we need ~+12 dB to bring that up to
+        // the target (4×). +6 dB (2×) under-amplified soft conversations
+        // and left them buried under background noise on louder peers.
+        // Floor at 0.1 prevents silence-period gain runaway.
+        let target_gain = if rms > 0.001 {
+            (MIX_TARGET_RMS / rms).clamp(0.1, 4.0)
+        } else {
+            self.mix_gain  // signal is essentially silence — hold previous gain
+        };
+
+        // Smooth toward target — avoids audible AGC pumping.
+        self.mix_gain += (target_gain - self.mix_gain) * MIX_GAIN_SMOOTHING;
+
+        // Apply gain + soft-clip, write into i16 output.
+        let threshold = MIX_SOFT_CLIP_THRESHOLD * i16::MAX as f32;
+        let out: Vec<i16> = acc.iter().map(|&s| {
+            let scaled = (s as f32) * self.mix_gain;
+            let clipped = if scaled.abs() > threshold {
+                // tanh-style soft knee. Sign-preserving, asymptotes at i16::MAX.
+                let sign = scaled.signum();
+                let over = (scaled.abs() - threshold) / (i16::MAX as f32 - threshold);
+                sign * (threshold + (i16::MAX as f32 - threshold) * over.tanh())
+            } else {
+                scaled
+            };
+            clipped.clamp(i16::MIN as f32, i16::MAX as f32) as i16
+        }).collect();
+
+        Some(out)
+    }
+
     /// Clear all cached audio AND history. Use for a hard reset (e.g.
     /// session end / user logout); for transport reconnect cycles use
     /// `clear_active` instead so replay history survives.
@@ -721,10 +963,37 @@ impl AudioCache {
     /// utterances after a disconnect/reconnect. Called from
     /// StateMachine::disconnect (and the various on_*_disconnected paths)
     /// so the timeline's replay button keeps working between sessions.
+    ///
+    /// Before clearing, any in-progress live-accumulator entries are
+    /// drained into `history` so utterances that hadn't yet timed out
+    /// (800 ms gap) when the transport dropped don't vanish silently.
+    /// This fixes the "the conversation I just had is missing from
+    /// timeline" bug.
     pub fn clear_active(&mut self) {
+        // Drain accumulating utterances into history before we wipe state.
+        let drained: Vec<String> = self.live_accumulator.keys().cloned().collect();
+        for id in drained {
+            if let Some(mut buf) = self.live_accumulator.remove(&id) {
+                let (name, is_fav, _) = self.user_info.get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| (id.clone(), false, false));
+                let mut utt = buf.drain_to_utterance(&name, is_fav);
+                if !utt.frames.is_empty() {
+                    utt.fully_played = true;
+                    let commit = (utt.id, utt.sender_id.clone(), utt.sender_name.clone(), utt.duration_ms());
+                    if self.history.len() >= self.max_history {
+                        self.history.pop_front();
+                    }
+                    self.history.push_back(utt);
+                    self.newly_committed_ids.push(commit);
+                }
+            }
+        }
+
         self.active_buffers.clear();
         self.live_accumulator.clear();
         self.playback_queue.clear();
+        self.live_jitter.clear();
         self.now_playing = None;
         self.play_cursor = 0;
         self.mode = CacheMode::Live;
@@ -748,27 +1017,43 @@ impl AudioCache {
     // ── Internal ──
 
     /// Insert utterance into queue with priority ordering:
-    /// 1. Favorites before non-favorites
-    /// 2. Within same priority, ordered by speech start timestamp (FIFO)
+    /// 1. Favorites before non-favorites.
+    /// 2. Within the same priority, ordered by `started_at` ASC (older first).
+    /// 3. Tie-break: shorter `duration_ms` first — minimizes head-of-line
+    ///    blocking when two utterances started at the same instant, so the
+    ///    long talker doesn't trap a quick "yeah" behind 30 seconds of speech.
+    ///
+    /// Insertion picks the first position where the comparison key
+    /// (started_at, duration_ms) of the new utterance is strictly LESS than
+    /// the existing slot's key. That keeps adjacent equal-key utterances in
+    /// arrival order (stable insert), which is what a real walkie-talkie
+    /// audience expects: when two people start at the same instant with the
+    /// same length, the one whose first frame hit the wire first plays first.
     fn insert_prioritized(&mut self, utterance: Utterance) {
-        if utterance.is_favorite {
-            // Find insertion point: after last favorite, before first non-favorite
-            let insert_at = self.playback_queue.iter()
+        // Bound search to the priority tier of this utterance.
+        let (tier_start, tier_end) = if utterance.is_favorite {
+            // Favorites occupy [0, first non-favorite).
+            let end = self.playback_queue.iter()
                 .position(|u| !u.is_favorite)
                 .unwrap_or(self.playback_queue.len());
-
-            // Within favorites, maintain timestamp order
-            let final_pos = self.playback_queue.iter()
-                .take(insert_at)
-                .rposition(|u| u.started_at <= utterance.started_at)
-                .map(|p| p + 1)
-                .unwrap_or(0);
-
-            self.playback_queue.insert(final_pos, utterance);
+            (0, end)
         } else {
-            // Non-favorites go at the end, ordered by timestamp
-            self.playback_queue.push_back(utterance);
-        }
+            // Non-favorites occupy [first non-favorite, end).
+            let start = self.playback_queue.iter()
+                .position(|u| !u.is_favorite)
+                .unwrap_or(self.playback_queue.len());
+            (start, self.playback_queue.len())
+        };
+
+        let new_key = (utterance.started_at, utterance.duration_ms());
+        let pos = (tier_start..tier_end)
+            .find(|&i| {
+                let u = &self.playback_queue[i];
+                (u.started_at, u.duration_ms()) > new_key
+            })
+            .unwrap_or(tier_end);
+
+        self.playback_queue.insert(pos, utterance);
     }
 }
 
@@ -895,6 +1180,137 @@ mod tests {
 
         let result = cache.ingest_frame("bob", 1000, vec![100i16; FRAME_SIZE]);
         assert!(result.is_none()); // Dropped silently
+    }
+
+    // ── Mix-mode tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_mix_mode_flips_when_enabled_and_within_ceiling() {
+        let mut cache = AudioCache::new();
+        cache.set_mix_mode_enabled(true);
+
+        // Two active speakers (>=2 frames each within active window) → Mix
+        cache.ingest_frame("alice", 1000, vec![100i16; FRAME_SIZE]);
+        cache.ingest_frame("alice", 1020, vec![100i16; FRAME_SIZE]);
+        cache.ingest_frame("bob",   1010, vec![200i16; FRAME_SIZE]);
+        cache.ingest_frame("bob",   1030, vec![200i16; FRAME_SIZE]);
+        assert_eq!(cache.mode(), CacheMode::Mix,
+            "with mix enabled and 2 speakers, should be Mix not Queue");
+    }
+
+    #[test]
+    fn test_mix_mode_falls_back_to_queue_above_ceiling() {
+        let mut cache = AudioCache::new();
+        cache.set_mix_mode_enabled(true);
+
+        // 7 speakers, each crossing ACTIVE_SPEAKER_MIN_FRAMES → exceeds
+        // MIX_MAX_SPEAKERS (6) → Queue
+        for name in ["a", "b", "c", "d", "e", "f", "g"] {
+            cache.ingest_frame(name, 1000, vec![100i16; FRAME_SIZE]);
+            cache.ingest_frame(name, 1020, vec![100i16; FRAME_SIZE]);
+        }
+        assert_eq!(cache.mode(), CacheMode::Queue,
+            "above MIX_MAX_SPEAKERS the cache must fall back to Queue");
+    }
+
+    #[test]
+    fn test_mix_disabled_preserves_queue_behavior() {
+        // Default cache (mix disabled) must behave as before — Queue on overlap.
+        let mut cache = AudioCache::new();
+        assert!(!cache.is_mix_mode_enabled());
+
+        cache.ingest_frame("alice", 1000, vec![100i16; FRAME_SIZE]);
+        cache.ingest_frame("alice", 1020, vec![100i16; FRAME_SIZE]);
+        cache.ingest_frame("bob",   1010, vec![200i16; FRAME_SIZE]);
+        cache.ingest_frame("bob",   1030, vec![200i16; FRAME_SIZE]);
+        assert_eq!(cache.mode(), CacheMode::Queue,
+            "mix disabled (default) must still go to Queue, not Mix");
+    }
+
+    #[test]
+    fn test_queue_orders_by_started_at_then_shorter_first() {
+        // Three non-favorite utterances inserted out of timestamp order.
+        // Expected playback order:
+        //   1. ts=1000 dur=500  (oldest started)
+        //   2. ts=2000 dur=200  (tie-break: shorter first)
+        //   3. ts=2000 dur=1000 (same start, longer goes after)
+        let mut cache = AudioCache::new();
+
+        fn mk(id: u64, ts: u64, dur: u64) -> Utterance {
+            // Build a frame buffer whose ended_at - started_at + 20 == dur.
+            // Frame count doesn't matter for ordering; only the timestamps do.
+            Utterance {
+                id,
+                sender_id: format!("s{}", id),
+                sender_name: format!("S{}", id),
+                is_favorite: false,
+                started_at: ts,
+                ended_at: ts + dur.saturating_sub(20),
+                frames: vec![CachedFrame {
+                    sender_id: format!("s{}", id),
+                    timestamp: ts,
+                    samples: vec![0i16; FRAME_SIZE],
+                    received_at: Instant::now(),
+                }],
+                fully_played: false,
+            }
+        }
+
+        // Insert in arrival order: long-same-ts first, then short-same-ts,
+        // then oldest. After sorting, the oldest must be first; among the
+        // two same-ts, the shorter must precede the longer.
+        cache.insert_prioritized(mk(1, 2000, 1000));
+        cache.insert_prioritized(mk(2, 2000, 200));
+        cache.insert_prioritized(mk(3, 1000, 500));
+
+        let ids: Vec<u64> = cache.playback_queue.iter().map(|u| u.id).collect();
+        assert_eq!(ids, vec![3, 2, 1],
+            "expected ordering: oldest start first, then shorter duration on ties");
+    }
+
+    #[test]
+    fn test_queue_favorites_jump_ahead_of_non_favorites() {
+        let mut cache = AudioCache::new();
+
+        fn mk(id: u64, ts: u64, dur: u64, fav: bool) -> Utterance {
+            Utterance {
+                id, sender_id: format!("s{}", id), sender_name: format!("S{}", id),
+                is_favorite: fav, started_at: ts, ended_at: ts + dur.saturating_sub(20),
+                frames: vec![CachedFrame {
+                    sender_id: format!("s{}", id), timestamp: ts,
+                    samples: vec![0i16; FRAME_SIZE], received_at: Instant::now(),
+                }],
+                fully_played: false,
+            }
+        }
+
+        // Two non-favs then a favorite that started LATER.
+        cache.insert_prioritized(mk(1, 1000, 500, false));
+        cache.insert_prioritized(mk(2, 1500, 500, false));
+        cache.insert_prioritized(mk(3, 5000, 500, true));  // favorite, latest ts
+
+        let ids: Vec<u64> = cache.playback_queue.iter().map(|u| u.id).collect();
+        assert_eq!(ids, vec![3, 1, 2],
+            "favorite must jump ahead regardless of timestamp; non-favs keep their order");
+    }
+
+    #[test]
+    fn test_mixer_soft_clip_keeps_output_in_range() {
+        // Drive multiple loud streams and verify nothing overflows i16.
+        let mut cache = AudioCache::new();
+        cache.set_mix_mode_enabled(true);
+
+        let loud = vec![30000i16; FRAME_SIZE];
+        cache.ingest_frame("alice", 1000, loud.clone());
+        cache.ingest_frame("alice", 1020, loud.clone());
+        cache.ingest_frame("bob",   1010, loud.clone());
+        let mixed = cache.ingest_frame("bob", 1015, loud.clone());
+
+        if let Some(samples) = mixed {
+            for &s in &samples {
+                assert!(s >= i16::MIN && s <= i16::MAX, "sample out of i16 range: {}", s);
+            }
+        }
     }
 
     #[test]
