@@ -20,8 +20,8 @@ android {
         applicationId = "com.sassyconsulting.sassytalkie"
         minSdk = 24
         targetSdk = 35
-        versionCode = 34
-        versionName = "2.6.7"
+        versionCode = 43
+        versionName = "2.7.6"
         
         // Feature flag: enable or disable cellular (relay) transport at build time
         buildConfigField("boolean", "ENABLE_CELLULAR_RELAY", "true")
@@ -172,13 +172,18 @@ dependencies {
     // QR Code generation
     implementation("com.google.zxing:core:3.5.2")
 
-    // QR Code scanning (ML Kit barcode)
-    implementation("com.google.mlkit:barcode-scanning:17.2.0")
+    // QR Code scanning — UNBUNDLED ML Kit barcode. The bundled
+    // com.google.mlkit:barcode-scanning ships libbarhopper_v3.so at 4 KB ELF
+    // alignment (frozen at 17.3.0, never fixed), which fails Play's 16 KB
+    // page-size requirement. The play-services variant delivers the model via
+    // Google Play Services, so no .so lands in our APK. Same BarcodeScanning API.
+    implementation("com.google.android.gms:play-services-mlkit-barcode-scanning:18.3.1")
 
-    // CameraX for QR scanner
-    implementation("androidx.camera:camera-camera2:1.3.1")
-    implementation("androidx.camera:camera-lifecycle:1.3.1")
-    implementation("androidx.camera:camera-view:1.3.1")
+    // CameraX for QR scanner — 1.4.0+ aligns libimage_processing_util_jni.so to 16 KB.
+    // Pinned to 1.4.2 (last 1.4.x): 1.6.x demands compileSdk 36 + AGP 8.9.1.
+    implementation("androidx.camera:camera-camera2:1.4.2")
+    implementation("androidx.camera:camera-lifecycle:1.4.2")
+    implementation("androidx.camera:camera-view:1.4.2")
 
     // JSON parsing
     implementation("org.json:json:20231013")

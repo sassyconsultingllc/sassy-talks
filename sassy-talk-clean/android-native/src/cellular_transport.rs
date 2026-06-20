@@ -12,6 +12,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use log::{info, warn, error};
 
 /// Max queued packets before dropping oldest.
@@ -37,12 +38,18 @@ pub enum CellularState {
 #[derive(Clone)]
 pub struct PacketQueue {
     inner: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    /// Cumulative count of frames discarded by drop-oldest overflow. Surfaced
+    /// via [dropped] / get_stats() so a "garbled RX" report can be pinned to
+    /// queue overflow (congestion → Opus PLC artifacts) rather than a crypto
+    /// or framing fault. Lifetime-cumulative; not reset on reconnect.
+    dropped: Arc<AtomicU64>,
 }
 
 impl PacketQueue {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_QUEUE_SIZE))),
+            dropped: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -51,9 +58,15 @@ impl PacketQueue {
         let mut q = self.inner.lock().unwrap();
         if q.len() >= MAX_QUEUE_SIZE {
             q.pop_front(); // Drop oldest to prevent unbounded growth
+            self.dropped.fetch_add(1, Ordering::Relaxed);
             log::warn!("PacketQueue: FULL ({} packets), dropped oldest frame — relay may be congested", MAX_QUEUE_SIZE);
         }
         q.push_back(data);
+    }
+
+    /// Cumulative number of frames discarded by drop-oldest overflow.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Returns true if queue is more than half full (backpressure signal).
@@ -92,6 +105,9 @@ pub struct CellularTransport {
     /// Stats
     packets_sent: u64,
     packets_received: u64,
+    /// Inbound frames dropped for exceeding MAX_PACKET_SIZE (distinct from
+    /// queue-overflow drops, which live on each PacketQueue).
+    packets_dropped_oversize: u64,
 }
 
 impl CellularTransport {
@@ -104,6 +120,7 @@ impl CellularTransport {
             outbound: PacketQueue::new(),
             packets_sent: 0,
             packets_received: 0,
+            packets_dropped_oversize: 0,
         }
     }
 
@@ -153,6 +170,7 @@ impl CellularTransport {
     /// Called when Kotlin receives a binary message from the relay
     pub fn on_message_received(&mut self, data: Vec<u8>) {
         if data.len() > MAX_PACKET_SIZE {
+            self.packets_dropped_oversize += 1;
             warn!("CellularTransport: dropping oversized packet ({} bytes)", data.len());
             return;
         }
@@ -236,7 +254,7 @@ impl CellularTransport {
     /// Get stats as JSON string
     pub fn get_stats(&self) -> String {
         format!(
-            r#"{{"state":"{}","room":"{}","sent":{},"received":{},"inbound_queue":{},"outbound_queue":{}}}"#,
+            r#"{{"state":"{}","room":"{}","sent":{},"received":{},"inbound_queue":{},"outbound_queue":{},"dropped_inbound_overflow":{},"dropped_outbound_overflow":{},"dropped_oversize":{}}}"#,
             match self.state {
                 CellularState::Disconnected => "disconnected",
                 CellularState::Connecting => "connecting",
@@ -247,7 +265,10 @@ impl CellularTransport {
             self.packets_sent,
             self.packets_received,
             self.inbound.len(),
-            self.outbound.len()
+            self.outbound.len(),
+            self.inbound.dropped(),
+            self.outbound.dropped(),
+            self.packets_dropped_oversize
         )
     }
 }

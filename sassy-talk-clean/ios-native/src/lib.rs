@@ -227,3 +227,125 @@ pub unsafe extern "C" fn sassytalkie_get_audio_output(
     }
     0
 }
+
+// ───────────────────────── Bluetooth peer-finding (CoreBluetooth bridge) ─────────────────────────
+//
+// On iOS, Bluetooth is the PEER-DISCOVERY plane only — audio rides the IP transport
+// (iOS does not expose Bluetooth Classic / RFCOMM to third-party apps). The radio
+// work (BLE advertise + scan) lives in Swift via CoreBluetooth (BluetoothManager.swift).
+// Swift reports discovered / lost peers across this FFI; Rust keeps the canonical
+// roster and hands it back to the UI as JSON.
+//
+// The advertised + scanned GATT service UUID MUST match the Android app so iOS↔Android
+// peers discover each other.
+
+use crate::bluetooth::{BluetoothManager, BluetoothDevice};
+use std::sync::OnceLock;
+
+/// SassyTalkie BLE service UUID — identical to Android `BleSignalingService.SERVICE_UUID`.
+pub const SASSYTALKIE_BLE_SERVICE_UUID: &str = "b1a2e5d4-d5ab-7890-bede-fa12345678f0";
+
+/// Process-wide BLE peer roster. `OnceLock<Mutex<_>>` (not `static mut`) so the
+/// Swift radio thread and the Rust UI-query thread share it without UB.
+static BT_MANAGER: OnceLock<Mutex<BluetoothManager>> = OnceLock::new();
+
+fn bt_manager() -> &'static Mutex<BluetoothManager> {
+    BT_MANAGER.get_or_init(|| Mutex::new(BluetoothManager::new()))
+}
+
+/// Return the BLE service UUID that Swift should advertise + scan for.
+///
+/// # Safety
+/// Caller must free the returned string with `sassytalkie_free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_bt_service_uuid() -> *const c_char {
+    CString::new(SASSYTALKIE_BLE_SERVICE_UUID).unwrap().into_raw()
+}
+
+/// Register a peer discovered by the Swift CoreBluetooth central.
+///
+/// # Safety
+/// `id` and `name` must be valid NUL-terminated UTF-8 C strings (or null).
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_bt_device_found(
+    id: *const c_char,
+    name: *const c_char,
+    rssi: i32,
+) -> bool {
+    let id = match ffi::helpers::c_string_to_rust(id) {
+        Some(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+    let name = ffi::helpers::c_string_to_rust(name).unwrap_or_else(|| "SassyTalkie".to_string());
+    if let Ok(mut mgr) = bt_manager().lock() {
+        mgr.add_device(BluetoothDevice { id, name, rssi });
+        info!("BLE peer discovered (rssi={})", rssi);
+        true
+    } else {
+        false
+    }
+}
+
+/// Remove a peer the Swift central reported as lost / disconnected.
+///
+/// # Safety
+/// `id` must be a valid NUL-terminated UTF-8 C string (or null).
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_bt_device_lost(id: *const c_char) -> bool {
+    let id = match ffi::helpers::c_string_to_rust(id) {
+        Some(s) => s,
+        None => return false,
+    };
+    if let Ok(mut mgr) = bt_manager().lock() {
+        mgr.remove_device(&id);
+        true
+    } else {
+        false
+    }
+}
+
+/// Number of currently-discovered BLE peers.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_bt_peer_count() -> usize {
+    bt_manager().lock().map(|m| m.devices().len()).unwrap_or(0)
+}
+
+/// JSON array of discovered peers: `[{"id":..,"name":..,"rssi":..}, ...]`.
+///
+/// # Safety
+/// Caller must free the returned string with `sassytalkie_free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_bt_get_peers_json() -> *const c_char {
+    let json = bt_manager()
+        .lock()
+        .ok()
+        .map(|m| serde_json::to_string(&m.devices()).unwrap_or_else(|_| "[]".to_string()))
+        .unwrap_or_else(|| "[]".to_string());
+    CString::new(json).unwrap_or_default().into_raw()
+}
+
+/// Mark a peer as the actively-connected device.
+///
+/// # Safety
+/// `id` must be a valid NUL-terminated UTF-8 C string (or null).
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_bt_set_connected(id: *const c_char) -> bool {
+    let id = match ffi::helpers::c_string_to_rust(id) {
+        Some(s) => s,
+        None => return false,
+    };
+    if let Ok(mut mgr) = bt_manager().lock() {
+        mgr.set_connected(id);
+        true
+    } else {
+        false
+    }
+}
+
+/// Clear the active BLE connection.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_bt_clear_connected() {
+    if let Ok(mut mgr) = bt_manager().lock() {
+        mgr.clear_connected();
+    }
+}

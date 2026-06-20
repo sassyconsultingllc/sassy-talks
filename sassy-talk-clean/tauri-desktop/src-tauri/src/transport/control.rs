@@ -1,17 +1,27 @@
 use rand::RngCore;
 
-pub const OP_PTT_START: u8      = 0x01;
-pub const OP_PTT_STOP: u8       = 0x02;
+// ── Protocol opcodes ──────────────────────────────────────────────────────
+// v2.7.x: sourced from the shared `sassytalkie-core::protocol` module so
+// any opcode added on the Android side propagates here automatically.
+// Previously these were hand-duplicated and silently drifted — Android
+// added OP_WAKE (0x17) and OP_REPLAY_FRAME (0x19) that the desktop never
+// learned about, leading to the desktop client misclassifying those frames
+// as audio nonces.
+pub use sassytalkie_core::protocol::{
+    OP_PTT_START, OP_PTT_STOP,
+    OP_HEARTBEAT, OP_PARTNER_OFFLINE,
+    OP_PTT_START_V2, OP_PTT_STOP_V2,
+    OP_WAKE, OP_REPLAY_FRAME,
+};
+
+// Desktop-specific opcodes — not (yet) in core because they're not on the
+// Android wire path. Move to core if/when Android starts emitting them.
 pub const OP_READY_ACK: u8      = 0x03;
 pub const OP_PING: u8           = 0x04;
 pub const OP_CHANNEL_SYNC: u8   = 0x05;
-pub const OP_HEARTBEAT: u8      = 0x10;
 pub const OP_RECV_ACK: u8       = 0x11;
 pub const OP_EOT_ACK: u8        = 0x12;
 pub const OP_CAPABILITIES: u8   = 0x13;
-pub const OP_PARTNER_OFFLINE: u8= 0x14;
-pub const OP_PTT_START_V2: u8   = 0x15;
-pub const OP_PTT_STOP_V2: u8    = 0x16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

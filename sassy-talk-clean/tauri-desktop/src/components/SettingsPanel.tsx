@@ -37,7 +37,7 @@ function SettingsPanel({ onClose }: SettingsPanelProps) {
 
   const handleInputDeviceChange = async (deviceName: string) => {
     try {
-      await invoke('set_input_device', { device_name: deviceName });
+      await invoke('set_input_device', { deviceName });
       setSelectedInput(deviceName);
     } catch (err) {
       console.error('Failed to set input device:', err);
@@ -46,7 +46,7 @@ function SettingsPanel({ onClose }: SettingsPanelProps) {
 
   const handleOutputDeviceChange = async (deviceName: string) => {
     try {
-      await invoke('set_output_device', { device_name: deviceName });
+      await invoke('set_output_device', { deviceName });
       setSelectedOutput(deviceName);
     } catch (err) {
       console.error('Failed to set output device:', err);

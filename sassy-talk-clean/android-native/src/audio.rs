@@ -4,7 +4,7 @@
 /// Uses Android AudioRecord/AudioTrack through JNI bridge
 
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use log::{info, warn};
 
@@ -87,6 +87,16 @@ pub struct AudioEngine {
     /// to wait for live audio to QUIET DOWN (poll the timestamp) BEFORE it
     /// acquires the lock — no thrashing.
     playback_lock: Arc<Mutex<()>>,
+
+    /// RX-side playback gain × 100 (so 100 == 1.0×, 250 == 2.5×). Applied
+    /// in `write_audio` before forwarding the buffer to AudioTrack. Lets
+    /// the user crank up quiet incoming voices independent of the system
+    /// media volume slider (which on COMM_MODE often caps lower than the
+    /// user expects).
+    ///
+    /// Clamped to [25, 400] (0.25× to 4.0×). 100 (1.0×) is the default —
+    /// no-op pre-existing behaviour.
+    rx_gain_x100: Arc<AtomicI32>,
 }
 
 impl AudioEngine {
@@ -104,7 +114,19 @@ impl AudioEngine {
             last_write_at_ms: Arc::new(AtomicU64::new(0)),
             write_seq: Arc::new(AtomicU64::new(0)),
             playback_lock: Arc::new(Mutex::new(())),
+            rx_gain_x100: Arc::new(AtomicI32::new(100)),
         })
+    }
+
+    /// Set RX playback gain. Clamped to [0.25×, 4.0×].
+    /// `x100` units: 100 = 1.0× (default), 250 = 2.5×, 400 = 4.0× (max).
+    pub fn set_rx_gain_x100(&self, x100: i32) {
+        let clamped = x100.clamp(25, 400);
+        self.rx_gain_x100.store(clamped, Ordering::Relaxed);
+    }
+
+    pub fn get_rx_gain_x100(&self) -> i32 {
+        self.rx_gain_x100.load(Ordering::Relaxed)
     }
 
     /// Cheap clone of the monotonic write-sequence counter. Replay uses
@@ -406,7 +428,21 @@ impl AudioEngine {
             Some(p) => Arc::clone(p),
             None => return Err("Player not initialized".to_string()),
         };
-        let result = play.write(buffer);
+        // Apply RX gain. Default (gain == 100) is a no-op fast path: skip
+        // the allocation + per-sample scaling entirely so unboosted users
+        // pay zero cost. Above 1.0× we scale into a scratch buffer and
+        // clamp to i16 range to avoid wrap-around on loud peaks.
+        let gain = self.rx_gain_x100.load(Ordering::Relaxed);
+        let result = if gain == 100 {
+            play.write(buffer)
+        } else {
+            let g = gain as i32;
+            let scaled: Vec<i16> = buffer.iter().map(|&s| {
+                let v = (s as i32 * g) / 100;
+                v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+            }).collect();
+            play.write(&scaled)
+        };
         if result.is_ok() {
             self.last_write_at_ms.store(now_ms(), Ordering::Relaxed);
             self.write_seq.fetch_add(1, Ordering::Relaxed);

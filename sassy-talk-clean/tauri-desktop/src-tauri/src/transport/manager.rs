@@ -69,7 +69,7 @@ impl PeerInfo {
     pub fn is_active(&self) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         now - self.last_seen < PEER_TIMEOUT_SECS
     }
@@ -114,7 +114,12 @@ pub struct TransportManager {
     
     // Our public key for sharing
     our_public_key: Arc<RwLock<Option<[u8; 32]>>>,
-    
+
+    // Our session identity engine — holds the static secret behind our_public_key.
+    // Reused to derive EVERY per-peer session key (derive_peer_session), so both
+    // sides agree on the shared key. Immutable for the session (no lock needed).
+    identity: Arc<CryptoEngine>,
+
     // Control
     running: Arc<AtomicBool>,
 
@@ -192,7 +197,9 @@ impl TransportManager {
         // Create audio channel
         let (audio_tx, audio_rx) = mpsc::unbounded_channel();
         
-        // Generate our keypair for encryption
+        // Generate our session keypair for encryption. We KEEP this engine (as
+        // `identity`) — it holds the static secret behind `our_public` and is reused
+        // to derive every per-peer session key.
         let mut crypto = CryptoEngine::new();
         let our_public = crypto.generate_keypair();
 
@@ -210,6 +217,7 @@ impl TransportManager {
             peers: Arc::new(RwLock::new(HashMap::new())),
             crypto_engines: Arc::new(RwLock::new(HashMap::new())),
             our_public_key: Arc::new(RwLock::new(Some(our_public))),
+            identity: Arc::new(crypto),
             running: Arc::new(AtomicBool::new(false)),
             audio_tx,
             audio_rx: Arc::new(RwLock::new(Some(audio_rx))),
@@ -382,7 +390,8 @@ impl TransportManager {
         let device_id_rx = self.device_id;
         let config = Arc::clone(&self.config);
         let liveness_rx = Arc::clone(&self.liveness);
-        
+        let identity_rx = Arc::clone(&self.identity);
+
         tokio::spawn(async move {
             let mut buf = vec![std::mem::MaybeUninit::<u8>::uninit(); MAX_PACKET_SIZE];
             
@@ -438,7 +447,7 @@ impl TransportManager {
                                         address: src_addr.as_socket().unwrap(),
                                         last_seen: SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
-                                            .unwrap()
+                                            .unwrap_or_default()
                                             .as_secs(),
                                         channel,
                                         public_key: None,
@@ -449,13 +458,13 @@ impl TransportManager {
                                 }
                                 PacketType::DiscoveryWithKey { device_name, channel, public_key } => {
                                     // Handle discovery with public key
-                                    let peer = PeerInfo {
+                                    let mut peer = PeerInfo {
                                         device_id: packet.device_id,
                                         device_name,
                                         address: src_addr.as_socket().unwrap(),
                                         last_seen: SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
-                                            .unwrap()
+                                            .unwrap_or_default()
                                             .as_secs(),
                                         channel,
                                         public_key: public_key.map(|k| hex::encode(k)),
@@ -475,14 +484,18 @@ impl TransportManager {
                                             let key_exchange_succeeded = {
                                                 let mut engines = crypto_engines.write().unwrap();
                                                 if !engines.contains_key(&packet.device_id) {
-                                                    let mut engine = CryptoEngine::new();
-                                                    let _ = engine.generate_keypair();
-                                                    if engine.key_exchange(&peer_public).is_ok() {
-                                                        info!("Key exchange completed with peer {:08X}", packet.device_id);
-                                                        engines.insert(packet.device_id, engine);
-                                                        true
-                                                    } else {
-                                                        false
+                                                    // Derive the per-peer key from OUR advertised identity
+                                                    // secret + the peer's public key (symmetric ECDH).
+                                                    match identity_rx.derive_peer_session(&peer_public) {
+                                                        Ok(engine) => {
+                                                            info!("Key exchange completed with peer {:08X}", packet.device_id);
+                                                            engines.insert(packet.device_id, engine);
+                                                            true
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("Key derivation failed for peer {:08X}: {:?}", packet.device_id, e);
+                                                            false
+                                                        }
                                                     }
                                                 } else {
                                                     false
@@ -490,13 +503,16 @@ impl TransportManager {
                                                 // `engines` (crypto_engines write guard) is dropped here
                                             };
 
-                                            // Now safe to acquire peers without holding crypto_engines
-                                            if key_exchange_succeeded {
-                                                let mut peers_w = peers.write().unwrap();
-                                                if let Some(p) = peers_w.get_mut(&packet.device_id) {
-                                                    p.key_exchanged = true;
-                                                }
-                                            }
+                                            // Mark the peer as encrypted iff we now hold a ready
+                                            // engine for it. The OLD code did get_mut() BEFORE the
+                                            // peer was inserted below (always a no-op on first
+                                            // contact), and the unconditional insert at the end of
+                                            // this arm then overwrote key_exchanged with false — so
+                                            // it was never actually true. Set it on the `peer` we're
+                                            // about to insert instead. (engines write guard already
+                                            // dropped above, so this read can't self-deadlock.)
+                                            peer.key_exchanged = key_exchange_succeeded
+                                                || crypto_engines.read().unwrap().contains_key(&packet.device_id);
                                         }
                                     }
                                     
@@ -557,7 +573,7 @@ impl TransportManager {
                                     if let Some(peer) = peers.write().unwrap().get_mut(&packet.device_id) {
                                         peer.last_seen = SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
-                                            .unwrap()
+                                            .unwrap_or_default()
                                             .as_secs();
                                     }
                                 }
@@ -569,11 +585,12 @@ impl TransportManager {
                                     if encryption_enabled {
                                         let mut engines = crypto_engines.write().unwrap();
                                         if !engines.contains_key(&packet.device_id) {
-                                            let mut engine = CryptoEngine::new();
-                                            let _ = engine.generate_keypair();
-                                            if engine.key_exchange(&public_key).is_ok() {
-                                                info!("Key exchange completed with peer {:08X}", packet.device_id);
-                                                engines.insert(packet.device_id, engine);
+                                            match identity_rx.derive_peer_session(&public_key) {
+                                                Ok(engine) => {
+                                                    info!("Key exchange completed with peer {:08X}", packet.device_id);
+                                                    engines.insert(packet.device_id, engine);
+                                                }
+                                                Err(e) => warn!("Key derivation failed for peer {:08X}: {:?}", packet.device_id, e),
                                             }
                                         }
                                     }
@@ -587,9 +604,7 @@ impl TransportManager {
                                         if encryption_enabled {
                                             let mut engines = crypto_engines.write().unwrap();
                                             if !engines.contains_key(&packet.device_id) {
-                                                let mut engine = CryptoEngine::new();
-                                                let _ = engine.generate_keypair();
-                                                if engine.key_exchange(&public_key).is_ok() {
+                                                if let Ok(engine) = identity_rx.derive_peer_session(&public_key) {
                                                     engines.insert(packet.device_id, engine);
                                                 }
                                             }
@@ -661,8 +676,13 @@ impl TransportManager {
                 encrypted_payload.extend_from_slice(&ciphertext);
                 Packet::audio(self.device_id, channel, encrypted_payload)
             } else {
-                // No ready engine yet (no completed key exchange) — send plain.
-                Packet::audio(self.device_id, channel, audio_data.to_vec())
+                // Encryption is ENABLED but no completed key exchange yet. Do NOT
+                // silently fall back to plaintext — that would transmit audio the
+                // user believes is encrypted. Drop the frame and signal the caller.
+                warn!("send_audio: encryption enabled but no ready crypto engine — refusing plaintext fallback");
+                return Err(TransportError::EncryptionError(
+                    "no completed key exchange yet — not sending plaintext".into(),
+                ));
             }
         } else {
             Packet::audio(self.device_id, channel, audio_data.to_vec())

@@ -54,7 +54,12 @@ impl VoiceEncoder {
     #[allow(dead_code)]
     pub fn reset(&mut self) { self.prev_sample = 0; self.step_index = 0; }
     pub fn encode(&mut self, pcm: &[i16]) -> Vec<u8> {
-        assert_eq!(pcm.len(), CODEC_FRAME_SIZE);
+        // Locally-controlled input: a wrong length is a real internal bug.
+        // Trap it in dev builds, but in release degrade gracefully instead of aborting.
+        debug_assert_eq!(pcm.len(), CODEC_FRAME_SIZE);
+        if pcm.len() != CODEC_FRAME_SIZE {
+            return Vec::new();
+        }
         let mut out = Vec::with_capacity(COMPRESSED_FRAME_SIZE);
         out.extend_from_slice(&(self.prev_sample as i16).to_le_bytes());
         out.push(self.step_index as u8);
@@ -75,7 +80,11 @@ impl VoiceDecoder {
     #[allow(dead_code)]
     pub fn reset(&mut self) { self.prev_sample = 0; self.step_index = 0; }
     pub fn decode(&mut self, compressed: &[u8]) -> Vec<i16> {
-        assert_eq!(compressed.len(), COMPRESSED_FRAME_SIZE);
+        // Input may originate from a remote Bluetooth/network peer.
+        // A malformed/truncated frame is dropped (empty Vec) instead of panicking the app.
+        if compressed.len() != COMPRESSED_FRAME_SIZE {
+            return Vec::new();
+        }
         self.prev_sample = i16::from_le_bytes([compressed[0], compressed[1]]) as i32;
         self.step_index = clamp_step_index(compressed[2] as i32);
         let mut out = Vec::with_capacity(CODEC_FRAME_SIZE);

@@ -78,7 +78,7 @@ impl CryptoSession {
 
     /// Encrypt plaintext, returns nonce || ciphertext || tag
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-        let nonce_bytes = self.next_nonce();
+        let nonce_bytes = self.next_nonce()?;
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = self.cipher
@@ -106,14 +106,21 @@ impl CryptoSession {
             .map_err(|e| format!("Decryption failed: {}", e))
     }
 
-    fn next_nonce(&mut self) -> [u8; NONCE_SIZE] {
+    /// Advance the per-session nonce counter and build the next 12-byte nonce
+    /// (4-byte random prefix || 8-byte little-endian counter).
+    ///
+    /// Returns `Err` on counter exhaustion instead of panicking or wrapping.
+    /// Reusing a (key, nonce) pair would be a catastrophic AES-GCM failure, so
+    /// the only safe action on overflow is to refuse to encrypt and signal the
+    /// caller that the session must be re-keyed.
+    fn next_nonce(&mut self) -> Result<[u8; NONCE_SIZE], String> {
         self.nonce_counter = self.nonce_counter
             .checked_add(1)
-            .expect("nonce counter overflow — session must be re-keyed");
+            .ok_or("nonce counter exhausted — session must be re-keyed")?;
         let mut nonce = [0u8; NONCE_SIZE];
         nonce[..4].copy_from_slice(&self.nonce_prefix);
         nonce[4..12].copy_from_slice(&self.nonce_counter.to_le_bytes());
-        nonce
+        Ok(nonce)
     }
 }
 

@@ -11,8 +11,9 @@ name = "sassytalkie_ios"
 crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
-# Audio codec
-audiopus = { version = "0.3", default-features = false }
+# Audio codec — pinned to the same resolvable release the desktop crate uses
+# (plain "0.3" selects nothing on crates.io; only 0.3.0-rc.0 is published).
+audiopus = { version = "0.3.0-rc.0", default-features = false }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

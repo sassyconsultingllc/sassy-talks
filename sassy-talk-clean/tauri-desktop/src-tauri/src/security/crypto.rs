@@ -9,7 +9,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Key, Nonce,
 };
-use x25519_dalek::{EphemeralSecret, PublicKey};
+use x25519_dalek::{PublicKey, StaticSecret};
 use sha2::{Sha256, Digest};
 use rand::RngCore;
 use thiserror::Error;
@@ -29,8 +29,10 @@ pub enum CryptoError {
 
 /// Crypto engine handles all encryption/decryption
 pub struct CryptoEngine {
-    // Our ephemeral keypair
-    secret_key: Option<EphemeralSecret>,
+    // Our session keypair. StaticSecret (not EphemeralSecret) so the SAME advertised
+    // keypair can perform ECDH with many peers — EphemeralSecret is consumed on first
+    // use, which is what made per-peer derivation mint mismatched throwaway keys.
+    secret_key: Option<StaticSecret>,
     public_key: Option<PublicKey>,
     
     // Derived symmetric key (from ECDH)
@@ -56,7 +58,7 @@ impl CryptoEngine {
 
     /// Generate new keypair for key exchange
     pub fn generate_keypair(&mut self) -> [u8; 32] {
-        let secret = EphemeralSecret::random_from_rng(rand::thread_rng());
+        let secret = StaticSecret::random_from_rng(rand::thread_rng());
         let public = PublicKey::from(&secret);
         
         let public_bytes = *public.as_bytes();
@@ -72,9 +74,11 @@ impl CryptoEngine {
 
     /// Perform key exchange with peer's public key
     pub fn key_exchange(&mut self, peer_public: &[u8; 32]) -> Result<(), CryptoError> {
-        let secret = self.secret_key.take()
+        // Borrow (do NOT consume) the static secret, so this engine's identity
+        // keypair stays usable for further exchanges.
+        let secret = self.secret_key.as_ref()
             .ok_or(CryptoError::KeyDerivationFailed)?;
-        
+
         let peer_public = PublicKey::from(*peer_public);
         let shared_secret = secret.diffie_hellman(&peer_public);
         
@@ -90,6 +94,27 @@ impl CryptoEngine {
         debug!("Key exchange complete");
         
         Ok(())
+    }
+
+    /// Derive a ready-to-use per-peer session engine from THIS engine's (static,
+    /// reusable) secret and the peer's advertised public key.
+    ///
+    /// This is the production key-exchange path. Because both nodes use the SAME
+    /// keypair they each advertised in their discovery beacon, X25519's symmetry
+    /// guarantees both sides derive the identical shared secret. The previous code
+    /// minted a fresh throwaway keypair per peer (whose public key was never sent),
+    /// so the two sides' derived keys never matched and encrypted audio silently
+    /// failed to decrypt. Does NOT consume our secret, so one identity keypair serves
+    /// every peer for the session.
+    pub fn derive_peer_session(&self, peer_public: &[u8; 32]) -> Result<CryptoEngine, CryptoError> {
+        let secret = self.secret_key.as_ref()
+            .ok_or(CryptoError::KeyDerivationFailed)?;
+        let peer_public = PublicKey::from(*peer_public);
+        let shared_secret = secret.diffie_hellman(&peer_public);
+        let key_bytes = self.derive_key(shared_secret.as_bytes());
+        let mut engine = CryptoEngine::new();
+        engine.set_key(&key_bytes)?;
+        Ok(engine)
     }
 
     /// Set symmetric key directly (for pre-shared key mode)
@@ -251,6 +276,43 @@ mod tests {
         let decrypted = bob.decrypt(&ciphertext, &nonce, &tag).unwrap();
         
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_derive_peer_session_interop() {
+        // Simulate two desktops, each with its own session identity keypair.
+        let mut node_a = CryptoEngine::new();
+        let pub_a = node_a.generate_keypair();
+        let mut node_b = CryptoEngine::new();
+        let pub_b = node_b.generate_keypair();
+
+        // Each derives a per-peer engine from ITS OWN static secret + the other's
+        // advertised public key — exactly the production path. Keys MUST match.
+        let a_to_b = node_a.derive_peer_session(&pub_b).unwrap();
+        let b_to_a = node_b.derive_peer_session(&pub_a).unwrap();
+        assert_eq!(
+            a_to_b.symmetric_key, b_to_a.symmetric_key,
+            "both peers must derive the identical shared key"
+        );
+
+        // Real encrypt (A) -> decrypt (B) roundtrip across the derived engines.
+        let plaintext = b"walkie audio frame";
+        let nonce = CryptoEngine::generate_nonce();
+        let (ct, tag) = a_to_b.encrypt(plaintext, &nonce).unwrap();
+        let decrypted = b_to_a.decrypt(&ct, &nonce, &tag).unwrap();
+        assert_eq!(decrypted, plaintext);
+
+        // The identity secret is reusable: deriving for a THIRD peer still works
+        // (the old EphemeralSecret would have been consumed after the first peer).
+        let mut node_c = CryptoEngine::new();
+        let pub_c = node_c.generate_keypair();
+        let a_to_c = node_a.derive_peer_session(&pub_c).unwrap();
+        let c_to_a = node_c.derive_peer_session(&pub_a).unwrap();
+        assert_eq!(a_to_c.symmetric_key, c_to_a.symmetric_key);
+        assert_ne!(
+            a_to_b.symmetric_key, a_to_c.symmetric_key,
+            "different peers must derive different keys"
+        );
     }
 
     #[test]

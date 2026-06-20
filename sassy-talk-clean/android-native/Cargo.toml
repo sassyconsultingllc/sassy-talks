@@ -13,6 +13,11 @@ path = "src/lib.rs"
 [features]
 default = []
 standalone-ui = ["eframe", "egui", "android-activity"]
+# Used only to force Cargo to fetch audiopus_sys so its bundled libopus C
+# source is unpacked into the registry, where build.rs reads it. The crate
+# itself is never linked — build.rs compiles libopus directly via the cc
+# crate. Activate with `cargo fetch --features _prefetch-opus-src`.
+_prefetch-opus-src = ["audiopus_sys"]
 
 [dependencies]
 # Android
@@ -47,6 +52,12 @@ thiserror = "1.0"
 uuid = { version = "1.11", features = ["v4"] }
 base64 = "0.22"
 once_cell = "1.19"
+
+# v2.7.x: shared cross-platform core. Source of truth for protocol opcodes,
+# audio_cache (Live/Queue/Mix modes), cohort_history, and crypto. The same
+# crate is consumed by tauri-desktop/src-tauri so any wire-protocol or audio-
+# pipeline change propagates to both platforms automatically.
+sassytalkie-core = { path = "../core" }
 
 # audiopus_sys is pulled in ONLY to ensure its bundled libopus C source
 # ends up in the cargo registry where our build.rs can find it.

@@ -65,7 +65,7 @@ private fun relativeAgo(unixSecs: Long): String {
 @Composable
 fun MyCohortsTab(
     onRejoinHost: (channel: Int, groupName: String, cohortId: String) -> Unit,
-    onRejoinJoiner: (hostDevice: String?) -> Unit,
+    onRejoinJoiner: (channel: Int, hostDevice: String?) -> Unit,
 ) {
     var items by remember { mutableStateOf(parseHistory(SassyTalkNative.getCohortHistory())) }
 
@@ -98,7 +98,7 @@ fun MyCohortsTab(
                         onRejoin = {
                             when (item.role) {
                                 "Hosted", "Both" -> onRejoinHost(item.channel, item.groupName, item.cohortId)
-                                else -> onRejoinJoiner(item.hostDevice)
+                                else -> onRejoinJoiner(item.channel, item.hostDevice)
                             }
                         },
                         onRemove = {

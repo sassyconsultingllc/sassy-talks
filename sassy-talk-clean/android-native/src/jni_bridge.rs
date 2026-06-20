@@ -780,6 +780,93 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     crate::audio_pipeline::get_mic_gain_x100()
 }
 
+/// JNI: Set RX (playback) gain × 100. Clamped to [25, 400] on the Rust side.
+/// Default 100 (1.0×) is a no-op fast path in `AudioEngine::write_audio`.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetRxGainX100(
+    _env: JNIEnv,
+    _class: JClass,
+    gain_x100: jni::sys::jint,
+) {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref sm) = guard.state_machine {
+        if let Ok(eng) = sm.get_audio().lock() {
+            eng.set_rx_gain_x100(gain_x100);
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetRxGainX100(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jint {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref sm) = guard.state_machine {
+        if let Ok(eng) = sm.get_audio().lock() {
+            return eng.get_rx_gain_x100();
+        }
+    }
+    100
+}
+
+/// JNI: Force speakerphone on or off for the current PTT session.
+/// Backed by `audio_routing::engage_comm_mode(force_speaker)`. Returns true
+/// on success, false on JNI failure (rare — usually missing AudioManager).
+///
+/// `true`  → loudspeaker (built-in main speaker, walkie-talkie default)
+/// `false` → earpiece (small speaker, private listening)
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetSpeakerphone(
+    _env: JNIEnv,
+    _class: JClass,
+    on: jni::sys::jboolean,
+) -> jni::sys::jboolean {
+    let force_speaker = on != 0;
+    match crate::audio_routing::engage_comm_mode(force_speaker) {
+        Ok(()) => 1,
+        Err(e) => {
+            warn!("nativeSetSpeakerphone({}) failed: {}", force_speaker, e);
+            0
+        }
+    }
+}
+
+/// JNI: True if our COMM mode is currently engaged. Doesn't directly tell
+/// you speakerphone vs earpiece (that flag is internal to audio_routing),
+/// but the UI uses its own persisted preference for the toggle state — this
+/// is only for diagnostics / "is routing active?" checks.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeIsCommModeActive(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jboolean {
+    if crate::audio_routing::is_active() { 1 } else { 0 }
+}
+
+/// JNI: Tune the Live-mode jitter buffer pre-buffer size. 3 = low-latency
+/// (~60ms), 5 = balanced (default, ~100ms), 8 = smooth (~160ms). Clamped
+/// to [2, 16] on the Rust side. Takes effect immediately for new frames.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetJitterPrebufferFrames(
+    _env: JNIEnv,
+    _class: JClass,
+    frames: jni::sys::jint,
+) {
+    let f = frames.max(0) as usize;
+    sassytalkie_core::audio_cache::set_live_jitter_prebuffer_frames(f);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetJitterPrebufferFrames(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jint {
+    sassytalkie_core::audio_cache::live_jitter_prebuffer_frames() as jni::sys::jint
+}
+
 /// JNI: Set squelch threshold in dBFS. 0 disables. Otherwise clamped to [-60, -10].
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetSquelchDbfs(
@@ -1430,6 +1517,20 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         let mut tm = sm.get_transport().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(crypto) = guard.session_manager.get_crypto_for_channel(ch) {
             tm.set_crypto(crypto);
+        }
+    }
+
+    // Sync the cellular relay room to the JUST-MINTED session_id so the host's
+    // own WS targets the same room the joiner will scan into. Previously the
+    // host only set crypto + persisted the session, but its WS stayed bound to
+    // whatever room was set earlier (or none) — joiners would import with the
+    // new session_id, connect to that room, and find an empty room because the
+    // host was still on a different room. Symmetric counterpart to the call
+    // already in nativeImportSessionFromQR.
+    if !sid.is_empty() {
+        if let Some(ref sm) = guard.state_machine {
+            sm.set_cellular_room(sid.clone());
+            info!("JNI: Cellular room synced to generated session_id {}", sid);
         }
     }
 

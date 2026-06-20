@@ -68,6 +68,11 @@ class BleSignalingService(
     private var scanner: BluetoothLeScanner? = null
     private val connectedPeers = ConcurrentHashMap<String, BluetoothDevice>()
     private val peerGattClients = ConcurrentHashMap<String, BluetoothGatt>()
+    /** Addresses with an in-flight connectGatt that has not yet reached a terminal
+     *  state. Guards against a connect storm: onScanResult fires repeatedly at
+     *  SCAN_MODE_LOW_LATENCY, so without this several connectGatt calls would race
+     *  before peerGattClients is populated by the first STATE_CONNECTED callback. */
+    private val connectingPeers = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     // —— GATT Server (receives commands from peers) ——
 
@@ -234,6 +239,30 @@ class BleSignalingService(
             return
         }
 
+        // On Android < 12 (API < 31), BLE scan silently returns ZERO results unless
+        // location services are switched on (separate from the runtime permission).
+        // Surface a clear log so an empty-scan situation is diagnosable in the field.
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S) {
+            val locationOn = try {
+                val lm = context.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                    lm.isLocationEnabled
+                } else {
+                    @Suppress("DEPRECATION")
+                    android.provider.Settings.Secure.getInt(
+                        context.contentResolver,
+                        android.provider.Settings.Secure.LOCATION_MODE,
+                        android.provider.Settings.Secure.LOCATION_MODE_OFF
+                    ) != android.provider.Settings.Secure.LOCATION_MODE_OFF
+                }
+            } catch (e: Exception) {
+                true // can't determine — don't block scanning
+            }
+            if (!locationOn) {
+                Log.w(TAG, "Location services are OFF — BLE peer discovery will find NOTHING on Android < 12. Prompt the user to enable Location.")
+            }
+        }
+
         val filter = ScanFilter.Builder()
             .setServiceUuid(ParcelUuid(SERVICE_UUID))
             .build()
@@ -348,6 +377,9 @@ class BleSignalingService(
 
     fun connectToPeer(device: BluetoothDevice) {
         if (peerGattClients.containsKey(device.address)) return
+        // Claim the in-flight slot atomically; if another scan result already
+        // started a connect to this address, bail out instead of racing a 2nd connectGatt.
+        if (!connectingPeers.add(device.address)) return
 
         Log.i(TAG, "Connecting GATT client to ${device.name ?: device.address}")
         device.connectGatt(context, false, object : BluetoothGattCallback() {
@@ -356,12 +388,14 @@ class BleSignalingService(
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     peerGattClients[device.address] = gatt
                     connectedPeers[device.address] = device
+                    connectingPeers.remove(device.address)
                     gatt.requestMtu(517)
 
                     Log.i(TAG, "GATT client connected to ${device.name ?: device.address}")
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     peerGattClients.remove(device.address)
                     connectedPeers.remove(device.address)
+                    connectingPeers.remove(device.address)
                     gatt.close()
 
                     listener?.onPeerLost(device.address)
@@ -434,6 +468,7 @@ class BleSignalingService(
 
         peerGattClients.clear()
         connectedPeers.clear()
+        connectingPeers.clear()
         stopServer()
     }
 }

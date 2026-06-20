@@ -10,6 +10,16 @@ import java.util.concurrent.atomic.AtomicInteger
 import com.sassyconsulting.sassytalkie.service.BluetoothTransport
 
 /**
+ * v2.7.1 peer-roster event.
+ * Emitted from the 1 Hz stale-check loop whenever the active peer set changes.
+ * Active = HEALTHY or DEGRADED; transitions to STALE fire [Left].
+ */
+sealed class PeerEvent {
+    data class Joined(val peerId: String) : PeerEvent()
+    data class Left(val peerId: String) : PeerEvent()
+}
+
+/**
  * PttCoordinator — Orchestrates BLE signaling + RFCOMM data for PTT.
  *
  * TX Flow (sender presses PTT):
@@ -142,6 +152,21 @@ class PttCoordinator(
     /** True when at least one connected peer has health == STALE. */
     val anyPeerStale = MutableStateFlow(false)
 
+    // —— v2.7.1: Peer roster + join/leave events ——
+
+    /** Set of currently-known peer IDs (HEALTHY or DEGRADED — excludes STALE
+     *  so the chip reflects "who can hear me right now"). Polled at the
+     *  same 1 Hz cadence as the stale-check loop. */
+    val peerIds = MutableStateFlow<Set<String>>(emptySet())
+
+    /** Hot signal for v2.7.1 toasts — emitted when a peer first appears
+     *  (`Joined`) or vanishes from the live set (`Left`). One per change;
+     *  no replay so a recomposing collector doesn't see stale events. */
+    private val _peerEvents = kotlinx.coroutines.flow.MutableSharedFlow<PeerEvent>(
+        replay = 0, extraBufferCapacity = 16
+    )
+    val peerEvents: kotlinx.coroutines.flow.SharedFlow<PeerEvent> = _peerEvents
+
     // —— Talk-over indicator (Task 6.2) ——
 
     /** True while a peer is actively transmitting (OP_PTT_START / OP_PTT_START_V2 received). */
@@ -161,8 +186,18 @@ class PttCoordinator(
     /** Wall-clock time of the last received audio frame; used to terminate
      *  the RECV_ACK loop when the peer goes silent without a clean PTT_STOP. */
     @Volatile private var lastRxFrameMs: Long = 0L
-    /** Coroutine job that sends RECV_ACK while audio is arriving. */
-    private var recvAckJob: Job? = null
+    /** Per-peer RECV_ACK state. Each transmitting peer gets its OWN ack loop so
+     *  that when 2+ peers transmit at once, every sender is acknowledged. A single
+     *  shared job keyed to the last-seen peer (the previous design) starved all but
+     *  the most recent sender. Keyed by peer device address / "relay:<epoch>" id. */
+    private class RxAckState(
+        @Volatile var epoch: Long,
+        @Volatile var seq: Int,
+        @Volatile var lastFrameMs: Long,
+    ) {
+        @Volatile var job: Job? = null
+    }
+    private val rxAckStates = ConcurrentHashMap<String, RxAckState>()
 
     // —— Reaching-Peer indicator (Task 4.2) — Sender side ——
 
@@ -435,7 +470,7 @@ class PttCoordinator(
 
     override fun onPttStopReceived(deviceAddress: String) {
         Log.i(TAG, "\u2190 PTT_STOP from $deviceAddress")
-        stopRecvAckJob()
+        stopRecvAckJob(deviceAddress)
         // Clear peer speaking indicator (Task 6.2)
         setPeerSpeaking(false)
         // TODO: Play roger beep
@@ -480,12 +515,17 @@ class PttCoordinator(
         if (!btTransport.isConnectedTo(device.address)) {
             btTransport.connectDevice(device)
         }
+        // Establish BLE GATT control channel (guards duplicates internally)
+        bleSignaling.connectToPeer(device)
     }
 
     override fun onPeerLost(deviceAddress: String) {
         Log.i(TAG, "Peer lost: $deviceAddress")
         liveness.removePeer(deviceAddress)
         peerCaps.remove(deviceAddress)
+        // Tear down this peer's RECV_ACK loop so it doesn't pump frames to a dead peer.
+        stopRecvAckJob(deviceAddress)
+        rxAckStates.remove(deviceAddress)
     }
 
     // —— Heartbeat Loop (Task 2.2) ——
@@ -529,9 +569,22 @@ class PttCoordinator(
             while (isActive) {
                 delay(1_000L)
                 val nowMs = System.currentTimeMillis()
-                val peerIds = liveness.peerIds()
-                val stale = peerIds.isNotEmpty() && peerIds.any { liveness.health(it, nowMs) == PeerHealth.STALE }
+                val allPeers = liveness.peerIds()
+                val stale = allPeers.isNotEmpty() && allPeers.any { liveness.health(it, nowMs) == PeerHealth.STALE }
                 if (anyPeerStale.value != stale) anyPeerStale.value = stale
+
+                // v2.7.1: publish active-peer set + join/leave events.
+                // "Active" = HEALTHY or DEGRADED; STALE peers are excluded
+                // so the chip shows who you can actually reach right now.
+                val active = allPeers.filter { liveness.health(it, nowMs) != PeerHealth.STALE }.toSet()
+                val previous = peerIds.value
+                if (active != previous) {
+                    val joined = active - previous
+                    val left = previous - active
+                    peerIds.value = active
+                    joined.forEach { _peerEvents.tryEmit(PeerEvent.Joined(it)) }
+                    left.forEach { _peerEvents.tryEmit(PeerEvent.Left(it)) }
+                }
             }
         }
     }
@@ -685,44 +738,59 @@ class PttCoordinator(
      * Updates lastRxEpoch/lastRxSeq and (re)starts the 500ms RECV_ACK loop.
      */
     private fun onAudioFrameReceived(peerId: String, epoch: Long, seq: Int) {
+        val now = System.currentTimeMillis()
+        // Keep the legacy "last received" fields current for other readers.
         lastRxEpoch = epoch
         lastRxSeq = seq
         lastRxPeerId = peerId
-        lastRxFrameMs = System.currentTimeMillis()
+        lastRxFrameMs = now
         // Extend peer-speaking timeout on each incoming audio frame (Task 6.2)
         onPeerAudioFrame()
-        // Ensure the ACK loop is running
-        if (recvAckJob?.isActive != true) {
-            recvAckJob = scope.launch {
+
+        // Per-peer RECV_ACK: update this peer's state and ensure ITS OWN loop runs,
+        // so concurrent senders are each acknowledged independently.
+        val st = rxAckStates.getOrPut(peerId) { RxAckState(epoch, seq, now) }
+        st.epoch = epoch
+        st.seq = seq
+        st.lastFrameMs = now
+        if (st.job?.isActive != true) {
+            st.job = scope.launch {
                 Log.d(TAG, "RECV_ACK loop started for $peerId epoch=$epoch")
                 while (isActive) {
-                    // Stop if the peer's audio dried up and no clean PTT_STOP
-                    // arrived. Without this, the loop pumps BLE control
-                    // frames forever after a dropped session, contending
-                    // with future RFCOMM audio.
-                    val silence = System.currentTimeMillis() - lastRxFrameMs
+                    // Stop if THIS peer's audio dried up and no clean PTT_STOP
+                    // arrived. Without this, the loop pumps BLE control frames
+                    // forever after a dropped session, contending with RFCOMM audio.
+                    val silence = System.currentTimeMillis() - st.lastFrameMs
                     if (silence > RECV_ACK_INTERVAL_MS * 3) {
-                        Log.d(TAG, "RECV_ACK loop stopping: ${silence}ms since last frame")
+                        Log.d(TAG, "RECV_ACK loop stopping for $peerId: ${silence}ms since last frame")
                         break
                     }
-                    val ackEpoch = lastRxEpoch
-                    val ackSeq = lastRxSeq
-                    val ackPeer = lastRxPeerId ?: break
-                    val frame = ControlFrame.encodeRecvAck(ackEpoch, ackSeq, System.currentTimeMillis())
-                    bleSignaling.sendControl(ackPeer, frame)
+                    val frame = ControlFrame.encodeRecvAck(st.epoch, st.seq, System.currentTimeMillis())
+                    bleSignaling.sendControl(peerId, frame)
                     cellularClient?.sendBinary(frame)
-                    Log.d(TAG, "RECV_ACK sent epoch=$ackEpoch seq=$ackSeq to $ackPeer")
+                    Log.d(TAG, "RECV_ACK sent epoch=${st.epoch} seq=${st.seq} to $peerId")
                     delay(RECV_ACK_INTERVAL_MS)
                 }
-                Log.d(TAG, "RECV_ACK loop stopped")
+                Log.d(TAG, "RECV_ACK loop stopped for $peerId")
             }
         }
     }
 
-    /** Stop the RECV_ACK coroutine (called when PTT session ends). */
-    private fun stopRecvAckJob() {
-        recvAckJob?.cancel()
-        recvAckJob = null
+    /** Stop the RECV_ACK loop for a SPECIFIC peer (called when that peer ends its PTT). */
+    private fun stopRecvAckJob(peerId: String) {
+        rxAckStates[peerId]?.let {
+            it.job?.cancel()
+            it.job = null
+        }
+    }
+
+    /** Stop ALL RECV_ACK loops (called on shutdown). */
+    private fun stopAllRecvAckJobs() {
+        rxAckStates.values.forEach {
+            it.job?.cancel()
+            it.job = null
+        }
+        rxAckStates.clear()
     }
 
     // —— PTT_STOP_V2 / EOT_ACK — Receiver + Sender (Task 4.3) ——
@@ -732,7 +800,7 @@ class PttCoordinator(
      * Wait 300ms for jitter buffer to drain, then send EOT_ACK back.
      */
     private fun handlePttStopV2(peerId: String, payload: ByteArray) {
-        stopRecvAckJob()
+        stopRecvAckJob(peerId)
         if (payload.size < 12) {
             Log.w(TAG, "PTT_STOP_V2 from $peerId: payload too short (${payload.size})")
             return
@@ -867,7 +935,7 @@ class PttCoordinator(
 
     fun shutdown() {
         stopHeartbeat()
-        stopRecvAckJob()
+        stopAllRecvAckJobs()
         stopWatchdog()
         _reachingPeer.value = false
         audioPathDegraded.value = false

@@ -50,6 +50,16 @@ class BluetoothTransport(private val context: Context) {
         private const val FRAME_HEADER_SIZE = 4
         private const val MAX_FRAME_SIZE = 4096
 
+        // Channel-sync control message framing. A plain [0xFF,0xFF,channel]
+        // 3-byte payload collides with any legitimate 3-byte audio/control
+        // frame whose first two bytes happen to be 0xFF. Use a reserved 3-byte
+        // magic (0xFF 0xFF 0x53 = 'S') plus a dedicated type byte 0x01, so the
+        // sync message is a fixed 5-byte payload that audio frames cannot match.
+        // Layout: [0xFF][0xFF][0x53][0x01][channel].
+        private val CHANNEL_SYNC_MAGIC = byteArrayOf(0xFF.toByte(), 0xFF.toByte(), 0x53.toByte())
+        private const val CHANNEL_SYNC_TYPE: Byte = 0x01
+        private const val CHANNEL_SYNC_LEN = 5
+
         // Dead peer detection timeout (ms)
         private const val DEAD_PEER_TIMEOUT_MS = 10_000L
     }
@@ -61,6 +71,45 @@ class BluetoothTransport(private val context: Context) {
     @Volatile
     var state: State = State.DISCONNECTED
         private set
+
+    // Single lock guarding all `state` transitions. Transitions are compound
+    // (they depend on whether `connectedPeers` is empty) so plain @Volatile
+    // visibility is not enough — concurrent connect/disconnect paths could
+    // otherwise clobber each other (e.g. report CONNECTED with no peers, or a
+    // racing failed-connect overwriting a successful one). All writes to
+    // `state` must go through the helpers below.
+    private val stateLock = Any()
+
+    /**
+     * Recompute `state` from the authoritative source of truth (`connectedPeers`).
+     * CONNECTED iff at least one peer is present, otherwise DISCONNECTED. Never
+     * downgrades or fabricates CONNECTING. Safe to call from any thread.
+     */
+    private fun refreshState() {
+        synchronized(stateLock) {
+            state = if (connectedPeers.isEmpty()) State.DISCONNECTED else State.CONNECTED
+        }
+    }
+
+    /**
+     * Mark CONNECTING only while genuinely idle (no peers yet). If peers already
+     * exist we keep CONNECTED rather than regressing to CONNECTING — a new
+     * connect attempt must not visually disconnect existing peers.
+     */
+    private fun markConnecting() {
+        synchronized(stateLock) {
+            if (connectedPeers.isEmpty()) {
+                state = State.CONNECTING
+            }
+        }
+    }
+
+    /** Force DISCONNECTED (used by shutdown, which tears down all peers). */
+    private fun forceDisconnected() {
+        synchronized(stateLock) {
+            state = State.DISCONNECTED
+        }
+    }
 
     private val btAdapter: BluetoothAdapter? by lazy {
         val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -152,7 +201,7 @@ class BluetoothTransport(private val context: Context) {
             return true
         }
 
-        state = State.CONNECTING
+        markConnecting()
         Log.i(TAG, "Connecting to ${device.name} ($addr)...")
 
         // === Fallback 1: Standard RFCOMM ===
@@ -189,7 +238,7 @@ class BluetoothTransport(private val context: Context) {
             Log.e(TAG, "All RFCOMM methods failed for ${device.name}: ${e.message}")
         }
 
-        state = if (connectedPeers.isEmpty()) State.DISCONNECTED else State.CONNECTED
+        refreshState()
         return false
     }
 
@@ -267,6 +316,15 @@ class BluetoothTransport(private val context: Context) {
                     continue
                 }
 
+                // Guard frame size against the RX-side limit. The receiver
+                // rejects any frame with length <= 0 or > MAX_FRAME_SIZE, so
+                // sending one would be unreadable by peers (and risks receiver
+                // buffer issues). Skip it rather than transmitting garbage.
+                if (frameData.size <= 0 || frameData.size > MAX_FRAME_SIZE) {
+                    Log.w(TAG, "BT TX pump: dropping oversized/empty frame (${frameData.size} bytes, max $MAX_FRAME_SIZE)")
+                    continue
+                }
+
                 // Write length-prefixed frame to all connected peers
                 headerBb.clear()
                 headerBb.putInt(frameData.size)
@@ -301,6 +359,9 @@ class BluetoothTransport(private val context: Context) {
             }
 
             txPumpRunning.set(false)
+            // If the pump exited because all peers dropped, make sure `state`
+            // reflects DISCONNECTED rather than a stale CONNECTED.
+            refreshState()
             Log.i(TAG, "BT TX pump stopped")
         }.start()
     }
@@ -344,7 +405,7 @@ class BluetoothTransport(private val context: Context) {
         val addrs = connectedPeers.keys.toList()
         addrs.forEach { removePeer(it) }
 
-        state = State.DISCONNECTED
+        forceDisconnected()
         SassyTalkNative.btDisconnected()
     }
 
@@ -366,7 +427,7 @@ class BluetoothTransport(private val context: Context) {
 
         connectedPeers[addr] = peer
         peerCount.set(connectedPeers.size)
-        state = State.CONNECTED
+        refreshState()
 
         // Notify Rust that BT transport is active
         SassyTalkNative.btConnected()
@@ -385,12 +446,16 @@ class BluetoothTransport(private val context: Context) {
 
     /**
      * Send channel sync message to a newly connected peer.
-     * Format: [0xFF][0xFF][channel:1] — distinguished from audio frames by the 0xFFFF prefix.
+     * Format: [0xFF][0xFF][0x53][0x01][channel:1] — a reserved 5-byte control
+     * frame (magic + type byte) that real audio frames cannot collide with.
      */
     private fun sendChannelSync(peer: ConnectedPeer) {
         try {
             val channel = SassyTalkNative.getChannel()
-            val syncMsg = byteArrayOf(0xFF.toByte(), 0xFF.toByte(), channel.toByte())
+            val syncMsg = byteArrayOf(
+                CHANNEL_SYNC_MAGIC[0], CHANNEL_SYNC_MAGIC[1], CHANNEL_SYNC_MAGIC[2],
+                CHANNEL_SYNC_TYPE, channel.toByte()
+            )
             val header = ByteBuffer.allocate(FRAME_HEADER_SIZE)
                 .order(ByteOrder.LITTLE_ENDIAN)
                 .putInt(syncMsg.size)
@@ -438,9 +503,16 @@ class BluetoothTransport(private val context: Context) {
 
                     peer.lastActivity = System.currentTimeMillis()
 
-                    // Check if it's a channel sync message (0xFF 0xFF prefix)
-                    if (frameLen == 3 && payload[0] == 0xFF.toByte() && payload[1] == 0xFF.toByte()) {
-                        val remoteChannel = payload[2].toInt() and 0xFF
+                    // Check if it's a channel sync message: reserved 5-byte
+                    // control frame [0xFF][0xFF][0x53][0x01][channel]. The full
+                    // magic + type byte makes this unambiguous so real audio
+                    // frames (even 5-byte ones) cannot be misread as sync.
+                    if (frameLen == CHANNEL_SYNC_LEN &&
+                        payload[0] == CHANNEL_SYNC_MAGIC[0] &&
+                        payload[1] == CHANNEL_SYNC_MAGIC[1] &&
+                        payload[2] == CHANNEL_SYNC_MAGIC[2] &&
+                        payload[3] == CHANNEL_SYNC_TYPE) {
+                        val remoteChannel = payload[4].toInt() and 0xFF
                         Log.i(TAG, "RX: channel sync received: ch=$remoteChannel from ${peer.device.name}")
                         // Optionally sync local channel (or just log for now)
                         continue
@@ -518,8 +590,8 @@ class BluetoothTransport(private val context: Context) {
 
         Log.i(TAG, "Peer removed: ${peer.device.name} ($address), remaining: ${connectedPeers.size}")
 
+        refreshState()
         if (connectedPeers.isEmpty()) {
-            state = State.DISCONNECTED
             SassyTalkNative.btDisconnected()
         }
     }

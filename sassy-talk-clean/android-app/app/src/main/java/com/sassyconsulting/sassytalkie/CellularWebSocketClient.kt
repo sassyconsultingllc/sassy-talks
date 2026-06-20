@@ -28,7 +28,13 @@ class CellularWebSocketClient {
 
     companion object {
         private const val TAG = "CellularWS"
-        private const val POLL_INTERVAL_MS = 5L  // Poll outbound queue every 5ms (200 fps)
+        // Outbound pump idle-poll interval. Each frame adds up to this many
+        // milliseconds of send latency beyond capture-to-encode time, and the
+        // receiver has no large jitter buffer so wire-side pacing irregularity
+        // is audible as "robotic / chopped" audio. 2 ms keeps the pump
+        // responsive without burning CPU. The pump also drains the queue
+        // fully each wake so bursts go on the wire immediately.
+        private const val POLL_INTERVAL_MS = 2L
         private const val PING_INTERVAL_SEC = 15L
         private const val MAX_RECONNECT_ATTEMPTS = 8
 
@@ -66,6 +72,14 @@ class CellularWebSocketClient {
 
     /** Callback for DO readiness confirmation. */
     var onRelayReady: (() -> Unit)? = null
+
+    /**
+     * Stable per-install peer identifier appended to the WS URL as `peer=...`.
+     * The relay uses it to map WS sessions to /presence registrations so audio
+     * for a peer with no active WS triggers an FCM wake push. Set this from
+     * the wire-up site (AutoConnectManager) via InstallId.get(context).
+     */
+    var peerId: String? = null
 
     /** PttCoordinator to route binary control frames (opcodes 0x10–0x1F). */
     var pttCoordinator: PttCoordinator? = null
@@ -137,12 +151,12 @@ class CellularWebSocketClient {
                     if (op in 0x10..0x1F) {
                         val payloadLen = (raw[1].toInt() and 0xFF) or ((raw[2].toInt() and 0xFF) shl 8)
                         if (raw.size == 3 + payloadLen) {
-                            // Derive a per-peer routing key from the TLV
-                            // payload when possible. Using a constant
-                            // "relay" key collapsed every cellular peer
-                            // into one entry in LivenessTracker, so the
-                            // Users tab showed N real peers as a single
-                            // pseudo-peer and presence/health was useless.
+                            // Derive a per-peer routing key from the TLV payload
+                            // when possible. Using a constant "relay" key
+                            // collapsed every cellular peer into one entry in
+                            // PttCoordinator's LivenessTracker, so the Users
+                            // tab showed N real peers as a single pseudo-peer
+                            // and presence/health was meaningless.
                             val peerId = relayPeerIdFromFrame(raw) ?: "relay"
                             pttCoordinator?.onControlFrame(peerId, raw)
                             return
@@ -237,10 +251,19 @@ class CellularWebSocketClient {
             Log.i(TAG, "Outbound pump started")
             while (isRunning.get() && isConnected.get()) {
                 try {
-                    val packet = SassyTalkNative.cellularPollOutbound()
-                    if (packet != null && packet.isNotEmpty()) {
+                    // Drain ALL queued packets per wake — bursts (e.g. from
+                    // PTT release buffer-mode, or post-jitter catch-up) go
+                    // out in one tight loop without paying the poll
+                    // interval per frame. Only after the queue is empty do
+                    // we sleep, and even then only briefly.
+                    var sentAny = false
+                    while (isRunning.get() && isConnected.get()) {
+                        val packet = SassyTalkNative.cellularPollOutbound() ?: break
+                        if (packet.isEmpty()) break
                         webSocket?.send(ByteString.of(*packet))
-                    } else {
+                        sentAny = true
+                    }
+                    if (!sentAny) {
                         Thread.sleep(POLL_INTERVAL_MS)
                     }
                 } catch (e: InterruptedException) {
@@ -331,12 +354,15 @@ class CellularWebSocketClient {
                             onResult(null, IllegalStateException("auth token missing"))
                             return
                         }
-                        val authedUrl = toHttpScheme(baseWsUrl).toHttpUrlOrNull()!!
+                        val builder = toHttpScheme(baseWsUrl).toHttpUrlOrNull()!!
                             .newBuilder()
                             .setQueryParameter("token", token)
-                            .build()
-                            .toString()
-                            .let { toWsScheme(it) }
+                        // Stable peer-id so the relay can match this WS to a
+                        // /presence row and skip FCM pushes when we're online.
+                        peerId?.takeIf { it.isNotBlank() }?.let {
+                            builder.setQueryParameter("peer", it)
+                        }
+                        val authedUrl = builder.build().toString().let { toWsScheme(it) }
                         onResult(authedUrl, null)
                     } catch (t: Throwable) {
                         onResult(null, t)
@@ -376,13 +402,30 @@ class CellularWebSocketClient {
      * tracker entry is just slightly less precise for two infrequent ops.
      */
     private fun relayPeerIdFromFrame(raw: ByteArray): String? {
-        if (raw.size < 3 + 8) return null
+        if (raw.isEmpty()) return null
         val op = raw[0].toInt() and 0xFF
-        // 0x10 HEARTBEAT, 0x11 RECV_ACK, 0x12 EOT_ACK, 0x15 PTT_START_V2,
-        // 0x16 PTT_STOP_V2 all share the {epoch:i64,...} payload prefix.
-        // 0x13 CAPABILITIES (JSON) and 0x14 PARTNER_OFFLINE (length-prefixed
-        // peerId) do not — bail and let the caller use the constant key.
-        if (op !in setOf(0x10, 0x11, 0x12, 0x15, 0x16)) return null
+
+        // PARTNER_OFFLINE is the only frame that names the peer that left.
+        // Layout: [op][len:u16 LE][peer_id_len:u8][peer_id bytes...]
+        // Route it under the leaving peer's own per-epoch id is not possible
+        // (we only get the server-assigned UUID here), but we CAN at least
+        // distinguish offline events for different peers by using their
+        // name as the routing key so liveness.removePeer targets correctly.
+        if (op == 0x14) {
+            if (raw.size < 4) return null
+            val idLen = raw[3].toInt() and 0xFF
+            if (raw.size < 4 + idLen || idLen == 0) return null
+            val name = String(raw, 4, idLen, Charsets.UTF_8)
+            return "relay:peer:$name"
+        }
+
+        // Epoch-prefixed opcodes: payload starts with i64 LE epoch of the
+        // SENDER. Use that as a stable per-peer routing key over the WS.
+        // OP_WAKE (0x17) was added in Phase-1 wake-beacon; if it's omitted
+        // here every cellular WAKE collapses to the constant 'relay' key
+        // and the wake's per-peer epoch tracking goes blind.
+        if (raw.size < 3 + 8) return null
+        if (op !in setOf(0x10, 0x11, 0x12, 0x15, 0x16, 0x17)) return null
         val bb = java.nio.ByteBuffer.wrap(raw, 3, 8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
         val epoch = bb.long
         // SessionEpoch.generate() never produces 0; treat 0 as "absent" and

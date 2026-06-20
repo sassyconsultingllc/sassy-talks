@@ -17,6 +17,8 @@ import com.sassyconsulting.sassytalkie.ui.TranscriptionEntry
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.math.sqrt
 
 /**
@@ -476,6 +478,88 @@ object TranscriptionBridge {
         _entries.value = updated
 
         showTimelineNotification(entry)
+
+        // v2.7.2: debounced persistence — schedule a save 250 ms in the future,
+        // coalescing rapid additions into one disk write. Survives process
+        // death so the "who spoke when" log isn't lost on app kill.
+        schedulePersist()
+    }
+
+    // ── v2.7.2: persisted timeline ──
+
+    private const val TIMELINE_FILE_NAME = "timeline_v1.json"
+    private const val PERSIST_DEBOUNCE_MS = 250L
+    @Volatile private var persistJob: kotlinx.coroutines.Job? = null
+    private val persistScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob()
+    )
+
+    private fun schedulePersist() {
+        val ctx = appContext ?: return
+        // Cancel pending; new save will pick up the latest snapshot.
+        persistJob?.cancel()
+        persistJob = persistScope.launch {
+            delay(PERSIST_DEBOUNCE_MS)
+            try {
+                val snapshot = _entries.value
+                val arr = org.json.JSONArray()
+                for (e in snapshot) {
+                    val o = org.json.JSONObject()
+                    o.put("senderId", e.senderId)
+                    o.put("senderName", e.senderName)
+                    o.put("text", e.text)
+                    o.put("timestamp", e.timestamp)
+                    o.put("isFavorite", e.isFavorite)
+                    o.put("isMuted", e.isMuted)
+                    o.put("utteranceId", e.utteranceId)
+                    arr.put(o)
+                }
+                val tmp = java.io.File(ctx.filesDir, "$TIMELINE_FILE_NAME.tmp")
+                tmp.writeText(arr.toString())
+                // Atomic-ish rename so a torn write never half-corrupts the live file.
+                val live = java.io.File(ctx.filesDir, TIMELINE_FILE_NAME)
+                if (!tmp.renameTo(live)) {
+                    // renameTo can fail on some Android filesystems if target exists
+                    live.delete()
+                    tmp.renameTo(live)
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "timeline persist failed: ${t.message}")
+            }
+        }
+    }
+
+    /**
+     * Restore the persisted timeline from disk. Call once during app init
+     * (after [initialize]) so the in-memory `_entries` is hydrated before
+     * the user opens the Timeline screen. Silent on missing/corrupt file.
+     */
+    fun restoreEntries() {
+        val ctx = appContext ?: return
+        try {
+            val file = java.io.File(ctx.filesDir, TIMELINE_FILE_NAME)
+            if (!file.exists()) return
+            val arr = org.json.JSONArray(file.readText())
+            val restored = mutableListOf<com.sassyconsulting.sassytalkie.ui.TranscriptionEntry>()
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                restored.add(
+                    com.sassyconsulting.sassytalkie.ui.TranscriptionEntry(
+                        senderId = o.optString("senderId"),
+                        senderName = o.optString("senderName"),
+                        text = o.optString("text"),
+                        timestamp = o.optLong("timestamp"),
+                        isFavorite = o.optBoolean("isFavorite", false),
+                        isMuted = o.optBoolean("isMuted", false),
+                        utteranceId = o.optLong("utteranceId", -1L),
+                    )
+                )
+            }
+            synchronized(lock) { _entries.value = restored }
+            Log.i(TAG, "timeline restored: ${restored.size} entries")
+        } catch (t: Throwable) {
+            Log.w(TAG, "timeline restore failed: ${t.message}")
+        }
     }
 
     private fun resetSpeechState() {

@@ -1,0 +1,175 @@
+name: Build iOS
+
+# Builds the SassyTalkie iOS app (SwiftUI shell over the Rust FFI core in
+# sassy-talk-clean/ios-native, generated with XcodeGen from project.yml).
+#
+# Two modes:
+#   * push / PR / plain dispatch → unsigned simulator build. Verifies the whole
+#     app compiles and links the Rust core. Needs NO Apple secrets.
+#   * dispatch with deploy_testflight=true → signed device archive + TestFlight
+#     upload. Requires these repo secrets:
+#       IOS_DIST_CERT_P12_BASE64        base64 of the distribution .p12
+#       IOS_DIST_CERT_PASSWORD          password for that .p12
+#       IOS_PROVISIONING_PROFILE_BASE64 base64 of the App Store provisioning profile
+#       APP_STORE_CONNECT_KEY_ID        App Store Connect API key id
+#       APP_STORE_CONNECT_ISSUER_ID     App Store Connect issuer id
+#       APP_STORE_CONNECT_API_KEY_BASE64 base64 of the .p8 API key
+#       IOS_TEAM_ID                     Apple Developer team id
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_testflight:
+        description: 'Sign, archive, and upload to TestFlight (requires Apple secrets)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+  push:
+    branches: [main]
+    paths:
+      - 'sassy-talk-clean/ios-native/**'
+      - 'sassy-talk-clean/core/**'
+  pull_request:
+    paths:
+      - 'sassy-talk-clean/ios-native/**'
+      - 'sassy-talk-clean/core/**'
+
+jobs:
+  build-ios:
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: sassy-talk-clean/ios-native
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 15
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+
+      - name: Set up Rust + iOS targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-apple-ios x86_64-apple-ios aarch64-apple-ios-sim
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sassy-talk-clean/ios-native/target
+          key: ${{ runner.os }}-ios-cargo-${{ hashFiles('sassy-talk-clean/ios-native/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ios-cargo-
+
+      - name: Install tooling (xcodegen, cbindgen, xcpretty)
+        run: |
+          brew install xcodegen
+          cargo install cbindgen --locked || true
+          gem install xcpretty || true
+
+      - name: Build Rust core for iOS (device + simulator)
+        run: bash build.sh
+
+      - name: Generate C headers
+        run: bash generate_headers.sh
+
+      - name: Generate Xcode project from project.yml
+        run: xcodegen generate
+
+      # ── Unsigned simulator build — every push/PR, no secrets needed. ──
+      - name: Build app for simulator (unsigned)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy_testflight != 'true' }}
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project SassyTalkie.xcodeproj \
+            -scheme SassyTalkie \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | (xcpretty || cat)
+
+      # ── Signed device archive + TestFlight — manual dispatch only. ──
+      - name: Verify Apple signing secrets
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_testflight == 'true' }}
+        env:
+          IOS_DIST_CERT_P12_BASE64:        ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
+          IOS_DIST_CERT_PASSWORD:          ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          APP_STORE_CONNECT_KEY_ID:        ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID:     ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          IOS_TEAM_ID:                     ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          missing=0
+          for v in IOS_DIST_CERT_P12_BASE64 IOS_DIST_CERT_PASSWORD IOS_PROVISIONING_PROFILE_BASE64 \
+                   APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_API_KEY_BASE64 IOS_TEAM_ID; do
+            if [ -z "${!v}" ]; then echo "::error::secret $v is unset"; missing=1; fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+      - name: Import signing certificate
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_testflight == 'true' }}
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.IOS_DIST_CERT_P12_BASE64 }}
+          p12-password: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+
+      - name: Install provisioning profile
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_testflight == 'true' }}
+        run: |
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          echo "${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}" | base64 -d \
+            > "$HOME/Library/MobileDevice/Provisioning Profiles/sassytalkie.mobileprovision"
+
+      - name: Archive (signed)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_testflight == 'true' }}
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project SassyTalkie.xcodeproj \
+            -scheme SassyTalkie \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/SassyTalkie.xcarchive" \
+            DEVELOPMENT_TEAM='${{ secrets.IOS_TEAM_ID }}' \
+            archive 2>&1 | (xcpretty || cat)
+
+      - name: Export .ipa
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_testflight == 'true' }}
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store</string>
+            <key>teamID</key><string>${{ secrets.IOS_TEAM_ID }}</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>uploadSymbols</key><true/>
+          </dict></plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/SassyTalkie.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" 2>&1 | (xcpretty || cat)
+
+      - name: Upload to TestFlight
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_testflight == 'true' }}
+        uses: apple-actions/upload-testflight-build@v3
+        with:
+          app-path: ${{ runner.temp }}/export/SassyTalkie.ipa
+          issuer-id: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          api-key-id: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          api-private-key: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+
+      - name: Upload .ipa artifact
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_testflight == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sassy-talkie-ios-ipa
+          path: ${{ runner.temp }}/export/*.ipa
+          retention-days: 30

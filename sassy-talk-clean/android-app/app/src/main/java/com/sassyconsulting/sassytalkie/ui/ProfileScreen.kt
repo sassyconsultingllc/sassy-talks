@@ -6,13 +6,12 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.*
@@ -93,162 +92,193 @@ fun ProfileScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(DarkBg)
-            .safeDrawingPadding()
-            .padding(horizontal = 24.dp, vertical = 16.dp),
+            .safeDrawingPadding(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // Header
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            if (showBackButton && onBack != null) {
-                TextButton(onClick = onBack) {
-                    Text("Cancel", color = TextGray)
-                }
-            } else {
-                Spacer(modifier = Modifier.width(72.dp))
-            }
-            Text(
-                text = "Your Profile",
-                fontSize = 22.sp,
-                fontWeight = FontWeight.Bold,
-                color = Orange,
-                modifier = Modifier.weight(1f),
-                textAlign = TextAlign.Center
-            )
-            Spacer(modifier = Modifier.width(72.dp))
-        }
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        // Avatar preview
-        Box(
+        // Scrollable content — so the Save button below is always reachable
+        // even on the smallest screens (Zebra TC21, etc.) and when the IME
+        // is open shrinking the viewport.
+        Column(
             modifier = Modifier
-                .size(100.dp)
-                .clip(CircleShape)
-                .background(avatarColor(selectedColorIdx)),
-            contentAlignment = Alignment.Center
+                .weight(1f)
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp, vertical = 12.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text(text = selectedEmoji, fontSize = 48.sp)
-        }
+            // Header
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (showBackButton && onBack != null) {
+                    TextButton(onClick = onBack) {
+                        Text("Cancel", color = TextGray)
+                    }
+                } else {
+                    Spacer(modifier = Modifier.width(64.dp))
+                }
+                Text(
+                    text = "Your Profile",
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Orange,
+                    modifier = Modifier.weight(1f),
+                    textAlign = TextAlign.Center
+                )
+                Spacer(modifier = Modifier.width(64.dp))
+            }
 
-        Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
-        // Name field
-        Text("Display Name", fontSize = 13.sp, color = TextMuted, modifier = Modifier.fillMaxWidth())
-        Spacer(modifier = Modifier.height(6.dp))
-        OutlinedTextField(
-            value = name,
-            onValueChange = { if (it.length <= 24) name = it },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-            keyboardActions = KeyboardActions(onDone = { keyboard?.hide() }),
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = Orange,
-                unfocusedBorderColor = CardBg,
-                focusedTextColor = TextWhite,
-                unfocusedTextColor = TextWhite,
-                cursorColor = Orange,
-                focusedContainerColor = SurfaceBg,
-                unfocusedContainerColor = SurfaceBg
-            ),
-            shape = RoundedCornerShape(12.dp)
-        )
+            // Avatar preview
+            Box(
+                modifier = Modifier
+                    .size(80.dp)
+                    .clip(CircleShape)
+                    .background(avatarColor(selectedColorIdx)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(text = selectedEmoji, fontSize = 40.sp)
+            }
 
-        Spacer(modifier = Modifier.height(20.dp))
+            Spacer(modifier = Modifier.height(16.dp))
 
-        // Color picker
-        Text("Avatar Color", fontSize = 13.sp, color = TextMuted, modifier = Modifier.fillMaxWidth())
-        Spacer(modifier = Modifier.height(8.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            AVATAR_COLORS.forEachIndexed { idx, color ->
-                Box(
-                    modifier = Modifier
-                        .size(36.dp)
-                        .clip(CircleShape)
-                        .background(color)
-                        .then(
-                            if (idx == selectedColorIdx)
-                                Modifier.border(3.dp, TextWhite, CircleShape)
-                            else
-                                Modifier
-                        )
-                        .clickable { selectedColorIdx = idx },
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (idx == selectedColorIdx) {
-                        Icon(
-                            Icons.Default.Check,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(18.dp)
-                        )
+            // Name field
+            Text("Display Name", fontSize = 12.sp, color = TextMuted, modifier = Modifier.fillMaxWidth())
+            Spacer(modifier = Modifier.height(4.dp))
+            OutlinedTextField(
+                value = name,
+                onValueChange = { if (it.length <= 24) name = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { keyboard?.hide() }),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = Orange,
+                    unfocusedBorderColor = CardBg,
+                    focusedTextColor = TextWhite,
+                    unfocusedTextColor = TextWhite,
+                    cursorColor = Orange,
+                    focusedContainerColor = SurfaceBg,
+                    unfocusedContainerColor = SurfaceBg
+                ),
+                shape = RoundedCornerShape(12.dp)
+            )
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // Color picker
+            Text("Avatar Color", fontSize = 12.sp, color = TextMuted, modifier = Modifier.fillMaxWidth())
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                AVATAR_COLORS.forEachIndexed { idx, color ->
+                    Box(
+                        modifier = Modifier
+                            .size(32.dp)
+                            .clip(CircleShape)
+                            .background(color)
+                            .then(
+                                if (idx == selectedColorIdx)
+                                    Modifier.border(3.dp, TextWhite, CircleShape)
+                                else
+                                    Modifier
+                            )
+                            .clickable { selectedColorIdx = idx },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (idx == selectedColorIdx) {
+                            Icon(
+                                Icons.Default.Check,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
                     }
                 }
             }
-        }
 
-        Spacer(modifier = Modifier.height(20.dp))
+            Spacer(modifier = Modifier.height(14.dp))
 
-        // Emoji picker
-        Text("Avatar Emoji", fontSize = 13.sp, color = TextMuted, modifier = Modifier.fillMaxWidth())
-        Spacer(modifier = Modifier.height(8.dp))
-        LazyVerticalGrid(
-            columns = GridCells.Fixed(6),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            items(AVATAR_EMOJIS) { emoji ->
-                Box(
-                    modifier = Modifier
-                        .size(48.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(if (emoji == selectedEmoji) SurfaceBg else CardBg)
-                        .then(
-                            if (emoji == selectedEmoji)
-                                Modifier.border(2.dp, avatarColor(selectedColorIdx), RoundedCornerShape(10.dp))
-                            else
-                                Modifier
-                        )
-                        .clickable { selectedEmoji = emoji },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(text = emoji, fontSize = 24.sp)
+            // Emoji picker — fixed 6×3 layout (18 items), no LazyGrid:
+            // a Lazy*Grid inside a verticalScroll throws at measure time, and
+            // for a tiny known set there's nothing to lazy-load anyway.
+            Text("Avatar Emoji", fontSize = 12.sp, color = TextMuted, modifier = Modifier.fillMaxWidth())
+            Spacer(modifier = Modifier.height(6.dp))
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                AVATAR_EMOJIS.chunked(6).forEach { rowEmojis ->
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        rowEmojis.forEach { emoji ->
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .aspectRatio(1f)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(if (emoji == selectedEmoji) SurfaceBg else CardBg)
+                                    .then(
+                                        if (emoji == selectedEmoji)
+                                            Modifier.border(2.dp, avatarColor(selectedColorIdx), RoundedCornerShape(10.dp))
+                                        else
+                                            Modifier
+                                    )
+                                    .clickable { selectedEmoji = emoji },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(text = emoji, fontSize = 22.sp)
+                            }
+                        }
+                        // Pad the last partial row so emojis don't stretch.
+                        repeat(6 - rowEmojis.size) {
+                            Spacer(modifier = Modifier.weight(1f))
+                        }
+                    }
                 }
             }
+
+            // Tail spacer so the last row doesn't sit flush against the
+            // sticky Save bar — small, since the bar already has padding.
+            Spacer(modifier = Modifier.height(8.dp))
         }
 
-        Spacer(modifier = Modifier.weight(1f))
-
-        // Save button
-        Button(
-            onClick = {
-                val trimmed = name.trim().ifEmpty { Build.MODEL }
-                prefs.edit()
-                    .putString(KEY_NAME, trimmed)
-                    .putString(KEY_EMOJI, selectedEmoji)
-                    .putInt(KEY_COLOR_IDX, selectedColorIdx)
-                    .putBoolean(KEY_PROFILE_SET, true)
-                    .apply()
-                SassyTalkNative.setDeviceName(trimmed)
-                onDone()
-            },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(52.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = Orange),
-            shape = RoundedCornerShape(26.dp),
-            enabled = name.isNotBlank()
+        // Sticky Save bar — always visible, raised slightly above content
+        // and respects the IME via safeDrawingPadding on the outer Column.
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = DarkBg,
+            shadowElevation = 8.dp
         ) {
-            Text("Save & Continue", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            Button(
+                onClick = {
+                    val trimmed = name.trim().ifEmpty { Build.MODEL }
+                    prefs.edit()
+                        .putString(KEY_NAME, trimmed)
+                        .putString(KEY_EMOJI, selectedEmoji)
+                        .putInt(KEY_COLOR_IDX, selectedColorIdx)
+                        .putBoolean(KEY_PROFILE_SET, true)
+                        .apply()
+                    SassyTalkNative.setDeviceName(trimmed)
+                    onDone()
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 10.dp)
+                    .height(48.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Orange),
+                shape = RoundedCornerShape(24.dp),
+                enabled = name.isNotBlank()
+            ) {
+                Text("Save & Continue", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+            }
         }
-
-        Spacer(modifier = Modifier.height(16.dp))
     }
 }

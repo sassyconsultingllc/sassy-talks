@@ -373,3 +373,32 @@ pub async fn get_connection_quality(
 ) -> Result<Vec<(String, String, Option<u32>, String)>, String> {
     Ok(state.get_connection_quality().await)
 }
+
+// ============================================================================
+// Cellular Relay Commands - Internet transport via the Cloudflare relay
+// ============================================================================
+
+/// Join a cellular relay session from a scanned/pasted QR JSON payload.
+/// Returns the relay room id (= session_id) on success. Errors surface auth or
+/// connect failures so the UI can show them.
+#[tauri::command]
+pub async fn join_cellular_session(
+    state: State<'_, Arc<AppState>>,
+    qr_json: String,
+) -> Result<String, String> {
+    state.join_cellular(&qr_json).await
+}
+
+/// Leave the current cellular relay session (idempotent).
+#[tauri::command]
+pub async fn leave_cellular_session(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.leave_cellular().await;
+    Ok(())
+}
+
+/// Cellular session status as JSON (`{state,room,sent,received}`), or an empty
+/// string when no session is joined.
+#[tauri::command]
+pub async fn get_cellular_status(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    Ok(state.cellular_status().await.unwrap_or_default())
+}

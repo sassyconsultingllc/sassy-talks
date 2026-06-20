@@ -17,6 +17,13 @@ tauri-build = { version = "2.0", features = [] }
 sha2 = "0.10"
 
 [dependencies]
+# v2.7.x: shared cross-platform core. Source of truth for protocol opcodes
+# (OP_PTT_START_V2, OP_HEARTBEAT, OP_WAKE, OP_REPLAY_FRAME, etc.), audio
+# cache (Live/Queue/Mix), cohort_history, and crypto. Wired here so the
+# desktop client stays in lockstep with the Android phone client — opcode
+# additions on either side propagate automatically.
+sassytalkie-core = { path = "../../core" }
+
 # Tauri framework
 tauri = { version = "2.0", features = [] }
 tauri-plugin-shell = "2.0"
@@ -46,6 +53,17 @@ sha2 = "0.10"
 
 # Networking - UDP multicast for cross-platform audio
 socket2 = { version = "0.5", features = ["all"] }
+
+# Cellular relay transport — native WebSocket client to the Cloudflare relay
+# (wss://relay.sassyconsultingllc.com). Desktop owns the socket directly
+# (unlike Android, where Kotlin/OkHttp owns it and Rust is a queue bridge).
+# rustls + webpki roots: pure-Rust TLS, no OpenSSL/system-cert dependency,
+# identical behavior across Windows/macOS/Linux.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+# /auth HMAC token fetch before the WS upgrade. rustls to share TLS stack with
+# tokio-tungstenite and avoid a second (OpenSSL) backend.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # Ring buffer for audio
 ringbuf = "0.4"
