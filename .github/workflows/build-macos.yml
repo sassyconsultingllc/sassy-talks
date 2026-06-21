@@ -37,6 +37,12 @@ on:
 jobs:
   build-macos:
     runs-on: macos-14
+    env:
+      # libopus (bundled by audiopus_sys → built via CMake) declares a
+      # pre-3.5 cmake_minimum_required, which CMake 4.x on the runner rejects
+      # ("Compatibility with CMake < 3.5 has been removed"). This env var
+      # (honoured by CMake >= 3.31) restores the old-policy compatibility.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     defaults:
       run:
         working-directory: sassy-talk-clean/tauri-desktop
