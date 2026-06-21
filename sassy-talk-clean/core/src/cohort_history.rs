@@ -153,11 +153,17 @@ impl CohortHistory {
 
         if let Some(ref cid) = incoming {
             let orphan_idx = self.records.iter().position(|r| {
+                // Only a *recent past* join is inside the merge window. A future
+                // last_joined_at (now < last_joined_at, from clock skew / imported /
+                // hostile timestamps) must NOT count as inside the window — using
+                // saturating_sub here would yield 0 and falsely merge the orphan.
+                let within = r.last_joined_at <= now
+                    && now - r.last_joined_at <= ORPHAN_MERGE_WINDOW_SECS;
                 r.cohort_id != *cid
                     && r.channel == channel
                     && r.group_name == group_name
                     && r.host_device.as_deref() == Some(host_device)
-                    && now.saturating_sub(r.last_joined_at) <= ORPHAN_MERGE_WINDOW_SECS
+                    && within
             });
             if let Some(idx) = orphan_idx {
                 info!("CohortHistory: orphan-merging {} → {}",

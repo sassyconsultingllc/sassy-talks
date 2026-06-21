@@ -140,6 +140,10 @@ fn main() {
             commands::set_random_port_enabled,
             // Connection quality (Task 6.1)
             commands::get_connection_quality,
+            // Cellular relay (internet transport)
+            commands::join_cellular_session,
+            commands::leave_cellular_session,
+            commands::get_cellular_status,
         ])
         .setup(|_app| {
             info!("Sassy-Talk setup complete");

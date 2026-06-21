@@ -10,6 +10,7 @@
 /// 
 /// Copyright 2025 Sassy Consulting LLC. All rights reserved.
 
+pub mod cellular;
 pub mod control;
 pub mod discovery;
 pub mod liveness;
@@ -17,6 +18,7 @@ pub mod manager;
 
 pub use manager::{TransportManager, PeerInfo, TransportConfig};
 pub use discovery::DiscoveryService;
+pub use cellular::{CellularConfig, CellularState, CellularTransport};
 
 use crate::constants;
 

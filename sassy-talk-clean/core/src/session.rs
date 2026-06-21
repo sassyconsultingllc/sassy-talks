@@ -180,7 +180,12 @@ impl SessionManager {
             return Err("Session has expired".to_string());
         }
 
-        let duration_secs = session.expires_at - session.created_at;
+        // checked_sub: a crafted QR can set created_at > expires_at while still
+        // having a future expires_at (so the expiry check above passes). Plain
+        // subtraction would panic in debug / wrap in release on that input.
+        let duration_secs = session.expires_at
+            .checked_sub(session.created_at)
+            .ok_or_else(|| "Invalid session: expires before creation".to_string())?;
         if duration_secs > MAX_SESSION_HOURS as u64 * 3600 {
             return Err("Session duration exceeds maximum".to_string());
         }
@@ -323,7 +328,7 @@ impl SessionManager {
                         "session_id": cs.key.session_id,
                         "peer_device": cs.key.device,
                         "remaining_seconds": remaining,
-                        "fingerprint": &cs.key.session_id[..8],
+                        "fingerprint": cs.key.session_id.chars().take(8).collect::<String>(),
                     })
                 }
                 None => serde_json::json!({
@@ -352,7 +357,7 @@ impl SessionManager {
                         "channel": ch,
                         "active": active,
                         "name": cs.group_name,
-                        "fingerprint": &cs.key.session_id[..8],
+                        "fingerprint": cs.key.session_id.chars().take(8).collect::<String>(),
                     })
                 }
                 None => serde_json::json!({
@@ -552,5 +557,52 @@ mod tests {
         let (_ch, _crypto, cid) = joiner.import_session(&legacy).unwrap();
         assert!(!cid.is_empty(), "legacy QR must yield a locally-minted cohort_id");
         assert!(uuid::Uuid::parse_str(&cid).is_ok(), "minted cohort_id must be a valid UUID: {}", cid);
+    }
+
+    #[test]
+    fn hostile_session_id_does_not_panic_in_status() {
+        // A crafted QR with a short / non-ASCII session_id must NOT panic the
+        // status or channel-info paths. Previously `&session_id[..8]` panicked
+        // on byte-len < 8 or a non-char-boundary at byte 8, unwinding across the
+        // JNI boundary into the JVM = process abort from hostile input.
+        let now = current_unix_time().unwrap();
+        for sid in ["ab", "\u{1F600}\u{1F600}", ""] {
+            let crafted = serde_json::json!({
+                "key": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[7u8; 32]),
+                "device": "Hostile",
+                "created_at": now,
+                "expires_at": now + 3600,
+                "session_id": sid,
+                "channel": 1,
+                "group_name": "X",
+            }).to_string();
+
+            let mut mgr = SessionManager::new("Victim");
+            mgr.import_session(&crafted).expect("crafted-but-valid session should import");
+            // These two previously panicked on the slice; now they return cleanly.
+            let _ = mgr.get_session_status();
+            let _ = mgr.get_channel_info();
+        }
+    }
+
+    #[test]
+    fn import_rejects_expires_before_creation() {
+        // created_at > expires_at (with expires_at still in the future) passed
+        // the expiry check and then underflowed the duration subtraction.
+        let now = current_unix_time().unwrap();
+        let crafted = serde_json::json!({
+            "key": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[7u8; 32]),
+            "device": "Hostile",
+            "created_at": now + 10_000,
+            "expires_at": now + 3600,
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "channel": 1,
+            "group_name": "X",
+        }).to_string();
+        let mut mgr = SessionManager::new("Victim");
+        assert!(
+            mgr.import_session(&crafted).is_err(),
+            "expires-before-creation must be rejected, not panic"
+        );
     }
 }

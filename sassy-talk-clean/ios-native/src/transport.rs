@@ -104,7 +104,13 @@ impl TransportManager {
     pub fn receive(&self, buffer: &mut [u8]) -> Result<(usize, SocketAddr), TransportError> {
         let socket = self.socket.lock().unwrap();
         if let Some(sock) = socket.as_ref() {
-            match sock.recv_from(buffer) {
+            // socket2 0.5 takes &mut [MaybeUninit<u8>]. The caller's &mut [u8] is
+            // already initialized, so this cast is sound; recv_from writes `size`
+            // valid bytes that the caller reads back from `buffer` (same memory).
+            let buf_uninit: &mut [std::mem::MaybeUninit<u8>] = unsafe {
+                &mut *(buffer as *mut [u8] as *mut [std::mem::MaybeUninit<u8>])
+            };
+            match sock.recv_from(buf_uninit) {
                 Ok((size, addr)) => {
                     let socket_addr = match addr.as_socket() {
                         Some(sa) => sa,

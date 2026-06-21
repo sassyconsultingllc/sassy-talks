@@ -39,7 +39,7 @@ pub use transport::{TransportManager, PeerInfo, TransportConfig};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use thiserror::Error;
@@ -101,7 +101,13 @@ pub struct AppState {
     // PTT threads
     tx_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
     rx_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
-    
+
+    // Cellular relay session (internet transport via the Cloudflare relay).
+    // None when not joined. When Some, PTT TX routes here instead of UDP and a
+    // dedicated RX loop feeds decrypted Opus into the shared audio pipeline.
+    cellular: Arc<Mutex<Option<Arc<transport::CellularTransport>>>>,
+    cellular_rx_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
+
     // Settings
     roger_beep: Arc<AtomicBool>,
     vox_enabled: Arc<AtomicBool>,
@@ -136,6 +142,8 @@ impl AppState {
             is_receiving: Arc::new(AtomicBool::new(false)),
             tx_thread: Arc::new(Mutex::new(None)),
             rx_thread: Arc::new(Mutex::new(None)),
+            cellular: Arc::new(Mutex::new(None)),
+            cellular_rx_thread: Arc::new(Mutex::new(None)),
             roger_beep: Arc::new(AtomicBool::new(true)),
             vox_enabled: Arc::new(AtomicBool::new(false)),
             vox_threshold: Arc::new(RwLock::new(0.1)),
@@ -175,15 +183,90 @@ impl AppState {
         // Stop transport
         let transport = self.transport.lock().await;
         transport.stop();
-        
+        drop(transport);
+
         // Stop RX thread
         self.stop_rx_thread().await;
-        
+
+        // Tear down any active cellular relay session too — otherwise its
+        // WebSocket + RX task leak across stop/disconnect (the Tauri
+        // `disconnect` command routes here).
+        self.leave_cellular().await;
+
         *self.connection_status.write().await = ConnectionStatus::Disconnected;
-        
+
         Ok(())
     }
-    
+
+    /// Join a cellular relay session from a scanned/pasted QR JSON payload.
+    ///
+    /// Imports the session through the shared `sassytalkie_core::session`
+    /// SessionManager so the PSK and relay room id are derived identically to
+    /// Android — that's what makes the desktop wire-compatible. Returns the
+    /// relay room id (= QR session_id) on success.
+    pub async fn join_cellular(&self, qr_json: &str) -> Result<String, String> {
+        // Derive (channel, PSK CryptoSession, _cohort) + room id from the QR.
+        let mut sm = sassytalkie_core::session::SessionManager::new(&self.device_name);
+        let (channel, crypto, _cohort) = sm.import_session(qr_json)?;
+        let room_id = sm
+            .get_session_id(channel)
+            .ok_or_else(|| "imported session has no session_id".to_string())?;
+
+        // Replace any prior cellular session cleanly.
+        self.leave_cellular().await;
+
+        let config = transport::CellularConfig {
+            room_id: room_id.clone(),
+            device_name: self.device_name.clone(),
+            peer_id: format!("{:08X}", self.device_id),
+        };
+        let cell = transport::CellularTransport::new(config, crypto);
+
+        // Await the first dial so auth/connect failures surface to the caller.
+        cell.connect().await?;
+
+        let audio_rx = cell
+            .take_audio_receiver()
+            .ok_or_else(|| "cellular receiver unavailable".to_string())?;
+
+        // Reuse the shared decode → audio_cache → output pipeline.
+        let handle = spawn_audio_rx_loop(
+            Arc::clone(&self.audio),
+            audio_rx,
+            Arc::clone(&self.is_receiving),
+            Arc::clone(&self.is_transmitting),
+        );
+        *self.cellular_rx_thread.lock().await = Some(handle);
+        *self.cellular.lock().await = Some(cell);
+
+        self.current_channel.store(channel, Ordering::Relaxed);
+        *self.connection_status.write().await = ConnectionStatus::Connected;
+
+        info!("Joined cellular room '{}' on channel {}", room_id, channel);
+        Ok(room_id)
+    }
+
+    /// Leave the cellular relay session (idempotent).
+    pub async fn leave_cellular(&self) {
+        if let Some(cell) = self.cellular.lock().await.take() {
+            cell.stop();
+        }
+        if let Some(handle) = self.cellular_rx_thread.lock().await.take() {
+            handle.abort();
+        }
+        *self.connection_status.write().await = ConnectionStatus::Disconnected;
+    }
+
+    /// Cellular session stats as JSON, or None if not joined.
+    pub async fn cellular_status(&self) -> Option<String> {
+        self.cellular.lock().await.as_ref().map(|c| c.stats_json())
+    }
+
+    /// True if a cellular relay session is currently active.
+    pub async fn is_cellular_active(&self) -> bool {
+        self.cellular.lock().await.is_some()
+    }
+
     /// Start transmitting (PTT press)
     pub async fn start_transmit(&self) -> Result<(), AppError> {
         if self.is_transmitting.load(Ordering::Relaxed) {
@@ -248,13 +331,21 @@ impl AppState {
         let audio = Arc::clone(&self.audio);
         let transport = Arc::clone(&self.transport);
         let is_transmitting = Arc::clone(&self.is_transmitting);
-        let channel = self.current_channel.load(Ordering::Relaxed);
-        
+        let _channel = self.current_channel.load(Ordering::Relaxed);
+        // Snapshot the active transport at PTT-press time: if a cellular
+        // session is joined, audio goes over the relay instead of UDP multicast.
+        let cellular = self.cellular.lock().await.clone();
+
         let handle = tokio::spawn(async move {
             let mut encoder = match OpusEncoder::new() {
                 Ok(e) => e,
                 Err(e) => {
                     error!("Failed to create encoder: {}", e);
+                    // The caller set is_transmitting=true before spawning this task.
+                    // Clear it on encoder-init failure, otherwise PTT stays stuck
+                    // "on" (start_transmit refuses to re-arm) and the user can
+                    // never transmit again until app restart.
+                    is_transmitting.store(false, Ordering::Relaxed);
                     return;
                 }
             };
@@ -271,12 +362,19 @@ impl AppState {
                     // Encode to Opus
                     match encoder.encode(&buffer) {
                         Ok(opus_data) => {
-                            // Send via transport
-                            let transport_lock = transport.lock().await;
-                            if let Err(e) = transport_lock.send_audio(&opus_data) {
-                                error!("Failed to send audio: {}", e);
+                            // Send via the active transport (cellular if joined,
+                            // else UDP multicast). Both encrypt internally.
+                            if let Some(cell) = &cellular {
+                                if let Err(e) = cell.send_audio(&opus_data) {
+                                    error!("Failed to send audio (cellular): {}", e);
+                                }
+                            } else {
+                                let transport_lock = transport.lock().await;
+                                if let Err(e) = transport_lock.send_audio(&opus_data) {
+                                    error!("Failed to send audio: {}", e);
+                                }
+                                drop(transport_lock);
                             }
-                            drop(transport_lock);
                         }
                         Err(e) => {
                             error!("Encoding error: {}", e);
@@ -301,79 +399,24 @@ impl AppState {
         }
     }
     
-    /// Start RX thread (receiving and decoding)
+    /// Start RX thread (receiving and decoding) for the UDP transport.
     async fn start_rx_thread(&self) -> Result<(), AppError> {
-        let audio = Arc::clone(&self.audio);
-        let transport = Arc::clone(&self.transport);
-        let is_receiving = Arc::clone(&self.is_receiving);
-        let is_transmitting = Arc::clone(&self.is_transmitting);
-        
-        // Get audio receiver
-        let mut audio_rx = {
-            let transport_lock = transport.lock().await;
+        // Get audio receiver from the UDP transport (yields decrypted Opus).
+        let audio_rx = {
+            let transport_lock = self.transport.lock().await;
             transport_lock.take_audio_receiver()
                 .ok_or(AppError::NotConnected)?
         };
-        
-        let handle = tokio::spawn(async move {
-            let mut decoder = match OpusDecoder::new() {
-                Ok(d) => d,
-                Err(e) => {
-                    error!("Failed to create decoder: {}", e);
-                    return;
-                }
-            };
-            
-            // Start audio playback
-            {
-                let audio_lock = audio.lock().await;
-                if let Err(e) = audio_lock.start_playing() {
-                    error!("Failed to start playback: {}", e);
-                    return;
-                }
-            }
-            
-            while let Some(opus_data) = audio_rx.recv().await {
-                // Don't play audio while transmitting
-                if is_transmitting.load(Ordering::Relaxed) {
-                    continue;
-                }
-                
-                is_receiving.store(true, Ordering::Relaxed);
-                
-                // Decode Opus to PCM
-                match decoder.decode(&opus_data) {
-                    Ok(pcm_samples) => {
-                        // Write to audio output
-                        let audio_lock = audio.lock().await;
-                        audio_lock.write_samples(&pcm_samples);
-                        drop(audio_lock);
-                    }
-                    Err(e) => {
-                        error!("Decoding error: {}", e);
-                        // Use packet loss concealment
-                        if let Ok(plc_samples) = decoder.decode_plc() {
-                            let audio_lock = audio.lock().await;
-                            audio_lock.write_samples(&plc_samples);
-                            drop(audio_lock);
-                        }
-                    }
-                }
-                
-                is_receiving.store(false, Ordering::Relaxed);
-            }
-            
-            // Stop audio playback
-            {
-                let audio_lock = audio.lock().await;
-                let _ = audio_lock.stop_playing();
-            }
-            
-            info!("RX thread stopped");
-        });
-        
+
+        let handle = spawn_audio_rx_loop(
+            Arc::clone(&self.audio),
+            audio_rx,
+            Arc::clone(&self.is_receiving),
+            Arc::clone(&self.is_transmitting),
+        );
+
         *self.rx_thread.lock().await = Some(handle);
-        
+
         Ok(())
     }
     
@@ -470,6 +513,9 @@ impl AppState {
             }
         };
         
+        // Route to whichever transport is active.
+        let cellular = self.cellular.lock().await.clone();
+
         // Generate 100ms of dual-tone beep (about 5 frames at 20ms each)
         let frames_to_send = 5;
         let mut samples = vec![0i16; FRAME_SIZE];
@@ -492,11 +538,17 @@ impl AppState {
                 *sample = tone as i16;
             }
             
-            // Encode and send
+            // Encode and send via the active transport.
             if let Ok(opus_data) = encoder.encode(&samples) {
-                let transport = self.transport.lock().await;
-                if let Err(e) = transport.send_audio(&opus_data) {
-                    warn!("Failed to send roger beep frame: {}", e);
+                if let Some(cell) = &cellular {
+                    if let Err(e) = cell.send_audio(&opus_data) {
+                        warn!("Failed to send roger beep frame (cellular): {}", e);
+                    }
+                } else {
+                    let transport = self.transport.lock().await;
+                    if let Err(e) = transport.send_audio(&opus_data) {
+                        warn!("Failed to send roger beep frame: {}", e);
+                    }
                 }
             }
             
@@ -552,4 +604,95 @@ impl AppState {
         let transport = self.transport.lock().await;
         transport.get_connection_quality()
     }
+}
+
+/// Shared RX pipeline: decode Opus → shared `sassytalkie-core` audio_cache
+/// (Live / Queue / Mix) → audio output. Driven by either the UDP transport or
+/// the cellular transport — both hand over a receiver of DECRYPTED Opus frames,
+/// so the decode + playback path is identical and lives here once.
+fn spawn_audio_rx_loop(
+    audio: Arc<Mutex<AudioEngine>>,
+    mut audio_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    is_receiving: Arc<AtomicBool>,
+    is_transmitting: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut decoder = match OpusDecoder::new() {
+            Ok(d) => d,
+            Err(e) => {
+                error!("Failed to create decoder: {}", e);
+                return;
+            }
+        };
+
+        // Start audio playback
+        {
+            let audio_lock = audio.lock().await;
+            if let Err(e) = audio_lock.start_playing() {
+                error!("Failed to start playback: {}", e);
+                return;
+            }
+        }
+
+        // Single-peer for now (1↔1 transports); multi-peer only needs the
+        // sender_id plumbed through `audio_rx` instead of the hardcoded "remote".
+        let mut cache = sassytalkie_core::audio_cache::AudioCache::new();
+        // Mix mode off by default — preserves classic walkie-talkie semantics
+        // (sequential utterances on overlap).
+        cache.set_mix_mode_enabled(false);
+        let sender_id = "remote";
+        // Synthetic wire timestamp — increments per 20 ms Opus frame; the cache
+        // uses the per-frame delta for ordering, absolute value is irrelevant.
+        let mut wire_ts: u64 = 0;
+        const FRAME_MS: u64 = 20;
+
+        while let Some(opus_data) = audio_rx.recv().await {
+            // Don't play audio while transmitting
+            if is_transmitting.load(Ordering::Relaxed) {
+                continue;
+            }
+
+            is_receiving.store(true, Ordering::Relaxed);
+
+            // Decode Opus to PCM; fall back to PLC if decode errors.
+            let pcm = match decoder.decode(&opus_data) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("Decoding error: {}", e);
+                    decoder.decode_plc().unwrap_or_default()
+                }
+            };
+            if pcm.is_empty() {
+                is_receiving.store(false, Ordering::Relaxed);
+                continue;
+            }
+
+            wire_ts = wire_ts.saturating_add(FRAME_MS);
+
+            // Live mode → Some(pcm) for immediate playback. Queue/Mix mode →
+            // None; frames drain via the loop below on tick().
+            if let Some(samples) = cache.ingest_frame(sender_id, wire_ts, pcm) {
+                let audio_lock = audio.lock().await;
+                audio_lock.write_samples(&samples);
+                drop(audio_lock);
+            }
+
+            cache.tick();
+            while let Some((_sender, samples)) = cache.next_playback_frame() {
+                let audio_lock = audio.lock().await;
+                audio_lock.write_samples(&samples);
+                drop(audio_lock);
+            }
+
+            is_receiving.store(false, Ordering::Relaxed);
+        }
+
+        // Stop audio playback
+        {
+            let audio_lock = audio.lock().await;
+            let _ = audio_lock.stop_playing();
+        }
+
+        info!("RX thread stopped");
+    })
 }

@@ -56,4 +56,13 @@ export interface NetworkInfo {
   public_key: string | null;
 }
 
+// Mirrors CellularTransport::stats_json() in transport/cellular.rs.
+// state: "disconnected" | "connecting" | "connected" | "error".
+export interface CellularStatus {
+  state: string;
+  room: string;
+  sent: number;
+  received: number;
+}
+
 export type View = 'lobby' | 'walkie' | 'settings';

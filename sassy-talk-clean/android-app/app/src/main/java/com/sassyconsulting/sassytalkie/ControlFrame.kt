@@ -52,6 +52,19 @@ object ControlFrame {
     const val OP_PARTNER_OFFLINE: Byte = 0x14
     const val OP_PTT_START_V2: Byte  = 0x15
     const val OP_PTT_STOP_V2: Byte   = 0x16
+    /**
+     * Wake beacon. Sent by a peer about to transmit when LivenessTracker
+     * marks any other peer STALE — tells receivers to immediately emit a
+     * fresh heartbeat (bypassing their own outbound interval) and re-warm
+     * any transport that's gone idle, so the imminent audio isn't lost on
+     * the first ~1.5s of the talk burst.
+     *
+     * Receivers that are already HEALTHY treat OP_WAKE as a no-op (still
+     * cheap — they just emit one extra HB). Receivers whose WS has fully
+     * disconnected won't see this frame at all; that case needs FCM (a
+     * Phase-2 follow-up). See [encodeWake] / [parseWake].
+     */
+    const val OP_WAKE: Byte          = 0x17
 
     fun encodeLegacy(op: Byte): ByteArray = byteArrayOf(op)
 
@@ -128,5 +141,18 @@ object ControlFrame {
         val p = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
         p.putLong(epoch); p.putInt(endSeq)
         return encodeTlv(OP_PTT_STOP_V2, p.array())
+    }
+
+    /** Wake beacon payload: [epoch:u64][senderTsMs:u64]. 16 bytes. */
+    fun encodeWake(epoch: Long, senderTsMs: Long): ByteArray {
+        val p = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
+        p.putLong(epoch); p.putLong(senderTsMs)
+        return encodeTlv(OP_WAKE, p.array())
+    }
+
+    /** Returns (senderEpoch, senderTsMs). */
+    fun parseWake(payload: ByteArray): Pair<Long, Long> {
+        val b = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+        return b.long to b.long
     }
 }

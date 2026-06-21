@@ -1,0 +1,42 @@
+[package]
+name = "sassytalkie-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared cross-platform core for SassyTalkie — protocol opcodes, audio cache, cohort history, crypto."
+license = "Proprietary"
+
+# Pure-logic library. No platform-specific code lives here — anything that
+# touches JNI, AudioRecord/AudioTrack, cpal, or OS-level audio APIs stays in
+# the consumer crates (android-native, tauri-desktop/src-tauri, ios-native).
+[lib]
+name = "sassytalkie_core"
+crate-type = ["lib"]
+
+[dependencies]
+# Logging — both consumers already pull `log`; no facade dance needed.
+log = "0.4"
+
+# Crypto stack — identical primitives on Android (libsodium-via-Java is NOT
+# in use; we do pure-Rust AES-GCM). Tauri uses the same versions today.
+aes-gcm        = "0.10"
+x25519-dalek   = { version = "2.0", features = ["static_secrets"] }
+hkdf           = "0.12"
+sha2           = "0.10"
+rand           = "0.8"
+zeroize        = "1.8"
+
+# Serde for cohort_history (LRU host/joiner persistence) + the QR JSON
+# helpers used inside session/qr building.
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# UUID v4 for cohort_history IDs.
+uuid = { version = "1.11", features = ["v4"] }
+
+# Base64 for QR JSON payload (session export/import).
+base64 = "0.22"
+
+[dev-dependencies]
+# In-crate unit tests for audio_cache mix/queue modes already pass on host
+# without an Android NDK toolchain.
+regex = "1"

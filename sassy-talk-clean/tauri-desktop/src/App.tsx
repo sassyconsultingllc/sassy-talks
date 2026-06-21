@@ -31,6 +31,7 @@ import type {
   Volume,
   AudioDevices,
   NetworkInfo,
+  CellularStatus,
   View,
 } from './types';
 
@@ -68,6 +69,12 @@ export default function App() {
   const [encryptionEnabled, setEncryptionEnabled] = useState(true);
   const [randomPortEnabled, setRandomPortEnabled] = useState(true);
 
+  // Cellular relay (internet transport) state
+  const [cellularQr, setCellularQr] = useState('');
+  const [cellularRoom, setCellularRoom] = useState<string | null>(null);
+  const [cellularStatus, setCellularStatus] = useState<CellularStatus | null>(null);
+  const [cellularJoining, setCellularJoining] = useState(false);
+
   // Audio visualization
   const [audioLevel, setAudioLevel] = useState(0);
 
@@ -80,6 +87,12 @@ export default function App() {
   // Refs
   const pttButtonRef = useRef<HTMLButtonElement>(null);
   const statusIntervalRef = useRef<number | null>(null);
+  // Mirror isSearching into a ref so the once-mounted init/polling effect can read
+  // the latest value WITHOUT re-running (which previously re-registered the
+  // audio_level/receiving listeners on every toggle — leaking them via the async
+  // listen().then race — and reset wasReceiving, causing spurious incoming chimes).
+  const isSearchingRef = useRef(isSearching);
+  useEffect(() => { isSearchingRef.current = isSearching; }, [isSearching]);
 
   // ============================================================================
   // Initialization
@@ -156,7 +169,7 @@ export default function App() {
         setStatus(s);
         setIsTransmitting(s.is_transmitting);
 
-        if (isSearching) {
+        if (isSearchingRef.current) {
           const nearbyPeers = await invoke<PeerInfo[]>('get_nearby_devices');
           // Play connection success when first peer discovered
           if (nearbyPeers.length > 0 && !hadPeers) {
@@ -166,6 +179,18 @@ export default function App() {
             hadPeers = false;
           }
           setPeers(nearbyPeers);
+        }
+
+        // Cellular relay status — authoritative, so a backend-side leave
+        // (e.g. via the disconnect command) is reflected in the UI too.
+        const cs = await invoke<string>('get_cellular_status');
+        if (cs) {
+          const parsed = JSON.parse(cs) as CellularStatus;
+          setCellularStatus(parsed);
+          setCellularRoom(parsed.room || null);
+        } else {
+          setCellularStatus(null);
+          setCellularRoom(null);
         }
       } catch (e) {
         // Ignore polling errors
@@ -177,7 +202,11 @@ export default function App() {
       if (unlistenReceiving) unlistenReceiving();
       if (statusIntervalRef.current) clearInterval(statusIntervalRef.current);
     };
-  }, [isSearching]);
+    // Run ONCE on mount: setup + listeners + polling interval live for the
+    // component's lifetime. isSearching is read via isSearchingRef inside the
+    // interval, so toggling it no longer re-registers listeners / resets state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ==========================================================================
   // Lobby Functions
@@ -326,7 +355,7 @@ export default function App() {
   const handleInputDeviceChange = async (deviceName: string) => {
     setSelectedInput(deviceName);
     try {
-      await invoke('set_input_device', { device_name: deviceName });
+      await invoke('set_input_device', { deviceName });
     } catch (e) {
       setError(`Failed to set microphone: ${e}`);
     }
@@ -335,7 +364,7 @@ export default function App() {
   const handleOutputDeviceChange = async (deviceName: string) => {
     setSelectedOutput(deviceName);
     try {
-      await invoke('set_output_device', { device_name: deviceName });
+      await invoke('set_output_device', { deviceName });
     } catch (e) {
       setError(`Failed to set speaker: ${e}`);
     }
@@ -378,15 +407,53 @@ export default function App() {
     }
   };
 
+  // ==========================================================================
+  // Cellular Relay (Internet) Handlers
+  // ==========================================================================
+
+  const joinCellular = async () => {
+    const qr = cellularQr.trim();
+    if (!qr || cellularJoining) return;
+    setError(null);
+    setCellularJoining(true);
+    try {
+      // Tauri v2 camelCases command params: Rust `qr_json` -> JS `qrJson`.
+      const room = await invoke<string>('join_cellular_session', { qrJson: qr });
+      setCellularRoom(room);
+      Sounds.connectionSuccess();
+      // Jump to the Talk view so the user can immediately push-to-talk.
+      setCurrentView('walkie');
+    } catch (e) {
+      console.error('Failed to join cellular session:', e);
+      setError(`Join failed: ${e}`);
+      Sounds.error();
+    } finally {
+      setCellularJoining(false);
+    }
+  };
+
+  const leaveCellular = async () => {
+    try {
+      await invoke('leave_cellular_session');
+    } catch (e) {
+      console.error('Failed to leave cellular session:', e);
+    }
+    setCellularRoom(null);
+    setCellularStatus(null);
+    Sounds.discoveryStop();
+  };
+
   // ============================================================================
   // PTT Handlers
   // ============================================================================
 
   const handlePttDown = useCallback(() => {
-    if (!isTransmitting && isSearching) {
+    // Allow PTT when local discovery is active OR a cellular relay session is
+    // joined (TX routes to whichever transport is active).
+    if (!isTransmitting && (isSearching || cellularRoom !== null)) {
       startTransmit();
     }
-  }, [isTransmitting, isSearching]);
+  }, [isTransmitting, isSearching, cellularRoom]);
 
   const handlePttUp = useCallback(() => {
     if (isTransmitting) {
@@ -418,6 +485,10 @@ export default function App() {
       window.removeEventListener('keyup', handleKeyUp);
     };
   }, [currentView, handlePttDown, handlePttUp]);
+
+  // True when the user can transmit: either local discovery is active OR a
+  // cellular relay session is joined (internet transport).
+  const canTalk = isSearching || cellularRoom !== null;
 
   // ============================================================================
   // Render: Lobby View
@@ -529,7 +600,7 @@ export default function App() {
 
       <header className="walkie-header">
         <div className="connection-info">
-          <StatusBar status={status} isConnected={isSearching} peerCount={peers.length} />
+          <StatusBar status={status} isConnected={canTalk} peerCount={peers.length} />
         </div>
         <div className="walkie-header-actions">
           <button className="settings-gear-btn" onClick={() => setShowSettingsModal(true)} title="Quick Settings">
@@ -553,17 +624,17 @@ export default function App() {
       <div className="ptt-container">
         <button
           ref={pttButtonRef}
-          className={`ptt-btn ${isTransmitting ? 'active' : ''} ${!isSearching ? 'disabled' : ''}`}
+          className={`ptt-btn ${isTransmitting ? 'active' : ''} ${!canTalk ? 'disabled' : ''}`}
           onMouseDown={handlePttDown}
           onMouseUp={handlePttUp}
           onMouseLeave={handlePttUp}
           onTouchStart={(e) => { e.preventDefault(); handlePttDown(); }}
           onTouchEnd={(e) => { e.preventDefault(); handlePttUp(); }}
-          disabled={!isSearching}
+          disabled={!canTalk}
         >
           <span className="ptt-icon">{isTransmitting ? <IconRecording size={48} /> : <IconMic size={48} />}</span>
           <span className="ptt-text">
-            {!isSearching ? 'START DISCOVERY FIRST' : isTransmitting ? 'RELEASE TO STOP' : 'PUSH TO TALK'}
+            {!canTalk ? 'CONNECT FIRST' : isTransmitting ? 'RELEASE TO STOP' : 'PUSH TO TALK'}
           </span>
           <span className="ptt-hint">or hold SPACEBAR</span>
         </button>
@@ -723,6 +794,57 @@ export default function App() {
               <span className="toggle-slider"></span>
             </label>
           </div>
+        </section>
+
+        <section className="settings-section">
+          <h3>Internet Relay</h3>
+          {cellularRoom === null ? (
+            <>
+              <p className="cellular-hint">
+                Join a session over the internet — no Wi-Fi or Bluetooth needed. Paste the
+                session QR data from the phone app's "Show QR" screen.
+              </p>
+              <textarea
+                className="cellular-qr-input"
+                placeholder='{"key":"...","session_id":"...","channel":1,"group_name":"...","cohort_id":"..."}'
+                value={cellularQr}
+                onChange={(e) => setCellularQr(e.target.value)}
+                rows={4}
+                spellCheck={false}
+              />
+              <button
+                className="cellular-join-btn"
+                onClick={joinCellular}
+                disabled={cellularJoining || cellularQr.trim().length === 0}
+              >
+                {cellularJoining ? 'Connecting…' : 'Join over Internet'}
+              </button>
+            </>
+          ) : (
+            <>
+              <div className="setting-row">
+                <span className="setting-label">Status</span>
+                <span className={`setting-value ${cellularStatus?.state === 'connected' ? 'secure' : 'insecure'}`}>
+                  {cellularStatus?.state ?? 'connecting'}
+                </span>
+              </div>
+              <div className="setting-row">
+                <span className="setting-label">Room</span>
+                <span className="setting-value key-value" title={cellularRoom}>
+                  {cellularRoom.slice(0, 18)}{cellularRoom.length > 18 ? '…' : ''}
+                </span>
+              </div>
+              <div className="setting-row">
+                <span className="setting-label">Frames (tx / rx)</span>
+                <span className="setting-value">
+                  {cellularStatus?.sent ?? 0} / {cellularStatus?.received ?? 0}
+                </span>
+              </div>
+              <button className="cellular-leave-btn" onClick={leaveCellular}>
+                Leave Internet Session
+              </button>
+            </>
+          )}
         </section>
 
         <section className="settings-section">

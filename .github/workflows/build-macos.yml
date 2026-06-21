@@ -1,0 +1,132 @@
+name: Build macOS
+
+# Builds the SassyTalkie desktop app for macOS (Tauri 2 — React frontend +
+# Rust in sassy-talk-clean/tauri-desktop, which consumes sassytalkie-core).
+#
+# Two modes:
+#   * push / PR / plain dispatch → unsigned universal .app/.dmg. Verifies the
+#     full build. Needs NO Apple secrets.
+#   * dispatch with sign_and_notarize=true → Developer ID signed + notarized
+#     bundle. Requires these repo secrets (read automatically by Tauri):
+#       APPLE_CERTIFICATE            base64 of the Developer ID Application .p12
+#       APPLE_CERTIFICATE_PASSWORD   password for that .p12
+#       APPLE_SIGNING_IDENTITY       e.g. "Developer ID Application: Name (TEAMID)"
+#       APPLE_ID                     Apple ID email (for notarization)
+#       APPLE_PASSWORD               app-specific password for that Apple ID
+#       APPLE_TEAM_ID                Apple Developer team id
+
+on:
+  workflow_dispatch:
+    inputs:
+      sign_and_notarize:
+        description: 'Sign + notarize the .app/.dmg (requires Apple Developer ID secrets)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+  push:
+    branches: [main]
+    paths:
+      - 'sassy-talk-clean/tauri-desktop/**'
+      - 'sassy-talk-clean/core/**'
+  pull_request:
+    paths:
+      - 'sassy-talk-clean/tauri-desktop/**'
+      - 'sassy-talk-clean/core/**'
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    env:
+      # libopus (bundled by audiopus_sys → built via CMake) declares a
+      # pre-3.5 cmake_minimum_required, which CMake 4.x on the runner rejects
+      # ("Compatibility with CMake < 3.5 has been removed"). This env var
+      # (honoured by CMake >= 3.31) restores the old-policy compatibility.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    defaults:
+      run:
+        working-directory: sassy-talk-clean/tauri-desktop
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Select Xcode 15
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+
+      - name: Set up Rust + macOS targets (universal)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sassy-talk-clean/tauri-desktop/src-tauri/target
+          key: ${{ runner.os }}-macos-cargo-${{ hashFiles('sassy-talk-clean/tauri-desktop/src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-macos-cargo-
+
+      - name: Install frontend deps
+        run: npm install
+
+      - name: Build frontend (produces ../dist)
+        run: npm run build
+
+      # The repo ships PNGs + a misnamed icon.icns.png but no real icon.icns,
+      # so the macOS bundler fails. Regenerate the full icon set (incl. .icns)
+      # from the source PNG on the runner.
+      - name: Generate app icons
+        run: npx --yes @tauri-apps/cli@^2 icon src-tauri/icons/icon.png
+
+      - name: Verify Apple signing secrets
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.sign_and_notarize == 'true' }}
+        env:
+          APPLE_CERTIFICATE:          ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY:     ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID:                   ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD:             ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID:              ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=0
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                   APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!v}" ]; then echo "::error::secret $v is unset"; missing=1; fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+      # Unsigned build (push / PR). Crucially sets NO APPLE_* env — Tauri only
+      # attempts codesign/keychain-import when those vars are present, so this
+      # path produces an unsigned bundle and never touches a certificate.
+      - name: Build Tauri app (universal, unsigned)
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.sign_and_notarize == 'true') }}
+        run: npx --yes @tauri-apps/cli@^2 build --target universal-apple-darwin
+
+      # Signed + notarized build (manual dispatch only). Tauri reads APPLE_*.
+      - name: Build Tauri app (universal, signed)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.sign_and_notarize == 'true' }}
+        env:
+          APPLE_CERTIFICATE:          ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY:     ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID:                   ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD:             ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID:              ${{ secrets.APPLE_TEAM_ID }}
+        run: npx --yes @tauri-apps/cli@^2 build --target universal-apple-darwin
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sassy-talk-macos
+          path: |
+            sassy-talk-clean/tauri-desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            sassy-talk-clean/tauri-desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
+          retention-days: 30
+          if-no-files-found: error

@@ -155,6 +155,10 @@ fun AppNavigation(
 
                 // Initialize the activity bridge for incoming-audio detection + notifications
                 TranscriptionBridge.initialize(context)
+                // v2.7.2: rehydrate the persisted timeline so the user's
+                // "who spoke when" log survives process death. Cheap I/O —
+                // a single small JSON file read.
+                TranscriptionBridge.restoreEntries()
                 TranscriptionBridge.setEnabled(true)
 
                 // Restore persisted mic settings (gain + squelch). Defaults
@@ -165,6 +169,12 @@ fun AppNavigation(
                 // Restore group-mix preference. Default false preserves the
                 // classic walkie-talkie behavior for users who never opt in.
                 SassyTalkNative.setMixModeEnabled(micPrefs.getBoolean("enable_mix_mode", false))
+                // v2.7.5: restore RX gain, speakerphone routing, jitter
+                // buffer preset so the user's prior choices stick across
+                // process death without requiring a Settings visit.
+                SassyTalkNative.setRxGain(micPrefs.getFloat("rx_gain", 1.0f))
+                SassyTalkNative.setSpeakerphone(micPrefs.getBoolean("speakerphone_on", true))
+                SassyTalkNative.setJitterPrebufferFrames(micPrefs.getInt("jitter_prebuffer_frames", 5))
             } else {
                 initFailed = true
             }
@@ -186,7 +196,19 @@ fun AppNavigation(
                         SassyTalkNative.importSessionFromQR(result.json)
                     }
                     if (imported) {
-                        Toast.makeText(context, "Joined session", Toast.LENGTH_SHORT).show()
+                        // Force a cellular WS teardown+reconnect so the relay
+                        // attaches to the imported session_id's room. Rust
+                        // updates the room target internally on import, but
+                        // the live WS stays bound to the OLD room until
+                        // explicitly reconnected — without this, joiner and
+                        // host land on different rooms and never see audio.
+                        walkieService?.forceCellularReconnect()
+                        // Pull the host's device name + channel out of the
+                        // just-imported QR JSON so the user knows WHICH
+                        // session they joined. The old "Joined session"
+                        // toast left them guessing.
+                        val ctx = describeImportedSession(result.json)
+                        Toast.makeText(context, ctx, Toast.LENGTH_LONG).show()
                         currentScreen = Screen.Main
                     } else {
                         Toast.makeText(
@@ -280,7 +302,15 @@ fun AppNavigation(
                 // a new session leaves the WS bound to the previous room.
                 autoConnect.disconnect()
                 currentScreen = Screen.Main
-            }
+            },
+            onSessionMutated = {
+                // Force-reconnect on EVERY session change (host generate,
+                // joiner scan, joiner paste). Host doesn't go through
+                // onAuthenticated until they tap Continue, so without this
+                // their WS would stay on the old room while joiners try to
+                // attach to the new one shown in the QR.
+                walkieService?.forceCellularReconnect()
+            },
         )
         Screen.Main -> MainScreen(
             onDisconnect = {
@@ -326,5 +356,32 @@ fun AppNavigation(
                 autoConnect.disconnect()
             }
         )
+    }
+}
+
+/**
+ * v2.7.0: extract a human-readable summary from the imported QR JSON so the
+ * post-import toast tells the user WHICH session they joined instead of the
+ * old generic "Joined session". Reads `device` + `channel` + optional
+ * `group_name` fields from the QR payload (set by `nativeGenerateChannelQR`
+ * on the host side).
+ *
+ * Defensive parsing — any field missing falls back to a sensible default,
+ * never throws.
+ */
+private fun describeImportedSession(qrJson: String): String {
+    return try {
+        val obj = org.json.JSONObject(qrJson)
+        val host = obj.optString("device", "").trim().ifEmpty { "host" }
+        val channel = obj.optInt("channel", -1)
+        val groupName = obj.optString("group_name", "").trim()
+        val channelLabel = when {
+            groupName.isNotEmpty() -> groupName
+            channel >= 0           -> "channel $channel"
+            else                   -> "shared channel"
+        }
+        "Joined $host on $channelLabel"
+    } catch (_: Throwable) {
+        "Joined session"
     }
 }

@@ -17,8 +17,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.graphics.Color
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.ui.theme.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val PREFS_SETTINGS = "sassy_settings"
 private const val KEY_LOCK_SCREEN_PTT = "lock_screen_ptt"
@@ -26,6 +30,13 @@ private const val KEY_MIC_GAIN = "mic_gain"
 private const val KEY_SQUELCH_DBFS = "squelch_dbfs"
 private const val KEY_ENABLE_WIFI = "enable_wifi_multicast"
 private const val KEY_ENABLE_RELAY = "enable_cloudflare_relay"
+// v2.7.5 — RX playback + speakerphone + jitter buffer
+private const val KEY_RX_GAIN = "rx_gain"
+private const val KEY_SPEAKERPHONE = "speakerphone_on"
+private const val KEY_JITTER_PREBUFFER = "jitter_prebuffer_frames"
+private const val DEFAULT_RX_GAIN = 1.0f
+private const val DEFAULT_SPEAKERPHONE = true   // walkie-talkie default = loud speaker
+private const val DEFAULT_JITTER_PREBUFFER = 5  // matches core's DEFAULT_LIVE_JITTER_PREBUFFER_FRAMES
 // When true, 2..=6 overlapping speakers are PCM-mixed in real time on the
 // receiver instead of being serialized into the legacy Queue. Lets a small
 // group sound like a real conversation (with step-on) instead of a walkie-
@@ -35,6 +46,7 @@ private const val KEY_ENABLE_MIX_MODE = "enable_mix_mode"
 private const val DEFAULT_MIC_GAIN = 1.0f
 private const val DEFAULT_SQUELCH_DBFS = 0 // 0 = disabled
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
     onBack: () -> Unit,
@@ -43,6 +55,8 @@ fun SettingsScreen(
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE) }
     val scrollState = rememberScrollState()
+    // v2.7.0 — used by the Diagnostics card's Test Relay button
+    val scope = rememberCoroutineScope()
 
     var lockScreenPtt by remember { mutableStateOf(prefs.getBoolean(KEY_LOCK_SCREEN_PTT, false)) }
     var micGain by remember { mutableFloatStateOf(prefs.getFloat(KEY_MIC_GAIN, DEFAULT_MIC_GAIN)) }
@@ -50,6 +64,10 @@ fun SettingsScreen(
     val squelchOn = squelchDbfs != 0
     var wifiEnabled by remember { mutableStateOf(prefs.getBoolean(KEY_ENABLE_WIFI, true)) }
     var relayEnabled by remember { mutableStateOf(prefs.getBoolean(KEY_ENABLE_RELAY, true)) }
+    // v2.7.5 playback state
+    var rxGain by remember { mutableFloatStateOf(prefs.getFloat(KEY_RX_GAIN, DEFAULT_RX_GAIN)) }
+    var speakerphoneOn by remember { mutableStateOf(prefs.getBoolean(KEY_SPEAKERPHONE, DEFAULT_SPEAKERPHONE)) }
+    var jitterFrames by remember { mutableIntStateOf(prefs.getInt(KEY_JITTER_PREBUFFER, DEFAULT_JITTER_PREBUFFER)) }
     // Sync mix-mode state from native on first composition so the toggle
     // reflects the actual cache state even after a config change / process
     // restart picked up a stale prefs value.
@@ -202,6 +220,121 @@ fun SettingsScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
+            // v2.7.5: Playback — RX-side controls (incoming audio).
+            // Three knobs that together address "audio is choppy and quiet":
+            //   1. Volume — pre-AudioTrack gain multiplier (independent of
+            //      system media volume); fixes "quiet".
+            //   2. Speakerphone — loudspeaker vs earpiece routing; fixes
+            //      "I can only hear it pressed to my ear".
+            //   3. Buffer — Live-mode jitter pre-buffer size preset; trades
+            //      latency for smoothness; fixes "choppy".
+            SettingsCard(title = "Playback") {
+                Text(
+                    text = "Tune the incoming audio: boost quiet peers, pick the speaker, and absorb cellular jitter at the cost of a small delay.",
+                    fontSize = 11.sp,
+                    color = TextMuted,
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // RX Volume / gain slider
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.VolumeUp, contentDescription = null, tint = TextMuted, modifier = Modifier.size(20.dp))
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("RX Volume", fontSize = 14.sp, color = TextGray, fontWeight = FontWeight.Medium)
+                        Text(
+                            String.format("%.2fx (%+.1f dB)", rxGain, 20.0 * kotlin.math.log10(rxGain.toDouble())),
+                            fontSize = 11.sp,
+                            color = TextMuted,
+                        )
+                    }
+                }
+                Slider(
+                    value = rxGain,
+                    onValueChange = { rxGain = it },
+                    onValueChangeFinished = {
+                        prefs.edit().putFloat(KEY_RX_GAIN, rxGain).apply()
+                        SassyTalkNative.setRxGain(rxGain)
+                    },
+                    valueRange = 0.25f..4.0f,
+                    steps = 14,  // 0.25, 0.5, …, 4.0
+                    colors = SliderDefaults.colors(
+                        thumbColor = Orange,
+                        activeTrackColor = Orange,
+                        inactiveTrackColor = SurfaceBg,
+                    ),
+                )
+                TextButton(
+                    onClick = {
+                        rxGain = DEFAULT_RX_GAIN
+                        prefs.edit().putFloat(KEY_RX_GAIN, rxGain).apply()
+                        SassyTalkNative.setRxGain(rxGain)
+                    }
+                ) {
+                    Text("Reset to 1.0×", fontSize = 11.sp, color = Cyan)
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // Speakerphone vs earpiece
+                SettingsToggle(
+                    icon = if (speakerphoneOn) Icons.Default.VolumeUp else Icons.Default.PhoneInTalk,
+                    title = if (speakerphoneOn) "Loud Speaker" else "Earpiece",
+                    description = if (speakerphoneOn) {
+                        "Route received voice through the main speaker (walkie-talkie default)."
+                    } else {
+                        "Route received voice through the earpiece (private listening — phone-call style)."
+                    },
+                    checked = speakerphoneOn,
+                    onCheckedChange = { on ->
+                        speakerphoneOn = on
+                        prefs.edit().putBoolean(KEY_SPEAKERPHONE, on).apply()
+                        SassyTalkNative.setSpeakerphone(on)
+                    },
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // Jitter buffer preset
+                Text("Buffer", fontSize = 14.sp, color = TextGray, fontWeight = FontWeight.Medium)
+                Text(
+                    "Larger buffer = smoother audio on jittery networks, but more delay between PTT-press and audio.",
+                    fontSize = 11.sp,
+                    color = TextMuted,
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                    listOf(
+                        Triple("Low-Latency", 3, "60 ms"),
+                        Triple("Balanced",    5, "100 ms"),
+                        Triple("Smooth",      8, "160 ms"),
+                    ).forEach { (label, frames, latency) ->
+                        val selected = jitterFrames == frames
+                        FilterChip(
+                            selected = selected,
+                            onClick = {
+                                jitterFrames = frames
+                                prefs.edit().putInt(KEY_JITTER_PREBUFFER, frames).apply()
+                                SassyTalkNative.setJitterPrebufferFrames(frames)
+                            },
+                            label = {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(label, fontSize = 11.sp)
+                                    Text(latency, fontSize = 9.sp, color = TextMuted)
+                                }
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Cyan.copy(alpha = 0.2f),
+                                selectedLabelColor = Cyan,
+                            ),
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
             // Group Voice — opt-in client-side mixing for 2-6 simultaneous
             // speakers. With this off, overlapping speakers are serialized
             // (classic walkie-talkie). With it on, they're PCM-mixed in real
@@ -269,7 +402,228 @@ fun SettingsScreen(
                     )
                 }
             }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // v2.7.0: Diagnostics — Test Relay reachability. Lets the user
+            // isolate "is the relay up?" from "are my peers there?" without
+            // having to interpret the connection-status badge or guess.
+            // v2.7.2 will expand this card with a full diagnostic-info sheet.
+            SettingsCard(title = "Diagnostics") {
+                Text(
+                    text = "Quick probe of the Cloudflare relay (relay.sassyconsultingllc.com). A 200 response means the relay is up; non-200 or timeout means try Bluetooth/WiFi-only or check connectivity.",
+                    fontSize = 11.sp,
+                    color = TextMuted,
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                var testing by remember { mutableStateOf(false) }
+                var testResult by remember { mutableStateOf<String?>(null) }
+                Button(
+                    onClick = {
+                        testing = true
+                        testResult = null
+                        scope.launch {
+                            val r = withContext(Dispatchers.IO) { probeRelay() }
+                            testResult = r
+                            testing = false
+                        }
+                    },
+                    enabled = !testing,
+                    colors = ButtonDefaults.buttonColors(containerColor = Cyan, contentColor = DarkBg),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Icon(Icons.Default.NetworkPing, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(if (testing) "Testing…" else "Test Relay", fontSize = 14.sp)
+                }
+                if (testResult != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = testResult!!,
+                        fontSize = 11.sp,
+                        color = if (testResult!!.startsWith("OK")) Color(0xFF4CD964) else Color(0xFFFF6B6B),
+                    )
+                }
+
+                // v2.7.2: "Show diagnostic info" — one-screen dump of every
+                // useful debug field, with a copy-all action. The thing you
+                // paste into a support thread when something's broken.
+                Spacer(modifier = Modifier.height(12.dp))
+                var showDiag by remember { mutableStateOf(false) }
+                OutlinedButton(
+                    onClick = { showDiag = true },
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Cyan),
+                    modifier = Modifier.fillMaxWidth().height(44.dp),
+                ) {
+                    Icon(Icons.Default.Info, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Show Diagnostic Info", fontSize = 14.sp)
+                }
+                if (showDiag) {
+                    DiagnosticInfoDialog(onDismiss = { showDiag = false })
+                }
+
+                // Live diagnostics HUD — a floating audio/network telemetry
+                // overlay for on-the-go field testing. Honoured in release
+                // builds (default off) so the shipped APK can be probed live.
+                Spacer(modifier = Modifier.height(12.dp))
+                val overlayOn by com.sassyconsulting.sassytalkie.debug.DiagnosticsPrefs
+                    .overlayEnabled.collectAsState()
+                SettingsToggle(
+                    icon = Icons.Default.Visibility,
+                    title = "Live diagnostics overlay",
+                    description = "Floating audio/network HUD over the app (works in release)",
+                    checked = overlayOn,
+                    onCheckedChange = {
+                        com.sassyconsulting.sassytalkie.debug.DiagnosticsPrefs.setOverlayEnabled(it)
+                    }
+                )
+            }
         }
+    }
+}
+
+/**
+ * v2.7.2 diagnostic-info sheet. Aggregates everything a troubleshooter would
+ * need into one scrollable + copyable text block:
+ *   - app build (version + versionCode + commit-ish)
+ *   - device / OS (Build.MODEL, Build.MANUFACTURER, SDK)
+ *   - native init status
+ *   - session status (channels, active cohorts) from `getSessionStatus`
+ *   - cache status from `getCacheStatus`
+ *   - current network transport (read from WalkieService.networkType — but
+ *     SettingsScreen doesn't bind to WalkieService directly; we read what
+ *     ConnectivityManager reports right now instead, which is the same value
+ *     the badge shows).
+ *   - relay probe result (one-shot)
+ *
+ * NOT included by design: any session keys, encrypted blobs, or peer-identifying
+ * tokens. The dump is safe to paste into a support thread.
+ */
+@Composable
+private fun DiagnosticInfoDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var dump by remember { mutableStateOf("Collecting…") }
+
+    LaunchedEffect(Unit) {
+        dump = withContext(Dispatchers.IO) { collectDiagnosticDump(context) }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE)
+                            as android.content.ClipboardManager
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("SassyTalkie diag", dump))
+                    scope.launch { onDismiss() }
+                }
+            ) { Text("Copy") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        },
+        title = { Text("Diagnostic Info") },
+        text = {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 480.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    text = dump,
+                    fontSize = 11.sp,
+                    color = TextGray,
+                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                )
+            }
+        }
+    )
+}
+
+private suspend fun collectDiagnosticDump(context: Context): String {
+    val sb = StringBuilder()
+    fun line(k: String, v: Any?) { sb.append(String.format("%-22s : %s%n", k, v)) }
+    try {
+        line("App", "SassyTalkie")
+        line("versionName", com.sassyconsulting.sassytalkie.BuildConfig.VERSION_NAME)
+        line("versionCode", com.sassyconsulting.sassytalkie.BuildConfig.VERSION_CODE)
+        line("buildType", com.sassyconsulting.sassytalkie.BuildConfig.BUILD_TYPE)
+        line("relayEnabled", com.sassyconsulting.sassytalkie.BuildConfig.ENABLE_CELLULAR_RELAY)
+        line("Device", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
+        line("Android", "${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
+        line("Native init", SassyTalkNative.isInitialized())
+        line("Authenticated", SassyTalkNative.isAuthenticated())
+        line("Encrypted", SassyTalkNative.isEncrypted())
+        line("Transport", SassyTalkNative.getTransportName())
+        // Network type — derive from ConnectivityManager right here so this
+        // works even if the user has never opened MainScreen.
+        try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+                    as android.net.ConnectivityManager
+            val net = cm.activeNetwork
+            val caps = net?.let { cm.getNetworkCapabilities(it) }
+            val t = when {
+                caps == null -> "none"
+                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)     -> "wifi"
+                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+                else -> "other"
+            }
+            line("Network", t)
+        } catch (_: Throwable) { line("Network", "unknown") }
+
+        line("---", "--- Session ---")
+        val sessJson = SassyTalkNative.getSessionStatus()
+        sb.append(prettyOrRaw(sessJson)).append('\n')
+
+        line("---", "--- Cache ---")
+        val cacheJson = SassyTalkNative.getCacheStatus()
+        sb.append(cacheJson?.toString(2) ?: "(no cache status)").append('\n')
+
+        line("---", "--- Relay probe ---")
+        sb.append(probeRelay()).append('\n')
+    } catch (t: Throwable) {
+        sb.append("\nFAILED to collect: ").append(t.javaClass.simpleName).append(": ").append(t.message)
+    }
+    return sb.toString()
+}
+
+private fun prettyOrRaw(json: String?): String {
+    if (json.isNullOrBlank()) return "(empty)"
+    return try { org.json.JSONObject(json).toString(2) } catch (_: Throwable) { json }
+}
+
+/**
+ * v2.7.0: probe the Cloudflare relay's /auth endpoint with a throwaway room
+ * ID and report HTTP status + round-trip ms. Blocking — caller must run on
+ * Dispatchers.IO. Returns a single-line summary suitable for inline display.
+ *
+ * Uses /auth (not /health) because /auth requires AUTH_SECRET to be configured
+ * on the server — a 200 or 500 here proves DNS + TLS + worker routing all
+ * resolved; only a network error would prevent any response at all.
+ */
+private suspend fun probeRelay(): String {
+    val start = System.currentTimeMillis()
+    return try {
+        val client = okhttp3.OkHttpClient.Builder()
+            .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+        val req = okhttp3.Request.Builder()
+            .url("https://relay.sassyconsultingllc.com/auth?room=test-probe-0001")
+            .get()
+            .build()
+        client.newCall(req).execute().use { resp ->
+            val ms = System.currentTimeMillis() - start
+            val tag = if (resp.code in 200..299 || resp.code == 500) "OK" else "WARN"
+            "$tag · HTTP ${resp.code} · ${ms} ms"
+        }
+    } catch (t: Throwable) {
+        val ms = System.currentTimeMillis() - start
+        "FAIL · ${t.javaClass.simpleName}: ${t.message ?: "unknown"} · ${ms} ms"
     }
 }
 

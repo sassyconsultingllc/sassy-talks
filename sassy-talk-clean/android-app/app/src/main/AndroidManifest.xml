@@ -22,11 +22,17 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- Bluetooth (Classic + BLE) -->
-    <uses-permission android:name="android.permission.BLUETOOTH" />
-    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <!-- Legacy BLUETOOTH/BLUETOOTH_ADMIN are only needed pre-31. -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <!-- neverForLocation: this app does not derive physical location from BLE
+         results, so on API 31+ it can scan without location permission. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <!-- On Android 7–11 (API 24–30) BLE scanning legally REQUIRES location
+         permission; without it BluetoothLeScanner.startScan returns no results. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
 
     <!-- Foreground service for BLE connected device -->
@@ -49,6 +55,12 @@
         android:supportsRtl="true"
         android:networkSecurityConfig="@xml/network_security_config"
         android:theme="@style/Theme.SassyTalk">
+
+        <!-- Unbundled ML Kit: have Play Services fetch the barcode model at
+             install time so QR session-pairing works on first use. -->
+        <meta-data
+            android:name="com.google.mlkit.vision.DEPENDENCIES"
+            android:value="barcode" />
 
         <activity
             android:name=".MainActivity"

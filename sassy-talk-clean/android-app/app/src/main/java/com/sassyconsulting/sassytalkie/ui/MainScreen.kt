@@ -96,6 +96,60 @@ fun MainScreen(
     // Talk-over indicator (Task 6.2)
     val peerSpeaking by (walkieService?.pttCoordinator?.peerSpeaking ?: falseFallback).collectAsState()
 
+    // v2.7.1: active peer roster — set of HEALTHY/DEGRADED peer IDs.
+    val peerIdsFallback = remember { kotlinx.coroutines.flow.MutableStateFlow<Set<String>>(emptySet()) }
+    val activePeerIds by (walkieService?.pttCoordinator?.peerIds ?: peerIdsFallback).collectAsState()
+
+    // v2.7.2: current network transport type ("wifi" / "cellular" / "none" / …)
+    val netTypeFallback = remember { kotlinx.coroutines.flow.MutableStateFlow("none") }
+    val networkType by (walkieService?.networkType ?: netTypeFallback).collectAsState()
+
+    // v2.7.1: peer name lookup — re-resolved when peerIds changes.
+    // getUsers() returns the cached UserRegistry roster; we filter to active.
+    val peerNames = remember(activePeerIds) {
+        val users = try { SassyTalkNative.getUsers() } catch (_: Throwable) { emptyList() }
+        val byId = users.associate { it.id to it.name }
+        activePeerIds.map { id -> byId[id] ?: id.take(6) }
+    }
+
+    // v2.7.1: snackbar host for peer join/leave toasts + the cache mini-strip.
+    // `scope` is already declared earlier in this composable for the existing
+    // disconnect handler — reuse it; don't redeclare.
+    val snackbarHost = remember { androidx.compose.material3.SnackbarHostState() }
+
+    // v2.7.1: subscribe to peer join/leave events → snackbar.
+    // Only collects while this composable is in the tree; key = pttCoordinator
+    // so we re-subscribe if the service rebinds (preserves identity otherwise).
+    val coord = walkieService?.pttCoordinator
+    LaunchedEffect(coord) {
+        val users = try { SassyTalkNative.getUsers() } catch (_: Throwable) { emptyList() }
+        val byId = users.associate { it.id to it.name }
+        coord?.peerEvents?.collect { ev ->
+            val name = when (ev) {
+                is com.sassyconsulting.sassytalkie.PeerEvent.Joined -> byId[ev.peerId] ?: ev.peerId.take(6)
+                is com.sassyconsulting.sassytalkie.PeerEvent.Left   -> byId[ev.peerId] ?: ev.peerId.take(6)
+            }
+            val verb = if (ev is com.sassyconsulting.sassytalkie.PeerEvent.Joined) "joined" else "left"
+            scope.launch { snackbarHost.showSnackbar("$name $verb") }
+        }
+    }
+
+    // v2.7.1: cache mini-status polled at 1 Hz for the bottom strip.
+    var cacheMode by remember { mutableStateOf("Live") }
+    var cacheQueued by remember { mutableIntStateOf(0) }
+    var cacheNowName by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            val st = SassyTalkNative.getCacheStatus()
+            if (st != null) {
+                cacheMode = st.optString("mode", "Live")
+                cacheQueued = st.optInt("queued_utterances", 0)
+                cacheNowName = st.optString("current_speaker_name", "").ifEmpty { null }
+            }
+            kotlinx.coroutines.delay(1000L)
+        }
+    }
+
     // Auto-connect and set cache to queue mode (cache-first)
     LaunchedEffect(Unit) {
         if (connectState != ConnectState.CONNECTED) {
@@ -151,11 +205,16 @@ fun MainScreen(
             val channelGroupName = remember(currentChannel) {
                 SassyTalkNative.getGroupName(currentChannel)
             }
+            // Brand title — blue→purple gradient, matching the Tauri reference
+            // (app.css --gradient-primary). GradientPrimary is defined in
+            // ui/theme/Color.kt.
             Text(
                 text = channelGroupName.ifEmpty { "Sassy-Talk" },
                 fontSize = 24.sp,
                 fontWeight = FontWeight.Bold,
-                color = Orange,
+                style = androidx.compose.ui.text.TextStyle(
+                    brush = Brush.linearGradient(GradientPrimary)
+                ),
                 maxLines = 1
             )
 
@@ -213,6 +272,64 @@ fun MainScreen(
                         )
                     }
                 }
+            }
+        }
+
+        // v2.7.2: network-type badge — small icon + label under the header.
+        // "wifi" = green, "cellular" = orange, others = grey. Single source
+        // of truth from WalkieService.networkType (registered ConnectivityManager
+        // callback). Hidden when "none" so the chip doesn't yell at the user
+        // during the brief boot window before the network resolves.
+        if (networkType != "none") {
+            val (badgeIcon, badgeColor, badgeText) = when (networkType) {
+                "wifi"     -> Triple(Icons.Default.Wifi, Color(0xFF4CD964), "WiFi")
+                "cellular" -> Triple(Icons.Default.SignalCellular4Bar, Color(0xFFFF8C00), "Cellular")
+                "ethernet" -> Triple(Icons.Default.SettingsEthernet, Cyan, "Ethernet")
+                "vpn"      -> Triple(Icons.Default.VpnLock, Cyan, "VPN")
+                else       -> Triple(Icons.Default.NetworkCheck, TextMuted, networkType)
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 2.dp),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(badgeIcon, contentDescription = null, tint = badgeColor, modifier = Modifier.size(12.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(badgeText, fontSize = 10.sp, color = badgeColor)
+            }
+        }
+
+        // v2.7.1: peer roster chip — only visible while there are active peers.
+        // Shows up to 3 names + "+N more"; full list available in the Users
+        // screen via the existing menu.
+        if (peerNames.isNotEmpty()) {
+            val display = if (peerNames.size <= 3) {
+                peerNames.joinToString(", ")
+            } else {
+                peerNames.take(3).joinToString(", ") + " +${peerNames.size - 3} more"
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.Default.People,
+                    contentDescription = null,
+                    tint = Cyan,
+                    modifier = Modifier.size(14.dp),
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "${peerNames.size} · $display",
+                    fontSize = 12.sp,
+                    color = TextGray,
+                    maxLines = 1,
+                )
             }
         }
 
@@ -596,7 +713,51 @@ fun MainScreen(
             modifier = Modifier.fillMaxWidth()
         )
 
+        // v2.7.1: cache mini-strip — only visible when cache is non-idle.
+        // Compact mirror of TranscriptionFeedScreen's cache bar so the user
+        // can see "audio is queued / playing" without leaving the main screen.
+        if (cacheNowName != null || cacheQueued > 0 || cacheMode == "Queue" || cacheMode == "Mix") {
+            val pipColor = when (cacheMode) {
+                "Queue"  -> Orange
+                "Mix"    -> Cyan
+                "Replay" -> OrangeLight
+                else     -> TextMuted
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .clip(CircleShape)
+                        .background(pipColor),
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = when {
+                        cacheNowName != null -> "Playing $cacheNowName" +
+                            (if (cacheQueued > 0) " · $cacheQueued queued" else "")
+                        cacheQueued > 0      -> "$cacheQueued queued"
+                        else                  -> cacheMode
+                    },
+                    fontSize = 11.sp,
+                    color = TextMuted,
+                )
+            }
+        }
+
         Spacer(modifier = Modifier.height(8.dp))
+    }
+
+    // v2.7.1: SnackbarHost overlay for peer join/leave toasts.
+    Box(modifier = Modifier.fillMaxSize()) {
+        androidx.compose.material3.SnackbarHost(
+            hostState = snackbarHost,
+            modifier = Modifier.align(Alignment.BottomCenter)
+        )
     }
 
     // Show QR dialog for current session

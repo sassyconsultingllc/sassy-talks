@@ -8,11 +8,15 @@ description = "SassyTalkie iOS Native Core - PTT Walkie-Talkie"
 
 [lib]
 name = "sassytalkie_ios"
-crate-type = ["staticlib", "cdylib"]
+# staticlib only: Xcode links libsassytalkie_ios.a into the app (project.yml
+# OTHER_LDFLAGS -lsassytalkie_ios). A cdylib (.dylib) can't be built/loaded for
+# an iOS device target and was failing the link step.
+crate-type = ["staticlib"]
 
 [dependencies]
-# Audio codec
-audiopus = { version = "0.3", default-features = false }
+# Audio codec — pinned to the same resolvable release the desktop crate uses
+# (plain "0.3" selects nothing on crates.io; only 0.3.0-rc.0 is published).
+audiopus = { version = "0.3.0-rc.0", default-features = false }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -32,6 +36,10 @@ parking_lot = "0.12"
 
 # Logging
 log = "0.4"
+env_logger = "0.11"
+
+# Lock-free ring buffer for the audio capture/playback path
+ringbuf = "0.3"
 
 # Error handling
 thiserror = "1.0"
@@ -50,3 +58,4 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+panic = "abort"

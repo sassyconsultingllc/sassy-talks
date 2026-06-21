@@ -14,12 +14,21 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.sassyconsulting.sassytalkie.debug.DebugOverlay
+import com.sassyconsulting.sassytalkie.debug.DiagnosticsPrefs
 import com.sassyconsulting.sassytalkie.ui.theme.SassyTalkTheme
 import com.sassyconsulting.sassytalkie.ui.AppNavigation
 
@@ -44,6 +53,7 @@ class MainActivity : ComponentActivity() {
     // Observable state that AppNavigation reads
     val permissionsGranted = mutableStateOf(false)
     val walkieService = mutableStateOf<WalkieService?>(null)
+    val pendingShareUri = mutableStateOf<android.net.Uri?>(null)
 
     private val requiredPermissions: Array<String>
         get() {
@@ -56,6 +66,11 @@ class MainActivity : ComponentActivity() {
                 perms.add(Manifest.permission.BLUETOOTH_CONNECT)
                 perms.add(Manifest.permission.BLUETOOTH_SCAN)
                 perms.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            } else {
+                // Android 7–11 (API 24–30): BLE scanning legally requires
+                // location permission or BluetoothLeScanner.startScan returns
+                // no results. (On 31+ neverForLocation removes this need.)
+                perms.add(Manifest.permission.ACCESS_FINE_LOCATION)
             }
             // Android 13+ requires POST_NOTIFICATIONS for foreground service notification
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -91,6 +106,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Diagnostics overlay toggle — persisted, honoured in release builds.
+        DiagnosticsPrefs.init(this)
+
         // Block screenshots, screen recording, and app preview in recent apps
         if (BuildConfig.NO_SCREENSHOTS) {
             window.setFlags(
@@ -99,17 +117,39 @@ class MainActivity : ComponentActivity() {
             )
         }
 
+        // Capture the initial deep-link URI if we were launched via VIEW intent.
+        captureShareIntent(intent)
+
         setContent {
             SassyTalkTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    AppNavigation(
-                        permissionsGranted = permissionsGranted.value,
-                        walkieService = walkieService.value,
-                        onRequestPermissions = { requestAllPermissions() }
-                    )
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        AppNavigation(
+                            permissionsGranted = permissionsGranted.value,
+                            walkieService = walkieService.value,
+                            onRequestPermissions = { requestAllPermissions() },
+                            pendingShareUri = pendingShareUri.value,
+                            onShareConsumed = { pendingShareUri.value = null },
+                        )
+                        // Audio + network diagnostics overlay. Driven by
+                        // com.sassyconsulting.sassytalkie.debug.AudioTelemetry,
+                        // which the PttAudioPipeline and WalkieService feed.
+                        // Shown in debug builds, OR in any build (incl. release)
+                        // when the user enables it via Settings → Diagnostics —
+                        // for on-the-go field testing. Tap to collapse/expand.
+                        val diagOn by DiagnosticsPrefs.overlayEnabled.collectAsState()
+                        if (BuildConfig.DEBUG || diagOn) {
+                            DebugOverlay(
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(8.dp)
+                                    .width(280.dp)
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -139,6 +179,24 @@ class MainActivity : ComponentActivity() {
         try {
             unbindService(serviceConnection)
         } catch (_: Exception) { }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        captureShareIntent(intent)
+    }
+
+    private fun captureShareIntent(i: Intent?) {
+        val uri = i?.data ?: return
+        if (i.action != Intent.ACTION_VIEW) return
+        // Only accept the encrypted https share-link form — the manifest no
+        // longer registers any cleartext-payload scheme (see SessionShareLink
+        // for the rationale).
+        val ok = uri.scheme == "https" &&
+            uri.host == "relay.sassyconsultingllc.com" &&
+            (uri.path ?: "").startsWith("/v/")
+        if (ok) pendingShareUri.value = uri
     }
 
     override fun onDestroy() {

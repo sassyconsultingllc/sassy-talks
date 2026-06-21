@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use thiserror::Error;
+use serde::Serialize;
 
 #[derive(Error, Debug)]
 pub enum BluetoothError {
@@ -25,7 +26,7 @@ pub enum BluetoothError {
 }
 
 /// Bluetooth device info
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BluetoothDevice {
     pub id: String,
     pub name: String,

@@ -11,9 +11,12 @@ settings:
     TARGETED_DEVICE_FAMILY: "1,2"
     INFOPLIST_FILE: Info.plist
     SWIFT_OBJC_BRIDGING_HEADER: SassyTalkie-Bridging-Header.h
-    LIBRARY_SEARCH_PATHS:
-      - "$(PROJECT_DIR)/target/aarch64-apple-ios/release"
-      - "$(PROJECT_DIR)/target/universal-sim/release"
+    # SDK-conditional: the simulator build must link the universal-sim archive
+    # (x86_64 + arm64-sim); the device build links the arm64 device archive.
+    # A single combined path made the linker pick the arm64 DEVICE lib for the
+    # x86_64 simulator slice → "undefined symbols / wrong architecture".
+    "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]": "$(PROJECT_DIR)/target/aarch64-apple-ios/release"
+    "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": "$(PROJECT_DIR)/target/universal-sim/release"
     OTHER_LDFLAGS:
       - "-lsassytalkie_ios"
       - "-framework Security"

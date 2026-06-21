@@ -30,14 +30,15 @@ class SassyTalkieViewModel: ObservableObject {
     }
     
     var statusColor: Color {
+        // Design tokens (Theme.swift). Also iOS-14-safe: .cyan/.teal are iOS 15+.
         if isTransmitting {
-            return .orange
+            return .stCoral
         } else if isReceiving {
-            return .cyan
+            return .stTeal
         } else if isConnected {
-            return .green
+            return .stOnline
         } else {
-            return .gray
+            return .stTextMuted
         }
     }
     

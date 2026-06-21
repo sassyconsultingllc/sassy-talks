@@ -3,6 +3,8 @@
 **/dist/
 **/target/
 **/out/
+# Android NDK / CMake build cache (machine-specific, regenerated every build)
+**/.cxx/
 
 # Gradle
 **/.gradle/
@@ -47,6 +49,14 @@ npm-debug.log*
 *.jks
 *.keystore
 **/keystore/
+# Local signing config (plaintext passwords) — CI uses env-var secrets instead
+**/keystore.properties
+
+# Firebase / Google services config (contains API keys) — inject in CI as a secret
+**/google-services.json
+
+# Mercury code-review bundles (generated artifacts, not source)
+mercury_*
 
 # Local test suites
 **/tests-local/

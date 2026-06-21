@@ -654,6 +654,68 @@ object SassyTalkNative {
         return try { nativeGetSquelchDbfs() } catch (_: Exception) { 0 }
     }
 
+    // ── v2.7.5: RX (playback) gain ──
+    //
+    // Multiplies decoded PCM samples on the receiver side before forwarding
+    // them to AudioTrack. Independent of the system media volume slider.
+    // Useful when peers are at low Opus loudness or speakerphone is off and
+    // the user wants louder voice without raising the global volume.
+
+    /** Set RX playback gain (1.0 = no change). Clamped to [0.25, 4.0]. */
+    fun setRxGain(gain: Float) {
+        if (!initialized) return
+        val x100 = (gain * 100f).toInt().coerceIn(25, 400)
+        try { nativeSetRxGainX100(x100) } catch (e: Exception) {
+            Log.e(TAG, "setRxGain failed: ${e.message}")
+        }
+    }
+
+    /** Current RX playback gain (1.0 = unity). */
+    fun getRxGain(): Float {
+        if (!initialized) return 1.0f
+        return try { nativeGetRxGainX100() / 100f } catch (_: Exception) { 1.0f }
+    }
+
+    // ── v2.7.5: Speakerphone vs earpiece routing ──
+
+    /**
+     * Force audio output to the loudspeaker (true) or the earpiece (false).
+     * Engages Android's MODE_IN_COMMUNICATION + setSpeakerphoneOn under the
+     * hood — see `audio_routing.rs`.
+     * @return true if the routing was applied, false if AudioManager wasn't
+     *         reachable (rare — usually means initContext wasn't called).
+     */
+    fun setSpeakerphone(on: Boolean): Boolean {
+        if (!initialized) return false
+        return try { nativeSetSpeakerphone(on) } catch (e: Exception) {
+            Log.e(TAG, "setSpeakerphone failed: ${e.message}")
+            false
+        }
+    }
+
+    /** True if our COMM-mode override is currently engaged. */
+    fun isCommModeActive(): Boolean {
+        if (!initialized) return false
+        return try { nativeIsCommModeActive() } catch (_: Exception) { false }
+    }
+
+    // ── v2.7.5: Live-mode jitter buffer size ──
+    //
+    // 3 = ~60ms (Low Latency)  · 5 = ~100ms (Balanced, default)  · 8 = ~160ms (Smooth)
+    // Trades end-to-end PTT latency for jitter absorption on flaky links.
+
+    fun setJitterPrebufferFrames(frames: Int) {
+        if (!initialized) return
+        try { nativeSetJitterPrebufferFrames(frames.coerceIn(2, 16)) } catch (e: Exception) {
+            Log.e(TAG, "setJitterPrebufferFrames failed: ${e.message}")
+        }
+    }
+
+    fun getJitterPrebufferFrames(): Int {
+        if (!initialized) return 5
+        return try { nativeGetJitterPrebufferFrames() } catch (_: Exception) { 5 }
+    }
+
     /** Clear all cached audio, reset to Live mode */
     fun clearAudioCache() {
         if (initialized) {
@@ -985,6 +1047,14 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeSyncCacheUserInfo()
     @JvmStatic private external fun nativeSetMixModeEnabled(enabled: Boolean)
     @JvmStatic private external fun nativeIsMixModeEnabled(): Boolean
+
+    // v2.7.5 — RX gain, speakerphone, jitter buffer
+    @JvmStatic private external fun nativeSetRxGainX100(x100: Int)
+    @JvmStatic private external fun nativeGetRxGainX100(): Int
+    @JvmStatic private external fun nativeSetSpeakerphone(on: Boolean): Boolean
+    @JvmStatic private external fun nativeIsCommModeActive(): Boolean
+    @JvmStatic private external fun nativeSetJitterPrebufferFrames(frames: Int)
+    @JvmStatic private external fun nativeGetJitterPrebufferFrames(): Int
 
     // Cellular Transport (WebSocket relay)
     @JvmStatic private external fun nativeCellularSetRoom(roomId: String)

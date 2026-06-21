@@ -9,7 +9,6 @@ import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -29,11 +28,31 @@ import androidx.compose.ui.unit.sp
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.sassyconsulting.sassytalkie.SassyTalkNative
+import com.sassyconsulting.sassytalkie.SessionShareLink
 import com.sassyconsulting.sassytalkie.ui.theme.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 @Composable
-fun QRAuthScreen(onAuthenticated: () -> Unit) {
+/**
+ * @param onAuthenticated invoked once the local session is established AND the
+ *   user is ready to leave this screen (after import, or after the host taps
+ *   Continue on their generated QR). Caller is expected to trigger a relay
+ *   reconnect (e.g. via AutoConnectManager.disconnect → MainScreen re-mounts).
+ * @param onSessionMutated invoked the instant the local session_id changes
+ *   (after a successful generate OR import) — caller should force a cellular
+ *   WS teardown+reconnect so the relay attaches to the new room immediately,
+ *   without waiting for the user to navigate.
+ *   Critical for the HOST path: the host generates a QR and STAYS on this
+ *   screen waiting for joiners; without an immediate reconnect, the host's
+ *   WS stays bound to the old room and joiners scan into an empty room.
+ */
+fun QRAuthScreen(
+    onAuthenticated: () -> Unit,
+    onSessionMutated: () -> Unit = {},
+) {
     val context = LocalContext.current
     var selectedTab by remember { mutableIntStateOf(0) }
     var selectedChannel by remember { mutableIntStateOf(1) }
@@ -49,29 +68,29 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .background(DarkBg)
-            .padding(16.dp),
+            .padding(horizontal = 8.dp, vertical = 4.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
         // Title
         Text(
             text = "Authenticate",
-            fontSize = 28.sp,
+            fontSize = 24.sp,
             fontWeight = FontWeight.Bold,
             color = Orange
         )
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(2.dp))
 
         Text(
             text = "Scan a QR code or share a session code",
-            fontSize = 14.sp,
+            fontSize = 12.sp,
             color = TextGray,
             textAlign = TextAlign.Center
         )
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
         // ── Existing session card ──
         if (hasExistingSession.value) {
@@ -99,26 +118,26 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
             Tab(
                 selected = selectedTab == 0,
                 onClick = { selectedTab = 0 },
-                text = { Text("Show QR", color = if (selectedTab == 0) Orange else TextGray, fontSize = 13.sp) }
+                text = { Text("Show QR", color = if (selectedTab == 0) Orange else TextGray, fontSize = 12.sp) }
             )
             Tab(
                 selected = selectedTab == 1,
                 onClick = { selectedTab = 1 },
-                text = { Text("Scan QR", color = if (selectedTab == 1) Orange else TextGray, fontSize = 13.sp) }
+                text = { Text("Scan QR", color = if (selectedTab == 1) Orange else TextGray, fontSize = 12.sp) }
             )
             Tab(
                 selected = selectedTab == 2,
                 onClick = { selectedTab = 2 },
-                text = { Text("Enter Code", color = if (selectedTab == 2) Orange else TextGray, fontSize = 13.sp) }
+                text = { Text("Enter Code", color = if (selectedTab == 2) Orange else TextGray, fontSize = 12.sp) }
             )
             Tab(
                 selected = selectedTab == 3,
                 onClick = { selectedTab = 3 },
-                text = { Text("My Cohorts", color = if (selectedTab == 3) Orange else TextGray, fontSize = 13.sp) }
+                text = { Text("My Cohorts", color = if (selectedTab == 3) Orange else TextGray, fontSize = 12.sp) }
             )
         }
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
         when (selectedTab) {
             0 -> ShowQRTab(
@@ -139,6 +158,10 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
                         lastGeneratedJson = qrJson
                         qrBitmap = generateQRBitmap(qrJson, 600)
                         hasExistingSession.value = true
+                        // Host-side: a new session_id was just minted. Force
+                        // the cellular WS to reconnect so the host attaches
+                        // to the new room BEFORE any joiner scans the QR.
+                        onSessionMutated()
                     }
                 },
                 onContinue = {
@@ -155,6 +178,12 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
                     scanResult = if (success) "Session established!" else "Invalid QR code"
                     if (success) {
                         hasExistingSession.value = true
+                        // Joiner-side: force-reconnect to the host's room
+                        // immediately. autoConnect.disconnect() in
+                        // onAuthenticated also tears down, but that's a
+                        // soft path that depends on MainScreen re-mounting;
+                        // the explicit force is the load-bearing call.
+                        onSessionMutated()
                         onAuthenticated()
                     }
                 }
@@ -163,6 +192,10 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
                 context = context,
                 onAuthenticated = {
                     hasExistingSession.value = true
+                    // Same path as scan-import: session_id just changed, need
+                    // the WS to land on the host's room before the joiner
+                    // exits this screen.
+                    onSessionMutated()
                     onAuthenticated()
                 }
             )
@@ -176,10 +209,40 @@ fun QRAuthScreen(onAuthenticated: () -> Unit) {
                         qrBitmap = generateQRBitmap(qr, 600)
                         hasExistingSession.value = true
                         selectedTab = 0
+                        // Same host-side reconnect as the fresh-generate path.
+                        onSessionMutated()
                     }
                 },
-                onRejoinJoiner = { hostDevice ->
-                    scanResult = if (hostDevice != null) "Ask $hostDevice to show their QR" else null
+                onRejoinJoiner = { channel, hostDevice ->
+                    // v2.7.3: prefer rejoining with the LOCALLY-PERSISTED
+                    // session credentials. The full JSON (including the
+                    // AES key) was stashed during the original import via
+                    // SessionManager → EncryptedSharedPreferences. If it
+                    // is still on disk, re-import + force reconnect — no
+                    // QR rescan, no message to the host needed.
+                    val stored = try {
+                        SassyTalkNative.getChannelSessionJson(channel)
+                    } catch (_: Throwable) { "" }
+
+                    if (stored.isNotEmpty()) {
+                        val ok = try {
+                            SassyTalkNative.importSessionFromQR(stored)
+                        } catch (_: Throwable) { false }
+                        if (ok) {
+                            hasExistingSession.value = true
+                            scanResult = "Rejoined " + (hostDevice ?: "session")
+                            onSessionMutated()   // force WS reconnect to host's room
+                            onAuthenticated()    // navigate to Main
+                            return@MyCohortsTab
+                        }
+                    }
+                    // Fallback: credentials gone (wiped / fresh install).
+                    // Send the user to the scan tab with a context hint.
+                    scanResult = if (hostDevice != null) {
+                        "Credentials expired — ask $hostDevice to show their QR"
+                    } else {
+                        "Credentials expired — scan a fresh QR"
+                    }
                     showScanner = false
                     selectedTab = 1
                 },
@@ -294,33 +357,42 @@ private fun ShowQRTab(
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(
-                modifier = Modifier.padding(16.dp),
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Text("Channel", color = TextGray, fontSize = 14.sp)
-                Spacer(modifier = Modifier.height(8.dp))
+                Text("Channel", color = TextGray, fontSize = 12.sp)
+                Spacer(modifier = Modifier.height(4.dp))
                 Row(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState())
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    modifier = Modifier.fillMaxWidth()
                 ) {
                     for (ch in 1..8) {
                         FilterChip(
                             selected = ch == selectedChannel,
                             onClick = { onChannelChange(ch) },
-                            label = { Text("$ch", fontSize = 13.sp, color = if (ch == selectedChannel) DarkBg else TextGray) },
+                            label = {
+                                Text(
+                                    "$ch",
+                                    fontSize = 11.sp,
+                                    color = if (ch == selectedChannel) DarkBg else TextGray,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            },
                             colors = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = Orange,
                                 containerColor = SurfaceBg
-                            )
+                            ),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(28.dp)
                         )
                     }
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
         // Group name input
         OutlinedTextField(
@@ -341,7 +413,7 @@ private fun ShowQRTab(
             shape = RoundedCornerShape(12.dp)
         )
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
         // Duration picker
         Card(
@@ -350,11 +422,11 @@ private fun ShowQRTab(
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(
-                modifier = Modifier.padding(16.dp),
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Text("Session Duration", color = TextGray, fontSize = 14.sp)
-                Spacer(modifier = Modifier.height(12.dp))
+                Text("Session Duration", color = TextGray, fontSize = 12.sp)
+                Spacer(modifier = Modifier.height(4.dp))
 
                 Row(
                     horizontalArrangement = Arrangement.SpaceEvenly,
@@ -367,7 +439,7 @@ private fun ShowQRTab(
             }
         }
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
         // Generate button
         Button(
@@ -376,86 +448,155 @@ private fun ShowQRTab(
             shape = RoundedCornerShape(25.dp),
             modifier = Modifier
                 .fillMaxWidth()
-                .height(56.dp)
+                .height(44.dp)
         ) {
-            Icon(Icons.Default.QrCode2, contentDescription = null)
-            Spacer(modifier = Modifier.width(8.dp))
+            Icon(Icons.Default.QrCode2, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(modifier = Modifier.width(6.dp))
             Text(
                 if (qrBitmap != null) "Regenerate QR" else "Generate Session QR",
-                fontSize = 16.sp
+                fontSize = 14.sp
             )
         }
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
         // QR display
         if (qrBitmap != null) {
             Card(
                 colors = CardDefaults.cardColors(containerColor = androidx.compose.ui.graphics.Color.White),
-                shape = RoundedCornerShape(16.dp)
+                shape = RoundedCornerShape(12.dp)
             ) {
                 Image(
                     bitmap = qrBitmap.asImageBitmap(),
                     contentDescription = "Session QR Code",
                     modifier = Modifier
-                        .size(200.dp)
-                        .padding(12.dp)
+                        .size(160.dp)
+                        .padding(6.dp)
                 )
             }
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(6.dp))
 
             Text(
                 text = "Scan this QR, or share the code for long-distance relay",
                 color = TextGray,
-                fontSize = 13.sp,
+                fontSize = 11.sp,
                 textAlign = TextAlign.Center
             )
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(6.dp))
 
             // Share / Copy row for long-distance relay
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                // Copy to clipboard
+                // Copy an encrypted one-shot share LINK to the clipboard.
+                // Earlier revisions copied the raw session JSON (including
+                // the AES-256 room key); that's the same plaintext leak the
+                // Share button refactor was meant to close. Both buttons now
+                // route through SessionShareLink so the clipboard only ever
+                // holds a URL whose fragment is the only decryption material.
+                var copying by remember { mutableStateOf(false) }
+                val copyScope = rememberCoroutineScope()
                 OutlinedButton(
+                    enabled = !copying,
                     onClick = {
-                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        cm.setPrimaryClip(ClipData.newPlainText("SassyTalk Session", sessionJson))
-                        Toast.makeText(context, "Session code copied", Toast.LENGTH_SHORT).show()
+                        copying = true
+                        copyScope.launch {
+                            val result = withContext(Dispatchers.IO) {
+                                SessionShareLink.createShare(sessionJson)
+                            }
+                            copying = false
+                            when (result) {
+                                is SessionShareLink.Result.Ok -> {
+                                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    cm.setPrimaryClip(ClipData.newPlainText("SassyTalk Invite", result.url))
+                                    Toast.makeText(context, "Invite link copied", Toast.LENGTH_SHORT).show()
+                                }
+                                is SessionShareLink.Result.Err -> {
+                                    Toast.makeText(context, "Copy failed: ${result.message}", Toast.LENGTH_LONG).show()
+                                }
+                            }
+                        }
                     },
                     shape = RoundedCornerShape(25.dp),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Cyan),
-                    modifier = Modifier.weight(1f).height(44.dp)
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    modifier = Modifier.weight(1f).height(36.dp)
                 ) {
-                    Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Copy Code", fontSize = 13.sp)
+                    if (copying) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(14.dp),
+                            color = Cyan,
+                            strokeWidth = 2.dp,
+                        )
+                    } else {
+                        Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                    }
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(if (copying) "Linking…" else "Copy Link", fontSize = 12.sp)
                 }
 
-                // Share via intent (text, Signal, WhatsApp, etc.)
+                // Share as an end-to-end encrypted one-shot link. The session
+                // JSON is AES-GCM encrypted with a fresh key that lives only
+                // in the URL fragment; the relay sees ciphertext.
+                var sharing by remember { mutableStateOf(false) }
+                val scope = rememberCoroutineScope()
                 OutlinedButton(
+                    enabled = !sharing,
                     onClick = {
-                        val intent = Intent(Intent.ACTION_SEND).apply {
-                            type = "text/plain"
-                            putExtra(Intent.EXTRA_TEXT, sessionJson)
-                            putExtra(Intent.EXTRA_SUBJECT, "SassyTalk Session Code")
+                        sharing = true
+                        scope.launch {
+                            val result = withContext(Dispatchers.IO) {
+                                SessionShareLink.createShare(sessionJson)
+                            }
+                            sharing = false
+                            when (result) {
+                                is SessionShareLink.Result.Ok -> {
+                                    val intent = Intent(Intent.ACTION_SEND).apply {
+                                        type = "text/plain"
+                                        putExtra(
+                                            Intent.EXTRA_TEXT,
+                                            "Join my SassyTalk session: ${result.url}\n" +
+                                                "(One-time link, expires shortly.)",
+                                        )
+                                        putExtra(Intent.EXTRA_SUBJECT, "SassyTalk invite")
+                                    }
+                                    context.startActivity(
+                                        Intent.createChooser(intent, "Share invite link"),
+                                    )
+                                }
+                                is SessionShareLink.Result.Err -> {
+                                    Toast.makeText(
+                                        context,
+                                        "Share failed: ${result.message}",
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                }
+                            }
                         }
-                        context.startActivity(Intent.createChooser(intent, "Share session code"))
                     },
                     shape = RoundedCornerShape(25.dp),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Cyan),
-                    modifier = Modifier.weight(1f).height(44.dp)
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    modifier = Modifier.weight(1f).height(36.dp)
                 ) {
-                    Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Share", fontSize = 13.sp)
+                    if (sharing) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(14.dp),
+                            color = Cyan,
+                            strokeWidth = 2.dp,
+                        )
+                    } else {
+                        Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                    }
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(if (sharing) "Sharing…" else "Share Link", fontSize = 12.sp)
                 }
             }
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(6.dp))
 
             // Continue button
             Button(
@@ -464,19 +605,19 @@ private fun ShowQRTab(
                 shape = RoundedCornerShape(25.dp),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(56.dp)
+                    .height(48.dp)
             ) {
-                Icon(Icons.Default.CheckCircle, contentDescription = null)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Continue", fontSize = 15.sp)
+                Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Continue", fontSize = 14.sp)
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(4.dp))
 
             Text(
                 text = "Your session key is active — the other device just needs to scan or enter the code.",
                 color = TextMuted,
-                fontSize = 12.sp,
+                fontSize = 10.sp,
                 textAlign = TextAlign.Center
             )
         }

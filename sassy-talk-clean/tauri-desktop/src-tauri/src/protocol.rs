@@ -282,7 +282,17 @@ impl Packet {
     
     /// Deserialize packet from bytes
     pub fn deserialize(data: &[u8]) -> Result<Self, String> {
-        let packet: Packet = bincode::deserialize(data)
+        // Bound allocation: a crafted length prefix (e.g. a huge Vec in the
+        // audio field) would otherwise make bincode pre-allocate gigabytes and
+        // OOM/abort the process before the checksum is checked. fixint +
+        // reject-trailing matches bincode::serialize's encoding; we only add a
+        // size limit on top.
+        use bincode::Options;
+        const MAX_PACKET_BYTES: u64 = 64 * 1024;
+        let packet: Packet = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(MAX_PACKET_BYTES)
+            .deserialize(data)
             .map_err(|e| format!("Deserialization failed: {}", e))?;
         
         // Verify version (allow both v1 and v2 for compatibility)

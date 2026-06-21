@@ -201,12 +201,12 @@ flowchart LR
 [^9]: PTT input includes screen button, hardware key, and BT HID button (where supported).
 [^10]: Opus frame size and bitrate are negotiated at session start; default 20 ms / 24 kbps.
 [^11]: Jitter buffer absorbs up to 60 ms of arrival skew before frame drop.
-[^12]: Each direction uses its own nonce counter; nonce reuse is structurally impossible.
+[^12]: Each peer uses its own monotonic nonce counter plus a per-session random 4-byte nonce prefix; a (key, nonce) collision across the two directions is cryptographically infeasible (32-bit random prefix) rather than structurally precluded.
 [^13]: Full-duplex: simultaneous TX and RX share no codec instance.
 [^14]: Default key rotation cadence: 60 s; rotation handshake overlaps the prior key.
 [^15]: Backup is excluded from cloud backup via `allowBackup=false` and a `dataExtractionRules` allowlist.
 [^16]: UI-RX consumes a `StateFlow`; mutation flows only from intent → reducer → state.
-[^17]: Encryption uses one AES-GCM key per direction per session; the inbound key never seals, the outbound key never opens.
+[^17]: Encryption uses a single AES-256-GCM session key shared by both directions — derived via HKDF-SHA256 from the X25519 shared secret, or installed directly from the QR/PSK. The 12-byte nonce is self-describing on the wire (4-byte per-session random prefix ‖ 8-byte little-endian counter), so decryption never depends on local counter state and the two directions cannot reuse a (key, nonce) pair. (Data-TX and Data-RX still hold separate codec instances and socket buffers.)
 [^18]: Relay forwards opaque encrypted frames; it cannot derive plaintext, key material, or peer identity beyond the room ID.
 [^19]: e.g., RX decode failure surfaces an error event but does not stall TX capture or UI render.
 [^20]: FCM payload contains only a wake hint — no audio data, no session key, no peer info.

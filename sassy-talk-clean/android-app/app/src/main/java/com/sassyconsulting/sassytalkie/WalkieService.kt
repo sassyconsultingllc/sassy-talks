@@ -73,6 +73,55 @@ class WalkieService : Service() {
     // Without it, a single uncaught exception silently kills every long-
     // lived coroutine in this service.
     private val serviceScope = CoroutineScope(Dispatchers.Default + kotlinx.coroutines.SupervisorJob())
+
+    // ── v2.7.2: network-type indicator ──
+
+    /** "wifi", "cellular", "ethernet", "vpn", "none" — derived from the
+     *  default network's TransportCapabilities. Updates whenever the
+     *  network changes (toggled WiFi, cellular handoff). Polled by
+     *  MainScreen to render a small badge. */
+    val networkType = kotlinx.coroutines.flow.MutableStateFlow("none")
+    private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
+
+    private fun registerNetworkCallback() {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) { refresh() }
+            override fun onLost(network: android.net.Network) { refresh() }
+            override fun onCapabilitiesChanged(
+                network: android.net.Network,
+                caps: android.net.NetworkCapabilities,
+            ) { refresh() }
+
+            private fun refresh() {
+                val net = cm.activeNetwork
+                val caps = net?.let { cm.getNetworkCapabilities(it) }
+                val type = when {
+                    caps == null -> "none"
+                    caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)     -> "wifi"
+                    caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+                    caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+                    caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)      -> "vpn"
+                    else -> "other"
+                }
+                networkType.value = type
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(cb)
+            networkCallback = cb
+        } catch (t: Throwable) {
+            Log.w(TAG, "network callback register failed: ${t.message}")
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            networkCallback?.let { cm.unregisterNetworkCallback(it) }
+        } catch (_: Throwable) {}
+        networkCallback = null
+    }
     private var cohortSnapshotJob: Job? = null
     private var telemetryBridgeJob: Job? = null
 
@@ -98,6 +147,9 @@ class WalkieService : Service() {
         Log.i(TAG, "Service created")
         createNotificationChannel()
         registerPttToggleReceiver()
+        // v2.7.2: monitor network type so MainScreen can render the badge
+        // and the diagnostic sheet can include "current transport" in its dump.
+        registerNetworkCallback()
         // Snapshotter is keyed to service lifetime, not multicast. The inner
         // getActiveCohortId() guard makes it a no-op when no channel has an
         // active session — so it's safe to run regardless of transport.
@@ -191,6 +243,58 @@ class WalkieService : Service() {
         Log.w(TAG, "kickCellularReconnect: gave up waiting for PttCoordinator after 15s")
     }
 
+    /**
+     * Force a full WS teardown + reconnect. Unlike [kickCellularReconnect],
+     * this does NOT skip when isConnected() returns true — it explicitly
+     * disconnects first. Use this after the Rust session room changes
+     * (QR generate / QR scan / share-link import), where the WS may still
+     * appear "connected" to the OLD room and silently drop everything sent
+     * for the new one.
+     *
+     * Public so SessionShareLink + QRAuthScreen can invoke it directly via
+     * a service binder reference.
+     */
+    fun forceCellularReconnect() {
+        serviceScope.launch {
+            // Brief window in case pttCoordinator is mid-initialization — but
+            // don't wait long. If the coordinator doesn't exist this is the
+            // Auth-screen-first-generate case: there's no live WS to bounce.
+            // The natural Auth → Main navigation will spin up a fresh
+            // cellular client against whatever room Rust has set, which
+            // already includes the new session_id (Rust's set_cellular_room
+            // ran synchronously inside nativeGenerateChannelQR before this
+            // Kotlin path fires). Bail quickly so we don't sit in a 15 s
+            // dead wait every time the host generates from a cold start.
+            val deadline = System.currentTimeMillis() + 2_000L
+            while (System.currentTimeMillis() < deadline) {
+                val client = pttCoordinator?.cellularClient
+                if (client != null) {
+                    try {
+                        Log.i(TAG, "forceCellularReconnect: disconnect → reconnect for room change")
+                        client.disconnect()
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "force disconnect threw: ${t.message}")
+                    }
+                    // Small grace gap so the prior socket close completes before
+                    // we open the new one; otherwise OkHttp can collapse the
+                    // second connect into the closing of the first.
+                    kotlinx.coroutines.delay(150)
+                    try {
+                        client.connect()
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "force connect threw: ${t.message}")
+                    }
+                    return@launch
+                }
+                kotlinx.coroutines.delay(200)
+            }
+            // No coordinator yet — that's fine. Rust already updated the
+            // room, and the next time MainScreen mounts autoConnect will
+            // create a fresh cellular client against the new room.
+            Log.d(TAG, "forceCellularReconnect: no PttCoordinator yet — relying on Main-mount autoConnect to pick up new room")
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onDestroy() {
@@ -202,6 +306,7 @@ class WalkieService : Service() {
         releaseMulticastLock()
         releaseWakeLock()
         unregisterPttToggleReceiver()
+        unregisterNetworkCallback()
         // Explicitly remove the ongoing notification so it doesn't linger in the
         // shade after the service itself is gone.
         try {

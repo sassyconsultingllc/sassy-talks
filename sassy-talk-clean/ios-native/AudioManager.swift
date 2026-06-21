@@ -88,9 +88,12 @@ class AudioManager: NSObject {
         let frameLength = Int(buffer.frameLength)
         let samples = Array(UnsafeBufferPointer(start: channelData[0], count: frameLength))
         
-        // Send to Rust
+        // Send to Rust. baseAddress is non-nil whenever samples is non-empty;
+        // the FFI param is _Nonnull, so guard rather than force-unwrap.
         samples.withUnsafeBufferPointer { pointer in
-            _ = sassytalkie_process_audio_input(pointer.baseAddress, samples.count)
+            if let base = pointer.baseAddress, samples.count > 0 {
+                _ = sassytalkie_process_audio_input(base, samples.count)
+            }
         }
     }
     

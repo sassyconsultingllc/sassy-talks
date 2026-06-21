@@ -1018,3 +1018,80 @@ html, body {
 .setting-value.key-value:hover {
   background: var(--bg-light, #2a2a4e);
 }
+
+/* ============================================
+   CELLULAR RELAY (Internet Transport)
+   ============================================ */
+.cellular-hint {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  line-height: 1.4;
+  margin-bottom: var(--spacing-sm);
+}
+
+.cellular-qr-input {
+  width: 100%;
+  background: var(--bg-dark);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius-sm);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  padding: var(--spacing-sm);
+  resize: vertical;
+  margin-bottom: var(--spacing-sm);
+}
+
+.cellular-qr-input:focus {
+  outline: none;
+  border-color: var(--primary-blue);
+  box-shadow: var(--shadow-glow-blue);
+}
+
+.cellular-qr-input::placeholder {
+  color: var(--text-muted);
+}
+
+.cellular-join-btn {
+  width: 100%;
+  padding: var(--spacing-sm) var(--spacing-md);
+  background: var(--gradient-accent);
+  border: none;
+  border-radius: var(--border-radius-sm);
+  color: white;
+  font-weight: 600;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: all 0.2s;
+  box-shadow: var(--shadow-glow-teal);
+}
+
+.cellular-join-btn:hover:not(:disabled) {
+  transform: scale(1.02);
+  box-shadow: var(--shadow-glow-blue);
+}
+
+.cellular-join-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.cellular-leave-btn {
+  width: 100%;
+  margin-top: var(--spacing-sm);
+  padding: var(--spacing-sm) var(--spacing-md);
+  background: transparent;
+  border: 1px solid var(--status-error);
+  border-radius: var(--border-radius-sm);
+  color: var(--status-error);
+  font-weight: 600;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.cellular-leave-btn:hover {
+  background: var(--status-error);
+  color: white;
+}

@@ -129,8 +129,11 @@ impl IntegrityChecker {
     }
 }
 
-/// Global flag for integrity check result
-static mut INTEGRITY_CHECK_PASSED: bool = false;
+/// Global flag for integrity check result.
+/// AtomicBool (not `static mut`) so the `.init_array` constructor write and the
+/// later `integrity_check_passed()` reads from tokio worker threads are not a data race.
+static INTEGRITY_CHECK_PASSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Constructor that runs BEFORE main()
 /// This is executed when the library is loaded, before any other code
@@ -148,15 +151,11 @@ pub static INTEGRITY_CHECK_INIT: extern "C" fn() = {
         match checker.verify() {
             Ok(_) => {
                 // Store result in global flag
-                unsafe {
-                    INTEGRITY_CHECK_PASSED = true;
-                }
+                INTEGRITY_CHECK_PASSED.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             Err(e) => {
                 // Integrity check failed - terminate immediately
-                unsafe {
-                    INTEGRITY_CHECK_PASSED = false;
-                }
+                INTEGRITY_CHECK_PASSED.store(false, std::sync::atomic::Ordering::SeqCst);
                 
                 // Cannot show UI yet, but we can write to logcat
                 // Note: android_logger not initialized yet, so this might not appear
@@ -174,7 +173,7 @@ pub static INTEGRITY_CHECK_INIT: extern "C" fn() = {
 /// Check if integrity verification passed
 /// Called from main code to double-check
 pub fn integrity_check_passed() -> bool {
-    unsafe { INTEGRITY_CHECK_PASSED }
+    INTEGRITY_CHECK_PASSED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Obfuscated hash storage (alternative method)

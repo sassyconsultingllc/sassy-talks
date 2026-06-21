@@ -163,10 +163,15 @@ impl VoiceDecoder {
         }
     }
 
-    /// Decode an Opus packet into PCM.
+    /// Decode an Opus packet into PCM (normal decode, no FEC).
     ///
-    /// Returns `CODEC_FRAME_SIZE` samples on success, or a zeroed frame on failure.
-    /// Uses FEC (forward error correction) when available in the bitstream.
+    /// `decode_fec=1` is intentionally NOT set here: that flag tells the
+    /// decoder to emit the FEC-reconstructed *previous* frame instead of
+    /// the current frame, which makes sense only when the previous frame
+    /// was actually lost — not as a routine option on every packet. The
+    /// previous unconditional `decode_fec=1` was an API misuse that
+    /// produced unexpected pitch/timing artifacts on lossy paths. See
+    /// `decode_fec_from_next` for the correct lost-frame repair path.
     pub fn decode(&mut self, compressed: &[u8]) -> Vec<i16> {
         if compressed.is_empty() {
             log::warn!("Opus decode: empty packet, returning silence frame");
@@ -180,12 +185,69 @@ impl VoiceDecoder {
                 compressed.len() as i32,
                 buf.as_mut_ptr(),
                 CODEC_FRAME_SIZE as i32,
-                1, // enable FEC decoding
+                0, // normal decode — FEC repair is via decode_fec_from_next
             )
         };
         if n <= 0 {
             log::error!("Opus decode FAILED (code={}, {} input bytes) — returning silence", n, compressed.len());
             check_opus_error(n, "decode");
+            return vec![0i16; CODEC_FRAME_SIZE];
+        }
+        buf.truncate(n as usize);
+        buf
+    }
+
+    /// Reconstruct a single missing previous frame from the in-band FEC
+    /// data embedded in `next_packet`. Call this BEFORE decoding the
+    /// successor packet, once per detected sequence-number gap.
+    ///
+    /// Per Opus spec, the encoder's `setInbandFec(true)` mode places a
+    /// down-quality replica of frame N-1 inside frame N's bitstream;
+    /// `opus_decode(decoder, next_packet, len, out, frame_size, 1)`
+    /// extracts that replica. We never call FEC for a frame whose
+    /// successor hasn't arrived — if both N-1 and N are lost, we use
+    /// `decode_plc` instead.
+    pub fn decode_fec_from_next(&mut self, next_packet: &[u8]) -> Vec<i16> {
+        if next_packet.is_empty() {
+            return self.decode_plc();
+        }
+        let mut buf = vec![0i16; CODEC_FRAME_SIZE];
+        let n = unsafe {
+            ffi::opus_decode(
+                self.dec,
+                next_packet.as_ptr(),
+                next_packet.len() as i32,
+                buf.as_mut_ptr(),
+                CODEC_FRAME_SIZE as i32,
+                1, // request FEC reconstruction of the prior frame
+            )
+        };
+        if n <= 0 {
+            log::warn!("Opus decode_fec: code={} from {}-byte packet — falling back to PLC", n, next_packet.len());
+            return self.decode_plc();
+        }
+        buf.truncate(n as usize);
+        buf
+    }
+
+    /// Pure packet-loss concealment — generate a plausible replacement
+    /// frame when there is neither a real packet nor a successor with
+    /// FEC. `opus_decode(NULL, 0, ...)` runs Opus's built-in PLC, which
+    /// extrapolates from the decoder's recent history and fades to silence
+    /// over a few frames.
+    pub fn decode_plc(&mut self) -> Vec<i16> {
+        let mut buf = vec![0i16; CODEC_FRAME_SIZE];
+        let n = unsafe {
+            ffi::opus_decode(
+                self.dec,
+                std::ptr::null(),
+                0,
+                buf.as_mut_ptr(),
+                CODEC_FRAME_SIZE as i32,
+                0,
+            )
+        };
+        if n <= 0 {
             return vec![0i16; CODEC_FRAME_SIZE];
         }
         buf.truncate(n as usize);
