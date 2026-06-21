@@ -79,6 +79,12 @@ jobs:
       - name: Build frontend (produces ../dist)
         run: npm run build
 
+      # The repo ships PNGs + a misnamed icon.icns.png but no real icon.icns,
+      # so the macOS bundler fails. Regenerate the full icon set (incl. .icns)
+      # from the source PNG on the runner.
+      - name: Generate app icons
+        run: npx --yes @tauri-apps/cli@^2 icon src-tauri/icons/icon.png
+
       - name: Verify Apple signing secrets
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.sign_and_notarize == 'true' }}
         env:
