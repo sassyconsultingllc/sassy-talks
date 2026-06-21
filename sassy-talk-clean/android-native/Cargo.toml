@@ -38,7 +38,7 @@ hkdf = "0.12"
 aes-gcm = { version = "0.10", features = ["zeroize"] }
 x25519-dalek = { version = "2.0", features = ["static_secrets", "zeroize"] }
 rand = "0.8"
-zeroize = { version = "1.7", features = ["zeroize_derive", "alloc"] }
+zeroize = { version = "1.8", features = ["zeroize_derive", "alloc"] }
 
 # Networking
 socket2 = { version = "0.5", features = ["all"] }

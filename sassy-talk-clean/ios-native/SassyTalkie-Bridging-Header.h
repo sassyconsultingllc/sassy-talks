@@ -60,4 +60,27 @@ bool sassytalkie_process_audio_input(const int16_t* _Nonnull audio_data, size_t 
 /// Returns: Number of samples written
 size_t sassytalkie_get_audio_output(int16_t* _Nonnull buffer, size_t buffer_size);
 
+// ── Bluetooth (CoreBluetooth bridge — Swift discovers, Rust tracks state) ──
+
+/// BLE service UUID string (must free with sassytalkie_free_string)
+const char* _Nonnull sassytalkie_bt_service_uuid(void);
+
+/// Register a peer discovered by the Swift central
+bool sassytalkie_bt_device_found(const char* _Nullable id, const char* _Nullable name, int32_t rssi);
+
+/// Remove a peer reported lost / disconnected
+bool sassytalkie_bt_device_lost(const char* _Nullable id);
+
+/// Number of currently-discovered peers
+size_t sassytalkie_bt_peer_count(void);
+
+/// JSON array of discovered peers (must free with sassytalkie_free_string)
+const char* _Nonnull sassytalkie_bt_get_peers_json(void);
+
+/// Mark a peer as the actively-connected device
+bool sassytalkie_bt_set_connected(const char* _Nullable id);
+
+/// Clear the active BLE connection
+void sassytalkie_bt_clear_connected(void);
+
 #endif /* SassyTalkie_Bridging_Header_h */

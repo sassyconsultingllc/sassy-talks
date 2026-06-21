@@ -84,6 +84,13 @@ export function buildPartnerOfflineFrame(peerId) {
   return out;
 }
 
+// decodeURIComponent throws URIError on malformed percent-sequences (e.g.
+// "%GG"). Query params are attacker-influenced (device/peer come from the
+// client), so a bad value would otherwise 500 the DO fetch handler.
+function safeDecode(s, fallback) {
+  try { return decodeURIComponent(s); } catch { return fallback; }
+}
+
 export class PttRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -137,7 +144,7 @@ export class PttRoom extends DurableObject {
 
     const clientId = crypto.randomUUID();
     const rawDevice = url.searchParams.get("device") || "Unknown";
-    const device = decodeURIComponent(rawDevice).substring(0, MAX_DEVICE_NAME_LEN);
+    const device = safeDecode(rawDevice, "Unknown").substring(0, MAX_DEVICE_NAME_LEN);
     // Stable per-install peer ID (provided by the app — see
     // SassyTalkNative.getStablePeerId on the client). Used to:
     //   1. Match WS sessions against /presence FCM registrations so we know
@@ -145,7 +152,7 @@ export class PttRoom extends DurableObject {
     //   2. Persist across app restarts so a returning user doesn't accumulate
     //      stale presence rows.
     const rawPeer = url.searchParams.get("peer") || "";
-    const peer = decodeURIComponent(rawPeer).substring(0, MAX_PEER_ID_LEN);
+    const peer = safeDecode(rawPeer, "").substring(0, MAX_PEER_ID_LEN);
     // Also remember which room this DO is — needed when firing FCM pushes.
     const roomParam = url.searchParams.get("room") || "";
     if (!this.roomId && roomParam) {

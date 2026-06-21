@@ -10,8 +10,10 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
 };
 use x25519_dalek::{PublicKey, StaticSecret};
-use sha2::{Sha256, Digest};
+use sha2::Sha256;
+use hkdf::Hkdf;
 use rand::RngCore;
+use rand::rngs::OsRng;
 use thiserror::Error;
 use tracing::{debug, error};
 
@@ -58,7 +60,7 @@ impl CryptoEngine {
 
     /// Generate new keypair for key exchange
     pub fn generate_keypair(&mut self) -> [u8; 32] {
-        let secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let secret = StaticSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
         
         let public_bytes = *public.as_bytes();
@@ -133,16 +135,16 @@ impl CryptoEngine {
         Ok(())
     }
 
-    /// Derive 256-bit key from shared secret
+    /// Derive 256-bit key from shared secret via HKDF-SHA256.
+    ///
+    /// Matches `sassytalkie-core::crypto` (same salt=None, same info tag) so an
+    /// X25519 session interops across desktop and mobile. The info tag MUST stay
+    /// byte-identical to core's `HKDF_INFO`.
     fn derive_key(&self, shared_secret: &[u8]) -> [u8; 32] {
-        // Simple key derivation - production should use HKDF
-        let mut hasher = Sha256::new();
-        hasher.update(b"SassyTalk-v1-");
-        hasher.update(shared_secret);
-        
-        let result = hasher.finalize();
+        let hk = Hkdf::<Sha256>::new(None, shared_secret);
         let mut key = [0u8; 32];
-        key.copy_from_slice(&result);
+        hk.expand(b"sassytalkie-aead-v2", &mut key)
+            .expect("HKDF expand of 32 bytes cannot fail");
         key
     }
 
@@ -185,7 +187,7 @@ impl CryptoEngine {
     /// Generate random nonce
     pub fn generate_nonce() -> [u8; 12] {
         let mut nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        OsRng.fill_bytes(&mut nonce);
         nonce
     }
 
@@ -212,17 +214,6 @@ impl Default for CryptoEngine {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// Fast XOR encryption for low-latency scenarios (not cryptographically secure!)
-// Kept for backwards compatibility with original implementation
-
-/// XOR encrypt/decrypt (symmetric operation)
-pub fn xor_cipher(data: &[u8], key: &[u8]) -> Vec<u8> {
-    data.iter()
-        .zip(key.iter().cycle())
-        .map(|(d, k)| d ^ k)
-        .collect()
 }
 
 #[cfg(test)]
@@ -313,16 +304,5 @@ mod tests {
             a_to_b.symmetric_key, a_to_c.symmetric_key,
             "different peers must derive different keys"
         );
-    }
-
-    #[test]
-    fn test_xor_cipher() {
-        let data = b"Test data";
-        let key = b"secret";
-        
-        let encrypted = xor_cipher(data, key);
-        let decrypted = xor_cipher(&encrypted, key);
-        
-        assert_eq!(decrypted, data);
     }
 }

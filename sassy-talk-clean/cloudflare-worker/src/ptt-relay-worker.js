@@ -72,7 +72,10 @@ export default {
       }
       const expSec = Math.floor(Date.now() / 1000) + TOKEN_TTL_SEC;
       const token = await signToken(roomId, expSec, env.AUTH_SECRET);
-      return jsonResponse({ token, expires_at: expSec, ttl: TOKEN_TTL_SEC });
+      // No CORS on the token response: native clients (OkHttp/reqwest) don't
+      // enforce CORS, and withholding it stops a malicious web origin from
+      // reading a freshly-minted room capability token.
+      return jsonResponse({ token, expires_at: expSec, ttl: TOKEN_TTL_SEC }, 200, false);
     }
 
     // Short-link redirects. 302 (not 301) so we can re-point later without
@@ -99,13 +102,16 @@ export default {
 
       // Token verification. We do this in the worker so an attacker can't
       // even cause a DO to be instantiated (which costs $) without a valid
-      // capability for that specific room.
-      if (env.AUTH_SECRET) {
-        const token = url.searchParams.get("token");
-        const tokenError = await verifyToken(token, roomId, env.AUTH_SECRET);
-        if (tokenError) {
-          return new Response(tokenError, { status: 401 });
-        }
+      // capability for that specific room. Fail CLOSED: a missing AUTH_SECRET
+      // is a server misconfiguration, not a reason to drop room-scoping and
+      // let anyone open any room.
+      if (!env.AUTH_SECRET) {
+        return new Response("Server misconfigured: AUTH_SECRET unset", { status: 503 });
+      }
+      const token = url.searchParams.get("token");
+      const tokenError = await verifyToken(token, roomId, env.AUTH_SECRET);
+      if (tokenError) {
+        return new Response(tokenError, { status: 401 });
       }
 
       const doId = env.PTT_RELAY.idFromName(roomId);
@@ -121,11 +127,10 @@ function isValidRoomId(id) {
   return typeof id === "string" && id.length >= 8 && id.length <= 64;
 }
 
-function jsonResponse(body, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
-  });
+function jsonResponse(body, status = 200, cors = true) {
+  const headers = { "Content-Type": "application/json" };
+  if (cors) Object.assign(headers, CORS_HEADERS);
+  return new Response(JSON.stringify(body), { status, headers });
 }
 
 /**
