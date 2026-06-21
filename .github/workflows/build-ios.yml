@@ -88,7 +88,6 @@ jobs:
       - name: Build app for simulator (unsigned)
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.deploy_testflight != 'true' }}
         run: |
-          set -o pipefail
           xcodebuild \
             -project SassyTalkie.xcodeproj \
             -scheme SassyTalkie \
@@ -96,7 +95,7 @@ jobs:
             -sdk iphonesimulator \
             -destination 'generic/platform=iOS Simulator' \
             CODE_SIGNING_ALLOWED=NO \
-            build 2>&1 | (xcpretty || cat)
+            build
 
       # ── Signed device archive + TestFlight — manual dispatch only. ──
       - name: Verify Apple signing secrets
