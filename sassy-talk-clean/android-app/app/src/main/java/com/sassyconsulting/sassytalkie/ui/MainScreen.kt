@@ -205,11 +205,16 @@ fun MainScreen(
             val channelGroupName = remember(currentChannel) {
                 SassyTalkNative.getGroupName(currentChannel)
             }
+            // Brand title — blue→purple gradient, matching the Tauri reference
+            // (app.css --gradient-primary). GradientPrimary is defined in
+            // ui/theme/Color.kt.
             Text(
                 text = channelGroupName.ifEmpty { "Sassy-Talk" },
                 fontSize = 24.sp,
                 fontWeight = FontWeight.Bold,
-                color = Orange,
+                style = androidx.compose.ui.text.TextStyle(
+                    brush = Brush.linearGradient(GradientPrimary)
+                ),
                 maxLines = 1
             )
 

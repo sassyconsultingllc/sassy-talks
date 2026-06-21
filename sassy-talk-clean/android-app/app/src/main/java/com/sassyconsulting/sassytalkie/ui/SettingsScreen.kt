@@ -462,6 +462,22 @@ fun SettingsScreen(
                 if (showDiag) {
                     DiagnosticInfoDialog(onDismiss = { showDiag = false })
                 }
+
+                // Live diagnostics HUD — a floating audio/network telemetry
+                // overlay for on-the-go field testing. Honoured in release
+                // builds (default off) so the shipped APK can be probed live.
+                Spacer(modifier = Modifier.height(12.dp))
+                val overlayOn by com.sassyconsulting.sassytalkie.debug.DiagnosticsPrefs
+                    .overlayEnabled.collectAsState()
+                SettingsToggle(
+                    icon = Icons.Default.Visibility,
+                    title = "Live diagnostics overlay",
+                    description = "Floating audio/network HUD over the app (works in release)",
+                    checked = overlayOn,
+                    onCheckedChange = {
+                        com.sassyconsulting.sassytalkie.debug.DiagnosticsPrefs.setOverlayEnabled(it)
+                    }
+                )
             }
         }
     }

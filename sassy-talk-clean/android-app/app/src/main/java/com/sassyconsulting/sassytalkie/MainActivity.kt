@@ -21,11 +21,14 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.sassyconsulting.sassytalkie.debug.DebugOverlay
+import com.sassyconsulting.sassytalkie.debug.DiagnosticsPrefs
 import com.sassyconsulting.sassytalkie.ui.theme.SassyTalkTheme
 import com.sassyconsulting.sassytalkie.ui.AppNavigation
 
@@ -103,6 +106,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Diagnostics overlay toggle — persisted, honoured in release builds.
+        DiagnosticsPrefs.init(this)
+
         // Block screenshots, screen recording, and app preview in recent apps
         if (BuildConfig.NO_SCREENSHOTS) {
             window.setFlags(
@@ -128,11 +134,14 @@ class MainActivity : ComponentActivity() {
                             pendingShareUri = pendingShareUri.value,
                             onShareConsumed = { pendingShareUri.value = null },
                         )
-                        // Debug-only audio + network overlay. Driven by
+                        // Audio + network diagnostics overlay. Driven by
                         // com.sassyconsulting.sassytalkie.debug.AudioTelemetry,
-                        // which the new PttAudioPipeline and WalkieService both
-                        // feed. Tap to collapse/expand.
-                        if (BuildConfig.DEBUG) {
+                        // which the PttAudioPipeline and WalkieService feed.
+                        // Shown in debug builds, OR in any build (incl. release)
+                        // when the user enables it via Settings → Diagnostics —
+                        // for on-the-go field testing. Tap to collapse/expand.
+                        val diagOn by DiagnosticsPrefs.overlayEnabled.collectAsState()
+                        if (BuildConfig.DEBUG || diagOn) {
                             DebugOverlay(
                                 modifier = Modifier
                                     .align(Alignment.TopEnd)

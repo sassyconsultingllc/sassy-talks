@@ -34,14 +34,14 @@ struct ContentView: View {
                 Spacer()
             }
             .padding()
-            .background(Color(hex: "1A1A2E"))
+            .background(Color.stBgDark.ignoresSafeArea())
             .navigationTitle("SassyTalkie")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button(action: { viewModel.showingSettings.toggle() }) {
                         Image(systemName: "gear")
-                            .foregroundColor(.cyan)
+                            .foregroundColor(.stTeal)
                     }
                 }
             }
@@ -55,13 +55,20 @@ struct ContentView: View {
     
     private var headerView: some View {
         VStack(spacing: 8) {
-            Text("SASSYTALKIE")
-                .font(.system(size: 32, weight: .bold, design: .monospaced))
-                .foregroundColor(.orange)
-            
-            Text("v\(viewModel.version)")
+            // Brand title — blue→purple gradient, matching the Tauri reference
+            // (app.css --gradient-primary). Overlay+mask keeps this iOS 14-safe
+            // (foregroundStyle gradients require iOS 15).
+            Text("Sassy-Talk")
+                .font(SassyTheme.ui(34, .bold))
+                .opacity(0)
+                .overlay(
+                    SassyTheme.gradientPrimary
+                        .mask(Text("Sassy-Talk").font(SassyTheme.ui(34, .bold)))
+                )
+
+            Text("Walkie-Talkie  ·  v\(viewModel.version)")
                 .font(.caption)
-                .foregroundColor(.gray)
+                .foregroundColor(.stTextMuted)
         }
         .padding(.top, 20)
     }
@@ -78,37 +85,37 @@ struct ContentView: View {
                 
                 Text(viewModel.statusText)
                     .font(.headline)
-                    .foregroundColor(.white)
+                    .foregroundColor(.stTextPrimary)
             }
-            
+
             // State indicator
             if viewModel.isTransmitting {
                 Text("TRANSMITTING")
                     .font(.system(size: 24, weight: .bold))
-                    .foregroundColor(.orange)
+                    .foregroundColor(.stCoral)
                     .padding(.horizontal, 20)
                     .padding(.vertical, 10)
                     .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color.orange.opacity(0.2))
+                        RoundedRectangle(cornerRadius: SassyTheme.radiusSm)
+                            .fill(Color.stCoral.opacity(0.2))
                     )
                     .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.orange, lineWidth: 2)
+                        RoundedRectangle(cornerRadius: SassyTheme.radiusSm)
+                            .stroke(Color.stCoral, lineWidth: 2)
                     )
             } else if viewModel.isReceiving {
                 Text("RECEIVING")
                     .font(.system(size: 24, weight: .bold))
-                    .foregroundColor(.cyan)
+                    .foregroundColor(.stTeal)
                     .padding(.horizontal, 20)
                     .padding(.vertical, 10)
                     .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color.cyan.opacity(0.2))
+                        RoundedRectangle(cornerRadius: SassyTheme.radiusSm)
+                            .fill(Color.stTeal.opacity(0.2))
                     )
                     .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.cyan, lineWidth: 2)
+                        RoundedRectangle(cornerRadius: SassyTheme.radiusSm)
+                            .stroke(Color.stTeal, lineWidth: 2)
                     )
             }
         }
@@ -120,24 +127,24 @@ struct ContentView: View {
         VStack(spacing: 12) {
             Text("CHANNEL")
                 .font(.caption)
-                .foregroundColor(.gray)
-            
+                .foregroundColor(.stTextSecondary)
+
             HStack(spacing: 20) {
                 Button(action: { viewModel.decrementChannel() }) {
                     Image(systemName: "minus.circle.fill")
                         .font(.system(size: 32))
-                        .foregroundColor(.cyan)
+                        .foregroundColor(.stTeal)
                 }
-                
+
                 Text(String(format: "%02d", viewModel.channel))
-                    .font(.system(size: 48, weight: .bold, design: .monospaced))
-                    .foregroundColor(.white)
+                    .font(SassyTheme.mono(48, .bold))
+                    .foregroundColor(.stTeal)
                     .frame(width: 100)
-                
+
                 Button(action: { viewModel.incrementChannel() }) {
                     Image(systemName: "plus.circle.fill")
                         .font(.system(size: 32))
-                        .foregroundColor(.cyan)
+                        .foregroundColor(.stTeal)
                 }
             }
         }
@@ -149,22 +156,24 @@ struct ContentView: View {
         Button(action: {}) {
             ZStack {
                 Circle()
-                    .fill(viewModel.isPTTPressed ? Color.orange : Color(hex: "252546"))
+                    .fill(viewModel.isPTTPressed ? Color.stCoral : Color.stBgLight)
                     .frame(width: 200, height: 200)
                     .overlay(
                         Circle()
-                            .stroke(viewModel.isPTTPressed ? Color.orange : Color.cyan, lineWidth: 4)
+                            .stroke(viewModel.isPTTPressed ? Color.stCoral : Color.stTeal, lineWidth: 4)
                     )
-                    .shadow(color: viewModel.isPTTPressed ? .orange.opacity(0.6) : .clear, radius: 20)
-                
+                    // Teal glow idle, coral glow while transmitting — mirrors the
+                    // Tauri CTA's --shadow-glow-* effect.
+                    .shadow(color: viewModel.isPTTPressed ? Color.stCoral.opacity(0.6) : Color.stTeal.opacity(0.35), radius: 20)
+
                 VStack(spacing: 8) {
                     Image(systemName: "mic.fill")
                         .font(.system(size: 48))
-                        .foregroundColor(viewModel.isPTTPressed ? .white : .cyan)
-                    
+                        .foregroundColor(viewModel.isPTTPressed ? .white : .stTeal)
+
                     Text("PUSH TO TALK")
                         .font(.system(size: 14, weight: .bold))
-                        .foregroundColor(viewModel.isPTTPressed ? .white : .cyan)
+                        .foregroundColor(viewModel.isPTTPressed ? .white : .stTeal)
                 }
             }
         }

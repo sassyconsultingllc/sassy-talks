@@ -10,30 +10,34 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 
+// Material3 scheme mapped onto the Tauri tokens: blue primary, teal secondary,
+// purple tertiary, slate surfaces. See ui/theme/Color.kt.
 private val DarkColorScheme = darkColorScheme(
-    primary = Orange,
-    onPrimary = TextWhite,
-    primaryContainer = OrangeDark,
-    onPrimaryContainer = TextWhite,
-    
-    secondary = Cyan,
-    onSecondary = DarkBg,
-    secondaryContainer = CyanDark,
-    onSecondaryContainer = TextWhite,
-    
-    tertiary = Purple,
-    onTertiary = TextWhite,
-    
-    background = DarkBg,
-    onBackground = TextWhite,
-    
-    surface = SurfaceBg,
-    onSurface = TextWhite,
-    surfaceVariant = CardBg,
-    onSurfaceVariant = TextGray,
-    
-    error = StatusDisconnected,
-    onError = TextWhite,
+    primary = PrimaryBlue,
+    onPrimary = TextPrimary,
+    primaryContainer = PrimaryBlueDark,
+    onPrimaryContainer = TextPrimary,
+
+    secondary = Teal,
+    onSecondary = BgDark,
+    secondaryContainer = TealDark,
+    onSecondaryContainer = TextPrimary,
+
+    tertiary = BrandPurple,
+    onTertiary = TextPrimary,
+
+    background = BgDark,
+    onBackground = TextPrimary,
+
+    surface = BgMedium,
+    onSurface = TextPrimary,
+    surfaceVariant = BgLight,
+    onSurfaceVariant = TextSecondary,
+
+    outline = BorderColor,
+
+    error = StatusErrorToken,
+    onError = TextPrimary,
 )
 
 @Composable

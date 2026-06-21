@@ -21,6 +21,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.sassyconsulting.sassytalkie.ui.theme.StatusOnline
+import com.sassyconsulting.sassytalkie.ui.theme.StatusWarning
+import com.sassyconsulting.sassytalkie.ui.theme.StatusErrorToken
+import com.sassyconsulting.sassytalkie.ui.theme.TextSecondary
+import com.sassyconsulting.sassytalkie.ui.theme.TextMutedToken
 
 /**
  * Always-on debug overlay. Tap header to collapse / expand.
@@ -43,12 +48,12 @@ fun DebugOverlay(modifier: Modifier = Modifier) {
     var expanded by remember { mutableStateOf(true) }
     val s by AudioTelemetry.state.collectAsState()
 
-    val border = if (s.gateOpen) Color(0xFF00FF88) else Color(0xFF666666)
+    val border = if (s.gateOpen) StatusOnline else TextMutedToken
 
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(6.dp))
-            .background(Color(0xCC0A0A0A))
+            .background(Color(0xE60F172A)) // slate (BgDark) ~90% opaque
             .border(1.dp, border, RoundedCornerShape(6.dp))
             .pointerInput(Unit) { detectTapGestures { expanded = !expanded } }
             .padding(8.dp)
@@ -90,7 +95,7 @@ private fun HeaderRow(s: AudioTelemetry.State) {
         Spacer(Modifier.width(8.dp))
         Mono(
             "TX ${s.txPacketsPerSec}/s  RX ${s.rxPacketsPerSec}/s",
-            color = if (s.gateOpen) Color(0xFF00FF88) else Color(0xFFAAAAAA),
+            color = if (s.gateOpen) StatusOnline else TextSecondary,
             bold = true,
         )
     }
@@ -141,7 +146,7 @@ private fun DeviceSection(s: AudioTelemetry.State) {
     Mono("DEVICE")
     Mono("  ${s.deviceLabel}")
     if (s.quirkNotes.isNotBlank()) {
-        Mono("  ${s.quirkNotes}", color = Color(0xFFFFAA00))
+        Mono("  ${s.quirkNotes}", color = StatusWarning)
     }
 }
 
@@ -157,9 +162,9 @@ private fun Meter(
     fun mapDb(db: Float): Float = ((db + 60f) / 60f).coerceIn(0f, 1f)
     val pct = mapDb(currentDbfs)
     val barColor = when {
-        gateOpen -> Color(0xFF00FF88)
-        pct > 0.6f -> Color(0xFFFFAA00)
-        else -> Color(0xFF666666)
+        gateOpen -> StatusOnline
+        pct > 0.6f -> StatusWarning
+        else -> TextMutedToken
     }
     Box(modifier.background(Color(0x22FFFFFF))) {
         Box(Modifier.fillMaxHeight().fillMaxWidth(pct).background(barColor))
@@ -183,7 +188,7 @@ private fun Meter(
                         .fillMaxHeight()
                         .width(2.dp)
                         .align(Alignment.CenterEnd)
-                        .background(Color(0xFFFF4444))
+                        .background(StatusErrorToken)
                 )
             }
         }
@@ -193,7 +198,7 @@ private fun Meter(
 @Composable
 private fun Mono(
     text: String,
-    color: Color = Color(0xFFE0E0E0),
+    color: Color = TextSecondary,
     bold: Boolean = false,
 ) {
     Text(
