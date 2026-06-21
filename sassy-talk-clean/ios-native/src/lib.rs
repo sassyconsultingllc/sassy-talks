@@ -21,14 +21,20 @@ pub use state::{StateMachine, AppState};
 
 use std::os::raw::{c_char, c_void};
 use std::ffi::{CStr, CString};
-use std::sync::{Arc, Mutex};
+use std::sync::{Mutex, OnceLock};
 use log::info;
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Global app state (singleton pattern for C FFI)
-static mut APP_STATE: Option<Arc<Mutex<StateMachine>>> = None;
+/// Global app state. `OnceLock<Mutex<Option<_>>>` (not `static mut`) so the
+/// Swift audio/render thread and the UI/timer thread share it without UB; the
+/// inner `Option` lets `sassytalkie_shutdown` clear it. Mirrors BT_MANAGER.
+static APP_STATE: OnceLock<Mutex<Option<StateMachine>>> = OnceLock::new();
+
+fn app_state() -> &'static Mutex<Option<StateMachine>> {
+    APP_STATE.get_or_init(|| Mutex::new(None))
+}
 
 /// Initialize the library
 /// 
@@ -43,7 +49,9 @@ pub unsafe extern "C" fn sassytalkie_init() -> bool {
     // Create state machine
     match StateMachine::new() {
         Ok(state) => {
-            APP_STATE = Some(Arc::new(Mutex::new(state)));
+            if let Ok(mut g) = app_state().lock() {
+                *g = Some(state);
+            }
             info!("SassyTalkie initialized successfully");
             true
         }
@@ -58,8 +66,8 @@ pub unsafe extern "C" fn sassytalkie_init() -> bool {
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_shutdown() {
     info!("SassyTalkie shutting down...");
-    if let Some(state) = APP_STATE.take() {
-        if let Ok(mut s) = state.lock() {
+    if let Ok(mut g) = app_state().lock() {
+        if let Some(mut s) = g.take() {
             let _ = s.shutdown();
         }
     }
@@ -88,8 +96,8 @@ pub unsafe extern "C" fn sassytalkie_free_string(s: *mut c_char) {
 /// Set current channel
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_set_channel(channel: u8) -> bool {
-    if let Some(state) = &APP_STATE {
-        if let Ok(mut s) = state.lock() {
+    if let Ok(mut g) = app_state().lock() {
+        if let Some(s) = g.as_mut() {
             s.set_channel(channel);
             return true;
         }
@@ -100,8 +108,8 @@ pub unsafe extern "C" fn sassytalkie_set_channel(channel: u8) -> bool {
 /// Get current channel
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_get_channel() -> u8 {
-    if let Some(state) = &APP_STATE {
-        if let Ok(s) = state.lock() {
+    if let Ok(g) = app_state().lock() {
+        if let Some(s) = g.as_ref() {
             return s.get_channel();
         }
     }
@@ -111,8 +119,8 @@ pub unsafe extern "C" fn sassytalkie_get_channel() -> u8 {
 /// Start PTT transmission
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_ptt_press() -> bool {
-    if let Some(state) = &APP_STATE {
-        if let Ok(mut s) = state.lock() {
+    if let Ok(mut g) = app_state().lock() {
+        if let Some(s) = g.as_mut() {
             return s.on_ptt_press().is_ok();
         }
     }
@@ -122,8 +130,8 @@ pub unsafe extern "C" fn sassytalkie_ptt_press() -> bool {
 /// Stop PTT transmission
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_ptt_release() -> bool {
-    if let Some(state) = &APP_STATE {
-        if let Ok(mut s) = state.lock() {
+    if let Ok(mut g) = app_state().lock() {
+        if let Some(s) = g.as_mut() {
             return s.on_ptt_release().is_ok();
         }
     }
@@ -133,8 +141,8 @@ pub unsafe extern "C" fn sassytalkie_ptt_release() -> bool {
 /// Connect to a peer device
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_connect(device_id: u32) -> bool {
-    if let Some(state) = &APP_STATE {
-        if let Ok(mut s) = state.lock() {
+    if let Ok(mut g) = app_state().lock() {
+        if let Some(s) = g.as_mut() {
             return s.connect_to_device(device_id).is_ok();
         }
     }
@@ -144,8 +152,8 @@ pub unsafe extern "C" fn sassytalkie_connect(device_id: u32) -> bool {
 /// Disconnect from peer
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_disconnect() -> bool {
-    if let Some(state) = &APP_STATE {
-        if let Ok(mut s) = state.lock() {
+    if let Ok(mut g) = app_state().lock() {
+        if let Some(s) = g.as_mut() {
             return s.disconnect().is_ok();
         }
     }
@@ -155,8 +163,8 @@ pub unsafe extern "C" fn sassytalkie_disconnect() -> bool {
 /// Start listening for incoming connections
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_start_listening() -> bool {
-    if let Some(state) = &APP_STATE {
-        if let Ok(mut s) = state.lock() {
+    if let Ok(mut g) = app_state().lock() {
+        if let Some(s) = g.as_mut() {
             return s.start_listening().is_ok();
         }
     }
@@ -166,8 +174,8 @@ pub unsafe extern "C" fn sassytalkie_start_listening() -> bool {
 /// Get current state (0=Idle, 1=Connecting, 2=Connected, 3=Transmitting, 4=Receiving)
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_get_state() -> u8 {
-    if let Some(state) = &APP_STATE {
-        if let Ok(s) = state.lock() {
+    if let Ok(g) = app_state().lock() {
+        if let Some(s) = g.as_ref() {
             return match s.current_state() {
                 AppState::Idle => 0,
                 AppState::Connecting => 1,
@@ -196,8 +204,8 @@ pub unsafe extern "C" fn sassytalkie_process_audio_input(
     
     let samples = std::slice::from_raw_parts(audio_data, sample_count);
     
-    if let Some(state) = &APP_STATE {
-        if let Ok(mut s) = state.lock() {
+    if let Ok(mut g) = app_state().lock() {
+        if let Some(s) = g.as_mut() {
             return s.process_audio_input(samples).is_ok();
         }
     }
@@ -220,8 +228,8 @@ pub unsafe extern "C" fn sassytalkie_get_audio_output(
     
     let out_buffer = std::slice::from_raw_parts_mut(buffer, buffer_size);
     
-    if let Some(state) = &APP_STATE {
-        if let Ok(mut s) = state.lock() {
+    if let Ok(mut g) = app_state().lock() {
+        if let Some(s) = g.as_mut() {
             return s.get_audio_output(out_buffer).unwrap_or(0);
         }
     }
@@ -240,7 +248,6 @@ pub unsafe extern "C" fn sassytalkie_get_audio_output(
 // peers discover each other.
 
 use crate::bluetooth::{BluetoothManager, BluetoothDevice};
-use std::sync::OnceLock;
 
 /// SassyTalkie BLE service UUID — identical to Android `BleSignalingService.SERVICE_UUID`.
 pub const SASSYTALKIE_BLE_SERVICE_UUID: &str = "b1a2e5d4-d5ab-7890-bede-fa12345678f0";

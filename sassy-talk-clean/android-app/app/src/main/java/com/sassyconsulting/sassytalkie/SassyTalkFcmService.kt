@@ -2,13 +2,17 @@ package com.sassyconsulting.sassytalkie
 
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.os.Build
 import android.util.Log
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
 /**
@@ -31,7 +35,11 @@ class SassyTalkFcmService : FirebaseMessagingService() {
 
     companion object {
         private const val TAG = "SassyTalkFcm"
-        const val WAKE_PREFS = "sassy_wake_state"
+        // Encrypted store filename. Deliberately NOT the old plaintext name so
+        // EncryptedSharedPreferences never tries to open a pre-existing
+        // plaintext file of the same name (that throws).
+        const val WAKE_PREFS = "sassy_wake_state_enc"
+        private const val LEGACY_WAKE_PREFS = "sassy_wake_state"
         const val WAKE_KEY_LAST_TOKEN = "fcm_token"
         const val WAKE_KEY_LAST_ROOM = "last_wake_room"
         const val WAKE_KEY_LAST_TS = "last_wake_ts"
@@ -39,13 +47,42 @@ class SassyTalkFcmService : FirebaseMessagingService() {
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    override fun onDestroy() {
+        super.onDestroy()
+        // Don't leak the IO scope past the service lifecycle.
+        scope.cancel()
+    }
+
+    /**
+     * Keystore-backed prefs for the FCM token + wake hints. The token addresses
+     * wake-pushes to this device, so it must not sit in a plaintext file
+     * (readable on a rooted device). Returns null if Keystore is unavailable —
+     * these are write-only hints, so skipping a write is harmless.
+     */
+    private fun wakePrefs(): SharedPreferences? = try {
+        // One-time cleanup of any legacy plaintext file from older builds.
+        applicationContext.deleteSharedPreferences(LEGACY_WAKE_PREFS)
+        val masterKey = MasterKey.Builder(applicationContext)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+        EncryptedSharedPreferences.create(
+            applicationContext,
+            WAKE_PREFS,
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+        )
+    } catch (e: Exception) {
+        Log.w(TAG, "Encrypted wake prefs unavailable; not persisting: ${e.message}")
+        null
+    }
+
     override fun onNewToken(token: String) {
         super.onNewToken(token)
         Log.i(TAG, "FCM token refreshed (len=${token.length})")
-        applicationContext.getSharedPreferences(WAKE_PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .putString(WAKE_KEY_LAST_TOKEN, token)
-            .apply()
+        wakePrefs()?.edit()
+            ?.putString(WAKE_KEY_LAST_TOKEN, token)
+            ?.apply()
 
         // Re-upload to /presence if we know the current room.
         val roomId = currentRoomId()
@@ -68,11 +105,10 @@ class SassyTalkFcmService : FirebaseMessagingService() {
         Log.i(TAG, "WAKE push received room=$room ts=${data["ts"]}")
 
         // Persist so a cold-started service can act on it.
-        applicationContext.getSharedPreferences(WAKE_PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .putString(WAKE_KEY_LAST_ROOM, room)
-            .putLong(WAKE_KEY_LAST_TS, System.currentTimeMillis())
-            .apply()
+        wakePrefs()?.edit()
+            ?.putString(WAKE_KEY_LAST_ROOM, room)
+            ?.putLong(WAKE_KEY_LAST_TS, System.currentTimeMillis())
+            ?.apply()
 
         // Two-pronged: cold-start MainActivity (which wires PttCoordinator +
         // cellular client via the existing AppNavigation flow), and ALSO send
