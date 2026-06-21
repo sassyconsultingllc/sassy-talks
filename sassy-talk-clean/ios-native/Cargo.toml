@@ -8,7 +8,10 @@ description = "SassyTalkie iOS Native Core - PTT Walkie-Talkie"
 
 [lib]
 name = "sassytalkie_ios"
-crate-type = ["staticlib", "cdylib"]
+# staticlib only: Xcode links libsassytalkie_ios.a into the app (project.yml
+# OTHER_LDFLAGS -lsassytalkie_ios). A cdylib (.dylib) can't be built/loaded for
+# an iOS device target and was failing the link step.
+crate-type = ["staticlib"]
 
 [dependencies]
 # Audio codec — pinned to the same resolvable release the desktop crate uses

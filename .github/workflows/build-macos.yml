@@ -102,9 +102,16 @@ jobs:
           done
           [ "$missing" -eq 0 ] || exit 1
 
-      # Tauri reads the APPLE_* env vars automatically: when present it signs +
-      # notarizes; when absent (push/PR path) it produces an unsigned bundle.
-      - name: Build Tauri app (universal)
+      # Unsigned build (push / PR). Crucially sets NO APPLE_* env — Tauri only
+      # attempts codesign/keychain-import when those vars are present, so this
+      # path produces an unsigned bundle and never touches a certificate.
+      - name: Build Tauri app (universal, unsigned)
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.sign_and_notarize == 'true') }}
+        run: npx --yes @tauri-apps/cli@^2 build --target universal-apple-darwin
+
+      # Signed + notarized build (manual dispatch only). Tauri reads APPLE_*.
+      - name: Build Tauri app (universal, signed)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.sign_and_notarize == 'true' }}
         env:
           APPLE_CERTIFICATE:          ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
