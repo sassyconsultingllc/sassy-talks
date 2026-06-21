@@ -222,7 +222,8 @@ impl AudioEngine {
     
     /// Get available output space
     pub fn output_available(&self) -> usize {
-        self.output_producer.lock().unwrap().vacant_len()
+        // ringbuf 0.3 Producer: free_len() = unoccupied slots (0.4 renamed it vacant_len).
+        self.output_producer.lock().unwrap().free_len()
     }
 }
 

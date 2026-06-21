@@ -4,7 +4,7 @@
 
 use audiopus::{
     coder::{Encoder as OpusEncoderImpl, Decoder as OpusDecoderImpl},
-    Application, Channels, SampleRate, Bitrate,
+    Application, Channels, SampleRate, Bitrate, MutSignals, packet::Packet,
 };
 use thiserror::Error;
 
@@ -108,11 +108,18 @@ impl OpusDecoder {
     /// Decode Opus to PCM
     pub fn decode(&mut self, opus: &[u8]) -> Result<Vec<i16>, CodecError> {
         let mut output = vec![0i16; self.frame_size];
-        
-        let decoded_size = self.decoder
-            .decode(Some(opus), &mut output, false)
+
+        // audiopus 0.3 API: input is a Packet, output is a MutSignals wrapper
+        // (mirrors tauri-desktop/src/codec.rs).
+        let packet: Packet<'_> = opus.try_into()
             .map_err(|e| CodecError::DecoderError(format!("{:?}", e)))?;
-        
+        let mut_signals: MutSignals<'_, i16> = (&mut output[..]).try_into()
+            .map_err(|e| CodecError::DecoderError(format!("{:?}", e)))?;
+
+        let decoded_size = self.decoder
+            .decode(Some(packet), mut_signals, false)
+            .map_err(|e| CodecError::DecoderError(format!("{:?}", e)))?;
+
         output.truncate(decoded_size);
         Ok(output)
     }
