@@ -37,6 +37,10 @@ data class DecodedFrame(val opcode: Byte, val payload: ByteArray) {
 data class HeartbeatPayload(
     val epoch: Long, val seq: Int, val tsMs: Long,
     val state: PresenceState, val rttMs: Int,
+    /** Capability bitmap (e.g. CAP_HYBRID_PQC=0x01). 0 for peers that predate
+     *  the caps byte — the heartbeat appends it, and parsing tolerates its
+     *  absence, so this is a backward-compatible wire extension. */
+    val caps: Int = 0,
 )
 
 object ControlFrame {
@@ -89,20 +93,25 @@ object ControlFrame {
     }
 
     fun encodeHeartbeat(epoch: Long, seq: Int, tsMs: Long,
-                        state: PresenceState, rttMs: Int): ByteArray {
-        val p = ByteBuffer.allocate(23).order(ByteOrder.LITTLE_ENDIAN)
+                        state: PresenceState, rttMs: Int, caps: Int = 0): ByteArray {
+        // 24 bytes: the original 23 (epoch|seq|tsMs|state|rtt) + a trailing caps
+        // byte. Appending keeps it readable by 23-byte-only peers (they ignore
+        // the extra) while letting upgraded peers advertise capabilities.
+        val p = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
         p.putLong(epoch); p.putInt(seq); p.putLong(tsMs)
         p.put(state.byte); p.putShort(rttMs.toShort())
+        p.put((caps and 0xFF).toByte())
         return encodeTlv(OP_HEARTBEAT, p.array())
     }
 
     fun parseHeartbeat(payload: ByteArray): HeartbeatPayload {
         val b = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
-        return HeartbeatPayload(
-            epoch = b.long, seq = b.int, tsMs = b.long,
-            state = PresenceState.fromByte(b.get()),
-            rttMs = b.short.toInt() and 0xFFFF,
-        )
+        val epoch = b.long; val seq = b.int; val tsMs = b.long
+        val state = PresenceState.fromByte(b.get())
+        val rttMs = b.short.toInt() and 0xFFFF
+        // Caps byte is optional — older peers send a 23-byte payload without it.
+        val caps = if (payload.size >= 24) payload[23].toInt() and 0xFF else 0
+        return HeartbeatPayload(epoch, seq, tsMs, state, rttMs, caps)
     }
 
     fun encodeRecvAck(epoch: Long, lastSeq: Int, tsMs: Long): ByteArray {

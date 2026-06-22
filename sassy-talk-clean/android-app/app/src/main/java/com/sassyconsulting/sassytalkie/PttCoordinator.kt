@@ -76,7 +76,7 @@ class PttCoordinator(
         }
         // Immediate heartbeat push
         val now = System.currentTimeMillis()
-        val frame = ControlFrame.encodeHeartbeat(selfEpoch, hbSeq.getAndIncrement(), now, currentPresenceState(), 0)
+        val frame = ControlFrame.encodeHeartbeat(selfEpoch, hbSeq.getAndIncrement(), now, currentPresenceState(), 0, SassyTalkNative.localCapabilities())
         bleSignaling.broadcastControl(frame)
         cellularClient?.sendBinary(frame)
     }
@@ -553,6 +553,7 @@ class PttCoordinator(
                     tsMs   = nowMs,
                     state  = currentPresenceState(),
                     rttMs  = 0,
+                    caps   = SassyTalkNative.localCapabilities(),
                 )
                 // Track sent heartbeat for RTT measurement per peer
                 for (peerId in bleSignaling.blePeerAddresses) {
@@ -681,7 +682,7 @@ class PttCoordinator(
         // Detect epoch change → peer restarted → re-send our Capabilities
         val epochFlipped = liveness.epochChanged(peerId, hb.epoch)
 
-        liveness.onHeartbeat(peerId, hb.epoch, hb.seq, hb.tsMs, nowMs)
+        liveness.onHeartbeat(peerId, hb.epoch, hb.seq, hb.tsMs, nowMs, hb.caps)
         liveness.updatePresence(peerId, hb.state)
 
         val health = liveness.health(peerId, nowMs)
@@ -700,6 +701,7 @@ class PttCoordinator(
             tsMs   = nowMs,
             state  = currentPresenceState(),
             rttMs  = rtt.coerceAtLeast(0),
+            caps   = SassyTalkNative.localCapabilities(),
         )
         bleSignaling.sendControl(peerId, echo)
     }
@@ -730,6 +732,7 @@ class PttCoordinator(
             tsMs  = nowMs,
             state = currentPresenceState(),
             rttMs = liveness.rttMs(peerId).coerceAtLeast(0),
+            caps  = SassyTalkNative.localCapabilities(),
         )
         bleSignaling.broadcastControl(hb)
         cellularClient?.sendBinary(hb)

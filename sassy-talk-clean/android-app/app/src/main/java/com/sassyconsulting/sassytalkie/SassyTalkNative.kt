@@ -538,6 +538,50 @@ object SassyTalkNative {
         } catch (e: Exception) { false }
     }
 
+    // ── Hybrid post-quantum key exchange (path a: PSK-authenticated) ──
+    //
+    // The QR PSK authenticates the pairing; the ephemeral X25519 + ML-KEM-768
+    // handshake adds forward secrecy + post-quantum protection. Negotiated via
+    // the heartbeat capabilities bitmap ([localCapabilities] / CAP_HYBRID_PQC) —
+    // only used when BOTH peers advertise support, else the classical path stands.
+
+    /** This build's capability bitmap (heartbeat caps byte). Today: hybrid-PQC. */
+    fun localCapabilities(): Int {
+        if (!initialized) return 0
+        return try { nativeLocalCapabilities() } catch (_: Exception) { 0 }
+    }
+
+    /**
+     * Initiator: begin a hybrid handshake for [channel]. Returns the base64
+     * initiator message to send to the peer, or null if the channel has no PSK.
+     * Finish with [hybridHandshakeComplete] once the peer replies.
+     */
+    fun hybridHandshakeInit(channel: Int): String? {
+        if (!initialized) return null
+        return try {
+            nativeHybridHandshakeInit(channel)?.ifEmpty { null }
+        } catch (e: Exception) { Log.e(TAG, "hybridHandshakeInit failed: ${e.message}"); null }
+    }
+
+    /**
+     * Responder: given the peer's base64 initiator message for [channel],
+     * establish the session and return the base64 reply to send back (or null).
+     */
+    fun hybridHandshakeRespond(channel: Int, initB64: String): String? {
+        if (!initialized) return null
+        return try {
+            nativeHybridHandshakeRespond(channel, initB64)?.ifEmpty { null }
+        } catch (e: Exception) { Log.e(TAG, "hybridHandshakeRespond failed: ${e.message}"); null }
+    }
+
+    /** Initiator: complete with the peer's base64 reply, establishing the session. */
+    fun hybridHandshakeComplete(respB64: String): Boolean {
+        if (!initialized) return false
+        return try {
+            nativeHybridHandshakeComplete(respB64)
+        } catch (e: Exception) { Log.e(TAG, "hybridHandshakeComplete failed: ${e.message}"); false }
+    }
+
     // ── Permissions ──
 
     fun checkPermissions(): JSONObject? {
@@ -1128,6 +1172,10 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeSetPsk(pskB64: String): Boolean
     @JvmStatic private external fun nativeKeyExchangeInit(): String
     @JvmStatic private external fun nativeKeyExchangeComplete(remotePubB64: String): Boolean
+    @JvmStatic private external fun nativeLocalCapabilities(): Int
+    @JvmStatic private external fun nativeHybridHandshakeInit(channel: Int): String?
+    @JvmStatic private external fun nativeHybridHandshakeRespond(channel: Int, initB64: String): String?
+    @JvmStatic private external fun nativeHybridHandshakeComplete(respB64: String): Boolean
     @JvmStatic private external fun nativeCheckPermissions(): String
     @JvmStatic private external fun nativeOnPermissionResult(permission: String, granted: Boolean)
     @JvmStatic private external fun nativeGetMissingPermissions(): String

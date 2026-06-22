@@ -10,6 +10,7 @@ class LivenessTracker {
         var lastRxMs: Long = 0,
         var lastPresence: PresenceState = PresenceState.IDLE,
         var rttMs: Int = -1,
+        var caps: Int = 0, // last-advertised capability bitmap (CAP_HYBRID_PQC etc.)
         val pendingEchoes: ConcurrentHashMap<Int, Long> = ConcurrentHashMap(), // seq -> sentTsMs
     )
 
@@ -25,16 +26,23 @@ class LivenessTracker {
     }
 
     /** Process an inbound heartbeat from this peer. */
-    fun onHeartbeat(peerId: String, epoch: Long, seq: Int, tsMs: Long, nowMs: Long) {
+    fun onHeartbeat(peerId: String, epoch: Long, seq: Int, tsMs: Long, nowMs: Long, caps: Int = 0) {
         val p = peers.getOrPut(peerId) { PeerState(epoch = epoch) }
         synchronized(p) {
             p.epoch = epoch
             p.lastRxMs = nowMs
+            p.caps = caps
             val sentAt = p.pendingEchoes.remove(seq)
             if (sentAt != null) {
                 p.rttMs = (nowMs - sentAt).toInt().coerceAtLeast(0)
             }
         }
+    }
+
+    /** Last capability bitmap advertised by a peer (0 if unknown/legacy). */
+    fun peerCaps(peerId: String): Int {
+        val p = peers[peerId] ?: return 0
+        return synchronized(p) { p.caps }
     }
 
     /** Update the last-known presence state for a peer (extracted from heartbeat). */

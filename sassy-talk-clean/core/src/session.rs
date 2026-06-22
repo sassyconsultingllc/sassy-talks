@@ -237,11 +237,21 @@ impl SessionManager {
     /// set and silently defeat replay rejection. Never put this on a decrypt
     /// hot path — decrypt through the one cached session instead.
     pub fn get_crypto_for_channel(&self, channel: u8) -> Option<CryptoSession> {
-        let ch_idx = match validate_channel(channel) {
-            Ok(i) => i,
-            Err(_) => return None,
-        };
+        let arr = self.get_psk_for_channel(channel)?;
+        Some(CryptoSession::from_psk(&arr))
+    }
 
+    /// Raw 32-byte PSK for a channel (the base64-decoded QR session key), if the
+    /// channel has a valid, non-expired session. Returned in a `Zeroizing`
+    /// wrapper so it wipes after use.
+    ///
+    /// This is the bootstrap secret for the path-(a) PSK-authenticated hybrid
+    /// handshake (`pqc::PskHybridInitiator` / `pqc::psk_hybrid_respond`): the QR
+    /// PSK authenticates the pairing while the ephemeral hybrid exchange adds
+    /// forward secrecy + post-quantum protection. Same expiry/validation rules as
+    /// `get_crypto_for_channel`.
+    pub fn get_psk_for_channel(&self, channel: u8) -> Option<Zeroizing<[u8; 32]>> {
+        let ch_idx = validate_channel(channel).ok()?;
         let cs = self.channels[ch_idx].as_ref()?;
         let now = current_unix_time().ok()?;
         if now > cs.key.expires_at {
@@ -256,7 +266,7 @@ impl SessionManager {
         if key_bytes.len() != 32 { return None; }
         let mut arr = Zeroizing::new([0u8; 32]);
         arr.copy_from_slice(&key_bytes);
-        Some(CryptoSession::from_psk(&arr))
+        Some(arr)
     }
 
     /// Check if ANY channel has a valid (non-expired) session.
