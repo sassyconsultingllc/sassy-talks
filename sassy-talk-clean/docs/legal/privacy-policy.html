@@ -8,82 +8,104 @@
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; line-height: 1.6; color: #333; }
         h1 { color: #1a1a1a; border-bottom: 2px solid #ff6b35; padding-bottom: 10px; }
         h2 { color: #2a2a2a; margin-top: 30px; }
+        h3 { color: #2a2a2a; margin-top: 20px; }
         .updated { color: #666; font-style: italic; }
         .contact { background: #f5f5f5; padding: 15px; border-radius: 8px; margin-top: 30px; }
+        .mode { background: #fafafa; border-left: 4px solid #ff6b35; padding: 12px 16px; margin: 16px 0; border-radius: 4px; }
+        table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+        th, td { border: 1px solid #ddd; padding: 8px 10px; text-align: left; vertical-align: top; }
+        th { background: #f5f5f5; }
+        code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; }
     </style>
 </head>
 <body>
     <h1>Privacy Policy</h1>
-    <p class="updated">Last updated: January 4, 2025</p>
-    
-    <p><strong>Sassy Consulting LLC</strong> ("we", "our", or "us") operates the Sassy-Talk application. This Privacy Policy explains how we collect, use, and protect your information.</p>
-    
+    <p class="updated">Last updated: June 22, 2026</p>
+
+    <p><strong>Sassy Consulting LLC</strong> ("we", "our", or "us") operates the Sassy-Talk push-to-talk application. This Privacy Policy explains, precisely, what data the app handles and where it goes. Sassy-Talk is built so that the people in your conversation are the only ones who can hear it: all voice is end-to-end encrypted, and we are structurally unable to listen to it, even when our servers help carry it.</p>
+
+    <h2>The One Thing That Matters Most: Transports</h2>
+    <p>Sassy-Talk can carry your voice over several different "transports." <strong>Which transport is in use determines whether any of your data ever reaches our servers.</strong></p>
+
+    <div class="mode">
+        <strong>Local transports — Bluetooth LE and Wi-Fi Direct / same-network.</strong><br>
+        When your devices reach each other directly, <strong>nothing is sent to our servers at all</strong> — not your audio, not your device ID, not connection metadata, not encrypted data, nothing. The conversation never leaves the local radio link or local network. We have no record that it happened.
+    </div>
+
+    <div class="mode">
+        <strong>Relay transport — internet fallback over our Cloudflare relay.</strong><br>
+        When your devices cannot reach each other directly (for example, you are on different networks across the internet), the app can fall back to a relay server we operate. The relay is a <strong>blind forwarder</strong>: every audio frame is end-to-end encrypted on your device before it is sent, the relay forwards only that ciphertext, and <strong>the relay cannot decrypt your audio</strong>. We never hold the keys. Audio is forwarded in real time and immediately discarded — it is never written to disk or stored.
+    </div>
+
+    <p>In short: <strong>if the relay is not used, there is nothing on our server — encrypted or otherwise. If the relay is used, the only thing that passes through it is encrypted, opaque data plus the minimal routing information described below.</strong></p>
+
     <h2>Information We Collect</h2>
-    
+
     <h3>Information You Provide</h3>
     <ul>
-        <li><strong>Device Name:</strong> A user-configurable name for identifying your device to other users</li>
-        <li><strong>Audio Data:</strong> Voice transmissions sent during push-to-talk sessions (not stored, transmitted in real-time only)</li>
+        <li><strong>Device Name:</strong> A name you choose so others can recognize your device in a room. You can make it anything; it does not need to be your real name.</li>
+        <li><strong>Audio Data:</strong> Your voice during push-to-talk. It is end-to-end encrypted on your device and is never stored. On local transports it never reaches us; on the relay it passes through only as ciphertext.</li>
     </ul>
-    
-    <h3>Automatically Collected Information</h3>
-    <ul>
-        <li><strong>Device Identifier:</strong> A randomly generated ID for peer discovery (not linked to personal identity)</li>
-        <li><strong>Network Information:</strong> Local IP address for peer-to-peer communication</li>
-    </ul>
-    
+
+    <h3>Automatically Handled Information (Relay Transport Only)</h3>
+    <p>The items below are processed <strong>only when the relay transport is in use</strong>. On local transports none of this reaches us.</p>
+    <table>
+        <tr><th>Data</th><th>Why the relay needs it</th><th>Stored?</th></tr>
+        <tr><td>Room ID (session identifier)</td><td>To connect the right peers to the same conversation. It is an opaque identifier, not linked to your identity.</td><td>Held in memory while the room is active; not retained after the room empties.</td></tr>
+        <tr><td>Device name &amp; peer/connection IDs</td><td>So peers can tell who joined/left. The connection ID is randomly generated per connection; the peer ID is a random per-install value used to route to you.</td><td>In memory during the session.</td></tr>
+        <tr><td>Connection &amp; timing metadata (join/leave events, heartbeats)</td><td>To manage room membership and detect dropped peers.</td><td>May appear in short-lived operational logs (see below).</td></tr>
+        <tr><td>IP address</td><td>Inherent to any internet connection — your device must have an address to receive packets.</td><td>Not stored by us beyond transient edge logs; processed by Cloudflare as our infrastructure provider.</td></tr>
+    </table>
+    <p>The relay does <strong>not</strong> require, and we do not ask for, your name, email, phone number, contacts, or location.</p>
+
     <h2>Information We Do NOT Collect</h2>
     <ul>
-        <li>Personal identification information (name, email, phone number)</li>
-        <li>Location data</li>
+        <li>The content of your conversations (we are cryptographically unable to read it)</li>
+        <li>Personal identification information (real name, email, phone number)</li>
+        <li>Location / GPS data</li>
         <li>Contacts or address book</li>
-        <li>Usage analytics or tracking data</li>
-        <li>Advertising identifiers</li>
+        <li>Usage analytics, behavioral tracking, or advertising identifiers</li>
     </ul>
-    
-    <h2>How We Use Your Information</h2>
-    <p>The information collected is used solely for:</p>
+
+    <h2>Encryption and Security</h2>
     <ul>
-        <li>Enabling peer-to-peer voice communication</li>
-        <li>Discovering nearby devices on the same network</li>
-        <li>Encrypting communications for security</li>
+        <li><strong>End-to-end encryption:</strong> Voice is encrypted with AES-256-GCM. Keys are established directly between participants using X25519 (Elliptic-Curve Diffie–Hellman) key agreement. The relay never receives the keys.</li>
+        <li><strong>Blind relay:</strong> Our relay forwards ciphertext only and cannot decrypt it.</li>
+        <li><strong>Capability tokens, not accounts:</strong> To open a relay connection, the app fetches a short-lived (5-minute), HMAC-signed token bound only to a room ID and an expiry. It contains no personal information and grants nothing beyond joining that one room.</li>
+        <li><strong>No persistent storage of communications:</strong> Audio is never recorded or written to disk by the app or the relay.</li>
     </ul>
-    
-    <h2>Data Storage and Transmission</h2>
-    <ul>
-        <li><strong>Local Only:</strong> All data remains on your device and local network</li>
-        <li><strong>No Cloud Storage:</strong> We do not transmit data to external servers</li>
-        <li><strong>End-to-End Encryption:</strong> Voice data is encrypted using AES-256-GCM</li>
-        <li><strong>No Recording:</strong> Audio is transmitted in real-time and not stored</li>
-    </ul>
-    
-    <h2>Third-Party Services</h2>
-    <p>Sassy-Talk does not use any third-party analytics, advertising, or tracking services.</p>
-    
+
+    <h2>Sharing an Invitation</h2>
+    <p>When you share access to a room via a link, the invitation payload is <strong>encrypted on your device</strong> and the encrypted blob is stored briefly on our infrastructure (Cloudflare KV) so the recipient can fetch it. The decryption key is placed in the link's URL fragment (the part after <code>#</code>), which browsers and apps <strong>never transmit to the server</strong>. As a result, we hold only an encrypted blob we cannot read, and it expires automatically. Anyone you give the full link to can open the invitation — treat invite links like a key.</p>
+
+    <h2>Push Notifications (Optional)</h2>
+    <p>If you enable wake notifications, the app registers a Firebase Cloud Messaging (FCM) token with the relay, mapped to your room and peer ID, so that an incoming transmission can wake your device when the app is in the background. The push message carries only a <strong>room identifier so the app knows where to reconnect — never your audio or message content</strong>. FCM is operated by Google and is subject to <a href="https://policies.google.com/privacy">Google's Privacy Policy</a>. If you do not enable wake notifications, no FCM token is registered and no push data is processed. You can disable this at any time in app settings.</p>
+
+    <h2>Operational Logs</h2>
+    <p>For debugging and abuse prevention, the relay may keep short-lived operational logs of <strong>connection events</strong> (a room being opened, a peer joining or leaving, rate-limit triggers). These logs contain connection metadata only — <strong>never the content of your audio</strong>, which we cannot read in any case. They are retained briefly and then rotated out.</p>
+
+    <h2>Where Data Is Processed</h2>
+    <p>When the relay transport is used, traffic is processed by <strong>Cloudflare, Inc.</strong>, our infrastructure provider, on its global edge network. Cloudflare acts as our data processor. Optional push notifications are delivered by <strong>Google (Firebase Cloud Messaging)</strong>. We do not use any analytics, advertising, or tracking SDKs.</p>
+
+    <h2>Self-Hosting</h2>
+    <p>Organizations that require full data sovereignty can run their own relay. When the app is pointed at a self-hosted relay, none of the traffic described above touches Sassy Consulting's infrastructure — it stays entirely within the operator's environment.</p>
+
     <h2>Children's Privacy</h2>
-    <p>Sassy-Talk is not directed at children under 13. We do not knowingly collect information from children under 13.</p>
-    
-    <h2>Security</h2>
-    <p>We implement industry-standard security measures including:</p>
-    <ul>
-        <li>AES-256-GCM encryption for all voice data</li>
-        <li>X25519 key exchange for secure sessions</li>
-        <li>No persistent storage of communications</li>
-    </ul>
-    
+    <p>Sassy-Talk is not directed at children under 13, and we do not knowingly collect information from children under 13.</p>
+
     <h2>Your Rights</h2>
-    <p>Since we don't collect personal data, there is no personal information to access, modify, or delete. You can uninstall the app at any time to remove all local data.</p>
-    
+    <p>We do not maintain user accounts or profiles, so there is no stored personal record tied to you to access or delete. You can stop all data processing by leaving relay rooms, disabling push notifications, or uninstalling the app, which removes all local data from your device. Encrypted invitation blobs expire on their own; contact us if you need one invalidated sooner.</p>
+
     <h2>Changes to This Policy</h2>
-    <p>We may update this Privacy Policy from time to time. Changes will be posted on this page with an updated revision date.</p>
-    
+    <p>We may update this Privacy Policy. Changes will be posted on this page with an updated revision date.</p>
+
     <div class="contact">
         <h2>Contact Us</h2>
         <p>If you have questions about this Privacy Policy, contact us at:</p>
         <p>
             <strong>Sassy Consulting LLC</strong><br>
-            Email: privacy@sassyconsulting.com<br>
-            Website: https://sassyconsulting.com
+            Email: privacy@sassyconsultingllc.com<br>
+            Website: https://sassyconsultingllc.com
         </p>
     </div>
 </body>

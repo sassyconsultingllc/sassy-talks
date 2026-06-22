@@ -2,19 +2,26 @@
  * SassyTalk PTT Relay — Dedicated Worker
  *
  * Pure WebSocket relay for encrypted audio. No website, no APIs, no assets.
- * Lives at relay.sassy-consults.com
+ * Lives at relay.sassyconsultingllc.com
  */
 
 export { PttRoom } from "./ptt-relay.js";
 import { handleShareRoute } from "./share.js";
 import { handlePresenceRoute } from "./presence.js";
+// Single source of truth for token verification + key rotation. The /ws path
+// uses the exact same verifier as /presence and /share so they can never drift
+// apart on what tokens they accept (the inline copy this replaced had already
+// diverged — it was missing a type guard in timingSafeEqualHex).
+import {
+  verifyCapabilityToken,
+  secretsFor,
+  hmacSha256Hex,
+  isValidRoomId,
+} from "./relay-auth.js";
 
 // Token lifetime in seconds. Short enough to limit replay risk, long enough
 // that flaky cellular reconnects within the same session don't need a refresh.
 const TOKEN_TTL_SEC = 300;
-
-// Allowed clock skew between worker and client when verifying token.exp.
-const CLOCK_SKEW_SEC = 30;
 
 // Short-link targets. Keep the right-hand-side updated whenever the underlying
 // R2 path or marketing-site download route changes — the public short URL
@@ -109,7 +116,7 @@ export default {
         return new Response("Server misconfigured: AUTH_SECRET unset", { status: 503 });
       }
       const token = url.searchParams.get("token");
-      const tokenError = await verifyToken(token, roomId, env.AUTH_SECRET);
+      const tokenError = await verifyCapabilityToken(token, roomId, secretsFor(env));
       if (tokenError) {
         return new Response(tokenError, { status: 401 });
       }
@@ -122,10 +129,6 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 };
-
-function isValidRoomId(id) {
-  return typeof id === "string" && id.length >= 8 && id.length <= 64;
-}
 
 function jsonResponse(body, status = 200, cors = true) {
   const headers = { "Content-Type": "application/json" };
@@ -140,46 +143,4 @@ function jsonResponse(body, status = 200, cors = true) {
 async function signToken(roomId, expSec, secret) {
   const sig = await hmacSha256Hex(`${roomId}.${expSec}`, secret);
   return `${expSec}.${sig}`;
-}
-
-async function verifyToken(token, roomId, secret) {
-  if (!token || typeof token !== "string") return "Missing token";
-  const dot = token.indexOf(".");
-  if (dot <= 0) return "Malformed token";
-  const expSec = Number.parseInt(token.slice(0, dot), 10);
-  const sig = token.slice(dot + 1);
-  if (!Number.isFinite(expSec) || !sig) return "Malformed token";
-
-  const nowSec = Math.floor(Date.now() / 1000);
-  if (expSec + CLOCK_SKEW_SEC < nowSec) return "Token expired";
-
-  const expected = await hmacSha256Hex(`${roomId}.${expSec}`, secret);
-  // Constant-time compare to avoid leaking byte-level timing.
-  if (!timingSafeEqualHex(sig, expected)) return "Invalid token signature";
-  return null;
-}
-
-async function hmacSha256Hex(data, secret) {
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(data));
-  const bytes = new Uint8Array(sig);
-  let hex = "";
-  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
-  return hex;
-}
-
-function timingSafeEqualHex(a, b) {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return diff === 0;
 }

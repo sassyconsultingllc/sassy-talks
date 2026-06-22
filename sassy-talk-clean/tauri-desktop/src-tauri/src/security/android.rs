@@ -278,44 +278,17 @@ pub fn decode_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).to_string()
 }
 
-/// XOR encryption for audio data
-pub fn encrypt_audio(data: &[u8], key: &[u8]) -> Vec<u8> {
-    data.iter()
-        .zip(key.iter().cycle())
-        .map(|(d, k)| d ^ k)
-        .collect()
-}
-
-/// XOR decryption for audio data (same as encryption)
-pub fn decrypt_audio(data: &[u8], key: &[u8]) -> Vec<u8> {
-    encrypt_audio(data, key)
-}
-
-/// Generate device-specific key for additional obfuscation
-pub fn generate_device_key() -> [u8; 16] {
-    // In production, derive from device ID, Android ID, etc.
-    // For now, use hardcoded key
-    [
-        0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89,
-        0x9A, 0xBC, 0xDE, 0xF0, 0x12, 0x34, 0x56, 0x78,
-    ]
-}
+// NOTE: the former `encrypt_audio`/`decrypt_audio` (repeating-key XOR keyed by a
+// hardcoded constant) and `generate_device_key` were removed. They provided zero
+// confidentiality and zero authentication and were a standing footgun for any
+// caller that reached for an "encrypt" helper here. Real audio encryption is
+// AES-256-GCM via `sassytalkie_core::crypto::CryptoSession` (HKDF-derived key,
+// counter nonces, anti-replay) — used through `security::CryptoEngine`. There is
+// no plaintext-XOR path on purpose.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_xor_encryption() {
-        let data = b"Hello, World!";
-        let key = b"secret";
-        
-        let encrypted = encrypt_audio(data, key);
-        assert_ne!(encrypted, data);
-        
-        let decrypted = decrypt_audio(&encrypted, key);
-        assert_eq!(decrypted, data);
-    }
 
     #[test]
     fn test_security_checker() {

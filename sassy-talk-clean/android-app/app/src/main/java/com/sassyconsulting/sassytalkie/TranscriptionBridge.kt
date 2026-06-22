@@ -201,6 +201,13 @@ object TranscriptionBridge {
         pcmSamples: ShortArray,
         isFavorite: Boolean,
         isMuted: Boolean,
+        // True when this is the LOCAL device's own outgoing audio (fed in for the
+        // activity timeline). When set, we still record the timeline segment but
+        // suppress the remote-speaker UI — the "X is speaking" toast and the
+        // activeSpeakerName/incomingAudio flows mean "a PEER is speaking", and
+        // firing them for your own transmit was why the indicator showed the
+        // local device while it was the one talking.
+        isSelf: Boolean,
     ) {
         if (!enabled || !initialized) return
 
@@ -214,11 +221,12 @@ object TranscriptionBridge {
         var startedSegment = false
         synchronized(lock) {
             if (isSpeech) {
-                startedSegment = handleSpeechFrame(senderId, senderName, isFavorite, isMuted)
+                startedSegment = handleSpeechFrame(senderId, senderName, isFavorite, isMuted, isSelf)
             } else {
                 handleSilenceFrame()
             }
         }
+        // Only surface the "is speaking" toast for a REMOTE speaker.
         if (startedSegment) {
             onSpeechSegmentStarted(senderName, isMuted)
         }
@@ -346,6 +354,7 @@ object TranscriptionBridge {
         senderName: String,
         isFavorite: Boolean,
         isMuted: Boolean,
+        isSelf: Boolean,
     ): Boolean {
         silentFrameCount = 0
 
@@ -357,10 +366,16 @@ object TranscriptionBridge {
             activeIsMuted = isMuted
             speechStartTime = System.currentTimeMillis()
             speechFrameCount = 0
+            speechFrameCount++
+            if (isSelf) {
+                // Local transmit: keep the timeline bookkeeping above (so the
+                // "you spoke for Xs" entry is recorded on finalize) but do NOT
+                // drive the remote-speaker indicators or the toast.
+                return false
+            }
             _incomingAudio.value = true
             _activeSpeakerName.value = senderName
-            speechFrameCount++
-            return true  // signal "new segment started, surface UX outside lock"
+            return true  // remote speaker: surface the toast outside the lock
         }
 
         speechFrameCount++

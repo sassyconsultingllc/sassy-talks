@@ -518,21 +518,23 @@ impl AudioCache {
         // pushed so it doesn't get re-queued when tick() finalizes the
         // SpeakerBuffer into an Utterance.
         if self.mode == CacheMode::Live && active_speakers <= 1 && self.now_playing.is_none() {
-            if let Some(buf) = self.active_buffers.get_mut(sender_id) {
-                buf.frames.pop();
-            }
+            // Reclaim the frame we pushed above (it already holds a copy of
+            // `samples`) and reuse it as the replay-history frame instead of
+            // cloning `samples` a second time. This halves the per-frame heap
+            // copies on the dominant single-speaker Live path: previously we
+            // cloned once for active_buffers (immediately popped + discarded)
+            // and again here for the accumulator.
+            let recycled = self.active_buffers
+                .get_mut(sender_id)
+                .and_then(|buf| buf.frames.pop());
 
-            // Shadow-accumulate for replay history even in Live mode
-            let live_frame = CachedFrame {
-                sender_id: sender_id.to_string(),
-                timestamp,
-                samples: samples.clone(),
-                received_at: Instant::now(),
-            };
-            if !self.live_accumulator.contains_key(sender_id) {
-                self.live_accumulator.insert(sender_id.to_string(), SpeakerBuffer::new(sender_id));
+            // Shadow-accumulate for replay history even in Live mode.
+            if let Some(live_frame) = recycled {
+                self.live_accumulator
+                    .entry(sender_id.to_string())
+                    .or_insert_with(|| SpeakerBuffer::new(sender_id))
+                    .push_frame(live_frame);
             }
-            self.live_accumulator.get_mut(sender_id).unwrap().push_frame(live_frame);
 
             // Jitter buffer: insertion-sort the incoming frame by wire
             // timestamp, then forward the oldest only once we have

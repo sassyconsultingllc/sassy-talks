@@ -148,7 +148,7 @@ impl CryptoSession {
     }
 
     /// Advance the per-session nonce counter and build the next 12-byte nonce
-    /// (4-byte random prefix || 8-byte little-endian counter).
+    /// (8-byte random prefix || 4-byte little-endian counter).
     ///
     /// Returns `Err` on counter exhaustion instead of panicking or wrapping.
     /// Reusing a (key, nonce) pair would be a catastrophic AES-GCM failure, so

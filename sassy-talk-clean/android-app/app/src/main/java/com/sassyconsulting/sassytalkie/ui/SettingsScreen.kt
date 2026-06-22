@@ -45,6 +45,12 @@ private const val DEFAULT_JITTER_PREBUFFER = 5  // matches core's DEFAULT_LIVE_J
 private const val KEY_ENABLE_MIX_MODE = "enable_mix_mode"
 private const val DEFAULT_MIC_GAIN = 1.0f
 private const val DEFAULT_SQUELCH_DBFS = 0 // 0 = disabled
+// AI noise suppression on the mic TX path (spectral-subtraction Wiener filter).
+// Default off — zero cost when disabled.
+private const val KEY_NOISE_SUPPRESSION = "noise_suppression"
+// Sealed sender — blind the relay's room/peer/device metadata behind per-epoch
+// HKDF handles. Default off; coordinated (all peers must enable + share the key).
+private const val KEY_SEALED_SENDER = "sealed_sender"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -74,6 +80,12 @@ fun SettingsScreen(
     var mixModeEnabled by remember {
         mutableStateOf(prefs.getBoolean(KEY_ENABLE_MIX_MODE, false))
     }
+    var noiseSuppression by remember { mutableStateOf(prefs.getBoolean(KEY_NOISE_SUPPRESSION, false)) }
+    var sealedSender by remember { mutableStateOf(prefs.getBoolean(KEY_SEALED_SENDER, false)) }
+    // Shared on-device translator (ML Kit + offline SpeechRecognizer). Released
+    // when the screen leaves composition so model handles don't leak.
+    val translationManager = remember { com.sassyconsulting.sassytalkie.translate.TranslationManager() }
+    DisposableEffect(Unit) { onDispose { translationManager.release() } }
     LaunchedEffect(Unit) {
         // Apply the persisted preference to native on screen entry — the
         // native side resets to default (off) whenever the audio cache is
@@ -355,6 +367,69 @@ fun SettingsScreen(
                         mixModeEnabled = enabled
                         prefs.edit().putBoolean(KEY_ENABLE_MIX_MODE, enabled).apply()
                         SassyTalkNative.setMixModeEnabled(enabled)
+                    }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // AI Noise Suppression — spectral-subtraction / Wiener denoise on
+            // the mic TX path. Default off (zero cost). For trucks/wind/sites.
+            SettingsCard(title = "AI Noise Suppression") {
+                Text(
+                    text = "On-device denoise of your microphone (wind, engine, HVAC, crowd) before it's transmitted. Runs entirely on the phone.",
+                    fontSize = 11.sp,
+                    color = TextMuted
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                SettingsToggle(
+                    icon = Icons.Default.GraphicEq,
+                    title = "Noise Suppression",
+                    description = "Clean up background noise on your outgoing voice",
+                    checked = noiseSuppression,
+                    onCheckedChange = { enabled ->
+                        noiseSuppression = enabled
+                        prefs.edit().putBoolean(KEY_NOISE_SUPPRESSION, enabled).apply()
+                        SassyTalkNative.setNoiseSuppressionEnabled(enabled)
+                    }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // On-device translation — ML Kit + offline SpeechRecognizer. Captions
+            // and translates your speech locally; nothing leaves the device. The
+            // panel carries its own enable switch + target-language picker.
+            com.sassyconsulting.sassytalkie.ui.TranslationPanel(
+                translationManager = translationManager,
+                requireWifiForModels = wifiEnabled,
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Privacy — sealed sender (metadata resistance). Blinds the relay's
+            // room/peer/device fields behind rotating, key-derived HKDF handles
+            // so the relay can't correlate who talks to whom or track a peer
+            // over time. Coordinated: every peer must enable it (shared key).
+            SettingsCard(title = "Privacy") {
+                Text(
+                    text = "Sealed Sender hides your room and device identity from the relay using rotating, key-derived handles — the relay only ever sees opaque tokens, never a stable room or device name. Everyone in the channel must turn this on (you all share the same key); toggling briefly reconnects.",
+                    fontSize = 11.sp,
+                    color = TextMuted
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                SettingsToggle(
+                    icon = Icons.Default.Lock,
+                    title = "Sealed Sender",
+                    description = "Blind room/peer/device metadata on the relay (metadata resistance)",
+                    checked = sealedSender,
+                    onCheckedChange = { enabled ->
+                        sealedSender = enabled
+                        prefs.edit().putBoolean(KEY_SEALED_SENDER, enabled).apply()
+                        SassyTalkNative.setSealedSenderEnabled(enabled)
+                        // Reconnect so the relay WS picks up the new (blinded or
+                        // plaintext) room URL immediately.
+                        onTransportPrefsChanged()
                     }
                 )
             }

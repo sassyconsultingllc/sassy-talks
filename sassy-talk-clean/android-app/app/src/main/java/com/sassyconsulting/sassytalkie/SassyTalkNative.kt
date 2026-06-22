@@ -302,12 +302,31 @@ object SassyTalkNative {
                 } catch (_: Exception) { 1 }
                 sessionPrefs()?.edit()?.putString("session_ch_$channel", qrJson)?.apply()
                 saveCohortHistoryBlob()
+                applySealedContext(qrJson)
             }
             ok
         } catch (e: Exception) {
             Log.e(TAG, "importSessionFromQR failed: ${e.message}")
             false
         }
+    }
+
+    /**
+     * Populate the native sealed-sender context (32-byte session key + stable
+     * per-install id) from a session QR/JSON so the relay's room/peer/device
+     * params can be replaced by per-epoch blinded handles. The key is read from
+     * the QR's "key" field and handed straight across JNI — it never lands in a
+     * long-lived JVM field. No-op on a missing key/context. Blinding only takes
+     * effect when the user enables Sealed Sender (setSealedSenderEnabled).
+     */
+    private fun applySealedContext(qrJson: String) {
+        try {
+            val keyB64 = org.json.JSONObject(qrJson).optString("key", "")
+            val ctx = appContext
+            if (keyB64.isNotEmpty() && ctx != null) {
+                setSealedContext(keyB64, InstallId.get(ctx))
+            }
+        } catch (_: Throwable) { /* sealed context is best-effort defense-in-depth */ }
     }
 
     /** Restore all previously persisted per-channel sessions (call after nativeInit). */
@@ -323,6 +342,7 @@ object SassyTalkNative {
             try {
                 if (nativeImportSessionFromQR(json)) {
                     anyRestored = true
+                    applySealedContext(json)
                     Log.d(TAG, "Restored session for channel $ch")
                 }
             } catch (e: Exception) {
@@ -438,6 +458,9 @@ object SassyTalkNative {
                 Log.e(TAG, "clearSession failed: ${e.message}")
             }
         }
+        // Drop the sealed-sender context so a stale session key can't blind a
+        // future room after this one is torn down.
+        clearSealedContext()
         // Clear per-channel sessions and legacy session_json, but preserve cohort_history_v1.
         val prefs = sessionPrefs() ?: return
         val editor = prefs.edit()
@@ -654,6 +677,64 @@ object SassyTalkNative {
         return try { nativeGetSquelchDbfs() } catch (_: Exception) { 0 }
     }
 
+    // ── Noise suppression (spectral-subtraction Wiener on the mic TX path) ──
+    // Default OFF (zero cost when disabled). Toggle + aggressiveness exposed to
+    // Settings; useful for trucks / wind / job sites.
+
+    /** Enable/disable mic-path noise suppression. */
+    fun setNoiseSuppressionEnabled(enabled: Boolean) {
+        if (!initialized) return
+        try { nativeSetNoiseSuppressionEnabled(enabled) } catch (e: Exception) {
+            Log.e(TAG, "setNoiseSuppressionEnabled failed: ${e.message}")
+        }
+    }
+
+    /** True if noise suppression is currently engaged. */
+    fun getNoiseSuppressionEnabled(): Boolean {
+        if (!initialized) return false
+        return try { nativeGetNoiseSuppressionEnabled() } catch (_: Exception) { false }
+    }
+
+    /** Max attenuation in dB (aggressiveness). Clamped to [6, 30] on the Rust side. */
+    fun setNoiseSuppressionAttenDb(db: Int) {
+        if (!initialized) return
+        try { nativeSetNoiseSuppressionAttenDb(db) } catch (e: Exception) {
+            Log.e(TAG, "setNoiseSuppressionAttenDb failed: ${e.message}")
+        }
+    }
+
+    // ── Sealed sender (metadata resistance) ──
+    // When enabled with a context set, the cellular relay sees only per-epoch
+    // blinded room/peer handles (no stable room id, no device name). Opt-in and
+    // coordinated: every member must enable it and share the session key.
+
+    /** Enable/disable sealed-sender connection blinding for the relay. */
+    fun setSealedSenderEnabled(enabled: Boolean) {
+        if (!initialized) return
+        try { nativeSetSealedSenderEnabled(enabled) } catch (e: Exception) {
+            Log.e(TAG, "setSealedSenderEnabled failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Push the sealed context: the 32-byte session key (base64) + the stable
+     * per-install peer id (see InstallId). Call after a session is imported.
+     * Returns false if the key isn't a valid 32-byte base64 blob.
+     */
+    fun setSealedContext(sessionKeyB64: String, stablePeerId: String): Boolean {
+        if (!initialized) return false
+        return try { nativeSetSealedContext(sessionKeyB64, stablePeerId) } catch (e: Exception) {
+            Log.e(TAG, "setSealedContext failed: ${e.message}")
+            false
+        }
+    }
+
+    /** Clear the sealed context (call on session clear). */
+    fun clearSealedContext() {
+        if (!initialized) return
+        try { nativeClearSealedContext() } catch (_: Exception) {}
+    }
+
     // ── v2.7.5: RX (playback) gain ──
     //
     // Multiplies decoded PCM samples on the receiver side before forwarding
@@ -674,6 +755,19 @@ object SassyTalkNative {
     fun getRxGain(): Float {
         if (!initialized) return 1.0f
         return try { nativeGetRxGainX100() / 100f } catch (_: Exception) { 1.0f }
+    }
+
+    /**
+     * Hard-mute RX playback (true half-duplex cut). Unlike [setRxGain] (which
+     * floors at 0.25×), this fully silences incoming audio — used to cut RX
+     * while the local user is transmitting so the remote stream can't feed back
+     * into the hot mic. Preserves the user's configured gain (restored on unmute).
+     */
+    fun setRxMuted(muted: Boolean) {
+        if (!initialized) return
+        try { nativeSetRxMuted(muted) } catch (e: Exception) {
+            Log.e(TAG, "setRxMuted failed: ${e.message}")
+        }
     }
 
     // ── v2.7.5: Speakerphone vs earpiece routing ──
@@ -997,6 +1091,16 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeSetSquelchDbfs(dbfs: Int)
     @JvmStatic private external fun nativeGetSquelchDbfs(): Int
 
+    // Noise suppression
+    @JvmStatic private external fun nativeSetNoiseSuppressionEnabled(enabled: Boolean)
+    @JvmStatic private external fun nativeGetNoiseSuppressionEnabled(): Boolean
+    @JvmStatic private external fun nativeSetNoiseSuppressionAttenDb(db: Int)
+
+    // Sealed sender (metadata resistance)
+    @JvmStatic private external fun nativeSetSealedSenderEnabled(enabled: Boolean)
+    @JvmStatic private external fun nativeSetSealedContext(keyB64: String, peerId: String): Boolean
+    @JvmStatic private external fun nativeClearSealedContext()
+
     // Transport
     @JvmStatic private external fun nativeGetTransport(): Byte
 
@@ -1051,6 +1155,7 @@ object SassyTalkNative {
     // v2.7.5 — RX gain, speakerphone, jitter buffer
     @JvmStatic private external fun nativeSetRxGainX100(x100: Int)
     @JvmStatic private external fun nativeGetRxGainX100(): Int
+    @JvmStatic private external fun nativeSetRxMuted(muted: Boolean)
     @JvmStatic private external fun nativeSetSpeakerphone(on: Boolean): Boolean
     @JvmStatic private external fun nativeIsCommModeActive(): Boolean
     @JvmStatic private external fun nativeSetJitterPrebufferFrames(frames: Int)

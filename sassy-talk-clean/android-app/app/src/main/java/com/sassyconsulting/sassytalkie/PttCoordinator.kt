@@ -267,6 +267,16 @@ class PttCoordinator(
         }
     }
 
+    /**
+     * LEGACY full TX state machine (probe + READY_ACK gate + watchdog + wake).
+     * NOT on the live path: the UI (MainScreen) drives PTT via
+     * `SassyTalkNative.pttStart()` + [notifyPttPressed] directly, so this method
+     * and [onPttReleased] are currently unreferenced. Kept because they encode
+     * the audio-path probe / reaching-peer watchdog logic the indicators expect;
+     * reviving them means routing MainScreen's press through here (and deleting
+     * the duplicate notify* path). Until then, treat this as dead code — don't
+     * assume the `transmitting` double-press guard or watchdog run on a real press.
+     */
     fun onPttPressed() {
         if (transmitting.getAndSet(true)) return
 

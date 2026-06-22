@@ -780,6 +780,94 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     crate::audio_pipeline::get_mic_gain_x100()
 }
 
+// ── Noise suppression (audio_effects) ──────────────────────────────────────
+
+/// JNI: Toggle the mic-path noise suppressor. Default OFF (zero cost disabled).
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetNoiseSuppressionEnabled(
+    _env: JNIEnv,
+    _class: JClass,
+    enabled: jboolean,
+) {
+    crate::audio_effects::set_noise_suppression_enabled(enabled != 0);
+}
+
+/// JNI: True if the noise suppressor is currently engaged.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetNoiseSuppressionEnabled(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    if crate::audio_effects::get_noise_suppression_enabled() { JNI_TRUE } else { JNI_FALSE }
+}
+
+/// JNI: Set max attenuation (dB) of the noise suppressor. Clamped on the Rust side.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetNoiseSuppressionAttenDb(
+    _env: JNIEnv,
+    _class: JClass,
+    db: jni::sys::jint,
+) {
+    crate::audio_effects::set_noise_suppression_atten_db(db);
+}
+
+// ── Sealed sender (metadata resistance) ────────────────────────────────────
+
+/// JNI: Enable/disable sealed-sender connection blinding for the cellular relay.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetSealedSenderEnabled(
+    _env: JNIEnv,
+    _class: JClass,
+    enabled: jboolean,
+) {
+    crate::cellular_transport::set_sealed_enabled(enabled != 0);
+}
+
+/// JNI: Push the sealed context — the 32-byte session key (base64) and the
+/// stable per-install peer id — used to derive per-epoch blinded room/peer
+/// handles. Returns false if the key isn't a valid 32-byte base64 blob.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetSealedContext<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    key_b64: JString<'local>,
+    peer_id: JString<'local>,
+) -> jboolean {
+    let key_b64: String = match env.get_string(&key_b64) {
+        Ok(s) => s.into(),
+        Err(_) => return JNI_FALSE,
+    };
+    let peer_id: String = env.get_string(&peer_id).map(|s| s.into()).unwrap_or_default();
+
+    let key_bytes = match base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &key_b64,
+    ) {
+        Ok(b) if b.len() == 32 => b,
+        Ok(b) => {
+            error!("JNI: sealed key wrong length: {} (expected 32)", b.len());
+            return JNI_FALSE;
+        }
+        Err(e) => {
+            error!("JNI: sealed key decode failed: {}", e);
+            return JNI_FALSE;
+        }
+    };
+    let mut key_array = [0u8; 32];
+    key_array.copy_from_slice(&key_bytes);
+    crate::cellular_transport::set_sealed_context(key_array, peer_id);
+    JNI_TRUE
+}
+
+/// JNI: Clear the sealed context (e.g. on session clear).
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeClearSealedContext(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    crate::cellular_transport::clear_sealed_context();
+}
+
 /// JNI: Set RX (playback) gain × 100. Clamped to [25, 400] on the Rust side.
 /// Default 100 (1.0×) is a no-op fast path in `AudioEngine::write_audio`.
 #[no_mangle]
@@ -810,6 +898,25 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         }
     }
     100
+}
+
+/// JNI: Hard-mute or unmute RX playback (true half-duplex cut). Unlike
+/// `nativeSetRxGainX100` (which floors at 0.25×), this fully silences incoming
+/// audio. Used to cut RX while the local user is transmitting so the remote
+/// stream can't acoustically feed back into the hot mic.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetRxMuted(
+    _env: JNIEnv,
+    _class: JClass,
+    muted: jni::sys::jboolean,
+) {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref sm) = guard.state_machine {
+        if let Ok(eng) = sm.get_audio().lock() {
+            eng.set_rx_muted(muted != 0);
+        }
+    }
 }
 
 /// JNI: Force speakerphone on or off for the current PTT session.
@@ -1199,6 +1306,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         &pcm_buffer[..CODEC_FRAME_SIZE],
         false,
         false,
+        true, // is_self — local BT transmit (timeline only, no "is speaking" UI)
     );
 
     // Pack wire frame
@@ -1343,6 +1451,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         &pcm_samples,
         is_favorite,
         is_muted,
+        false, // remote — BT-received audio
     );
 
     // Feed into audio cache and play

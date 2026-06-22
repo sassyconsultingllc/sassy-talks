@@ -58,6 +58,15 @@ npm-debug.log*
 # Mercury code-review bundles (generated artifacts, not source)
 mercury_*
 
+# Editor/backup scratch files
+*.bak
+
+# Stray native-build snapshot artifacts (compiled libs + source tarballs that
+# duplicate the live android-native/ crate — never commit these)
+**/sassytalkie-android-native-build/
+sassytalkie-native-*.tar.gz
+ios-native.zip
+
 # Local test suites
 **/tests-local/
 

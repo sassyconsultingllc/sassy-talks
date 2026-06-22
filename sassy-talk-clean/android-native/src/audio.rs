@@ -97,6 +97,12 @@ pub struct AudioEngine {
     /// Clamped to [25, 400] (0.25× to 4.0×). 100 (1.0×) is the default —
     /// no-op pre-existing behaviour.
     rx_gain_x100: Arc<AtomicI32>,
+
+    /// True half-duplex RX cut: when set, `write_audio` drops incoming frames
+    /// (absolute silence, independent of `rx_gain_x100`'s 0.25× floor). Used to
+    /// hard-mute playback while the local user is transmitting so the remote
+    /// stream can't feed back into the hot mic. Default false.
+    rx_muted: Arc<AtomicBool>,
 }
 
 impl AudioEngine {
@@ -115,6 +121,7 @@ impl AudioEngine {
             write_seq: Arc::new(AtomicU64::new(0)),
             playback_lock: Arc::new(Mutex::new(())),
             rx_gain_x100: Arc::new(AtomicI32::new(100)),
+            rx_muted: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -127,6 +134,16 @@ impl AudioEngine {
 
     pub fn get_rx_gain_x100(&self) -> i32 {
         self.rx_gain_x100.load(Ordering::Relaxed)
+    }
+
+    /// Hard-mute / unmute RX playback (true half-duplex cut). Unlike
+    /// `set_rx_gain_x100`, this fully silences playback rather than ducking.
+    pub fn set_rx_muted(&self, muted: bool) {
+        self.rx_muted.store(muted, Ordering::Relaxed);
+    }
+
+    pub fn is_rx_muted(&self) -> bool {
+        self.rx_muted.load(Ordering::Relaxed)
     }
 
     /// Cheap clone of the monotonic write-sequence counter. Replay uses
@@ -424,6 +441,14 @@ impl AudioEngine {
     ///     intrusion detection. Counter is granular per-call so two writes
     ///     in the same ms are still distinguishable.
     pub fn write_audio(&self, buffer: &[i16]) -> Result<usize, String> {
+        // Half-duplex RX cut: while hard-muted (local PTT transmitting), drop the
+        // decoded frame instead of playing it — absolute silence, not a duck.
+        // Report it as consumed so the RX/decoder pipeline advances normally, and
+        // skip the write-seq/last-write bookkeeping so muted frames aren't counted
+        // as RX activity (no false "RX intrusion" while we hold the channel).
+        if self.rx_muted.load(Ordering::Relaxed) {
+            return Ok(buffer.len());
+        }
         let play = match self.player.lock().unwrap().as_ref() {
             Some(p) => Arc::clone(p),
             None => return Err("Player not initialized".to_string()),
