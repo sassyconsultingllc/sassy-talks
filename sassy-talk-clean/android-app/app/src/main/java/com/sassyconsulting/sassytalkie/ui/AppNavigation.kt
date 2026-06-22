@@ -169,6 +169,12 @@ fun AppNavigation(
                 // Restore group-mix preference. Default false preserves the
                 // classic walkie-talkie behavior for users who never opt in.
                 SassyTalkNative.setMixModeEnabled(micPrefs.getBoolean("enable_mix_mode", false))
+                // Re-assert the noise-suppression preference (native defaults off).
+                SassyTalkNative.setNoiseSuppressionEnabled(micPrefs.getBoolean("noise_suppression", false))
+                // Re-assert sealed-sender. The sealed CONTEXT (key + peer id) is
+                // (re)populated by restoreSession()/importSessionFromQR above;
+                // this just re-arms the blinding toggle the user last chose.
+                SassyTalkNative.setSealedSenderEnabled(micPrefs.getBoolean("sealed_sender", false))
                 // v2.7.5: restore RX gain, speakerphone routing, jitter
                 // buffer preset so the user's prior choices stick across
                 // process death without requiring a Settings visit.

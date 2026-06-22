@@ -15,13 +15,16 @@ if (file("google-services.json").exists()) {
 android {
     namespace = "com.sassyconsulting.sassytalkie"
     compileSdk = 35
+    // Pin to an NDK that is actually installed. AGP's default for this version
+    // is 27.0.12077973 (not present); 27.1.12297006 is installed.
+    ndkVersion = "27.1.12297006"
 
     defaultConfig {
         applicationId = "com.sassyconsulting.sassytalkie"
         minSdk = 24
         targetSdk = 35
-        versionCode = 44
-        versionName = "2.7.7"
+        versionCode = 45
+        versionName = "2.8.0"
         
         // Feature flag: enable or disable cellular (relay) transport at build time
         buildConfigField("boolean", "ENABLE_CELLULAR_RELAY", "true")
@@ -178,6 +181,18 @@ dependencies {
     // page-size requirement. The play-services variant delivers the model via
     // Google Play Services, so no .so lands in our APK. Same BarcodeScanning API.
     implementation("com.google.android.gms:play-services-mlkit-barcode-scanning:18.3.1")
+
+    // On-device translation — ML Kit Translate. Powers translate/TranslationManager
+    // for offline, privacy-preserving real-time translation (no cloud). Models are
+    // downloaded per-language on first use, then translation runs fully on-device.
+    //
+    // ⚠️ 16 KB page-size CAVEAT — unlike the barcode scanner above, ML Kit Translate
+    // has NO unbundled play-services variant: this dependency BUNDLES native .so
+    // files (TFLite / language-id) into our APK. Google Play now requires all .so
+    // segments be 16 KB-aligned. Before release, VALIDATE the bundled translate .so
+    // alignment (NDK check_elf_alignment.sh, or `objdump -p <lib>.so | grep LOAD`).
+    // If any segment is < 16 KB-aligned, bump the translate version until it is.
+    implementation("com.google.mlkit:translate:17.0.3")
 
     // CameraX for QR scanner — 1.4.0+ aligns libimage_processing_util_jni.so to 16 KB.
     // Pinned to 1.4.2 (last 1.4.x): 1.6.x demands compileSdk 36 + AGP 8.9.1.

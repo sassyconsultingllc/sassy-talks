@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.util.Log
+import android.view.KeyEvent
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -29,6 +30,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.sassyconsulting.sassytalkie.debug.DebugOverlay
 import com.sassyconsulting.sassytalkie.debug.DiagnosticsPrefs
+import com.sassyconsulting.sassytalkie.input.HardwarePttController
 import com.sassyconsulting.sassytalkie.ui.theme.SassyTalkTheme
 import com.sassyconsulting.sassytalkie.ui.AppNavigation
 
@@ -54,6 +56,13 @@ class MainActivity : ComponentActivity() {
     val permissionsGranted = mutableStateOf(false)
     val walkieService = mutableStateOf<WalkieService?>(null)
     val pendingShareUri = mutableStateOf<android.net.Uri?>(null)
+
+    // ── Hardware push-to-talk ──
+    // Routes physical PTT buttons + Bluetooth PTT accessories (media buttons)
+    // to SassyTalkNative.pttStart()/pttStop(). Created in onCreate, armed in
+    // onStart, disarmed in onStop. Key events are delegated from the
+    // onKeyDown/onKeyUp overrides below.
+    private val hardwarePtt: HardwarePttController by lazy { HardwarePttController(this) }
 
     private val requiredPermissions: Array<String>
         get() {
@@ -168,10 +177,21 @@ class MainActivity : ComponentActivity() {
             startService(intent)
         }
         bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+
+        // Arm hardware/BT PTT while the Activity is in the foreground. The
+        // controller registers its MediaSession here so BT PTT pucks keep
+        // working when we're subsequently backgrounded behind WalkieService.
+        try { hardwarePtt.enable() } catch (e: Exception) {
+            Log.w(TAG, "hardwarePtt enable failed: ${e.message}")
+        }
     }
 
     override fun onStop() {
         super.onStop()
+        // Disarm hardware PTT (releases the MediaSession, stops any held TX).
+        try { hardwarePtt.disable() } catch (e: Exception) {
+            Log.w(TAG, "hardwarePtt disable failed: ${e.message}")
+        }
         SassyTalkNative.pttStop()
         // Don't stop the service here — it should keep running in the background
         // so audio keeps working when the screen is off.
@@ -197,6 +217,21 @@ class MainActivity : ComponentActivity() {
             uri.host == "relay.sassyconsultingllc.com" &&
             (uri.path ?: "").startsWith("/v/")
         if (ok) pendingShareUri.value = uri
+    }
+
+    // ── Hardware key delegation ──
+    // Delegate to HardwarePttController first; consume only when it handled the
+    // configured PTT key. Returning super.* otherwise preserves all normal
+    // system key behavior (volume, back, etc.).
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (hardwarePtt.onKeyDown(keyCode, event)) return true
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        if (hardwarePtt.onKeyUp(keyCode, event)) return true
+        return super.onKeyUp(keyCode, event)
     }
 
     override fun onDestroy() {

@@ -50,16 +50,34 @@ export async function verifyCapabilityToken(token, roomId, secret) {
 
 /**
  * Active verification keys, current first: [AUTH_SECRET] normally, or
- * [AUTH_SECRET, AUTH_SECRET_PREV] during a rotation grace window.
+ * [AUTH_SECRET, AUTH_SECRET_PREV] during a *time-bounded* rotation grace window.
+ *
+ * The previous key is honored ONLY while AUTH_SECRET_PREV_UNTIL (unix seconds)
+ * is set and in the future. This makes the grace window self-closing: if the
+ * operator forgets the final `secret delete`, a leaked old key still stops being
+ * accepted at AUTH_SECRET_PREV_UNTIL instead of forging tokens forever. A
+ * PREV with no/expired UNTIL is ignored (fail toward the current key only).
  *
  * Zero-downtime rotation:
- *   1. wrangler secret put AUTH_SECRET_PREV   (= the current AUTH_SECRET value)
- *   2. wrangler secret put AUTH_SECRET        (= a fresh `openssl rand -hex 32`)
- *   3. wait one token lifetime (TOKEN_TTL_SEC) for old tokens to expire
- *   4. wrangler secret delete AUTH_SECRET_PREV
+ *   1. wrangler secret put AUTH_SECRET_PREV        (= the current AUTH_SECRET value)
+ *   2. wrangler secret put AUTH_SECRET_PREV_UNTIL  (= now + a few token lifetimes, e.g. `date -d '+15 min' +%s`)
+ *   3. wrangler secret put AUTH_SECRET             (= a fresh `openssl rand -hex 32`)
+ *   4. after AUTH_SECRET_PREV_UNTIL passes, optionally `wrangler secret delete AUTH_SECRET_PREV AUTH_SECRET_PREV_UNTIL`
+ *      (acceptance already stopped at the deadline — the delete is just cleanup)
  */
 export function secretsFor(env) {
-  return [env.AUTH_SECRET, env.AUTH_SECRET_PREV].filter(Boolean);
+  const active = [env.AUTH_SECRET];
+  if (env.AUTH_SECRET_PREV && prevWindowOpen(env)) {
+    active.push(env.AUTH_SECRET_PREV);
+  }
+  return active.filter(Boolean);
+}
+
+/** True while a configured AUTH_SECRET_PREV is still inside its grace window. */
+function prevWindowOpen(env) {
+  const until = Number.parseInt(env.AUTH_SECRET_PREV_UNTIL || "", 10);
+  if (!Number.isFinite(until)) return false; // no deadline set → don't honor PREV
+  return Math.floor(Date.now() / 1000) <= until;
 }
 
 /**

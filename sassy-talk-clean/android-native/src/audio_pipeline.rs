@@ -366,6 +366,13 @@ pub fn spawn_tx_thread(
                 // headset users with hot mics, a fractional gain attenuates.
                 apply_mic_gain(&mut pcm_buffer[..CODEC_FRAME_SIZE], MIC_GAIN_X100.load(Ordering::Relaxed));
 
+                // Software noise suppression (spectral subtraction / Wiener).
+                // No-op when disabled (default). Runs AFTER gain so it cleans
+                // the level the listener hears, and BEFORE squelch so the
+                // dBFS check sees the denoised signal — steady noise no longer
+                // holds the squelch gate open.
+                crate::audio_effects::denoise_frame(&mut pcm_buffer[..CODEC_FRAME_SIZE]);
+
                 // Squelch: if user enabled a dBFS threshold, drop frames
                 // below it so background noise isn't transmitted. 0 = off
                 // (default) — every frame goes through.

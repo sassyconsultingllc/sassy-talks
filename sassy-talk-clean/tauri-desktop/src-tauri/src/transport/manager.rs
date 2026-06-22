@@ -392,9 +392,17 @@ impl TransportManager {
         let liveness_rx = Arc::clone(&self.liveness);
         let identity_rx = Arc::clone(&self.identity);
 
-        tokio::spawn(async move {
+        // Dedicated OS thread, NOT a tokio task: recv_from on the socket2 socket
+        // is a blocking syscall (the socket is non-blocking, so it returns
+        // WouldBlock and we poll). Running that poll on a tokio worker monopolized
+        // a runtime thread and forced a busy-sleep. On its own thread it can block
+        // freely without starving the async runtime. Everything it touches
+        // (RwLocks, the unbounded mpsc sender) is sync, so no runtime is needed.
+        std::thread::Builder::new()
+            .name("transport-rx".into())
+            .spawn(move || {
             let mut buf = vec![std::mem::MaybeUninit::<u8>::uninit(); MAX_PACKET_SIZE];
-            
+
             while running_rx.load(Ordering::Relaxed) {
                 match socket_rx.recv_from(&mut buf) {
                     Ok((size, src_addr)) => {
@@ -440,11 +448,18 @@ impl TransportManager {
                             
                             match packet.packet_type {
                                 PacketType::Discovery { device_name, channel } => {
+                                    // Skip (don't panic) if the source isn't an IP
+                                    // socket — recv_from on our UDP socket always
+                                    // yields one, but as_socket() returns Option.
+                                    let src = match src_addr.as_socket() {
+                                        Some(a) => a,
+                                        None => continue,
+                                    };
                                     // Update peer info
                                     let peer = PeerInfo {
                                         device_id: packet.device_id,
                                         device_name,
-                                        address: src_addr.as_socket().unwrap(),
+                                        address: src,
                                         last_seen: SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
                                             .unwrap_or_default()
@@ -457,11 +472,15 @@ impl TransportManager {
                                     peers.write().unwrap().insert(packet.device_id, peer);
                                 }
                                 PacketType::DiscoveryWithKey { device_name, channel, public_key } => {
+                                    let src = match src_addr.as_socket() {
+                                        Some(a) => a,
+                                        None => continue,
+                                    };
                                     // Handle discovery with public key
                                     let mut peer = PeerInfo {
                                         device_id: packet.device_id,
                                         device_name,
-                                        address: src_addr.as_socket().unwrap(),
+                                        address: src,
                                         last_seen: SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
                                             .unwrap_or_default()
@@ -615,16 +634,19 @@ impl TransportManager {
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No data available, sleep briefly
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        // No data available — blocking sleep on this dedicated
+                        // thread (does not occupy a tokio worker). 2ms keeps
+                        // inbound latency low without spinning the CPU.
+                        std::thread::sleep(Duration::from_millis(2));
                     }
                     Err(e) => {
                         error!("Receive error: {}", e);
                     }
                 }
             }
-        });
-        
+        })
+        .map_err(|e| TransportError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
         info!("✓ Transport manager started");
         Ok(())
     }
@@ -638,63 +660,96 @@ impl TransportManager {
     /// Send audio data (with encryption if enabled)
     pub fn send_audio(&self, audio_data: &[u8]) -> Result<(), TransportError> {
         let channel = *self.current_channel.read().unwrap();
-        let config = self.config.read().unwrap();
-        
-        let packet = if config.encryption_enabled {
-            // SECURITY NOTE (CRITICAL-3): This transport uses UDP multicast, so a single
-            // encrypted packet is broadcast to all peers. True per-peer encryption would
-            // require unicast sends (one encrypted copy per peer, each using that peer's
-            // shared session key). With multicast, all peers receiving the packet must be
-            // able to decrypt it with the same key, which means a compromised peer exposes
-            // all audio in the session.
-            //
-            // The correct architectural fix is to switch to per-peer unicast:
-            //
-            //   for (peer_id, engine) in engines.iter() {
-            //       let encrypted = engine.encrypt(audio_data, &nonce);
-            //       unicast_send(peer_id, encrypted);
-            //   }
-            //
-            // Until unicast is implemented, we encrypt with the first available peer engine
-            // and broadcast. We iterate all engines here (rather than short-circuiting with
-            // `.next()`) to make the single-key limitation explicit and auditable.
-            let nonce = CryptoEngine::generate_nonce();
-            let engines = self.crypto_engines.read().unwrap();
+        let encryption_enabled = self.config.read().unwrap().encryption_enabled;
 
-            // Find the first ready engine across ALL peer engines (not just the first
-            // engine in the map — we check is_ready() on each to be explicit).
-            let maybe_encrypted = engines
-                .iter()
-                .find(|(_, e)| e.is_ready())
-                .and_then(|(_, engine)| engine.encrypt(audio_data, &nonce).ok());
+        if !encryption_enabled {
+            // Plaintext mode keeps the single multicast send.
+            let packet = Packet::audio(self.device_id, channel, audio_data.to_vec());
+            let data = packet.serialize().map_err(TransportError::SerializationError)?;
+            self.socket.send_to(&data, &self.multicast_addr.into())
+                .map_err(TransportError::IoError)?;
+            return Ok(());
+        }
 
-            if let Some((ciphertext, auth_tag)) = maybe_encrypted {
-                // Pack: nonce (12) + auth_tag (16) + ciphertext
-                let mut encrypted_payload = Vec::with_capacity(28 + ciphertext.len());
-                encrypted_payload.extend_from_slice(&nonce);
-                encrypted_payload.extend_from_slice(&auth_tag);
-                encrypted_payload.extend_from_slice(&ciphertext);
-                Packet::audio(self.device_id, channel, encrypted_payload)
-            } else {
-                // Encryption is ENABLED but no completed key exchange yet. Do NOT
-                // silently fall back to plaintext — that would transmit audio the
-                // user believes is encrypted. Drop the frame and signal the caller.
-                warn!("send_audio: encryption enabled but no ready crypto engine — refusing plaintext fallback");
-                return Err(TransportError::EncryptionError(
-                    "no completed key exchange yet — not sending plaintext".into(),
-                ));
+        // Per-peer unicast (fixes CRITICAL-3): each peer derived a DIFFERENT
+        // pairwise session key, so a single multicast packet encrypted under one
+        // peer's key was undecryptable by everyone else. We now encrypt one copy
+        // per ready peer with THAT peer's engine + a unique counter nonce and
+        // unicast it to the peer's address. Side benefit: a compromised peer's
+        // key no longer exposes the whole room's audio.
+        let engines = self.crypto_engines.read().unwrap();
+        let peers = self.peers.read().unwrap();
+
+        let mut sent_any = false;
+        let mut last_err: Option<TransportError> = None;
+        let mut had_ready_peer = false;
+
+        for (peer_id, engine) in engines.iter() {
+            if !engine.is_ready() {
+                continue;
             }
+            // Need the peer's address to unicast. An engine without a known
+            // address (key exchanged but no discovery address yet) is skipped.
+            let addr = match peers.get(peer_id) {
+                Some(p) => p.address,
+                None => continue,
+            };
+            had_ready_peer = true;
+
+            // Unique (key, nonce) per frame for THIS engine — never random-reuse.
+            let nonce = match engine.next_nonce() {
+                Ok(n) => n,
+                Err(_) => {
+                    last_err = Some(TransportError::EncryptionError(
+                        "nonce counter exhausted for peer".into(),
+                    ));
+                    continue;
+                }
+            };
+            let (ciphertext, auth_tag) = match engine.encrypt(audio_data, &nonce) {
+                Ok(v) => v,
+                Err(_) => {
+                    last_err = Some(TransportError::EncryptionError("encrypt failed".into()));
+                    continue;
+                }
+            };
+
+            // Pack: nonce (12) + auth_tag (16) + ciphertext
+            let mut payload = Vec::with_capacity(28 + ciphertext.len());
+            payload.extend_from_slice(&nonce);
+            payload.extend_from_slice(&auth_tag);
+            payload.extend_from_slice(&ciphertext);
+
+            let packet = Packet::audio(self.device_id, channel, payload);
+            let data = match packet.serialize() {
+                Ok(d) => d,
+                Err(e) => {
+                    last_err = Some(TransportError::SerializationError(e));
+                    continue;
+                }
+            };
+
+            match self.socket.send_to(&data, &addr.into()) {
+                Ok(_) => sent_any = true,
+                Err(e) => last_err = Some(TransportError::IoError(e)),
+            }
+        }
+
+        if sent_any {
+            Ok(())
+        } else if !had_ready_peer {
+            // Encryption is ENABLED but no peer has a completed key exchange yet.
+            // Do NOT fall back to plaintext — drop the frame and signal the caller.
+            warn!("send_audio: encryption enabled but no ready peer — refusing plaintext fallback");
+            Err(TransportError::EncryptionError(
+                "no completed key exchange yet — not sending plaintext".into(),
+            ))
         } else {
-            Packet::audio(self.device_id, channel, audio_data.to_vec())
-        };
-        
-        let data = packet.serialize()
-            .map_err(|e| TransportError::SerializationError(e))?;
-        
-        self.socket.send_to(&data, &self.multicast_addr.into())
-            .map_err(|e| TransportError::IoError(e))?;
-        
-        Ok(())
+            // Had ready peers but every send/encrypt failed — surface the last error.
+            Err(last_err.unwrap_or_else(|| {
+                TransportError::EncryptionError("encrypted send failed for all peers".into())
+            }))
+        }
     }
     
     /// Get received audio receiver

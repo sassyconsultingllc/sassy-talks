@@ -41,13 +41,13 @@ PERFECT FOR:
 
 PRIVACY:
 
-Sassy-Talk collects zero data. No accounts, no registration, no analytics. Your voice never leaves your local network. Encryption keys are exchanged directly between devices via QR code and never transmitted to any server. See our full privacy policy at https://sassyconsultingllc.com/privacy-policy.html
+Sassy-Talk has no accounts, no registration, and no analytics. Your voice is end-to-end encrypted (AES-256-GCM) and we are never able to listen to it. On local transports (Bluetooth, Wi-Fi) your audio never leaves your local network. When you choose the internet relay to reach peers across networks, audio is forwarded as end-to-end-encrypted ciphertext through a blind relay that cannot decrypt it and stores no audio. Encryption keys are exchanged directly between devices via QR code and are never transmitted to any server. See our full privacy policy at https://sassyconsultingllc.com/privacy-policy.html
 
 TECHNICAL SPECS:
 
 - Encryption: AES-256-GCM (Galois/Counter Mode)
 - Key Exchange: ECDH with X25519 curve
-- Transport: UDP multicast over local WiFi (239.255.42.42:5555)
+- Transport: Bluetooth LE + UDP multicast over local WiFi (239.255.42.42:5555); optional end-to-end-encrypted internet relay for cross-network reach
 - Language: Pure Rust with Android JNI
 - Minimum Android: 8.0 (API 24)
 - Install Size: ~28 MB

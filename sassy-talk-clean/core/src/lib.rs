@@ -27,3 +27,15 @@ pub mod audio_cache;
 pub mod cohort_history;
 pub mod crypto;
 pub mod session;
+
+// ── 2026–2027 roadmap modules (pure logic, cross-platform) ─────────────────
+//   - `pqc`        — hybrid X25519 + ML-KEM-768 post-quantum key agreement,
+//                    layered on top of `crypto` without modifying it.
+//   - `channels`   — channel scan / priority-channel preemption state machine.
+//   - `emergency`  — SOS / man-down / emergency-broadcast signalling.
+pub mod pqc;
+pub mod channels;
+pub mod emergency;
+// `sealed` — metadata-resistant blinded room/peer handles so the relay sees
+// only rotating opaque tokens it cannot correlate to identity or across epochs.
+pub mod sealed;

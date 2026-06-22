@@ -3,7 +3,12 @@
 //
 // Key exchange: X25519 ECDH
 // Symmetric: AES-256-GCM
-// Nonce: 96-bit random per packet
+// Nonce: 32-bit random prefix || 64-bit monotonic counter (per engine).
+//        A fully-random 96-bit nonce per packet risks a birthday collision under
+//        one long-lived key at audio frame rates (~50 fps), which is catastrophic
+//        for GCM (a repeated (key, nonce) breaks both confidentiality and the
+//        auth tag). The counter scheme guarantees no reuse for 2^64 frames and
+//        errors on exhaustion — mirroring sassytalkie-core's CryptoSession.
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -14,6 +19,7 @@ use sha2::Sha256;
 use hkdf::Hkdf;
 use rand::RngCore;
 use rand::rngs::OsRng;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tracing::{debug, error};
 
@@ -42,19 +48,31 @@ pub struct CryptoEngine {
     
     // Cipher instance
     cipher: Option<Aes256Gcm>,
-    
+
     // Key rotation timestamp
     key_created_at: Option<std::time::Instant>,
+
+    // Per-engine nonce state: a random 32-bit prefix fixed at construction plus
+    // a monotonic 64-bit counter. Interior-mutable so `next_nonce` works through
+    // the shared `&CryptoEngine` held in the transport's RwLock without a write
+    // lock. Each engine instance picks an independent prefix, so two engines
+    // sharing a pairwise key (the two ends of a peer link) never collide.
+    nonce_prefix: [u8; 4],
+    nonce_counter: AtomicU64,
 }
 
 impl CryptoEngine {
     pub fn new() -> Self {
+        let mut nonce_prefix = [0u8; 4];
+        OsRng.fill_bytes(&mut nonce_prefix);
         Self {
             secret_key: None,
             public_key: None,
             symmetric_key: None,
             cipher: None,
             key_created_at: None,
+            nonce_prefix,
+            nonce_counter: AtomicU64::new(0),
         }
     }
 
@@ -184,7 +202,29 @@ impl CryptoEngine {
             .map_err(|_| CryptoError::DecryptionFailed)
     }
 
-    /// Generate random nonce
+    /// Next unique nonce for THIS engine: 32-bit random prefix || 64-bit BE
+    /// counter. Use this for every production encrypt — it guarantees a unique
+    /// (key, nonce) pair for the engine's lifetime. Returns Err when the counter
+    /// would overflow (2^64 frames ≈ never, but fail closed rather than wrap and
+    /// reuse a nonce). Takes &self via an atomic so it works through the shared
+    /// engine handle in the transport's RwLock.
+    pub fn next_nonce(&self) -> Result<[u8; 12], CryptoError> {
+        let ctr = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
+        if ctr == u64::MAX {
+            // Counter exhausted — refuse to encrypt rather than wrap to 0 and
+            // reuse a nonce under the same key.
+            return Err(CryptoError::EncryptionFailed);
+        }
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&self.nonce_prefix);
+        nonce[4..].copy_from_slice(&ctr.to_be_bytes());
+        Ok(nonce)
+    }
+
+    /// Random 96-bit nonce. TESTS ONLY — production must use `next_nonce()`.
+    /// A random nonce per packet under a long-lived key risks a birthday
+    /// collision (catastrophic for GCM); only safe for one-shot round-trip tests.
+    #[cfg(test)]
     pub fn generate_nonce() -> [u8; 12] {
         let mut nonce = [0u8; 12];
         OsRng.fill_bytes(&mut nonce);

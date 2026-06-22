@@ -228,6 +228,14 @@ impl SessionManager {
     }
 
     /// Get the CryptoSession for a specific channel (if it has a valid key).
+    ///
+    /// INVARIANT — call this ONCE per channel at session establishment and hold
+    /// the returned session for the channel's lifetime (as the transport does
+    /// via `set_crypto`). Each call mints a FRESH `CryptoSession` with an empty
+    /// `seen_nonces` set: the anti-replay window lives on the session instance,
+    /// so calling this per received frame would hand every frame a clean replay
+    /// set and silently defeat replay rejection. Never put this on a decrypt
+    /// hot path — decrypt through the one cached session instead.
     pub fn get_crypto_for_channel(&self, channel: u8) -> Option<CryptoSession> {
         let ch_idx = match validate_channel(channel) {
             Ok(i) => i,

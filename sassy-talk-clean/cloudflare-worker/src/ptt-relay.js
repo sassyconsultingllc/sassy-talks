@@ -33,6 +33,13 @@ const SWEEP_INTERVAL_MS  = 2_000;
 // active WS in this DO. Per-peer cooldown so a chatty operator can't turn
 // the relay into an FCM spam pump.
 const FCM_PUSH_COOLDOWN_MS = 10_000;
+// Per-ROOM push budget on top of the per-peer cooldown. The per-peer cooldown
+// alone lets an authorized peer cycle through N offline peers and wake all of
+// them every 10 s on demand (each wake = a presence read + an FCM OAuth/send).
+// This bounds total pushes a single room can emit per window regardless of how
+// many offline peers exist or how often a sender fires trigger frames.
+const FCM_ROOM_PUSH_BUDGET = 30;       // max pushes per room per window
+const FCM_ROOM_PUSH_WINDOW_MS = 60_000;
 // Re-fetch presence list at most this often. Reads are cheap but a busy
 // room with 50 audio frames/sec doesn't need fresh presence every frame.
 const PRESENCE_CACHE_TTL_MS = 5_000;
@@ -157,6 +164,9 @@ export class PttRoom extends DurableObject {
     // delivery of wake pushes is benign.
     this.lastFcmPushMs = new Map();      // peerId -> ms
     this.presenceCache = null;           // { list: [{peer, token}], fetchedMs: number }
+    // Per-room FCM push budget window (in-memory, see FCM_ROOM_PUSH_* consts).
+    this.fcmRoomWindowStartMs = 0;
+    this.fcmRoomPushCount = 0;
     // Store-and-forward ring buffer — DO-local, NOT persisted (see the
     // BUFFER_* consts above). Each entry is { ts: number, frame: Uint8Array }.
     // Oldest at index 0; we push to the end and shift the front when over cap.
@@ -164,6 +174,13 @@ export class PttRoom extends DurableObject {
     // stays O(1) (no re-summing the array on the hot path).
     this.audioBuffer = [];
     this.audioBufferBytes = 0;
+    // Store-and-forward is only useful when a peer might reconnect and ask to
+    // catch up. We open a buffering window (this.bufferUntilMs) after any peer
+    // disconnect or FCM wake — the only moments a catch-up reconnect can follow.
+    // In the steady state (all peers live-connected, nobody dropping) we skip
+    // the per-frame copy entirely instead of buffering ~800 frames/sec/room
+    // that no one will ever replay.
+    this.bufferUntilMs = 0;
     // Cache the room name for FCM data payload. Restored from DO storage on
     // wake — without persistence, a wake-message arriving on a hibernated DO
     // would find roomId=null and silently skip FCM fan-out for offline peers.
@@ -364,31 +381,41 @@ export class PttRoom extends DurableObject {
         }
       }
 
-      // Store-and-forward append. Record this broadcast frame in the DO-local
-      // ring buffer so a peer that reconnects with ?catchup=1 can be replayed
-      // the audio it missed. Hot-path cost: one Uint8Array copy + array push,
-      // plus an occasional O(1) front-shift when over cap. NO storage write,
-      // NO await — purely in-RAM. We copy because `bytes` may alias a transient
-      // runtime buffer that is reused after this turn; the copy is also exactly
-      // what gets re-emitted later, so there is zero per-replay work.
+      // Store-and-forward append — ONLY while a catch-up reconnect is plausible
+      // (this.bufferUntilMs, opened on peer disconnect / FCM wake). In the
+      // steady state (everyone live, nobody dropping) catch-up is never
+      // requested, so we skip the per-frame Uint8Array copy + push + trim
+      // entirely — that's ~800 copies/sec saved in a full 16-peer room.
+      //
+      // Hot-path cost when active: one Uint8Array copy + array push, plus an
+      // occasional O(1) front-shift when over cap. NO storage write, NO await.
+      // We copy because `bytes` may alias a transient runtime buffer reused
+      // after this turn; the copy is also exactly what gets re-emitted later.
       //
       // Control frames (PTT_START/STOP/WAKE/etc.) are tiny and harmless to keep
       // — replaying them is a no-op for receivers — so we buffer every binary
       // frame uniformly rather than branch on opcode in the hot path.
-      const framed = new Uint8Array(bytes.length);
-      framed.set(bytes);
-      this.audioBuffer.push({ ts: Date.now(), frame: framed });
-      this.audioBufferBytes += framed.length;
-      // O(1) trim: shift the oldest until both caps are satisfied. `shift()`
-      // on a JS array is amortized cheap and we only ever drop a handful per
-      // append at steady state (one in, one out once the window is full).
-      while (
-        this.audioBuffer.length > BUFFER_MAX_FRAMES ||
-        this.audioBufferBytes > BUFFER_MAX_BYTES
-      ) {
-        const evicted = this.audioBuffer.shift();
-        if (!evicted) break;
-        this.audioBufferBytes -= evicted.frame.length;
+      if (Date.now() <= this.bufferUntilMs) {
+        const framed = new Uint8Array(bytes.length);
+        framed.set(bytes);
+        this.audioBuffer.push({ ts: Date.now(), frame: framed });
+        this.audioBufferBytes += framed.length;
+        // O(1) trim: shift the oldest until both caps are satisfied. `shift()`
+        // on a JS array is amortized cheap and we only ever drop a handful per
+        // append at steady state (one in, one out once the window is full).
+        while (
+          this.audioBuffer.length > BUFFER_MAX_FRAMES ||
+          this.audioBufferBytes > BUFFER_MAX_BYTES
+        ) {
+          const evicted = this.audioBuffer.shift();
+          if (!evicted) break;
+          this.audioBufferBytes -= evicted.frame.length;
+        }
+      } else if (this.audioBuffer.length > 0) {
+        // Window lapsed and no one is around to catch up — release the retained
+        // frames so a quiet room doesn't hold ~2 MB until hibernation.
+        this.audioBuffer.length = 0;
+        this.audioBufferBytes = 0;
       }
 
       // FCM wake-push fan-out for offline peers. Only fires for OP_WAKE (0x17)
@@ -435,8 +462,10 @@ export class PttRoom extends DurableObject {
       }
       const session = this.sessions.get(ws);
       if (session && session.lastSeenMs && now - session.lastSeenMs > HEARTBEAT_STALE_MS) {
-        // Push PARTNER_OFFLINE to other peers
-        const frame = buildPartnerOfflineFrame(session.id || "unknown");
+        // A stale peer is being dropped — it may reconnect with ?catchup.
+        this.bufferUntilMs = now + BUFFER_TTL_MS;
+        // Push PARTNER_OFFLINE to other peers, keyed on the stable peer id.
+        const frame = buildPartnerOfflineFrame(session.peer || session.id || "unknown");
         for (const peer of this.ctx.getWebSockets()) {
           if (peer !== ws) {
             try { peer.send(frame); } catch {}
@@ -474,10 +503,17 @@ export class PttRoom extends DurableObject {
     // fired). The previous explicit `ws.close()` was a no-op at best — the
     // socket is by-definition closing here.
 
+    // A peer just dropped — it may reconnect with ?catchup. Open a buffering
+    // window so the store-and-forward ring actually retains what it missed.
+    this.bufferUntilMs = Date.now() + BUFFER_TTL_MS;
+
     const sockets = this.ctx.getWebSockets();
 
-    // Push binary PARTNER_OFFLINE TLV to remaining peers
-    const offlineFrame = buildPartnerOfflineFrame(session.id || "unknown");
+    // Push binary PARTNER_OFFLINE TLV to remaining peers, keyed on the STABLE
+    // per-install peer id (not session.id, the per-connection UUID the other
+    // side never learned). Receivers track partners by the stable peer id, so
+    // keying on session.id meant the offline notice never matched a partner.
+    const offlineFrame = buildPartnerOfflineFrame(session.peer || session.id || "unknown");
     for (const peer of sockets) {
       try { peer.send(offlineFrame); } catch {}
     }
@@ -505,6 +541,16 @@ export class PttRoom extends DurableObject {
     if (!this.env || !this.env.SHARES) return;
     if (!this.roomId) return;
     if (!this.env.FCM_SERVICE_ACCOUNT_JSON) return; // FCM not configured — silent skip
+
+    // Per-room budget: cap total pushes this room can emit per window, on top of
+    // the per-peer cooldown. Stops a peer cycling triggers across many offline
+    // peers from turning the relay into an FCM/KV pump.
+    const winNow = Date.now();
+    if (winNow - this.fcmRoomWindowStartMs > FCM_ROOM_PUSH_WINDOW_MS) {
+      this.fcmRoomWindowStartMs = winNow;
+      this.fcmRoomPushCount = 0;
+    }
+    if (this.fcmRoomPushCount >= FCM_ROOM_PUSH_BUDGET) return; // budget exhausted this window
 
     // Build the set of currently-attached peerIds.
     const attached = new Set();
@@ -536,9 +582,14 @@ export class PttRoom extends DurableObject {
 
     for (const { peer, token } of this.presenceCache.list) {
       if (attached.has(peer)) continue; // peer is online — no push needed
+      if (this.fcmRoomPushCount >= FCM_ROOM_PUSH_BUDGET) break; // room budget hit
       const lastMs = this.lastFcmPushMs.get(peer) || 0;
       if (now - lastMs < FCM_PUSH_COOLDOWN_MS) continue; // cooled down
       this.lastFcmPushMs.set(peer, now);
+      this.fcmRoomPushCount++;
+      // We're waking an offline peer — it will reconnect (likely with ?catchup),
+      // so open the store-and-forward buffering window to retain the utterance.
+      this.bufferUntilMs = now + BUFFER_TTL_MS;
 
       try {
         const r = await sendWakePush(this.env, token, this.roomId);

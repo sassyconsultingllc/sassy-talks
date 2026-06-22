@@ -36,6 +36,12 @@ uuid = { version = "1.11", features = ["v4"] }
 # Base64 for QR JSON payload (session export/import).
 base64 = "0.22"
 
+# Post-quantum KEM for the hybrid X25519+ML-KEM-768 key agreement (pqc.rs).
+# `getrandom` lets us call the crate's system-RNG helpers directly (its rand_core
+# 0.10 CryptoRng is a different trait version from rand 0.8's, so bridging OsRng
+# would be fragile); `zeroize` makes the ML-KEM decapsulation key wipe on drop.
+ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
+
 [dev-dependencies]
 # In-crate unit tests for audio_cache mix/queue modes already pass on host
 # without an Android NDK toolchain.

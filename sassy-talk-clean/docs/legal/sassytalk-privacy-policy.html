@@ -49,8 +49,8 @@
 
 <h1>SassyTalk Privacy Policy</h1>
 <div class="meta">
-  Version 2.0.0 &bull; Effective Date: March 30, 2026 &bull; Last Updated: March 30, 2026<br>
-  Sassy Consulting LLC &bull; <a href="mailto:support@sassyconsulting.com">support@sassyconsulting.com</a>
+  Version 2.1.0 &bull; Effective Date: March 30, 2026 &bull; Last Updated: June 22, 2026<br>
+  Sassy Consulting LLC &bull; <a href="mailto:support@sassyconsultingllc.com">support@sassyconsultingllc.com</a>
 </div>
 
 <div class="card">
@@ -59,15 +59,17 @@
 
 <h2>1. Who We Are</h2>
 <p>SassyTalk is developed and operated by <strong>Sassy Consulting LLC</strong> ("we", "us", "our"). We are the data controller for any personal data processed through the SassyTalk application.</p>
-<p>Contact: <a href="mailto:support@sassyconsulting.com">support@sassyconsulting.com</a></p>
+<p>Contact: <a href="mailto:support@sassyconsultingllc.com">support@sassyconsultingllc.com</a></p>
 
 <h2>2. What SassyTalk Does</h2>
 <p>SassyTalk is a push-to-talk voice communication app that works like a digital walkie-talkie. Users press a button to transmit voice to other devices on the same encrypted channel. Audio is encrypted with AES-256-GCM on your device before transmission and can only be decrypted by devices that share your session key.</p>
-<p>The app supports two communication paths:</p>
+<p>The app supports several communication paths. <span class="highlight">Which path is in use determines whether any data reaches our servers at all.</span></p>
 <ul>
-  <li><strong>WiFi Multicast</strong> &mdash; direct device-to-device on the same local network. No server involved.</li>
-  <li><strong>Cellular Relay</strong> &mdash; encrypted audio forwarded through a Cloudflare relay server at <code>relay.sassy-consults.com</code>. The relay is a blind binary forwarder and <span class="highlight">cannot decrypt your audio</span>.</li>
+  <li><strong>Bluetooth LE</strong> &mdash; direct device-to-device over a local radio link. No server involved.</li>
+  <li><strong>WiFi Multicast / Wi-Fi Direct</strong> &mdash; direct device-to-device on the same local network. No server involved.</li>
+  <li><strong>Cellular Relay</strong> &mdash; encrypted audio forwarded through a Cloudflare relay server at <code>relay.sassyconsultingllc.com</code>. The relay is a blind binary forwarder and <span class="highlight">cannot decrypt your audio</span>.</li>
 </ul>
+<p><strong>If the relay is not used, nothing &mdash; encrypted or otherwise &mdash; reaches our servers.</strong> The local paths above never contact us. The data described in Section 3.2 exists <em>only</em> while the Cellular Relay path is active.</p>
 
 <h2>3. Data We Collect</h2>
 
@@ -111,6 +113,12 @@
   <li><strong>Temporary audio cache</strong> &mdash; recent audio is held in memory for replay. Cleared when the app closes. Never written to disk.</li>
 </ul>
 
+<h3>3.5 Encrypted Session Sharing (Optional)</h3>
+<p>When you share access to a channel via a link, the invitation is <strong>encrypted on your device</strong> and the resulting encrypted blob is stored briefly in Cloudflare KV so the recipient can fetch it. The decryption key is placed in the link's URL fragment (the part after <code>#</code>), which browsers and apps <strong>never send to the server</strong>. We therefore hold only an opaque blob we cannot read, and it expires automatically. Anyone with the full link can open the invitation &mdash; treat invite links like a key.</p>
+
+<h3>3.6 Wake Notifications (Optional)</h3>
+<p>If you enable wake notifications, the app registers a Firebase Cloud Messaging (FCM) token with the relay, mapped to your room and peer ID, so an incoming transmission can wake your device while the app is backgrounded. The push message carries only a <strong>room identifier so the app knows where to reconnect &mdash; never your audio or message content</strong>. Delivery is performed by Google (FCM). If you do not enable wake notifications, no FCM token is registered. You can disable this at any time in app settings.</p>
+
 <h2>4. Permissions We Request</h2>
 <table>
   <tr><th>Permission</th><th>Why</th></tr>
@@ -131,6 +139,9 @@
 <h3>HuggingFace (Model Download)</h3>
 <p>The Whisper speech recognition model is downloaded from HuggingFace's public model repository. This is a one-time download. HuggingFace may log the download request (IP, timestamp). No audio or personal data is sent to HuggingFace. HuggingFace's privacy policy: <a href="https://huggingface.co/privacy" rel="noopener">huggingface.co/privacy</a></p>
 
+<h3>Google Firebase Cloud Messaging (Optional Push Wake)</h3>
+<p>Only if you enable wake notifications, SassyTalk uses Google's Firebase Cloud Messaging to deliver a wake signal to your device. The push payload contains only a room identifier &mdash; never audio or message content. FCM is operated by Google and subject to <a href="https://policies.google.com/privacy" rel="noopener">Google's Privacy Policy</a>. If wake notifications are disabled, FCM is not used.</p>
+
 <h3>No Other Third Parties</h3>
 <p>SassyTalk does not include any analytics SDKs, advertising networks, crash reporting services, or social media integrations.</p>
 
@@ -144,7 +155,7 @@
 </ul>
 
 <h2>7. Children's Privacy</h2>
-<p>SassyTalk does not knowingly collect personal data from children under 13 (or the applicable age in your jurisdiction). Since SassyTalk does not create accounts or collect personal information, there is no mechanism for us to identify the age of users. If you believe a child is using SassyTalk in a way that concerns you, contact us at <a href="mailto:support@sassyconsulting.com">support@sassyconsulting.com</a>.</p>
+<p>SassyTalk does not knowingly collect personal data from children under 13 (or the applicable age in your jurisdiction). Since SassyTalk does not create accounts or collect personal information, there is no mechanism for us to identify the age of users. If you believe a child is using SassyTalk in a way that concerns you, contact us at <a href="mailto:support@sassyconsultingllc.com">support@sassyconsultingllc.com</a>.</p>
 
 <h2>8. Your Rights by Jurisdiction</h2>
 
@@ -155,7 +166,7 @@
 
 <div class="jurisdiction">
   <strong>California, USA (CCPA/CPRA)</strong>
-  <p>We do not sell or share personal information. We do not use personal information for cross-context behavioral advertising. Categories of personal information collected: Internet activity information (IP address, connection timestamps) via Cloudflare infrastructure only. You have the right to know, delete, correct, and opt-out of sale/sharing. Since we do not sell data, there is nothing to opt out of. Contact: <a href="mailto:support@sassyconsulting.com">support@sassyconsulting.com</a></p>
+  <p>We do not sell or share personal information. We do not use personal information for cross-context behavioral advertising. Categories of personal information collected: Internet activity information (IP address, connection timestamps) via Cloudflare infrastructure only. You have the right to know, delete, correct, and opt-out of sale/sharing. Since we do not sell data, there is nothing to opt out of. Contact: <a href="mailto:support@sassyconsultingllc.com">support@sassyconsultingllc.com</a></p>
 </div>
 
 <div class="jurisdiction">
@@ -165,7 +176,7 @@
 
 <div class="jurisdiction">
   <strong>Brazil (LGPD)</strong>
-  <p>Legal basis: Legitimate interest. You have the right to confirmation of processing, access, correction, anonymization, portability, deletion, information about sharing, and the right to revoke consent. As we do not store personal data, these rights are satisfied by default. Contact our data protection officer at <a href="mailto:support@sassyconsulting.com">support@sassyconsulting.com</a>.</p>
+  <p>Legal basis: Legitimate interest. You have the right to confirmation of processing, access, correction, anonymization, portability, deletion, information about sharing, and the right to revoke consent. As we do not store personal data, these rights are satisfied by default. Contact our data protection officer at <a href="mailto:support@sassyconsultingllc.com">support@sassyconsultingllc.com</a>.</p>
 </div>
 
 <div class="jurisdiction">
@@ -196,17 +207,19 @@
 <h2>12. Contact Us</h2>
 <p>If you have questions about this privacy policy or want to exercise your privacy rights:</p>
 <ul>
-  <li>Email: <a href="mailto:support@sassyconsulting.com">support@sassyconsulting.com</a></li>
+  <li>Email: <a href="mailto:support@sassyconsultingllc.com">support@sassyconsultingllc.com</a></li>
   <li>Website: <a href="https://sassyconsultingllc.com">sassyconsultingllc.com</a></li>
   <li>Entity: Sassy Consulting LLC</li>
 </ul>
 
 <div class="card" style="margin-top: 2rem;">
   <strong>Google Play Data Safety Summary:</strong><br>
-  Data collected: Connection metadata (IP, timestamps) via Cloudflare infrastructure.<br>
+  Data collected (relay path only): Connection metadata (IP, timestamps) via Cloudflare infrastructure; peer/room IDs; FCM token if wake notifications are enabled.<br>
   Data shared with peers: Encrypted audio, display name, device ID.<br>
-  Encryption: Yes (AES-256-GCM end-to-end).<br>
-  Data deletion: No user data stored to delete. Clear app data to remove local keys and profile.
+  Processed ephemerally: Encrypted audio (forwarded and discarded, never stored).<br>
+  Encryption: Yes (AES-256-GCM end-to-end; relay cannot decrypt).<br>
+  Local-only paths (Bluetooth LE, WiFi): No data leaves the device.<br>
+  Data deletion: No user accounts. Clear app data to remove local keys and profile; encrypted invite blobs expire automatically.
 </div>
 
 </body>

@@ -9,16 +9,27 @@
  *
  * Consumed by ptt-relay-worker.js → handleShareRoute.
  *
- *   POST   /share          body = ciphertext bytes   → { id, expires_at }
- *   GET    /share/<id>      → ciphertext bytes (application/octet-stream)
- *   DELETE /share/<id>      → revoke early
+ *   POST   /share?room=<id>  body = ciphertext bytes   → { id, expires_at }
+ *                            requires Authorization: Bearer <room capability>
+ *   GET    /share/<id>       → ciphertext bytes (application/octet-stream)
+ *   DELETE /share/<id>?room=<id> → revoke early (requires room capability)
+ *
+ * Auth model: CREATE and DELETE require a capability token for the room the
+ * invite belongs to (same token used to open the WebSocket / register presence,
+ * verified via relay-auth.js). This stops anonymous storage abuse and stops a
+ * third party who learns an id from revoking someone's invite. GET stays open:
+ * the recipient is being invited and has no room token yet, so the unguessable
+ * 128-bit id *is* the bearer capability — and the blob is useless without the
+ * #fragment key anyway.
  *
  * Optional one-time semantics: POST /share?burn=1 deletes the blob on first
  * successful GET (a dead-drop). KV layout: share:<id> in the SHARES namespace.
  */
 
+import { verifyCapabilityToken, extractToken, isValidRoomId, secretsFor } from "./relay-auth.js";
+
 // Invites are small (a key id, room id, codec params, signature). 64 KiB is
-// generous headroom while bounding storage abuse from an unauthenticated POST.
+// generous headroom while bounding storage size.
 const MAX_BLOB_BYTES = 64 * 1024;
 const DEFAULT_TTL_SEC = 60 * 60 * 24 * 7;   // 7 days
 const MAX_TTL_SEC = 60 * 60 * 24 * 30;      // 30 days ceiling
@@ -49,12 +60,19 @@ export async function handleShareRoute(request, env, url) {
     const id = path.slice("/share/".length);
     if (!ID_RE.test(id)) return json({ error: "Invalid share id" }, 400);
     if (request.method === "GET") return readShare(env, id);
-    if (request.method === "DELETE") return deleteShare(env, id);
+    if (request.method === "DELETE") return deleteShare(request, env, url, id);
   }
   return json({ error: "Method not allowed" }, 405);
 }
 
 async function createShare(request, env, url) {
+  // Require a capability token for the room this invite belongs to. Blocks
+  // anonymous storage abuse; the creator is already a member of that room.
+  const room = url.searchParams.get("room");
+  if (!isValidRoomId(room)) return json({ error: "Missing or invalid room" }, 400);
+  const capErr = await verifyCapabilityToken(extractToken(request, url), room, secretsFor(env));
+  if (capErr) return json({ error: capErr }, 401);
+
   const buf = await request.arrayBuffer();
   if (!buf || buf.byteLength === 0) return json({ error: "Empty body" }, 400);
   if (buf.byteLength > MAX_BLOB_BYTES) return json({ error: "Blob too large" }, 413);
@@ -69,7 +87,8 @@ async function createShare(request, env, url) {
 
   await env.SHARES.put(shareKey(id), buf, {
     expirationTtl: ttl,
-    metadata: { burn, createdAt: Date.now() },
+    // Bind the blob to its room so DELETE can authorize the revoker.
+    metadata: { burn, room, createdAt: Date.now() },
   });
 
   return json({ id, expires_at: expiresAt, burn });
@@ -96,7 +115,19 @@ async function readShare(env, id) {
   });
 }
 
-async function deleteShare(env, id) {
+async function deleteShare(request, env, url, id) {
+  // Authorize against the room the blob was created for. Reading metadata first
+  // also makes "already gone" return cleanly instead of a silent no-op delete.
+  const { value, metadata } = await env.SHARES.getWithMetadata(shareKey(id), { type: "arrayBuffer" });
+  if (!value) return json({ error: "Not found or expired" }, 404);
+  const room = metadata && metadata.room;
+  // Legacy rows (created before room-binding) have no room — fall back to the
+  // ?room= param so a future migration can still revoke them with a valid cap.
+  const claimRoom = room || url.searchParams.get("room");
+  if (!isValidRoomId(claimRoom)) return json({ error: "Missing or invalid room" }, 400);
+  const capErr = await verifyCapabilityToken(extractToken(request, url), claimRoom, secretsFor(env));
+  if (capErr) return json({ error: capErr }, 401);
+
   await env.SHARES.delete(shareKey(id));
   return json({ ok: true });
 }

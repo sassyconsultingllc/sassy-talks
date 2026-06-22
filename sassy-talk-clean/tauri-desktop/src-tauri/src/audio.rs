@@ -4,13 +4,13 @@
 /// Handles microphone input and speaker output with ring buffers
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, Host, Stream};
+use cpal::{Device, Host, SampleRate, Stream, StreamConfig};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Producer, Consumer, Split};
 use ringbuf::wrap::caching::{CachingProd, CachingCons};
 use send_wrapper::SendWrapper;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tracing::{error, info, warn};
 use thiserror::Error;
 
@@ -94,20 +94,64 @@ pub struct AudioEngine {
     input_stream: Arc<Mutex<Option<SendableStream>>>,
     output_stream: Arc<Mutex<Option<SendableStream>>>,
     
-    // Ring buffers for audio data
-    input_producer: Arc<Mutex<Option<HeapProducer<i16>>>>,
+    // Ring buffers for audio data. The RT callback owns its endpoint directly
+    // (moved into the stream closure) so it never locks on the audio thread:
+    //   - input  callback OWNS the producer; `input_consumer` is the non-RT read side
+    //   - output callback OWNS the consumer; `output_producer` is the non-RT write side
     input_consumer: Arc<Mutex<Option<HeapConsumer<i16>>>>,
     output_producer: Arc<Mutex<Option<HeapProducer<i16>>>>,
-    output_consumer: Arc<Mutex<Option<HeapConsumer<i16>>>>,
-    
+
     // State
     state: Arc<Mutex<AudioState>>,
     recording: Arc<AtomicBool>,
     playing: Arc<AtomicBool>,
-    
-    // Volume
-    input_volume: Arc<Mutex<f32>>,
-    output_volume: Arc<Mutex<f32>>,
+
+    // Volume — atomic f32 bits so the RT audio callback reads it with a single
+    // relaxed load instead of taking a Mutex (a poisoned/contended lock inside
+    // the driver callback caused xruns or panicked the stream).
+    input_volume: Arc<AtomicU32>,
+    output_volume: Arc<AtomicU32>,
+}
+
+/// Pack/unpack an f32 volume into an AtomicU32 (lock-free RT read).
+#[inline]
+fn store_volume(a: &AtomicU32, v: f32) { a.store(v.to_bits(), Ordering::Relaxed); }
+#[inline]
+fn load_volume(a: &AtomicU32) -> f32 { f32::from_bits(a.load(Ordering::Relaxed)) }
+
+/// Choose a stream config at 48 kHz (what Opus needs) when the device supports
+/// it — preferring the fewest channels — falling back to the device default
+/// (with a warning) only when 48 kHz is genuinely unavailable. Returns the
+/// config plus its channel count. The callback downmixes/duplicates channels;
+/// at 48 kHz no resampling is required, which is the case on essentially all
+/// modern hardware even when its *default* is 44.1 kHz stereo.
+fn choose_config(
+    default_cfg: Result<cpal::SupportedStreamConfig, cpal::DefaultStreamConfigError>,
+    supported: Option<Vec<cpal::SupportedStreamConfigRange>>,
+    label: &str,
+) -> Result<(StreamConfig, u16), AudioError> {
+    if let Some(ranges) = supported {
+        let mut best: Option<cpal::SupportedStreamConfigRange> = None;
+        for r in &ranges {
+            if r.min_sample_rate().0 <= SAMPLE_RATE && SAMPLE_RATE <= r.max_sample_rate().0 {
+                let better = best.as_ref().map_or(true, |b| r.channels() < b.channels());
+                if better { best = Some(r.clone()); }
+            }
+        }
+        if let Some(r) = best {
+            let cfg = r.with_sample_rate(SampleRate(SAMPLE_RATE));
+            let channels = cfg.channels();
+            return Ok((cfg.into(), channels));
+        }
+    }
+    let def = default_cfg.map_err(|e| AudioError::ConfigError(e.to_string()))?;
+    warn!(
+        "{}: device has no 48kHz config; using {}Hz/{}ch (audio may be degraded — \
+         a resampler is the follow-up for non-48k hardware)",
+        label, def.sample_rate().0, def.channels()
+    );
+    let channels = def.channels();
+    Ok((def.into(), channels))
 }
 
 impl AudioEngine {
@@ -123,15 +167,13 @@ impl AudioEngine {
             output_device: Arc::new(Mutex::new(None)),
             input_stream: Arc::new(Mutex::new(None)),
             output_stream: Arc::new(Mutex::new(None)),
-            input_producer: Arc::new(Mutex::new(None)),
             input_consumer: Arc::new(Mutex::new(None)),
             output_producer: Arc::new(Mutex::new(None)),
-            output_consumer: Arc::new(Mutex::new(None)),
             state: Arc::new(Mutex::new(AudioState::Idle)),
             recording: Arc::new(AtomicBool::new(false)),
             playing: Arc::new(AtomicBool::new(false)),
-            input_volume: Arc::new(Mutex::new(1.0)),
-            output_volume: Arc::new(Mutex::new(1.0)),
+            input_volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            output_volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
         })
     }
 
@@ -229,39 +271,39 @@ impl AudioEngine {
             .clone()
             .or_else(|| self.host.default_input_device())
             .ok_or(AudioError::NoDevice)?;
-        
-        let config = device.default_input_config()
-            .map_err(|e| AudioError::ConfigError(e.to_string()))?;
-        
+
+        let (config, in_channels) = choose_config(
+            device.default_input_config(),
+            device.supported_input_configs().ok().map(|c| c.collect()),
+            "input",
+        )?;
+        let channels = in_channels.max(1) as usize;
+
         info!("Input device: {}", device.name().unwrap_or_default());
-        info!("Input config: {:?}", config);
-        
-        // Create ring buffer
+        info!("Input config: {:?} ({} ch)", config, channels);
+
+        // Create ring buffer. The producer is MOVED into the callback (sole
+        // owner — no lock on the RT path); the consumer is the non-RT read side.
         let rb = HeapRb::<i16>::new(BUFFER_SIZE);
-        let (producer, consumer) = rb.split();
-        
-        *self.input_producer.lock().unwrap() = Some(producer);
+        let (mut producer, consumer) = rb.split();
         *self.input_consumer.lock().unwrap() = Some(consumer);
-        
-        let producer = Arc::clone(&self.input_producer);
+
         let volume = Arc::clone(&self.input_volume);
         let recording = Arc::clone(&self.recording);
-        
+
         let stream = device.build_input_stream(
-            &config.into(),
+            &config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 if !recording.load(Ordering::Relaxed) {
                     return;
                 }
-                
-                let vol = *volume.lock().unwrap();
-                let mut prod = producer.lock().unwrap();
-                
-                if let Some(ref mut p) = *prod {
-                    for &sample in data {
-                        let scaled = (sample * vol * 32767.0) as i16;
-                        let _ = p.try_push(scaled);
-                    }
+
+                let vol = load_volume(&volume); // single relaxed load, no lock
+                // Downmix interleaved frames to mono (Opus capture is mono).
+                for frame in data.chunks_exact(channels) {
+                    let mono = frame.iter().sum::<f32>() / channels as f32;
+                    let scaled = (mono * vol * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                    let _ = producer.try_push(scaled);
                 }
             },
             |err| error!("Input stream error: {}", err),
@@ -284,26 +326,28 @@ impl AudioEngine {
             .clone()
             .or_else(|| self.host.default_output_device())
             .ok_or(AudioError::NoDevice)?;
-        
-        let config = device.default_output_config()
-            .map_err(|e| AudioError::ConfigError(e.to_string()))?;
-        
+
+        let (config, out_channels) = choose_config(
+            device.default_output_config(),
+            device.supported_output_configs().ok().map(|c| c.collect()),
+            "output",
+        )?;
+        let channels = out_channels.max(1) as usize;
+
         info!("Output device: {}", device.name().unwrap_or_default());
-        info!("Output config: {:?}", config);
-        
-        // Create ring buffer
+        info!("Output config: {:?} ({} ch)", config, channels);
+
+        // Create ring buffer. The consumer is MOVED into the callback (sole
+        // owner — no lock on the RT path); the producer is the non-RT write side.
         let rb = HeapRb::<i16>::new(BUFFER_SIZE);
-        let (producer, consumer) = rb.split();
-        
+        let (producer, mut consumer) = rb.split();
         *self.output_producer.lock().unwrap() = Some(producer);
-        *self.output_consumer.lock().unwrap() = Some(consumer);
-        
-        let consumer = Arc::clone(&self.output_consumer);
+
         let volume = Arc::clone(&self.output_volume);
         let playing = Arc::clone(&self.playing);
-        
+
         let stream = device.build_output_stream(
-            &config.into(),
+            &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 if !playing.load(Ordering::Relaxed) {
                     for sample in data.iter_mut() {
@@ -311,17 +355,16 @@ impl AudioEngine {
                     }
                     return;
                 }
-                
-                let vol = *volume.lock().unwrap();
-                let mut cons = consumer.lock().unwrap();
-                
-                if let Some(ref mut c) = *cons {
-                    for sample in data.iter_mut() {
-                        if let Some(s) = c.try_pop() {
-                            *sample = (s as f32 / 32767.0) * vol;
-                        } else {
-                            *sample = 0.0;
-                        }
+
+                let vol = load_volume(&volume); // single relaxed load, no lock
+                // One mono sample from the 48 kHz stream fans out to all output
+                // channels (duplicate L/R) so a stereo device plays correctly.
+                for frame in data.chunks_mut(channels) {
+                    let s = consumer.try_pop()
+                        .map(|v| (v as f32 / 32767.0) * vol)
+                        .unwrap_or(0.0);
+                    for sample in frame.iter_mut() {
+                        *sample = s;
                     }
                 }
             },
@@ -424,22 +467,22 @@ impl AudioEngine {
 
     /// Set input volume (0.0 - 2.0)
     pub fn set_input_volume(&self, volume: f32) {
-        *self.input_volume.lock().unwrap() = volume.clamp(0.0, 2.0);
+        store_volume(&self.input_volume, volume.clamp(0.0, 2.0));
     }
 
     /// Set output volume (0.0 - 2.0)
     pub fn set_output_volume(&self, volume: f32) {
-        *self.output_volume.lock().unwrap() = volume.clamp(0.0, 2.0);
+        store_volume(&self.output_volume, volume.clamp(0.0, 2.0));
     }
 
     /// Get input volume
     pub fn get_input_volume(&self) -> f32 {
-        *self.input_volume.lock().unwrap()
+        load_volume(&self.input_volume)
     }
 
     /// Get output volume
     pub fn get_output_volume(&self) -> f32 {
-        *self.output_volume.lock().unwrap()
+        load_volume(&self.output_volume)
     }
 
     /// Get current audio state

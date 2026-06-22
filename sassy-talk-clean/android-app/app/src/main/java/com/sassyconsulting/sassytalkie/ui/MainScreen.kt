@@ -96,6 +96,16 @@ fun MainScreen(
     // Talk-over indicator (Task 6.2)
     val peerSpeaking by (walkieService?.pttCoordinator?.peerSpeaking ?: falseFallback).collectAsState()
 
+    // Half-duplex: while WE transmit, hard-mute incoming RX playback so the
+    // remote stream isn't played out the speaker into our hot mic (acoustic
+    // feedback) — radio convention is you don't hear others while keyed. This is
+    // an absolute cut (native rx_muted), not a duck, and it preserves the user's
+    // configured RX gain. We intentionally do NOT block transmitting while a peer
+    // speaks (this app has an emergency path — barge-in must always be possible).
+    LaunchedEffect(isTransmitting) {
+        SassyTalkNative.setRxMuted(isTransmitting)
+    }
+
     // v2.7.1: active peer roster — set of HEALTHY/DEGRADED peer IDs.
     val peerIdsFallback = remember { kotlinx.coroutines.flow.MutableStateFlow<Set<String>>(emptySet()) }
     val activePeerIds by (walkieService?.pttCoordinator?.peerIds ?: peerIdsFallback).collectAsState()
