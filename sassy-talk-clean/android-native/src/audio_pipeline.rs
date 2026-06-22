@@ -125,8 +125,9 @@ pub fn call_transcription_bridge_public(
     pcm: &[i16],
     is_favorite: bool,
     is_muted: bool,
+    is_self: bool,
 ) {
-    call_transcription_bridge(sender_id, device_name, pcm, is_favorite, is_muted);
+    call_transcription_bridge(sender_id, device_name, pcm, is_favorite, is_muted, is_self);
 }
 
 /// Maximum sender ID length on the wire
@@ -385,15 +386,17 @@ pub fn spawn_tx_thread(
                 }
 
                 // Feed self-PCM into the timeline bridge so the activity log
-                // records "you spoke for Xs" on PTT release. Same VAD/finalize
-                // path as RX-side speakers, so self entries also serve as a
-                // smoke test that the bridge wiring is healthy.
+                // records "you spoke for Xs" on PTT release. is_self = true so
+                // the bridge records the timeline entry but does NOT surface the
+                // remote-speaker UI ("X is speaking" toast / activeSpeakerName)
+                // for our own transmit.
                 call_transcription_bridge(
                     &local_sender_id,
                     &local_device_name,
                     &pcm_buffer[..CODEC_FRAME_SIZE],
                     false,
                     false,
+                    true, // is_self
                 );
 
                 // Encode with Opus
@@ -627,7 +630,7 @@ pub fn spawn_rx_thread(
                     (reg.is_favorite(&sender_id), reg.is_muted(&sender_id))
                 };
 
-                call_transcription_bridge(&sender_id, &device_name, &pcm_samples, is_favorite, is_muted);
+                call_transcription_bridge(&sender_id, &device_name, &pcm_samples, is_favorite, is_muted, false /* remote */);
             }
 
             // Cleanup
@@ -707,6 +710,11 @@ fn call_transcription_bridge(
     pcm_samples: &[i16],
     is_favorite: bool,
     is_muted: bool,
+    // True when this frame is the LOCAL device's own outgoing audio (fed in so
+    // the activity timeline can log "you spoke"). The Kotlin side keeps the
+    // timeline bookkeeping but suppresses the remote-speaker UI (the
+    // "X is speaking" toast / activeSpeakerName / incomingAudio) for self frames.
+    is_self: bool,
 ) {
     // Fast path: feature disabled → return without touching JNI. Avoids
     // attaching a JNI thread + allocating a short[] every 20 ms when
@@ -751,6 +759,7 @@ fn call_transcription_bridge(
 
         let j_fav = if is_favorite { JNI_TRUE } else { JNI_FALSE };
         let j_muted = if is_muted { JNI_TRUE } else { JNI_FALSE };
+        let j_self = if is_self { JNI_TRUE } else { JNI_FALSE };
 
         // Call static method using cached GlobalRef (carries app classloader context)
         // Safety: GlobalRef -> JObject -> JClass cast is valid for class references
@@ -758,13 +767,14 @@ fn call_transcription_bridge(
         let result = env.call_static_method(
             &bridge_class,
             "onAudioReceived",
-            "(Ljava/lang/String;Ljava/lang/String;[SZZ)V",
+            "(Ljava/lang/String;Ljava/lang/String;[SZZZ)V",
             &[
                 JValue::Object(&j_sender_id.into()),
                 JValue::Object(&j_sender_name.into()),
                 JValue::Object(&j_pcm.into()),
                 JValue::Bool(j_fav),
                 JValue::Bool(j_muted),
+                JValue::Bool(j_self),
             ],
         );
 

@@ -1306,6 +1306,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         &pcm_buffer[..CODEC_FRAME_SIZE],
         false,
         false,
+        true, // is_self — local BT transmit (timeline only, no "is speaking" UI)
     );
 
     // Pack wire frame
@@ -1450,6 +1451,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         &pcm_samples,
         is_favorite,
         is_muted,
+        false, // remote — BT-received audio
     );
 
     // Feed into audio cache and play
