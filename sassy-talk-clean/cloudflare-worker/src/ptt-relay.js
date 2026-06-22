@@ -64,6 +64,25 @@ function looksLikeTrigger(bytes) {
 const MAX_MESSAGES_PER_SEC = 120;
 const RATE_WINDOW_MS = 1_000;
 
+// ── Store-and-forward (async voice / catch-up) ────────────────────────────
+// A bounded, DO-local in-memory ring buffer of the most recent broadcast
+// audio frames. A peer woken by an FCM push (or recovering from a network
+// drop) can reconnect with `?catchup=1` (or `?since=<ms>`) and be replayed
+// the audio it missed, wrapped as OP_REPLAY_FRAME (0x19) frames.
+//
+// The buffer is intentionally NOT persisted to ctx.storage — appending on the
+// 50 fps audio hot path must add zero storage round-trips. Losing it across
+// hibernation is acceptable: catch-up is best-effort voicemail, not the
+// primary delivery path (live fan-out + FCM wake already cover that). This
+// mirrors `lastFcmPushMs` / `presenceCache`, which are likewise RAM-only.
+//
+// Bounds are enforced by BOTH count and bytes, whichever trips first, with an
+// O(1) shift of the oldest entry. At ~50 fps a 30 s window is ~1500 frames;
+// the byte cap protects against larger frames (or higher rates) blowing RAM.
+const BUFFER_MAX_FRAMES = 1500;        // ~30 s of audio at 50 fps (20 ms Opus)
+const BUFFER_MAX_BYTES  = 2 * 1024 * 1024; // ~2 MB hard cap regardless of count
+const BUFFER_TTL_MS     = 30_000;      // drop frames older than this on replay
+
 /**
  * Build a PARTNER_OFFLINE TLV binary frame for the given peerId.
  * Frame layout:
@@ -81,6 +100,36 @@ export function buildPartnerOfflineFrame(peerId) {
   out[2] = (len >> 8) & 0xFF; // u16 LE payload length
   out[3] = idBytes.length; // peer_id_len: u8
   out.set(idBytes, 4);
+  return out;
+}
+
+/**
+ * Wrap a previously-broadcast audio frame as an OP_REPLAY_FRAME (0x19) for
+ * catch-up delivery. NOTE: this is NOT the standard `encode_tlv`
+ * `[op][len:u16 LE][payload]` shape — per core/src/protocol.rs the replay
+ * frame carries a peer_id LENGTH (not a payload length) right after the
+ * opcode, then the original audio appended raw to the end of the message:
+ *
+ *   [0]      opcode: u8        = 0x19
+ *   [1..2]   peer_id_len: u16 LE
+ *   [3..]    peer_id bytes (UTF-8)
+ *   [...]    original_audio_frame (encrypted: nonce + ciphertext + tag),
+ *            copied verbatim — the receiver reads it to end-of-message.
+ *
+ * The relay forwards blind and never tracks which peer originated a given
+ * broadcast frame (the fan-out path does zero parsing), so peer_id is emitted
+ * as the EMPTY STRING (peer_id_len = 0). Receivers route replayed audio by the
+ * sender epoch embedded inside the encrypted/decoded frame, exactly as they do
+ * for live frames — the relay-level peer_id is informational only.
+ */
+export function buildReplayFrame(audioFrame, peerId = "") {
+  const idBytes = new TextEncoder().encode(peerId);
+  const out = new Uint8Array(3 + idBytes.length + audioFrame.length);
+  out[0] = 0x19; // OP_REPLAY_FRAME
+  out[1] = idBytes.length & 0xFF;
+  out[2] = (idBytes.length >> 8) & 0xFF; // peer_id_len: u16 LE
+  out.set(idBytes, 3);
+  out.set(audioFrame, 3 + idBytes.length);
   return out;
 }
 
@@ -108,6 +157,13 @@ export class PttRoom extends DurableObject {
     // delivery of wake pushes is benign.
     this.lastFcmPushMs = new Map();      // peerId -> ms
     this.presenceCache = null;           // { list: [{peer, token}], fetchedMs: number }
+    // Store-and-forward ring buffer — DO-local, NOT persisted (see the
+    // BUFFER_* consts above). Each entry is { ts: number, frame: Uint8Array }.
+    // Oldest at index 0; we push to the end and shift the front when over cap.
+    // `audioBufferBytes` shadows the summed `frame.length` so the byte-cap trim
+    // stays O(1) (no re-summing the array on the hot path).
+    this.audioBuffer = [];
+    this.audioBufferBytes = 0;
     // Cache the room name for FCM data payload. Restored from DO storage on
     // wake — without persistence, a wake-message arriving on a hibernated DO
     // would find roomId=null and silently skip FCM fan-out for offline peers.
@@ -192,6 +248,25 @@ export class PttRoom extends DurableObject {
       client_id: clientId,
       peers: this.sessions.size,
     }));
+
+    // Store-and-forward catch-up. Only replay when the client explicitly asks
+    // (so normal joins don't get a replay blast on top of live audio):
+    //   ?catchup=1       → replay the whole retained window
+    //   ?since=<ms>      → replay only frames with ts > <ms> (epoch millis)
+    // A peer woken by the FCM push reconnects with one of these to hear what
+    // it missed. Replay is paced in arrival order, after the welcome, so the
+    // client sees its session is live before the catch-up stream starts.
+    const wantsCatchup = url.searchParams.get("catchup") === "1";
+    const sinceRaw = url.searchParams.get("since");
+    const sinceMs = sinceRaw !== null ? Number(sinceRaw) : NaN;
+    if (wantsCatchup || Number.isFinite(sinceMs)) {
+      // Snapshot the buffer cutoff now; replay runs in waitUntil so it never
+      // blocks the 101 handshake response.
+      const cutoff = Number.isFinite(sinceMs)
+        ? sinceMs
+        : Date.now() - BUFFER_TTL_MS;
+      this.ctx.waitUntil(this.replayBufferedAudio(server, cutoff, clientId));
+    }
 
     // Start sweeper alarm if not already running. In-memory flag avoids a
     // storage round-trip per connection.
@@ -287,6 +362,33 @@ export class PttRoom extends DurableObject {
             this.sessions.delete(peer);
           }
         }
+      }
+
+      // Store-and-forward append. Record this broadcast frame in the DO-local
+      // ring buffer so a peer that reconnects with ?catchup=1 can be replayed
+      // the audio it missed. Hot-path cost: one Uint8Array copy + array push,
+      // plus an occasional O(1) front-shift when over cap. NO storage write,
+      // NO await — purely in-RAM. We copy because `bytes` may alias a transient
+      // runtime buffer that is reused after this turn; the copy is also exactly
+      // what gets re-emitted later, so there is zero per-replay work.
+      //
+      // Control frames (PTT_START/STOP/WAKE/etc.) are tiny and harmless to keep
+      // — replaying them is a no-op for receivers — so we buffer every binary
+      // frame uniformly rather than branch on opcode in the hot path.
+      const framed = new Uint8Array(bytes.length);
+      framed.set(bytes);
+      this.audioBuffer.push({ ts: Date.now(), frame: framed });
+      this.audioBufferBytes += framed.length;
+      // O(1) trim: shift the oldest until both caps are satisfied. `shift()`
+      // on a JS array is amortized cheap and we only ever drop a handful per
+      // append at steady state (one in, one out once the window is full).
+      while (
+        this.audioBuffer.length > BUFFER_MAX_FRAMES ||
+        this.audioBufferBytes > BUFFER_MAX_BYTES
+      ) {
+        const evicted = this.audioBuffer.shift();
+        if (!evicted) break;
+        this.audioBufferBytes -= evicted.frame.length;
       }
 
       // FCM wake-push fan-out for offline peers. Only fires for OP_WAKE (0x17)
@@ -452,6 +554,51 @@ export class PttRoom extends DurableObject {
         }
       } catch (e) {
         console.error(`FCM push exception room=${this.roomId} peer=${peer}: ${e.message}`);
+      }
+    }
+  }
+
+  /**
+   * Replay buffered audio frames newer than `cutoff` (epoch ms) to a single
+   * just-connected socket, wrapped as OP_REPLAY_FRAME (0x19). Frames are sent
+   * in arrival order. Runs inside waitUntil() so it never blocks the WS
+   * handshake; best-effort, so a closed socket mid-replay just stops.
+   *
+   * We snapshot the matching frames up front so concurrent appends to
+   * `this.audioBuffer` (the live hot path keeps running) can't shift indices
+   * out from under us. peer_id is emitted empty — see buildReplayFrame.
+   */
+  async replayBufferedAudio(ws, cutoff, clientId) {
+    // Drop anything older than the TTL even if `since` reaches further back —
+    // the buffer never retains beyond ~30 s anyway, but this keeps the cutoff
+    // honest if a client sends an ancient `since`.
+    const floor = Math.max(cutoff, Date.now() - BUFFER_TTL_MS);
+    const pending = [];
+    for (const entry of this.audioBuffer) {
+      if (entry.ts > floor) pending.push(entry.frame);
+    }
+    if (pending.length === 0) return;
+
+    // Pace the replay so a full ~1500-frame window doesn't land as one
+    // synchronous burst. A small yield every CHUNK frames keeps the DO
+    // responsive to live traffic and lets backpressure surface as a send
+    // throw (which we treat as "peer gone" and stop).
+    const CHUNK = 50; // ~1 s of audio per chunk at 50 fps
+    let sent = 0;
+    for (const frame of pending) {
+      try {
+        ws.send(buildReplayFrame(frame, ""));
+      } catch {
+        // Socket closed/failed mid-replay — stop; nothing else to do.
+        return;
+      }
+      sent++;
+      if (sent % CHUNK === 0) {
+        // Yield to the event loop between chunks so live fan-out and the
+        // sweeper aren't starved during a long catch-up. A microtask yield
+        // (no timer, no `scheduler` global / compat-flag dependency) is enough
+        // to let queued WS messages and the alarm run between chunks.
+        await Promise.resolve();
       }
     }
   }

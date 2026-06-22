@@ -2,7 +2,7 @@
  * SassyTalk PTT Relay — Dedicated Worker
  *
  * Pure WebSocket relay for encrypted audio. No website, no APIs, no assets.
- * Lives at relay.sassy-consults.com
+ * Lives at relay.sassyconsultingllc.com
  */
 
 export { PttRoom } from "./ptt-relay.js";
@@ -109,7 +109,7 @@ export default {
         return new Response("Server misconfigured: AUTH_SECRET unset", { status: 503 });
       }
       const token = url.searchParams.get("token");
-      const tokenError = await verifyToken(token, roomId, env.AUTH_SECRET);
+      const tokenError = await verifyToken(token, roomId, activeSecrets(env));
       if (tokenError) {
         return new Response(tokenError, { status: 401 });
       }
@@ -142,7 +142,18 @@ async function signToken(roomId, expSec, secret) {
   return `${expSec}.${sig}`;
 }
 
+// Active verification keys, current first. [AUTH_SECRET] normally, or
+// [AUTH_SECRET, AUTH_SECRET_PREV] during a rotation grace window so tokens
+// minted under the outgoing key keep working until they expire. Mirrors
+// secretsFor() in relay-auth.js — kept inline to keep the /ws hot path
+// dependency-free. New tokens are always signed with the current AUTH_SECRET.
+function activeSecrets(env) {
+  return [env.AUTH_SECRET, env.AUTH_SECRET_PREV].filter(Boolean);
+}
+
 async function verifyToken(token, roomId, secret) {
+  const secrets = (Array.isArray(secret) ? secret : [secret]).filter(Boolean);
+  if (secrets.length === 0) return "AUTH_SECRET not configured";
   if (!token || typeof token !== "string") return "Missing token";
   const dot = token.indexOf(".");
   if (dot <= 0) return "Malformed token";
@@ -153,10 +164,14 @@ async function verifyToken(token, roomId, secret) {
   const nowSec = Math.floor(Date.now() / 1000);
   if (expSec + CLOCK_SKEW_SEC < nowSec) return "Token expired";
 
-  const expected = await hmacSha256Hex(`${roomId}.${expSec}`, secret);
-  // Constant-time compare to avoid leaking byte-level timing.
-  if (!timingSafeEqualHex(sig, expected)) return "Invalid token signature";
-  return null;
+  // Constant-time compare against each active key; loop fully (no early exit)
+  // so timing doesn't reveal which key matched.
+  let ok = false;
+  for (const s of secrets) {
+    const expected = await hmacSha256Hex(`${roomId}.${expSec}`, s);
+    if (timingSafeEqualHex(sig, expected)) ok = true;
+  }
+  return ok ? null : "Invalid token signature";
 }
 
 async function hmacSha256Hex(data, secret) {
