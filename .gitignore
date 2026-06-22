@@ -65,6 +65,7 @@ mercury_*
 # duplicate the live android-native/ crate — never commit these)
 **/sassytalkie-android-native-build/
 sassytalkie-native-*.tar.gz
+ios-native.zip
 
 # Local test suites
 **/tests-local/
