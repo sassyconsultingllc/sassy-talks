@@ -70,6 +70,17 @@ object ControlFrame {
      */
     const val OP_WAKE: Byte          = 0x17
 
+    /** Hybrid PQC handshake (path a). INIT carries the initiator message
+     *  (X25519 pub || ML-KEM encaps key), RESP carries the responder message
+     *  (X25519 pub || ML-KEM ciphertext). Payload: [channel:u8][message bytes].
+     *  These are large (~1.2 KB) — send over a transport that carries big frames
+     *  (cellular relay / RFCOMM), not a small-MTU BLE GATT write. */
+    const val OP_HYBRID_INIT: Byte   = 0x1B
+    const val OP_HYBRID_RESP: Byte   = 0x1C
+
+    /** Capability bit advertised in the heartbeat caps byte: hybrid-PQC support. */
+    const val CAP_HYBRID_PQC: Int    = 0x01
+
     fun encodeLegacy(op: Byte): ByteArray = byteArrayOf(op)
 
     fun encodeTlv(op: Byte, payload: ByteArray): ByteArray {
@@ -150,6 +161,22 @@ object ControlFrame {
         val p = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
         p.putLong(epoch); p.putInt(endSeq)
         return encodeTlv(OP_PTT_STOP_V2, p.array())
+    }
+
+    /** Hybrid handshake frame: [channel:u8][message bytes]. Used for both
+     *  OP_HYBRID_INIT (initiator msg) and OP_HYBRID_RESP (responder msg). */
+    fun encodeHybridFrame(op: Byte, channel: Int, msg: ByteArray): ByteArray {
+        val p = ByteArray(1 + msg.size)
+        p[0] = (channel and 0xFF).toByte()
+        System.arraycopy(msg, 0, p, 1, msg.size)
+        return encodeTlv(op, p)
+    }
+
+    /** Parse a hybrid handshake payload → (channel, messageBytes), or null. */
+    fun parseHybridFrame(payload: ByteArray): Pair<Int, ByteArray>? {
+        if (payload.isEmpty()) return null
+        val channel = payload[0].toInt() and 0xFF
+        return channel to payload.copyOfRange(1, payload.size)
     }
 
     /** Wake beacon payload: [epoch:u64][senderTsMs:u64]. 16 bytes. */

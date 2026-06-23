@@ -1,5 +1,6 @@
 package com.sassyconsulting.sassytalkie
 
+import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -652,6 +653,8 @@ class PttCoordinator(
             ControlFrame.OP_PTT_STOP_V2 -> handlePttStopV2(peerId, frame.payload)
             ControlFrame.OP_EOT_ACK -> handleEotAck(peerId, frame.payload)
             ControlFrame.OP_WAKE -> handleWake(peerId, frame.payload)
+            ControlFrame.OP_HYBRID_INIT -> handleHybridInit(peerId, frame.payload)
+            ControlFrame.OP_HYBRID_RESP -> handleHybridResp(peerId, frame.payload)
             ControlFrame.OP_PARTNER_OFFLINE -> {
                 if (frame.payload.isNotEmpty()) {
                     val idLen = frame.payload[0].toInt() and 0xFF
@@ -742,6 +745,82 @@ class PttCoordinator(
         if (epochFlipped) {
             scope.launch { sendCapabilitiesToPeer(peerId) }
         }
+    }
+
+    // —— Hybrid PQC handshake (path a) — Phase 3 wire exchange ——
+    //
+    // The QR PSK already authenticates the pairing; this exchange layers an
+    // ephemeral X25519 + ML-KEM-768 handshake on top so the live session key
+    // gains forward secrecy + post-quantum protection. The native side does all
+    // the crypto (SassyTalkNative.hybridHandshake*); here we just carry the two
+    // ~1.2 KB messages between peers as OP_HYBRID_INIT / OP_HYBRID_RESP frames.
+    //
+    // CAUTION — pairwise vs group: the established key is shared by exactly the
+    // two handshaking peers and REPLACES the channel's group-PSK session, so it
+    // is only correct 2-party. Do NOT auto-start it on a channel with 3+ peers
+    // (a pairwise key would lock the others out). Group PQC = MLS, a later track.
+    // The reactive handlers below are always safe; only the INITIATOR action
+    // ([startHybridHandshake]) needs the 2-party + both-support guard, which the
+    // caller applies before invoking it. Default behavior is unchanged until a
+    // caller chooses to upgrade a 2-party session.
+
+    /** Responder side: a peer sent us OP_HYBRID_INIT. Establish the session and
+     *  reply with OP_HYBRID_RESP. Idempotent-ish — a duplicate INIT just re-keys. */
+    private fun handleHybridInit(peerId: String, payload: ByteArray) {
+        val (channel, initMsg) = ControlFrame.parseHybridFrame(payload) ?: run {
+            Log.w(TAG, "hybrid INIT from $peerId: malformed payload"); return
+        }
+        val initB64 = Base64.encodeToString(initMsg, Base64.NO_WRAP)
+        val respB64 = SassyTalkNative.hybridHandshakeRespond(channel, initB64)
+        if (respB64 == null) {
+            Log.w(TAG, "hybrid INIT from $peerId ch=$channel: respond failed (no PSK / bad msg)")
+            return
+        }
+        val respMsg = Base64.decode(respB64, Base64.NO_WRAP)
+        val frame = ControlFrame.encodeHybridFrame(ControlFrame.OP_HYBRID_RESP, channel, respMsg)
+        bleSignaling.sendControl(peerId, frame)
+        cellularClient?.sendBinary(frame)
+        Log.i(TAG, "hybrid handshake: responded to $peerId ch=$channel — PQ session installed")
+    }
+
+    /** Initiator side: the peer replied with OP_HYBRID_RESP. Complete + install. */
+    private fun handleHybridResp(peerId: String, payload: ByteArray) {
+        val (_, respMsg) = ControlFrame.parseHybridFrame(payload) ?: run {
+            Log.w(TAG, "hybrid RESP from $peerId: malformed payload"); return
+        }
+        val respB64 = Base64.encodeToString(respMsg, Base64.NO_WRAP)
+        if (SassyTalkNative.hybridHandshakeComplete(respB64)) {
+            Log.i(TAG, "hybrid handshake: completed with $peerId — PQ session installed")
+        } else {
+            Log.w(TAG, "hybrid handshake: complete failed with $peerId")
+        }
+    }
+
+    /**
+     * Initiator entry point: start a hybrid PQC upgrade with [peerId] on
+     * [channel]. Sends OP_HYBRID_INIT; the peer replies via OP_HYBRID_RESP and we
+     * finish in [handleHybridResp]. Returns true if the init frame was sent.
+     *
+     * The CALLER must ensure this is a 2-party session and that both sides
+     * advertise CAP_HYBRID_PQC (check `SassyTalkNative.localCapabilities()` and
+     * `liveness.peerCaps(peerId)`), and must pick a single initiator (e.g. the
+     * peer with the smaller stable id) to avoid a double handshake.
+     */
+    fun startHybridHandshake(peerId: String, channel: Int): Boolean {
+        if (SassyTalkNative.localCapabilities() and ControlFrame.CAP_HYBRID_PQC == 0) return false
+        if (liveness.peerCaps(peerId) and ControlFrame.CAP_HYBRID_PQC == 0) {
+            Log.d(TAG, "hybrid start skipped: $peerId doesn't advertise hybrid support")
+            return false
+        }
+        val initB64 = SassyTalkNative.hybridHandshakeInit(channel) ?: run {
+            Log.w(TAG, "hybrid start: init failed for ch=$channel (no PSK?)"); return false
+        }
+        val initMsg = Base64.decode(initB64, Base64.NO_WRAP)
+        val frame = ControlFrame.encodeHybridFrame(ControlFrame.OP_HYBRID_INIT, channel, initMsg)
+        bleSignaling.sendControl(peerId, frame)
+        cellularClient?.sendBinary(frame)
+        Log.i(TAG, "hybrid handshake: INIT sent to $peerId ch=$channel")
+        return true
     }
 
     // —— RECV_ACK — Receiver side (Task 4.2) ——
