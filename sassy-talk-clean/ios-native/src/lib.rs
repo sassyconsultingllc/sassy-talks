@@ -12,6 +12,7 @@ pub mod codec;
 pub mod protocol;
 pub mod state;
 pub mod transport;
+pub mod control;
 pub mod ffi;
 
 pub use audio::{AudioEngine, AudioFrame};
@@ -136,6 +137,47 @@ pub unsafe extern "C" fn sassytalkie_set_psk(key_b64: *const c_char) -> bool {
     false
 }
 
+/// Import a scanned QR session — the JSON an Android/desktop host generates.
+/// Switches to the QR's channel and installs its key, reusing the SHARED core
+/// validation so iOS accepts/rejects exactly the QRs Android does. Returns the
+/// channel (1-8) on success, or 0 on a malformed / expired QR. This is the
+/// cross-platform pairing entry point: scan a host's QR → encrypted audio flows.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_import_session_qr(qr_json: *const c_char) -> u8 {
+    let json = match ffi::helpers::c_string_to_rust(qr_json) {
+        Some(s) if !s.is_empty() => s,
+        _ => return 0,
+    };
+    if let Ok(g) = app_state().lock() {
+        if let Some(s) = g.as_ref() { return s.import_session_qr(&json).unwrap_or(0); }
+    }
+    0
+}
+
+/// Host a channel: mint a fresh session QR (the JSON another device scans) and
+/// install its key locally so the host can TX/RX on this channel too. Returns the
+/// QR JSON to render (free with sassytalkie_free_string), or null on failure.
+/// `group_name` may be null/empty ("Channel N"); duration clamps to 1..=72 h.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_generate_session_qr(
+    channel: u8,
+    duration_hours: u32,
+    group_name: *const c_char,
+) -> *mut c_char {
+    let group = ffi::helpers::c_string_to_rust(group_name).unwrap_or_default();
+    let json = {
+        let g = match app_state().lock() { Ok(g) => g, Err(_) => return std::ptr::null_mut() };
+        match g.as_ref().and_then(|s| s.generate_session_qr(channel, duration_hours, &group)) {
+            Some(j) => j,
+            None => return std::ptr::null_mut(),
+        }
+    };
+    match CString::new(json) {
+        Ok(c) => c.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Begin a classical X25519 key exchange. Returns our base64 public key (free
 /// with sassytalkie_free_string), or null. Complete with
 /// sassytalkie_key_exchange_complete.
@@ -214,6 +256,111 @@ pub unsafe extern "C" fn sassytalkie_hybrid_handshake_complete(resp_b64: *const 
     let resp_bytes = match decode_b64_arg(resp_b64) { Some(b) => b, None => return false };
     if let Ok(g) = app_state().lock() {
         if let Some(s) = g.as_ref() { return s.hybrid_complete(&resp_bytes); }
+    }
+    false
+}
+
+// ── Relay (Cloudflare WebSocket) FFI ────────────────────────────────────────
+// The WebSocket itself is owned by Swift (URLSessionWebSocketTask); these expose
+// the Rust crypto/queue bridge. Binary frames cross the C ABI as (ptr, len); the
+// caller MUST free a returned buffer with `sassytalkie_free_bytes`.
+
+/// Move a Vec<u8> across the C ABI as an owned buffer. `into_boxed_slice` forces
+/// capacity == length so `sassytalkie_free_bytes` can reconstruct it exactly.
+fn bytes_into_raw(v: Vec<u8>, out_len: *mut usize) -> *mut u8 {
+    let boxed = v.into_boxed_slice();
+    let len = boxed.len();
+    let ptr = Box::into_raw(boxed) as *mut u8;
+    unsafe { *out_len = len; }
+    ptr
+}
+
+/// Free a buffer returned by `sassytalkie_relay_poll_outbound` /
+/// `sassytalkie_relay_heartbeat_frame`.
+///
+/// # Safety
+/// `ptr`/`len` must be exactly a pair previously returned by those functions.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_free_bytes(ptr: *mut u8, len: usize) {
+    if ptr.is_null() { return; }
+    let slice = std::slice::from_raw_parts_mut(ptr, len);
+    let _ = Box::from_raw(slice as *mut [u8]);
+}
+
+/// The relay room id (= QR session_id) for the active session, or null if not
+/// paired. Free with `sassytalkie_free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_relay_room_id() -> *mut c_char {
+    let id = {
+        let g = match app_state().lock() { Ok(g) => g, Err(_) => return std::ptr::null_mut() };
+        match g.as_ref().and_then(|s| s.relay_room_id()) {
+            Some(r) => r,
+            None => return std::ptr::null_mut(),
+        }
+    };
+    CString::new(id).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// Mark the relay connected (true) / disconnected (false). While connected, TX
+/// frames are teed into the relay outbound queue for Swift to forward.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_relay_set_active(active: bool) {
+    if let Ok(g) = app_state().lock() {
+        if let Some(s) = g.as_ref() { s.set_relay_active(active); }
+    }
+}
+
+/// Drain one sealed audio frame to send over the WebSocket. Writes the length to
+/// `out_len` and returns a buffer (free with `sassytalkie_free_bytes`), or null
+/// when the queue is empty.
+///
+/// # Safety
+/// `out_len` must be a valid pointer to a usize.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_relay_poll_outbound(out_len: *mut usize) -> *mut u8 {
+    if out_len.is_null() { return std::ptr::null_mut(); }
+    *out_len = 0;
+    let frame = {
+        let g = match app_state().lock() { Ok(g) => g, Err(_) => return std::ptr::null_mut() };
+        match g.as_ref().and_then(|s| s.poll_relay_outbound()) {
+            Some(f) => f,
+            None => return std::ptr::null_mut(),
+        }
+    };
+    bytes_into_raw(frame, out_len)
+}
+
+/// Build the next OP_HEARTBEAT frame to send over the WebSocket (~every 2 s).
+/// Free with `sassytalkie_free_bytes`. Null only if not initialized.
+///
+/// # Safety
+/// `out_len` must be a valid pointer to a usize.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_relay_heartbeat_frame(out_len: *mut usize) -> *mut u8 {
+    if out_len.is_null() { return std::ptr::null_mut(); }
+    *out_len = 0;
+    let frame = {
+        let g = match app_state().lock() { Ok(g) => g, Err(_) => return std::ptr::null_mut() };
+        match g.as_ref() {
+            Some(s) => s.relay_heartbeat_frame(),
+            None => return std::ptr::null_mut(),
+        }
+    };
+    bytes_into_raw(frame, out_len)
+}
+
+/// Process a binary frame received from the relay WebSocket: decrypt + unpack +
+/// decode + play. Returns true if it was a playable audio frame for our channel
+/// (false = control/heartbeat from a peer, wrong channel, or not for us).
+///
+/// # Safety
+/// `ptr` must point to `len` valid bytes.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_relay_on_message(ptr: *const u8, len: usize) -> bool {
+    if ptr.is_null() || len == 0 { return false; }
+    let bytes = std::slice::from_raw_parts(ptr, len);
+    if let Ok(g) = app_state().lock() {
+        if let Some(s) = g.as_ref() { return s.process_relay_frame(bytes); }
     }
     false
 }

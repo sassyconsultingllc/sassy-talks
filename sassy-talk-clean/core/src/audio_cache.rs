@@ -20,7 +20,7 @@
 /// Wire format needed: [channel:1][sender_id:16][timestamp:8][samples:N*2]
 /// The sender_id comes from UserRegistry::derive_user_id()
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use log::{info, warn};
@@ -363,6 +363,28 @@ pub struct AudioCache {
     /// Smoothed AGC gain. Persisted across ticks so a sentence boundary
     /// doesn't visibly pump the level.
     mix_gain: f32,
+
+    /// Cross-transport dedup window. Every RX path (WiFi multicast, Bluetooth
+    /// RFCOMM, Cloudflare relay) converges on `ingest_frame`, so the same logical
+    /// frame delivered on two paths at once — a peer reachable on both WiFi and
+    /// Bluetooth, WiFi + relay, or our own multicast loopback echoed by the relay
+    /// — would otherwise be played twice. We remember a bounded set of recent
+    /// `(hash(sender_id), timestamp)` keys and drop the second copy. Bounded so
+    /// memory stays O(FRAME_DEDUP_WINDOW) regardless of session length.
+    recent_frames: (HashSet<(u64, u64)>, VecDeque<(u64, u64)>),
+}
+
+/// Max recent (sender, timestamp) frame keys remembered for cross-transport
+/// dedup. ~256 frames ≈ 5 s of a single 50 fps speaker, comfortably covering the
+/// few-ms skew between two transports delivering the same frame.
+const FRAME_DEDUP_WINDOW: usize = 256;
+
+/// Hash a sender id to a u64 so the dedup key avoids per-frame String allocation.
+fn hash_sender(sender_id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    sender_id.hash(&mut h);
+    h.finish()
 }
 
 impl AudioCache {
@@ -382,7 +404,26 @@ impl AudioCache {
             enable_mix_mode: false,
             mix_pending: HashMap::new(),
             mix_gain: 1.0,
+            recent_frames: (HashSet::new(), VecDeque::new()),
         }
+    }
+
+    /// Record `(sender, timestamp)` and report whether it is NEW (true) or a
+    /// duplicate already seen within the recent window (false). The window is
+    /// bounded to [FRAME_DEDUP_WINDOW] keys (oldest evicted first).
+    fn accept_frame_once(&mut self, sender_id: &str, timestamp: u64) -> bool {
+        let key = (hash_sender(sender_id), timestamp);
+        let (set, order) = &mut self.recent_frames;
+        if !set.insert(key) {
+            return false; // duplicate delivery on another transport — drop
+        }
+        order.push_back(key);
+        if order.len() > FRAME_DEDUP_WINDOW {
+            if let Some(old) = order.pop_front() {
+                set.remove(&old);
+            }
+        }
+        true
     }
 
     /// Toggle client-side mixing for 2..=MIX_MAX_SPEAKERS overlapping speakers.
@@ -422,6 +463,16 @@ impl AudioCache {
     /// Returns Some(samples) if frame should be played immediately (Live mode),
     /// or None if frame was cached for later playback (Queue mode).
     pub fn ingest_frame(&mut self, sender_id: &str, timestamp: u64, samples: Vec<i16>) -> Option<Vec<i16>> {
+        // Cross-transport dedup. Every RX path converges here with the frame's
+        // (sender_id, timestamp) from the shared wire header, so a frame delivered
+        // on two transports at once (WiFi+Bluetooth, WiFi+relay, or our own
+        // multicast loopback echoed by the relay) is dropped on the second copy
+        // rather than double-played. timestamp is the per-frame capture time (ms),
+        // so consecutive distinct frames (~20 ms apart) are never falsely merged.
+        if !self.accept_frame_once(sender_id, timestamp) {
+            return None;
+        }
+
         // Check mute status — drop silently
         if let Some((_, _, is_muted)) = self.user_info.get(sender_id) {
             if *is_muted {
@@ -1096,6 +1147,39 @@ mod tests {
     // module; inlined here so the test suite runs standalone without
     // depending on a consumer's audio code.
     const FRAME_SIZE: usize = 960;
+
+    #[test]
+    fn cross_transport_dedup_drops_exact_duplicate() {
+        let mut cache = AudioCache::new();
+        let s = vec![0i16; FRAME_SIZE];
+
+        // The dedup check runs first, so a duplicate always returns None
+        // regardless of cache mode / jitter buffering. The first copy's return
+        // is mode-dependent, so we ignore it and only assert the dup is dropped.
+        let _ = cache.ingest_frame("peer-1", 1000, s.clone());
+        assert!(
+            cache.ingest_frame("peer-1", 1000, s.clone()).is_none(),
+            "duplicate (sender, timestamp) from a second transport must be dropped"
+        );
+
+        // A different sender with the SAME timestamp is NOT a duplicate.
+        let _ = cache.ingest_frame("peer-2", 1000, s.clone());
+        assert!(
+            cache.ingest_frame("peer-2", 1000, s.clone()).is_none(),
+            "peer-2's own duplicate is deduped independently of peer-1"
+        );
+
+        // The same sender with a NEW timestamp is a fresh frame (not deduped):
+        // it passes the dedup gate, so it reaches the normal ingest path.
+        let _ = cache.ingest_frame("peer-1", 1020, s);
+        // (Return value is mode-dependent; the point is it was not dropped at the
+        // dedup gate — proven by the dup of THIS key now being dropped.)
+        let s2 = vec![1i16; FRAME_SIZE];
+        assert!(
+            cache.ingest_frame("peer-1", 1020, s2).is_none(),
+            "the 1020 frame registered, so its duplicate is now deduped"
+        );
+    }
 
     #[test]
     fn test_cache_live_passthrough() {

@@ -89,6 +89,18 @@ void sassytalkie_bt_clear_connected(void);
 /// After this, TX is AES-256-GCM encrypted and RX is decrypted + replay-checked.
 bool sassytalkie_set_psk(const char* _Nullable key_b64);
 
+/// Import a scanned QR session (the host's QR JSON). Switches to the QR's channel
+/// and installs its key, reusing the shared core validation (same accept/reject
+/// as Android). Returns the channel (1-8) on success, or 0 on a malformed/expired
+/// QR. The cross-platform pairing entry point.
+uint8_t sassytalkie_import_session_qr(const char* _Nullable qr_json);
+
+/// Host a channel: mint a fresh session QR (the JSON another device scans) and
+/// install its key locally so the host can TX/RX too. Returns the QR JSON to
+/// render (must free with sassytalkie_free_string), or NULL on failure.
+/// group_name may be NULL/empty; duration clamps to 1..=72 hours.
+char* _Nullable sassytalkie_generate_session_qr(uint8_t channel, uint32_t duration_hours, const char* _Nullable group_name);
+
 /// Begin a classical X25519 key exchange. Returns our base64 public key (must
 /// free with sassytalkie_free_string). Complete with the function below.
 char* _Nullable sassytalkie_key_exchange_init(void);
@@ -113,5 +125,31 @@ char* _Nullable sassytalkie_hybrid_handshake_respond(const char* _Nullable init_
 /// Initiator: complete with the peer's base64 responder message, installing the
 /// post-quantum session. Returns true on success.
 bool sassytalkie_hybrid_handshake_complete(const char* _Nullable resp_b64);
+
+// ── Relay (Cloudflare WebSocket) ──
+// The WebSocket is owned by Swift (URLSessionWebSocketTask); these bridge the
+// Rust crypto/queue. Binary frames cross as (ptr, len); free returned buffers
+// with sassytalkie_free_bytes.
+
+/// Relay room id (= QR session_id), or NULL if not paired (free with
+/// sassytalkie_free_string).
+char* _Nullable sassytalkie_relay_room_id(void);
+
+/// Mark the relay connected (true) / disconnected (false).
+void sassytalkie_relay_set_active(bool active);
+
+/// Drain one sealed audio frame to send over the WS. Returns a buffer and writes
+/// its length to out_len (free with sassytalkie_free_bytes), or NULL if empty.
+uint8_t* _Nullable sassytalkie_relay_poll_outbound(size_t* _Nonnull out_len);
+
+/// Build the next heartbeat frame to send over the WS (free with sassytalkie_free_bytes).
+uint8_t* _Nullable sassytalkie_relay_heartbeat_frame(size_t* _Nonnull out_len);
+
+/// Process a binary frame received from the relay WS. Returns true if it was
+/// playable audio for our channel.
+bool sassytalkie_relay_on_message(const uint8_t* _Nullable ptr, size_t len);
+
+/// Free a buffer returned by sassytalkie_relay_poll_outbound / _heartbeat_frame.
+void sassytalkie_free_bytes(uint8_t* _Nullable ptr, size_t len);
 
 #endif /* SassyTalkie_Bridging_Header_h */

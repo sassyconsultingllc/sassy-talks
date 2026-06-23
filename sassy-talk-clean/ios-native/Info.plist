@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.0</string>
+	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>UIApplicationSceneManifest</key>
@@ -51,6 +51,8 @@
 	<!-- Permissions -->
 	<key>NSMicrophoneUsageDescription</key>
 	<string>SassyTalkie needs microphone access for push-to-talk voice communication.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>SassyTalkie uses the camera to scan a channel's pairing QR code.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>SassyTalkie uses Bluetooth to discover and connect to nearby walkie-talkie peers.</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>

@@ -349,10 +349,22 @@ impl TransportManager {
 
     // ── Bluetooth operations (Kotlin-managed RFCOMM, Rust handles codec) ──
 
-    /// Called by Kotlin when BT RFCOMM connects
+    /// Called by Kotlin when BT RFCOMM connects.
+    ///
+    /// Bluetooth is the FALLBACK plane: it only takes the active audio slot when
+    /// no IP transport (WiFi multicast / relay) is carrying audio. Otherwise a BT
+    /// peer wandering into range while we're on WiFi would silently steal `active`
+    /// and stop WiFi TX, since `send()` routes by `active`. BT's own audio path
+    /// (Kotlin `btEncodeFrame`/`btDecodeFrame` pump) runs in parallel regardless
+    /// of this flag, so promoting it is unnecessary while an IP path is healthy —
+    /// and harmful, because it would knock IP peers off the air.
     pub fn on_bluetooth_connected(&mut self) {
-        info!("TransportManager: Bluetooth RFCOMM connected");
-        self.active = ActiveTransport::Bluetooth;
+        if self.active == ActiveTransport::None {
+            self.active = ActiveTransport::Bluetooth;
+            info!("TransportManager: Bluetooth RFCOMM connected — now the active path (no IP transport up)");
+        } else {
+            info!("TransportManager: Bluetooth RFCOMM connected — IP path still active, BT runs in parallel");
+        }
     }
 
     /// Called by Kotlin when BT RFCOMM disconnects

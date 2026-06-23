@@ -113,7 +113,7 @@ fun SettingsScreen(
                 text = "Settings",
                 fontSize = 24.sp,
                 fontWeight = FontWeight.Bold,
-                color = Orange
+                color = BrandPurpleLight
             )
 
             Spacer(modifier = Modifier.width(48.dp))
@@ -175,8 +175,8 @@ fun SettingsScreen(
                     valueRange = 0.25f..4.0f,
                     steps = 14, // 0.25, 0.5, 0.75, ..., 4.0
                     colors = SliderDefaults.colors(
-                        thumbColor = Orange,
-                        activeTrackColor = Orange,
+                        thumbColor = Teal,
+                        activeTrackColor = Teal,
                         inactiveTrackColor = SurfaceBg
                     )
                 )
@@ -222,8 +222,8 @@ fun SettingsScreen(
                         valueRange = -60f..-10f,
                         steps = 9, // -60, -55, ..., -10
                         colors = SliderDefaults.colors(
-                            thumbColor = Orange,
-                            activeTrackColor = Orange,
+                            thumbColor = Teal,
+                            activeTrackColor = Teal,
                             inactiveTrackColor = SurfaceBg
                         )
                     )
@@ -271,8 +271,8 @@ fun SettingsScreen(
                     valueRange = 0.25f..4.0f,
                     steps = 14,  // 0.25, 0.5, …, 4.0
                     colors = SliderDefaults.colors(
-                        thumbColor = Orange,
-                        activeTrackColor = Orange,
+                        thumbColor = Teal,
+                        activeTrackColor = Teal,
                         inactiveTrackColor = SurfaceBg,
                     ),
                 )
@@ -756,8 +756,8 @@ private fun SettingsToggle(
             checked = checked,
             onCheckedChange = onCheckedChange,
             colors = SwitchDefaults.colors(
-                checkedThumbColor = Orange,
-                checkedTrackColor = Orange.copy(alpha = 0.3f),
+                checkedThumbColor = Teal,
+                checkedTrackColor = Teal.copy(alpha = 0.3f),
                 uncheckedThumbColor = TextMuted,
                 uncheckedTrackColor = SurfaceBg
             )

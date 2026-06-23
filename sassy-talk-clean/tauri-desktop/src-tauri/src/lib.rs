@@ -212,6 +212,16 @@ impl AppState {
             .get_session_id(channel)
             .ok_or_else(|| "imported session has no session_id".to_string())?;
 
+        // Install the same PSK into the UDP/multicast transport so the LAN audio
+        // plane uses the shared core::wire + core::crypto path and interoperates
+        // with Android/iOS phones on the same WiFi — independent of, and before,
+        // the relay dial (so LAN works even if the relay is unreachable).
+        if let Some(psk) = sm.get_psk_for_channel(channel) {
+            self.transport.lock().await.set_session_psk(&psk);
+            self.current_channel.store(channel, Ordering::Relaxed);
+            self.transport.lock().await.set_channel(channel);
+        }
+
         // Replace any prior cellular session cleanly.
         self.leave_cellular().await;
 
@@ -221,6 +231,7 @@ impl AppState {
             peer_id: format!("{:08X}", self.device_id),
         };
         let cell = transport::CellularTransport::new(config, crypto);
+        cell.set_channel(channel); // stamp the right channel into relay wire frames
 
         // Await the first dial so auth/connect failures surface to the caller.
         cell.connect().await?;
@@ -448,8 +459,15 @@ impl AppState {
         let channel = channel.clamp(1, 16);
         self.current_channel.store(channel, Ordering::Relaxed);
 
-        let transport = self.transport.lock().await;
-        transport.set_channel(channel);
+        {
+            let transport = self.transport.lock().await;
+            transport.set_channel(channel);
+        }
+        // Keep the relay's wire-frame channel in sync so its payload stays
+        // byte-compatible with the phone after a channel change.
+        if let Some(cell) = self.cellular.lock().await.as_ref() {
+            cell.set_channel(channel);
+        }
     }
     
     /// Get audio devices

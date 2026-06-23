@@ -17,8 +17,11 @@
 ///   - **Keying**: the QR carries a random 32-byte AES key. Both peers load it
 ///     as a PSK (`sassytalkie_core::crypto::CryptoSession::from_psk`). The relay
 ///     room id is the QR's `session_id`.
-///   - **Audio frame**: `CryptoSession::encrypt(opus)` → `nonce(12) || ct || tag(16)`,
-///     sent as a single binary WS message. RX decrypts the same shape.
+///   - **Audio frame**: `CryptoSession::encrypt(core::wire::pack_wire_frame(..))`
+///     → `nonce(12) || ct || tag(16)`, sent as a single binary WS message. The
+///     plaintext under the seal is the SHARED wire frame (channel/sender/name/ts
+///     header + opus), byte-identical to what the Android phone pushes onto the
+///     relay. RX decrypts then `unpack_wire_frame` to recover the Opus.
 ///   - **Control frames**: opcode `0x10..=0x1F` with a valid TLV length are
 ///     non-audio (heartbeat, PTT markers, partner-offline, replay). They are
 ///     skipped on the audio path, exactly as the Kotlin client does.
@@ -43,6 +46,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use sassytalkie_core::crypto::CryptoSession;
+use sassytalkie_core::wire;
 
 use super::control;
 
@@ -124,6 +128,10 @@ pub struct CellularTransport {
     running: AtomicBool,
     state: AtomicU8,
 
+    /// Current channel, stamped into every outbound core::wire frame so the relay
+    /// payload matches the Android phone byte-for-byte. Synced via `set_channel`.
+    current_channel: AtomicU8,
+
     /// Heartbeat identity — epoch fixed per session, seq monotonic.
     session_epoch: u64,
     heartbeat_seq: AtomicU32,
@@ -148,6 +156,7 @@ impl CellularTransport {
             inbound_rx: Mutex::new(Some(inbound_rx)),
             running: AtomicBool::new(false),
             state: AtomicU8::new(CellularState::Disconnected as u8),
+            current_channel: AtomicU8::new(1),
             session_epoch: control::new_session_epoch(),
             heartbeat_seq: AtomicU32::new(0),
             packets_sent: AtomicU32::new(0),
@@ -338,11 +347,24 @@ impl CellularTransport {
             return;
         }
         match self.crypto.lock().unwrap().decrypt(&bytes) {
-            Ok(opus) => {
-                self.packets_received.fetch_add(1, Ordering::Relaxed);
-                // Unbounded send to the audio pipeline; only fails if the
-                // receiver was dropped (transport tearing down).
-                let _ = self.inbound_tx.send(opus);
+            Ok(plain) => {
+                // The decrypted bytes are a shared core::wire frame (header + opus),
+                // matching the Android relay payload. Unpack to recover the Opus
+                // for the decode pipeline; drop our own frame echoed by the relay.
+                match wire::unpack_wire_frame(&plain) {
+                    Ok((_ch, _sub, sender, _name, _ts, opus)) => {
+                        if sender == self.config.peer_id {
+                            return; // our own loopback
+                        }
+                        self.packets_received.fetch_add(1, Ordering::Relaxed);
+                        // Unbounded send to the audio pipeline; only fails if the
+                        // receiver was dropped (transport tearing down).
+                        let _ = self.inbound_tx.send(opus);
+                    }
+                    Err(e) => {
+                        debug!("Cellular: wire unpack failed ({} bytes): {}", plain.len(), e);
+                    }
+                }
             }
             Err(e) => {
                 // Wrong key, truncated frame, or a frame from a peer on another
@@ -350,6 +372,12 @@ impl CellularTransport {
                 debug!("Cellular: decrypt failed ({} bytes): {}", bytes.len(), e);
             }
         }
+    }
+
+    /// Update the channel stamped into outbound wire frames (kept in sync with
+    /// the UDP transport's channel by the caller).
+    pub fn set_channel(&self, channel: u8) {
+        self.current_channel.store(channel, Ordering::Relaxed);
     }
 
     fn encode_heartbeat(&self) -> Vec<u8> {
@@ -373,14 +401,26 @@ impl CellularTransport {
         if self.state() != CellularState::Connected {
             return Err("cellular not connected".to_string());
         }
-        let frame = self
+        // Seal the WHOLE core::wire frame (header + opus), matching the Android
+        // relay payload exactly — Android pushes the same `encrypt(pack_wire_frame)`
+        // bytes onto the relay. (Previously this sealed bare Opus, which an Android
+        // peer in the same room could decrypt but then failed to parse as a frame.)
+        let frame = wire::pack_wire_frame(
+            self.current_channel.load(Ordering::Relaxed),
+            wire::SUBCH_MAIN,
+            &self.config.peer_id,
+            &self.config.device_name,
+            wire::now_ms(),
+            opus,
+        );
+        let sealed = self
             .crypto
             .lock()
             .unwrap()
-            .encrypt(opus)
+            .encrypt(&frame)
             .map_err(|e| format!("encrypt failed: {}", e))?;
         self.outbound_tx
-            .send(frame)
+            .send(sealed)
             .map_err(|_| "outbound channel closed".to_string())?;
         self.packets_sent.fetch_add(1, Ordering::Relaxed);
         Ok(())

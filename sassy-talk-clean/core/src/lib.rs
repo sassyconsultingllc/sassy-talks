@@ -39,3 +39,7 @@ pub mod emergency;
 // `sealed` — metadata-resistant blinded room/peer handles so the relay sees
 // only rotating opaque tokens it cannot correlate to identity or across epochs.
 pub mod sealed;
+// `wire` — the audio data-plane frame (pack/unpack_wire_frame). Single shared
+// definition so iOS, Android, and desktop are byte-identical on the multicast
+// wire (previously lived only in android-native and could drift).
+pub mod wire;

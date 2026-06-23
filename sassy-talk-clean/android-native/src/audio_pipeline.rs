@@ -130,81 +130,14 @@ pub fn call_transcription_bridge_public(
     call_transcription_bridge(sender_id, device_name, pcm, is_favorite, is_muted, is_self);
 }
 
-/// Maximum sender ID length on the wire
-const MAX_SENDER_ID_LEN: usize = 32;
-
-/// Maximum device name length on the wire
-const MAX_DEVICE_NAME_LEN: usize = 64;
-
-/// Encapsulate an audio frame for transport over the wire.
-///
-/// Format: [channel:1][subchannel:1][sender_id_len:1][sender_id:N][name_len:1][device_name:M][timestamp:8][compressed_audio]
-/// subchannel: 0=Main, 1=A, 2=B
-pub fn pack_wire_frame(channel: u8, subchannel: u8, sender_id: &str, device_name: &str, timestamp: u64, compressed: &[u8]) -> Vec<u8> {
-    let id_bytes = sender_id.as_bytes();
-    let id_len = id_bytes.len().min(MAX_SENDER_ID_LEN);
-    let name_bytes = device_name.as_bytes();
-    let name_len = name_bytes.len().min(MAX_DEVICE_NAME_LEN);
-    let mut packet = Vec::with_capacity(2 + 1 + id_len + 1 + name_len + 8 + compressed.len());
-    packet.push(channel);
-    packet.push(subchannel);
-    packet.push(id_len as u8);
-    packet.extend_from_slice(&id_bytes[..id_len]);
-    packet.push(name_len as u8);
-    packet.extend_from_slice(&name_bytes[..name_len]);
-    packet.extend_from_slice(&timestamp.to_le_bytes());
-    packet.extend_from_slice(compressed);
-    packet
-}
-
-/// Parse a wire frame back into its components.
-///
-/// Returns (channel, subchannel, sender_id, device_name, timestamp, compressed_audio) or error.
-pub fn unpack_wire_frame(data: &[u8]) -> Result<(u8, u8, String, String, u64, Vec<u8>), String> {
-    // Minimum: channel(1) + subchannel(1) + id_len(1) + name_len(1) + timestamp(8) = 12
-    if data.len() < 12 {
-        return Err(format!("Wire frame too short: {} bytes", data.len()));
-    }
-
-    let channel = data[0];
-    let subchannel = data[1];
-    let id_len = data[2] as usize;
-
-    if id_len > MAX_SENDER_ID_LEN || data.len() < 3 + id_len + 1 {
-        return Err(format!("Invalid sender_id length: {}", id_len));
-    }
-
-    let sender_id = String::from_utf8_lossy(&data[3..3 + id_len]).to_string();
-
-    let name_len_offset = 3 + id_len;
-    let name_len = data[name_len_offset] as usize;
-
-    if name_len > MAX_DEVICE_NAME_LEN || data.len() < name_len_offset + 1 + name_len + 8 {
-        return Err(format!("Invalid device_name length: {}", name_len));
-    }
-
-    let name_start = name_len_offset + 1;
-    let device_name = String::from_utf8_lossy(&data[name_start..name_start + name_len]).to_string();
-
-    let ts_offset = name_start + name_len;
-    let timestamp = u64::from_le_bytes([
-        data[ts_offset], data[ts_offset + 1], data[ts_offset + 2], data[ts_offset + 3],
-        data[ts_offset + 4], data[ts_offset + 5], data[ts_offset + 6], data[ts_offset + 7],
-    ]);
-
-    let audio_offset = ts_offset + 8;
-    let compressed = data[audio_offset..].to_vec();
-
-    Ok((channel, subchannel, sender_id, device_name, timestamp, compressed))
-}
-
-/// Get current time in milliseconds since epoch
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+// The audio wire frame now lives in `sassytalkie-core` (core::wire) so iOS,
+// Android, and desktop stay byte-identical on the multicast wire — it used to be
+// defined only here, leaving the other consumers nothing to build against. The
+// format, bounds checks, and MAX_* limits moved verbatim; re-exported under the
+// original names so every call site (and test) in this crate is unchanged.
+pub use sassytalkie_core::wire::{
+    pack_wire_frame, unpack_wire_frame, now_ms, MAX_SENDER_ID_LEN, MAX_DEVICE_NAME_LEN,
+};
 
 /// Spawn the TX thread: captures mic audio, encodes, encrypts, and sends while PTT is held.
 ///

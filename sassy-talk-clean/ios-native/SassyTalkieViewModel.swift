@@ -21,6 +21,13 @@ class SassyTalkieViewModel: ObservableObject {
     @Published var isConnected: Bool = false
     @Published var statusText: String = "Initializing..."
     @Published var showingSettings: Bool = false
+    @Published var showingScanner: Bool = false
+    @Published var showingHostQR: Bool = false
+    /// The QR JSON to render when hosting a channel (nil unless hosting).
+    @Published var hostQRJSON: String? = nil
+    /// True once a QR session is installed — audio is encrypted (mandatory) and
+    /// cross-platform on the paired channel. Until then TX refuses to send.
+    @Published var isPaired: Bool = false
     
     var version: String {
         let cString = sassytalkie_get_version()
@@ -48,6 +55,50 @@ class SassyTalkieViewModel: ObservableObject {
     /// path (TX encrypts, RX decrypts + replay-checks).
     func setPsk(_ keyB64: String) -> Bool {
         return keyB64.withCString { sassytalkie_set_psk($0) }
+    }
+
+    /// Import a scanned QR session (the host's QR JSON). Switches to the QR's
+    /// channel and installs its key using the SAME validation as Android, so the
+    /// pairing is genuinely cross-platform. Returns the channel (1-8) on success,
+    /// 0 on a malformed/expired QR. After success, audio is AES-256-GCM encrypted
+    /// both ways and an Android peer on that channel can hear this device.
+    @discardableResult
+    func importSessionQR(_ json: String) -> Int {
+        let ch = json.withCString { Int(sassytalkie_import_session_qr($0)) }
+        if ch > 0 {
+            DispatchQueue.main.async {
+                self.channel = UInt8(ch)
+                self.isPaired = true
+                self.showingScanner = false
+                self.statusText = "Paired · ch \(ch)"
+                // Bring up the relay for remote peers (room id was just set by
+                // the import). Local WiFi peers already work via multicast.
+                self.relayClient.connect()
+            }
+        }
+        return ch
+    }
+
+    /// Host the current channel: mint a fresh QR (installs our own key so the host
+    /// is paired too) and publish the JSON to render for a joiner to scan. The QR
+    /// is cross-platform — an Android device can scan it to join the same channel.
+    func hostChannel(durationHours: UInt32 = 24, groupName: String = "") {
+        let ch = channel
+        let json: String? = groupName.withCString { gp in
+            guard let c = sassytalkie_generate_session_qr(ch, durationHours, gp) else { return nil }
+            defer { sassytalkie_free_string(c) }
+            return String(cString: c)
+        }
+        if let json = json {
+            DispatchQueue.main.async {
+                self.isPaired = true
+                self.hostQRJSON = json
+                self.showingHostQR = true
+                self.statusText = "Hosting · ch \(ch)"
+                // Host the relay room too so remote joiners can reach us.
+                self.relayClient.connect()
+            }
+        }
     }
 
     /// This build's capability bitmap (hybrid-PQC support).
@@ -93,6 +144,9 @@ class SassyTalkieViewModel: ObservableObject {
     // MARK: - Private Properties
 
     private let audioManager = AudioManager()
+    /// Cloudflare relay client for remote peers. Auto-joins on pairing (mirrors
+    /// Android's AutoConnectManager bringing the relay up alongside WiFi).
+    private let relayClient = RelayClient()
     private var stateTimer: Timer?
     
     // MARK: - Initialization
@@ -119,6 +173,7 @@ class SassyTalkieViewModel: ObservableObject {
     
     deinit {
         stateTimer?.invalidate()
+        relayClient.disconnect()
         sassytalkie_shutdown()
     }
     

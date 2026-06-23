@@ -189,7 +189,9 @@ fun MainScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(DarkBg)
+            // Subtle slate radial wash (BgMedium center → BgDark edge) to mirror
+            // the Tauri desktop background's depth instead of a flat fill.
+            .background(Brush.radialGradient(listOf(BgMedium, BgDark)))
             .safeDrawingPadding()
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
@@ -500,7 +502,7 @@ fun MainScreen(
                         SassyTalkNative.setSubchannel(idx)
                     },
                     colors = ButtonDefaults.textButtonColors(
-                        contentColor = if (selected) Orange else TextMuted
+                        contentColor = if (selected) Teal else TextMuted
                     )
                 ) {
                     Text(
@@ -520,8 +522,8 @@ fun MainScreen(
                 checked = pttHoldMode,
                 onCheckedChange = { pttHoldMode = it },
                 colors = SwitchDefaults.colors(
-                    checkedThumbColor = Orange,
-                    checkedTrackColor = Orange.copy(alpha = 0.3f),
+                    checkedThumbColor = Teal,
+                    checkedTrackColor = Teal.copy(alpha = 0.3f),
                     uncheckedThumbColor = TextMuted,
                     uncheckedTrackColor = SurfaceBg
                 ),
@@ -905,7 +907,7 @@ private fun ChannelSelector(
                     text = "%02d".format(channel),
                     fontSize = 48.sp,
                     fontWeight = FontWeight.Bold,
-                    color = Cyan
+                    color = TealLight
                 )
             }
 
@@ -945,9 +947,16 @@ private fun PTTButton(
     onPressStart: () -> Unit,
     onPressEnd: () -> Unit
 ) {
-    val buttonColor = if (isTransmitting) Orange else SurfaceBg
-    val ringColor = if (isTransmitting) Orange else if (dimmed) TextMuted else Cyan
-    val innerColor = if (isTransmitting) OrangeLight else CardBg
+    // Gradient fill to match the Tauri desktop PTT: teal→purple (GradientCool)
+    // idle, coral→purple (GradientWarm) while transmitting. Was a flat single-
+    // color fill, which is why the Android PTT read as "unchanged" vs desktop.
+    val buttonBrush = if (isTransmitting) {
+        Brush.linearGradient(GradientWarm)
+    } else {
+        Brush.linearGradient(GradientCool)
+    }
+    val ringColor = if (isTransmitting) Coral else if (dimmed) TextMuted else Teal
+    val innerColor = if (isTransmitting) CoralLight else BgCard
 
     Box(
         contentAlignment = Alignment.Center,
@@ -978,7 +987,7 @@ private fun PTTButton(
                 .size(240.dp)
                 .clip(CircleShape)
                 .border(8.dp, ringColor, CircleShape)
-                .background(buttonColor)
+                .background(buttonBrush)
                 .pointerInteropFilter { event ->
                     if (!enabled) return@pointerInteropFilter false
                     when (event.action) {

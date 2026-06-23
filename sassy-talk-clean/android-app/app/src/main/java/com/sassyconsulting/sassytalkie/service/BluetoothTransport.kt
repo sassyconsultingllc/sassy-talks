@@ -425,7 +425,19 @@ class BluetoothTransport(private val context: Context) {
             output = socket.outputStream
         )
 
-        connectedPeers[addr] = peer
+        // Dedup the symmetric-connect race. BLE discovery fires on BOTH peers, so
+        // each may dial RFCOMM at the same instant: our outgoing connectTo() and
+        // their connection landing on our accept thread can both reach this method
+        // for the same address. putIfAbsent picks one winner atomically; the loser
+        // closes its socket and bails. The previous `connectedPeers[addr] = peer`
+        // overwrote the entry, leaking the first socket + its RX thread and
+        // double-playing every received frame.
+        val existing = connectedPeers.putIfAbsent(addr, peer)
+        if (existing != null) {
+            Log.i(TAG, "Duplicate RFCOMM link to ${device.name ?: addr} — closing late socket")
+            try { socket.close() } catch (_: IOException) {}
+            return
+        }
         peerCount.set(connectedPeers.size)
         refreshState()
 

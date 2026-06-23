@@ -4,11 +4,17 @@
 /// Same approach as desktop version
 
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
+
+// Shared cross-platform AEAD session (AES-256-GCM, `nonce||ct||tag` wire format).
+// The transport seals the WHOLE serialized packet with this — byte-for-byte the
+// same layer android-native seals at — so encrypted audio interops cross-platform.
+use crate::crypto::CryptoSession;
 
 /// Multicast address
 pub const MULTICAST_ADDR: &str = "239.255.42.42";
@@ -32,6 +38,12 @@ pub enum TransportError {
     
     #[error("Serialization error: {0}")]
     SerializationError(String),
+
+    #[error("Crypto error: {0}")]
+    Crypto(String),
+
+    #[error("Encryption required: authenticate via QR code first")]
+    NotEncrypted,
 }
 
 /// Peer information
@@ -49,7 +61,26 @@ pub struct TransportManager {
     socket: Arc<Mutex<Option<Socket>>>,
     multicast_addr: SocketAddr,
     peers: Arc<Mutex<HashMap<u32, PeerInfo>>>,
+    /// Active channel encryption session. `None` until a QR session is imported
+    /// (or a PSK installed); while `None`, `send` refuses and `receive` drops, so
+    /// the app physically cannot move cleartext audio. Mirrors android-native's
+    /// single-active-session model — the channel byte lives inside the sealed
+    /// frame, so channel switching re-installs the session for the new channel.
+    crypto: Arc<Mutex<Option<CryptoSession>>>,
+
+    /// Relay (Cloudflare WebSocket) outbound mirror. When the relay is connected
+    /// (`relay_active`), every sealed audio frame that goes out on multicast is
+    /// ALSO queued here for the Swift `RelayClient` to drain and send over the WS
+    /// — byte-identical to the multicast frame, exactly as android-native pushes
+    /// the same sealed `payload` onto both WiFi and the cellular relay. The Swift
+    /// side owns the socket; Rust just bridges frames + crypto.
+    relay_active: Arc<AtomicBool>,
+    relay_outbound: Arc<Mutex<VecDeque<Vec<u8>>>>,
 }
+
+/// Cap on buffered relay frames if Swift stalls draining — drop oldest (stale
+/// audio replayed late is worse than a gap for a walkie).
+const RELAY_OUTBOUND_CAP: usize = 256;
 
 impl TransportManager {
     /// Create new transport manager
@@ -63,7 +94,59 @@ impl TransportManager {
             socket: Arc::new(Mutex::new(None)),
             multicast_addr,
             peers: Arc::new(Mutex::new(HashMap::new())),
+            crypto: Arc::new(Mutex::new(None)),
+            relay_active: Arc::new(AtomicBool::new(false)),
+            relay_outbound: Arc::new(Mutex::new(VecDeque::new())),
         })
+    }
+
+    /// Mark the relay connected/disconnected. While active, `send` tees every
+    /// sealed frame into the relay outbound queue for Swift to forward.
+    pub fn set_relay_active(&self, active: bool) {
+        self.relay_active.store(active, Ordering::SeqCst);
+        if !active {
+            self.relay_outbound.lock().unwrap().clear();
+        }
+    }
+
+    /// Drain one queued sealed frame for the Swift RelayClient to send over the
+    /// WebSocket. Returns `None` when the queue is empty.
+    pub fn poll_relay_outbound(&self) -> Option<Vec<u8>> {
+        self.relay_outbound.lock().unwrap().pop_front()
+    }
+
+    /// Decrypt + return the plaintext wire frame of a sealed relay datagram
+    /// received over the WebSocket. `None` if there is no session or the frame
+    /// fails authentication. (The caller then `unpack_wire_frame`s it.)
+    pub fn open_sealed(&self, sealed: &[u8]) -> Option<Vec<u8>> {
+        let guard = self.crypto.lock().unwrap();
+        guard.as_ref().and_then(|c| c.decrypt(sealed).ok())
+    }
+
+    /// Install the active channel's encryption session. One session is active at
+    /// a time; switching channels re-installs the session for the newly-selected
+    /// channel (the channel byte lives INSIDE the sealed frame, so a receiver
+    /// can't pick a per-channel key before decrypting — identical to Android).
+    pub fn set_crypto(&self, session: CryptoSession) {
+        *self.crypto.lock().unwrap() = Some(session);
+        log::info!("Transport: encryption enabled");
+    }
+
+    /// Install encryption directly from a 32-byte pre-shared key.
+    pub fn set_psk(&self, key: &[u8; 32]) {
+        *self.crypto.lock().unwrap() = Some(CryptoSession::from_psk(key));
+        log::info!("Transport: PSK encryption enabled");
+    }
+
+    /// Whether an encryption session is currently installed.
+    pub fn is_encrypted(&self) -> bool {
+        self.crypto.lock().unwrap().is_some()
+    }
+
+    /// Tear down the active session (disconnect / logout). After this, `send`
+    /// refuses and `receive` drops until a new session is installed.
+    pub fn clear_crypto(&self) {
+        *self.crypto.lock().unwrap() = None;
     }
     
     /// Start transport
@@ -91,24 +174,64 @@ impl TransportManager {
         *self.socket.lock().unwrap() = None;
     }
     
-    /// Send packet
+    /// Send packet. SECURITY: refuses to transmit cleartext — the whole
+    /// serialized packet is sealed (`nonce||ct||tag`) with the active channel's
+    /// `CryptoSession`, byte-for-byte the same framing android-native produces,
+    /// so encrypted audio interops cross-platform. Returns `NotEncrypted` when no
+    /// session is installed (authenticate via QR first).
     pub fn send(&self, data: &[u8]) -> Result<(), TransportError> {
+        // MANDATORY ENCRYPTION. Seal first, releasing the crypto lock before
+        // taking the socket lock; receive() locks in the opposite order, so
+        // never holding both at once keeps the two deadlock-free.
+        let payload = {
+            let mut guard = self.crypto.lock().unwrap();
+            match guard.as_mut() {
+                Some(crypto) => crypto.encrypt(data).map_err(TransportError::Crypto)?,
+                None => return Err(TransportError::NotEncrypted),
+            }
+        };
+
+        // Tee the identical sealed frame to the relay (when connected) so remote
+        // peers get the same bytes as local multicast peers. Mirrors android's
+        // dual-path send (wifi + cellular get the same sealed payload).
+        if self.relay_active.load(Ordering::SeqCst) {
+            let mut q = self.relay_outbound.lock().unwrap();
+            q.push_back(payload.clone());
+            while q.len() > RELAY_OUTBOUND_CAP {
+                q.pop_front();
+            }
+        }
+
         let socket = self.socket.lock().unwrap();
         if let Some(sock) = socket.as_ref() {
-            sock.send_to(data, &self.multicast_addr.into())?;
+            sock.send_to(&payload, &self.multicast_addr.into())?;
         }
         Ok(())
     }
-    
-    /// Receive packet
+
+    /// Receive packet. SECURITY: drops anything that isn't a valid frame under
+    /// the active session. Unencrypted, tampered, or replayed packets surface as
+    /// `WouldBlock` (the RX loop treats that as "no data"), and with no session
+    /// installed ALL inbound data is dropped. Mirrors android-native.
     pub fn receive(&self, buffer: &mut [u8]) -> Result<(usize, SocketAddr), TransportError> {
-        let socket = self.socket.lock().unwrap();
-        if let Some(sock) = socket.as_ref() {
-            // socket2 0.5 takes &mut [MaybeUninit<u8>]. The caller's &mut [u8] is
-            // already initialized, so this cast is sound; recv_from writes `size`
-            // valid bytes that the caller reads back from `buffer` (same memory).
+        // 1) Pull the raw datagram into an oversized scratch buffer — the wire
+        //    frame carries a 12-byte nonce + 16-byte GCM tag over the plaintext.
+        //    Scope the socket lock so it drops before we lock crypto (opposite
+        //    order from send(), so the pair can't deadlock).
+        let mut raw = vec![0u8; buffer.len() + 64];
+        let (size, addr) = {
+            let socket = self.socket.lock().unwrap();
+            let sock = match socket.as_ref() {
+                Some(s) => s,
+                None => return Err(TransportError::IoError(
+                    std::io::Error::new(std::io::ErrorKind::NotConnected, "Socket not initialized")
+                )),
+            };
+            // socket2 0.5 takes &mut [MaybeUninit<u8>]; `raw` is already
+            // initialized so the cast is sound, and recv_from writes `size`
+            // valid bytes we read back from the same memory.
             let buf_uninit: &mut [std::mem::MaybeUninit<u8>] = unsafe {
-                &mut *(buffer as *mut [u8] as *mut [std::mem::MaybeUninit<u8>])
+                &mut *(raw.as_mut_slice() as *mut [u8] as *mut [std::mem::MaybeUninit<u8>])
             };
             match sock.recv_from(buf_uninit) {
                 Ok((size, addr)) => {
@@ -118,19 +241,35 @@ impl TransportManager {
                             std::io::Error::new(std::io::ErrorKind::Other, "Invalid address")
                         )),
                     };
-                    Ok((size, socket_addr))
+                    (size, socket_addr)
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    Err(TransportError::IoError(
+                    return Err(TransportError::IoError(
                         std::io::Error::new(std::io::ErrorKind::WouldBlock, "No data")
-                    ))
+                    ));
                 }
-                Err(e) => Err(TransportError::IoError(e)),
+                Err(e) => return Err(TransportError::IoError(e)),
             }
-        } else {
-            Err(TransportError::IoError(
-                std::io::Error::new(std::io::ErrorKind::NotConnected, "Socket not initialized")
-            ))
+        };
+
+        // 2) MANDATORY DECRYPTION. Drop unencrypted / tampered / replayed frames
+        //    (surfaced as WouldBlock so the RX loop just keeps polling).
+        let guard = self.crypto.lock().unwrap();
+        let crypto = match guard.as_ref() {
+            Some(c) => c,
+            None => return Err(TransportError::IoError(
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, "No session — dropped")
+            )),
+        };
+        match crypto.decrypt(&raw[..size]) {
+            Ok(plaintext) => {
+                let copy_len = plaintext.len().min(buffer.len());
+                buffer[..copy_len].copy_from_slice(&plaintext[..copy_len]);
+                Ok((copy_len, addr))
+            }
+            Err(_) => Err(TransportError::IoError(
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, "Decrypt failed — dropped")
+            )),
         }
     }
     

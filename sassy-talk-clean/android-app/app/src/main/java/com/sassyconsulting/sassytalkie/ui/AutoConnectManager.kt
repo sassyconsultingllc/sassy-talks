@@ -42,6 +42,10 @@ class AutoConnectManager(private val context: Context) {
         // staring at a spinner forever; long enough that nRF/BLE SCAN_RSP
         // round-trips can finish in normal RF conditions.
         private const val BT_PEER_DISCOVERY_TIMEOUT_MS = 6_000L
+        // While degraded (Bluetooth-only / nothing), how often to re-probe for a
+        // returning WiFi/relay path. Long enough not to thrash the radios, short
+        // enough that recovery feels automatic.
+        private const val DEGRADED_RETRY_MS = 12_000L
     }
 
     private fun wifiEnabledPref(): Boolean =
@@ -85,6 +89,10 @@ class AutoConnectManager(private val context: Context) {
     // `var` not `val` so disconnect()/shutdown() can replace it after a
     // full cancel — see notes in shutdown() below.
     private var scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // While we're on Bluetooth-only / fully degraded, this loop keeps probing for
+    // a returning WiFi/relay path so we auto-upgrade the moment service is back.
+    private var degradedRetryJob: Job? = null
 
     private fun hasWifi(): Boolean {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -278,7 +286,95 @@ class AutoConnectManager(private val context: Context) {
     }
 
     /**
-     * Register a NetworkCallback to detect WiFi loss and auto-failover to cellular.
+     * Reflect Bluetooth as the surviving transport when no IP path is up. BT runs
+     * continuously (started at service bind), so this just checks whether it has —
+     * or finds within a short window — at least one peer, and if so promotes the
+     * UI/notification to "Connected via Bluetooth". Returns true when BT is
+     * carrying us.
+     */
+    private suspend fun reflectBluetoothFallback(): Boolean {
+        if (!bluetoothEnabledPref()) return false
+        var peers = btPeerCount(walkieServiceRef)
+        if (peers == 0) {
+            _statusText.value = "Searching for Bluetooth peers..."
+            val deadline = System.currentTimeMillis() + BT_PEER_DISCOVERY_TIMEOUT_MS
+            while (System.currentTimeMillis() < deadline) {
+                peers = btPeerCount(walkieServiceRef)
+                if (peers > 0) break
+                kotlinx.coroutines.delay(500)
+            }
+        }
+        if (peers > 0) {
+            activeTransport = "bluetooth"
+            _state.value = ConnectState.CONNECTED
+            _statusText.value = "Connected via Bluetooth"
+            walkieServiceRef?.updateNotification("Radio active — Bluetooth")
+            Log.i(TAG, "Bluetooth fallback active ($peers peer(s) in range)")
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Try to (re)establish the best IP transport on top of whatever is currently
+     * active (e.g. Bluetooth-only or none): WiFi multicast first, then the relay.
+     * This is what auto-switches us back from Bluetooth once signal/service
+     * returns. No-op if neither is reachable — Bluetooth keeps carrying audio.
+     */
+    private suspend fun upgradeToBestIp() {
+        if (wifiEnabledPref() && hasWifi()) {
+            walkieServiceRef?.acquireMulticastLock()
+            if (SassyTalkNative.connectWifiMulticast()) {
+                val relayOk = cellularClient?.isConnected() == true ||
+                    (relayEnabledPref() && connectCellularSilent(walkieServiceRef))
+                activeTransport = if (relayOk) "both" else "wifi"
+                val label = if (relayOk) "WiFi + Relay" else "WiFi"
+                _state.value = ConnectState.CONNECTED
+                _statusText.value = "Connected — $label"
+                walkieServiceRef?.updateNotification("Radio active — $label")
+                Log.i(TAG, "Upgraded to WiFi (activeTransport=$activeTransport)")
+                stopDegradedRetry()
+                return
+            }
+            walkieServiceRef?.releaseMulticastLock()
+        }
+        // WiFi unavailable/failed — try the relay on its own.
+        if (relayEnabledPref() && connectCellularSilent(walkieServiceRef)) {
+            activeTransport = "cellular"
+            _state.value = ConnectState.CONNECTED
+            _statusText.value = "Connected via Cloudflare Relay"
+            walkieServiceRef?.updateNotification("Radio active — Cloudflare Relay")
+            Log.i(TAG, "Upgraded to relay (no WiFi)")
+            stopDegradedRetry()
+        }
+    }
+
+    /**
+     * While degraded (Bluetooth-only or nothing), keep probing for a returning
+     * WiFi/relay path so we auto-upgrade even when no ConnectivityManager event
+     * fires (e.g. WiFi stayed "available" but multicast had failed, or service
+     * flaps). Stops itself once an IP transport is restored.
+     */
+    private fun startDegradedRetry() {
+        if (degradedRetryJob?.isActive == true) return
+        degradedRetryJob = scope.launch {
+            while (activeTransport == "bluetooth" || activeTransport == "none") {
+                kotlinx.coroutines.delay(DEGRADED_RETRY_MS)
+                if (activeTransport == "bluetooth" || activeTransport == "none") {
+                    upgradeToBestIp()
+                }
+            }
+        }
+    }
+
+    private fun stopDegradedRetry() {
+        degradedRetryJob?.cancel()
+        degradedRetryJob = null
+    }
+
+    /**
+     * Register a NetworkCallback to detect WiFi loss and auto-failover (relay →
+     * Bluetooth) and auto-recovery when service returns.
      */
     private fun registerNetworkCallback() {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -298,19 +394,32 @@ class AutoConnectManager(private val context: Context) {
                     _state.value = ConnectState.CONNECTED
                     _statusText.value = "Connected via Cloudflare Relay"
                     walkieServiceRef?.updateNotification("Radio active \u2014 Cloudflare Relay")
-                } else if (activeTransport == "wifi") {
-                    // WiFi-only mode lost — try to connect relay
-                    Log.w(TAG, "WiFi lost, no relay — attempting reconnect")
+                } else if (activeTransport == "wifi" || activeTransport == "cellular" || activeTransport == "none") {
+                    // Lost our (only) IP path. Relay needs internet; if that's gone too
+                    // (true signal loss → obsolescence) we fall back to Bluetooth below.
+                    Log.w(TAG, "IP path lost — relay then Bluetooth fallback chain")
                     activeTransport = "none"
                     walkieServiceRef?.releaseMulticastLock()
                     _statusText.value = "Reconnecting..."
 
                     scope.launch {
-                        val ok = connectCellular(walkieServiceRef)
-                        if (!ok) {
-                            Log.e(TAG, "Relay fallback failed after WiFi loss")
+                        // Relay needs internet; if it's gone too (true obsolescence),
+                        // fall back to Bluetooth, which needs no infrastructure. Keep a
+                        // retry running either way so WiFi/relay auto-restore on return.
+                        val relayOk = relayEnabledPref() && connectCellularSilent(walkieServiceRef)
+                        if (relayOk) {
+                            activeTransport = "cellular"
+                            _state.value = ConnectState.CONNECTED
+                            _statusText.value = "Connected via Cloudflare Relay"
+                            walkieServiceRef?.updateNotification("Radio active \u2014 Cloudflare Relay")
+                        } else if (reflectBluetoothFallback()) {
+                            // BT is carrying us now; keep trying to restore IP.
+                            startDegradedRetry()
+                        } else {
+                            Log.e(TAG, "All transports down after signal loss")
                             _state.value = ConnectState.FAILED
                             _statusText.value = "Disconnected \u2014 tap to retry"
+                            startDegradedRetry()
                         }
                     }
                 }
@@ -318,19 +427,11 @@ class AutoConnectManager(private val context: Context) {
 
             override fun onAvailable(network: Network) {
                 Log.d(TAG, "Network available — activeTransport=$activeTransport")
-                // If we were relay-only and WiFi came back, reconnect multicast
-                if (activeTransport == "cellular" && hasWifi()) {
-                    scope.launch {
-                        walkieServiceRef?.acquireMulticastLock()
-                        val wifiOk = SassyTalkNative.connectWifiMulticast()
-                        if (wifiOk) {
-                            activeTransport = "both"
-                            _state.value = ConnectState.CONNECTED
-                            _statusText.value = "Connected \u2014 WiFi + Relay"
-                            walkieServiceRef?.updateNotification("Radio active \u2014 WiFi + Relay")
-                            Log.i(TAG, "WiFi restored, dual transport active")
-                        }
-                    }
+                // Connectivity (re)appeared. If we're not already on the richest local
+                // path, upgrade: WiFi multicast first, then relay. This is what auto-
+                // switches us back from Bluetooth-only or relay-only once service returns.
+                if (activeTransport != "wifi" && activeTransport != "both") {
+                    scope.launch { upgradeToBestIp() }
                 }
             }
 
@@ -378,6 +479,7 @@ class AutoConnectManager(private val context: Context) {
 
     fun disconnect() {
         unregisterNetworkCallback()
+        stopDegradedRetry()
         walkieServiceRef?.pttCoordinator?.cellularClient = null
         cellularClient?.disconnect()
         cellularClient = null

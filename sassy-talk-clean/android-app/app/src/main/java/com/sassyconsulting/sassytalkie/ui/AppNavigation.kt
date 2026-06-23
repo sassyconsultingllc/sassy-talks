@@ -83,7 +83,7 @@ fun AppNavigation(
                     text = "Permissions Required",
                     fontSize = 24.sp,
                     fontWeight = FontWeight.Bold,
-                    color = Orange
+                    color = Teal
                 )
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
@@ -95,7 +95,7 @@ fun AppNavigation(
                 Spacer(modifier = Modifier.height(32.dp))
                 Button(
                     onClick = onRequestPermissions,
-                    colors = ButtonDefaults.buttonColors(containerColor = Orange),
+                    colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
                     shape = RoundedCornerShape(25.dp),
                     modifier = Modifier.height(52.dp).width(220.dp)
                 ) {
@@ -266,7 +266,7 @@ fun AppNavigation(
                 }
             } else {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    CircularProgressIndicator(color = Orange)
+                    CircularProgressIndicator(color = Teal)
                     Spacer(modifier = Modifier.height(16.dp))
                     Text(
                         text = "Starting radio...",

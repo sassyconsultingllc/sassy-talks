@@ -14,6 +14,13 @@ use super::control;
 use crate::constants::{DEFAULT_MULTICAST_ADDR, DEFAULT_MULTICAST_PORT, PORT_RANGE_START, PORT_RANGE_END, KEEPALIVE_INTERVAL_SECS};
 use crate::protocol::{Packet, PacketType};
 use crate::security::CryptoEngine;
+// Shared cross-platform crypto + audio wire frame. The desktop audio plane now
+// matches Android/iOS: the WHOLE core::wire frame is sealed with the QR-PSK
+// CryptoSession (AES-256-GCM, nonce||ct||tag) and multicast on the shared group,
+// instead of the legacy per-peer X25519 ECDH + bincode Packet path (kept only as
+// a desktop↔desktop fallback when no QR session is installed).
+use sassytalkie_core::crypto::CryptoSession;
+use sassytalkie_core::wire;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -42,7 +49,11 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             multicast_addr: DEFAULT_MULTICAST_ADDR.to_string(),
-            use_random_port: true,  // Default to random port for security
+            // MUST be the shared fixed port (5555) to interoperate with the
+            // Android/iOS phones — UDP multicast delivery is port-specific, so a
+            // random port silently isolates the desktop from the phone group.
+            // App-layer AES-256-GCM is the security boundary, not port obscurity.
+            use_random_port: false,
             fixed_port: DEFAULT_MULTICAST_PORT,
             encryption_enabled: true,  // Default to encrypted
         }
@@ -109,8 +120,17 @@ pub struct TransportManager {
     // Peer tracking
     peers: Arc<RwLock<HashMap<u32, PeerInfo>>>,
     
-    // Encryption engines per peer
+    // Encryption engines per peer (legacy desktop↔desktop X25519 ECDH path).
     crypto_engines: Arc<RwLock<HashMap<u32, CryptoEngine>>>,
+
+    // Shared GROUP session installed from the QR PSK (core::crypto). When present
+    // this is the canonical audio cipher: the whole core::wire frame is sealed
+    // with it and multicast to the group, byte-identical to Android/iOS. `None`
+    // until a QR session is imported (then the legacy per-peer path is bypassed).
+    group_crypto: Arc<RwLock<Option<CryptoSession>>>,
+
+    // Stable per-install sender id placed in every core::wire frame (<= 32 bytes).
+    sender_id: String,
     
     // Our public key for sharing
     our_public_key: Arc<RwLock<Option<[u8; 32]>>>,
@@ -216,6 +236,8 @@ impl TransportManager {
             config: Arc::new(RwLock::new(config)),
             peers: Arc::new(RwLock::new(HashMap::new())),
             crypto_engines: Arc::new(RwLock::new(HashMap::new())),
+            group_crypto: Arc::new(RwLock::new(None)),
+            sender_id: format!("desk-{:08x}", device_id),
             our_public_key: Arc::new(RwLock::new(Some(our_public))),
             identity: Arc::new(crypto),
             running: Arc::new(AtomicBool::new(false)),
@@ -391,6 +413,8 @@ impl TransportManager {
         let config = Arc::clone(&self.config);
         let liveness_rx = Arc::clone(&self.liveness);
         let identity_rx = Arc::clone(&self.identity);
+        let group_crypto_rx = Arc::clone(&self.group_crypto);
+        let sender_id_rx = self.sender_id.clone();
 
         // Dedicated OS thread, NOT a tokio task: recv_from on the socket2 socket
         // is a blocking syscall (the socket is non-blocking, so it returns
@@ -410,6 +434,32 @@ impl TransportManager {
                         let received = unsafe {
                             std::slice::from_raw_parts(buf.as_ptr() as *const u8, size)
                         };
+
+                        // ── Cross-platform GROUP audio plane (Android/iOS) ──
+                        // With a QR session PSK installed, a datagram that decrypts
+                        // under it (valid GCM tag) IS a shared core::wire frame.
+                        // Try this FIRST: sealed audio has a random first byte and
+                        // would otherwise be misclassified as a control frame. The
+                        // 128-bit GCM tag makes false positives (a legacy/control
+                        // frame "decrypting") astronomically unlikely.
+                        let group_plain = {
+                            let guard = group_crypto_rx.read().unwrap();
+                            match guard.as_ref() {
+                                Some(crypto) => crypto.decrypt(received).ok(),
+                                None => None,
+                            }
+                        };
+                        if let Some(plain) = group_plain {
+                            if let Ok((_ch, _sub, sender, _name, _ts, opus)) =
+                                wire::unpack_wire_frame(&plain)
+                            {
+                                // Skip our own multicast loopback.
+                                if sender != sender_id_rx {
+                                    let _ = audio_tx.send(opus);
+                                }
+                            }
+                            continue;
+                        }
 
                         // Control frames have first byte >= 0x10; handle before Packet deserialize
                         if received.first().copied().unwrap_or(0) >= 0x10 {
@@ -656,10 +706,49 @@ impl TransportManager {
         info!("Stopping transport manager");
         self.running.store(false, Ordering::Relaxed);
     }
-    
+
+    /// Install the shared GROUP session key (the QR PSK), switching the audio
+    /// plane to the cross-platform `core::wire` + `core::crypto` path. After this,
+    /// `send_audio` seals whole wire frames with this key and multicasts them, and
+    /// the RX loop decrypts inbound group frames — byte-identical to Android/iOS.
+    pub fn set_session_psk(&self, key: &[u8; 32]) {
+        *self.group_crypto.write().unwrap() = Some(CryptoSession::from_psk(key));
+        info!("Transport: group session installed (core::wire audio plane active)");
+    }
+
     /// Send audio data (with encryption if enabled)
     pub fn send_audio(&self, audio_data: &[u8]) -> Result<(), TransportError> {
         let channel = *self.current_channel.read().unwrap();
+
+        // ── Cross-platform GROUP path (matches Android/iOS) ──
+        // With a QR session PSK installed, seal the WHOLE core::wire frame with the
+        // group CryptoSession and multicast ONE copy to the group — byte-identical
+        // to the Android/iOS multicast audio plane. Bypasses the legacy per-peer
+        // X25519 path entirely.
+        let group_sealed = {
+            let mut guard = self.group_crypto.write().unwrap();
+            match guard.as_mut() {
+                Some(crypto) => {
+                    let frame = wire::pack_wire_frame(
+                        channel,
+                        wire::SUBCH_MAIN,
+                        &self.sender_id,
+                        &self.device_name,
+                        wire::now_ms(),
+                        audio_data,
+                    );
+                    Some(crypto.encrypt(&frame).map_err(TransportError::EncryptionError)?)
+                }
+                None => None,
+            }
+        };
+        if let Some(sealed) = group_sealed {
+            self.socket
+                .send_to(&sealed, &self.multicast_addr.into())
+                .map_err(TransportError::IoError)?;
+            return Ok(());
+        }
+
         let encryption_enabled = self.config.read().unwrap().encryption_enabled;
 
         if !encryption_enabled {

@@ -1,8 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- Slate chrome to match the Tauri desktop reference + Compose Theme.kt
+         (status/nav = DarkerBg #0B1120, window = BgDark #0F172A). -->
     <style name="Theme.SassyTalk" parent="android:Theme.Material.NoActionBar">
-        <item name="android:statusBarColor">#12121F</item>
-        <item name="android:navigationBarColor">#12121F</item>
-        <item name="android:windowBackground">#1A1A2E</item>
+        <item name="android:statusBarColor">#0B1120</item>
+        <item name="android:navigationBarColor">#0B1120</item>
+        <item name="android:windowBackground">#0F172A</item>
     </style>
 </resources>

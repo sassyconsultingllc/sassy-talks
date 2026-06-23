@@ -19,6 +19,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -78,7 +80,7 @@ fun QRAuthScreen(
             text = "Authenticate",
             fontSize = 24.sp,
             fontWeight = FontWeight.Bold,
-            color = Orange
+            color = Teal
         )
 
         Spacer(modifier = Modifier.height(2.dp))
@@ -111,29 +113,29 @@ fun QRAuthScreen(
         ScrollableTabRow(
             selectedTabIndex = selectedTab,
             containerColor = CardBg,
-            contentColor = Orange,
+            contentColor = Teal,
             edgePadding = 0.dp,
             modifier = Modifier.clip(RoundedCornerShape(12.dp))
         ) {
             Tab(
                 selected = selectedTab == 0,
                 onClick = { selectedTab = 0 },
-                text = { Text("Show QR", color = if (selectedTab == 0) Orange else TextGray, fontSize = 12.sp) }
+                text = { Text("Show QR", color = if (selectedTab == 0) Teal else TextGray, fontSize = 12.sp) }
             )
             Tab(
                 selected = selectedTab == 1,
                 onClick = { selectedTab = 1 },
-                text = { Text("Scan QR", color = if (selectedTab == 1) Orange else TextGray, fontSize = 12.sp) }
+                text = { Text("Scan QR", color = if (selectedTab == 1) Teal else TextGray, fontSize = 12.sp) }
             )
             Tab(
                 selected = selectedTab == 2,
                 onClick = { selectedTab = 2 },
-                text = { Text("Enter Code", color = if (selectedTab == 2) Orange else TextGray, fontSize = 12.sp) }
+                text = { Text("Enter Code", color = if (selectedTab == 2) Teal else TextGray, fontSize = 12.sp) }
             )
             Tab(
                 selected = selectedTab == 3,
                 onClick = { selectedTab = 3 },
-                text = { Text("My Cohorts", color = if (selectedTab == 3) Orange else TextGray, fontSize = 12.sp) }
+                text = { Text("My Cohorts", color = if (selectedTab == 3) Teal else TextGray, fontSize = 12.sp) }
             )
         }
 
@@ -380,7 +382,7 @@ private fun ShowQRTab(
                                 )
                             },
                             colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = Orange,
+                                selectedContainerColor = Teal,
                                 containerColor = SurfaceBg
                             ),
                             modifier = Modifier
@@ -402,11 +404,11 @@ private fun ShowQRTab(
             singleLine = true,
             placeholder = { Text("Group name (optional)", color = TextMuted) },
             colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = Orange,
+                focusedBorderColor = Teal,
                 unfocusedBorderColor = CardBg,
                 focusedTextColor = TextWhite,
                 unfocusedTextColor = TextWhite,
-                cursorColor = Orange,
+                cursorColor = Teal,
                 focusedContainerColor = SurfaceBg,
                 unfocusedContainerColor = SurfaceBg
             ),
@@ -444,11 +446,15 @@ private fun ShowQRTab(
         // Generate button
         Button(
             onClick = onGenerate,
-            colors = ButtonDefaults.buttonColors(containerColor = Orange),
+            colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
             shape = RoundedCornerShape(25.dp),
             modifier = Modifier
                 .fillMaxWidth()
                 .height(44.dp)
+                // Teal→blue gradient CTA (GradientAccent), matching the Tauri
+                // desktop "Find Devices"/primary action; transparent container
+                // lets the gradient show through the Material button surface.
+                .background(Brush.linearGradient(GradientAccent), RoundedCornerShape(25.dp))
         ) {
             Icon(Icons.Default.QrCode2, contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(modifier = Modifier.width(6.dp))
@@ -744,11 +750,11 @@ private fun EnterCodeTab(
                 .heightIn(min = 120.dp),
             placeholder = { Text("Paste session code here...", color = TextMuted) },
             colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = Orange,
+                focusedBorderColor = Teal,
                 unfocusedBorderColor = CardBg,
                 focusedTextColor = TextWhite,
                 unfocusedTextColor = TextWhite,
-                cursorColor = Orange,
+                cursorColor = Teal,
                 focusedContainerColor = SurfaceBg,
                 unfocusedContainerColor = SurfaceBg
             ),
@@ -792,11 +798,12 @@ private fun EnterCodeTab(
                     onAuthenticated()
                 }
             },
-            colors = ButtonDefaults.buttonColors(containerColor = Orange),
+            colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
             shape = RoundedCornerShape(25.dp),
             modifier = Modifier
                 .fillMaxWidth()
-                .height(56.dp),
+                .height(56.dp)
+                .background(Brush.linearGradient(GradientAccent), RoundedCornerShape(25.dp)),
             enabled = codeText.isNotBlank()
         ) {
             Icon(Icons.Default.VpnKey, contentDescription = null)
