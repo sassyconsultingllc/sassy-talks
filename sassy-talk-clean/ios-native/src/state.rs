@@ -79,6 +79,8 @@ pub struct StateMachine {
     psk: Arc<Mutex<Option<[u8; 32]>>>,
     // Pending path-(a) hybrid handshake (initiator side), between init & complete.
     pending_hybrid: Arc<Mutex<Option<crate::pqc::PskHybridInitiator>>>,
+    // Pending classical X25519 key exchange, between init & complete.
+    pending_key_exchange: Arc<Mutex<Option<crate::crypto::KeyExchange>>>,
 }
 
 impl StateMachine {
@@ -114,7 +116,34 @@ impl StateMachine {
             crypto: Arc::new(Mutex::new(None)),
             psk: Arc::new(Mutex::new(None)),
             pending_hybrid: Arc::new(Mutex::new(None)),
+            pending_key_exchange: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Begin a classical X25519 key exchange. Returns our public key bytes to
+    /// send to the peer; finish with `key_exchange_complete`.
+    pub fn key_exchange_init(&self) -> Vec<u8> {
+        let kx = crate::crypto::KeyExchange::new();
+        let pubkey = kx.public_key_bytes().to_vec();
+        *self.pending_key_exchange.lock().unwrap() = Some(kx);
+        pubkey
+    }
+
+    /// Complete the classical key exchange with the peer's public key, installing
+    /// the AEAD session. Returns false if there's no pending exchange.
+    pub fn key_exchange_complete(&self, remote_pub: &[u8; 32]) -> bool {
+        let kx = match self.pending_key_exchange.lock().unwrap().take() {
+            Some(k) => k,
+            None => return false,
+        };
+        match kx.complete(remote_pub) {
+            Ok(session) => {
+                *self.crypto.lock().unwrap() = Some(session);
+                info!("Crypto: X25519 session installed");
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     // ── Crypto / key agreement (mirrors android-native's JNI crypto seam) ──

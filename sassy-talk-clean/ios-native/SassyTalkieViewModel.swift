@@ -55,6 +55,18 @@ class SassyTalkieViewModel: ObservableObject {
         return sassytalkie_local_capabilities()
     }
 
+    /// Begin a classical X25519 key exchange. Returns our base64 public key, or nil.
+    func keyExchangeInit() -> String? {
+        guard let c = sassytalkie_key_exchange_init() else { return nil }
+        defer { sassytalkie_free_string(c) }
+        return String(cString: c)
+    }
+
+    /// Complete the classical key exchange with the peer's base64 public key.
+    func keyExchangeComplete(_ remoteB64: String) -> Bool {
+        return remoteB64.withCString { sassytalkie_key_exchange_complete($0) }
+    }
+
     /// Initiator: begin a path-(a) hybrid PQC handshake. Returns the base64
     /// initiator message to send to the peer, or nil if no PSK is installed.
     func hybridHandshakeInit() -> String? {

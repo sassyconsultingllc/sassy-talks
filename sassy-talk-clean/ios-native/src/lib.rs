@@ -136,6 +136,35 @@ pub unsafe extern "C" fn sassytalkie_set_psk(key_b64: *const c_char) -> bool {
     false
 }
 
+/// Begin a classical X25519 key exchange. Returns our base64 public key (free
+/// with sassytalkie_free_string), or null. Complete with
+/// sassytalkie_key_exchange_complete.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_key_exchange_init() -> *mut c_char {
+    let pubkey = {
+        let g = match app_state().lock() { Ok(g) => g, Err(_) => return std::ptr::null_mut() };
+        match g.as_ref() {
+            Some(s) => s.key_exchange_init(),
+            None => return std::ptr::null_mut(),
+        }
+    };
+    encode_b64_cstring(&pubkey)
+}
+
+/// Complete the classical key exchange with the peer's base64 public key,
+/// installing the AEAD session. Returns true on success.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_key_exchange_complete(remote_b64: *const c_char) -> bool {
+    let bytes = match decode_b64_arg(remote_b64) { Some(b) => b, None => return false };
+    if bytes.len() != 32 { return false; }
+    let mut remote = [0u8; 32];
+    remote.copy_from_slice(&bytes);
+    if let Ok(g) = app_state().lock() {
+        if let Some(s) = g.as_ref() { return s.key_exchange_complete(&remote); }
+    }
+    false
+}
+
 /// This build's capability bitmap (hybrid-PQC support) — same value Android
 /// advertises in its heartbeat caps byte.
 #[no_mangle]

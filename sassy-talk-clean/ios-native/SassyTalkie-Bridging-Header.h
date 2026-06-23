@@ -89,6 +89,14 @@ void sassytalkie_bt_clear_connected(void);
 /// After this, TX is AES-256-GCM encrypted and RX is decrypted + replay-checked.
 bool sassytalkie_set_psk(const char* _Nullable key_b64);
 
+/// Begin a classical X25519 key exchange. Returns our base64 public key (must
+/// free with sassytalkie_free_string). Complete with the function below.
+char* _Nullable sassytalkie_key_exchange_init(void);
+
+/// Complete the classical key exchange with the peer's base64 public key,
+/// installing the AEAD session. Returns true on success.
+bool sassytalkie_key_exchange_complete(const char* _Nullable remote_b64);
+
 /// This build's capability bitmap (hybrid-PQC support) — same value Android
 /// advertises in its heartbeat caps byte.
 uint8_t sassytalkie_local_capabilities(void);
