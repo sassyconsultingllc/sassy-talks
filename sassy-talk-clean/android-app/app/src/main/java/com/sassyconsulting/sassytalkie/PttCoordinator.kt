@@ -688,6 +688,10 @@ class PttCoordinator(
         liveness.onHeartbeat(peerId, hb.epoch, hb.seq, hb.tsMs, nowMs, hb.caps)
         liveness.updatePresence(peerId, hb.state)
 
+        // Opportunistically upgrade a 2-party session to post-quantum (path a).
+        // We now know this peer's caps + epoch, which is everything the gate needs.
+        maybeAutoHybridHandshake(peerId, hb.epoch)
+
         val health = liveness.health(peerId, nowMs)
         val rtt = liveness.rttMs(peerId)
         Log.d(TAG, "HB from $peerId seq=${hb.seq} epoch=${hb.epoch} state=${hb.state} health=$health rtt=${rtt}ms")
@@ -763,6 +767,59 @@ class PttCoordinator(
     // ([startHybridHandshake]) needs the 2-party + both-support guard, which the
     // caller applies before invoking it. Default behavior is unchanged until a
     // caller chooses to upgrade a 2-party session.
+
+    /**
+     * Master switch for AUTO-upgrading a 2-party session to PQC. The reactive
+     * responder/completer always work; this only governs whether THIS device
+     * initiates unprompted. On a wip branch we default it on so it's live on real
+     * hardware; a caller can flip it off. Note the pairwise-key constraint below.
+     */
+    @Volatile var hybridPqcAuto: Boolean = true
+
+    /** Tracks the (peer → peer-epoch) we've already auto-handshaked, so we
+     *  initiate at most once per peer session and re-handshake only on restart. */
+    private val hybridHandshakeEpoch = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * Auto-initiate a hybrid PQC upgrade with [peerId] (whose session epoch is
+     * [peerEpoch]) when ALL of these hold:
+     *   - the feature is enabled ([hybridPqcAuto]),
+     *   - both sides advertise CAP_HYBRID_PQC,
+     *   - exactly one other peer is active (2-party — a pairwise key would lock
+     *     out a 3+ group on the shared channel),
+     *   - WE are the deterministic initiator: the smaller session epoch starts,
+     *     so of the two peers exactly one fires (epochs are random 64-bit, ties
+     *     are negligible),
+     *   - we haven't already handshaked this peer at this epoch.
+     *
+     * CAVEAT (production hardening): install is per-side — the responder installs
+     * on RESP, the initiator on completing. If the RESP frame is lost the two can
+     * diverge until the next epoch/re-pair; a robust rollout adds an ACK/retry or
+     * a 3-way confirm. The crypto itself is verified (core pqc tests).
+     */
+    private fun maybeAutoHybridHandshake(peerId: String, peerEpoch: Long) {
+        if (!hybridPqcAuto) return
+        if (SassyTalkNative.localCapabilities() and ControlFrame.CAP_HYBRID_PQC == 0) return
+        if (liveness.peerCaps(peerId) and ControlFrame.CAP_HYBRID_PQC == 0) return
+
+        // 2-party only: count currently-active (non-stale) peers.
+        val now = System.currentTimeMillis()
+        val activePeers = liveness.peerIds().count { liveness.health(it, now) != PeerHealth.STALE }
+        if (activePeers != 1) return
+
+        // Deterministic single initiator: the smaller epoch starts.
+        if (selfEpoch >= peerEpoch) return
+
+        // Once per (peer, peerEpoch).
+        if (hybridHandshakeEpoch[peerId] == peerEpoch) return
+        hybridHandshakeEpoch[peerId] = peerEpoch
+
+        Log.i(TAG, "auto-hybrid: initiating PQC upgrade with $peerId (selfEpoch=$selfEpoch < peerEpoch=$peerEpoch)")
+        if (!startHybridHandshake(peerId, SassyTalkNative.getChannel())) {
+            // Failed to send (no PSK / caps gone) — clear so we retry next HB.
+            hybridHandshakeEpoch.remove(peerId)
+        }
+    }
 
     /** Responder side: a peer sent us OP_HYBRID_INIT. Establish the session and
      *  reply with OP_HYBRID_RESP. Idempotent-ish — a duplicate INIT just re-keys. */
