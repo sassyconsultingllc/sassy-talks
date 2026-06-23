@@ -42,8 +42,44 @@ class SassyTalkieViewModel: ObservableObject {
         }
     }
     
+    // MARK: - Crypto / PQC (parity with Android SassyTalkNative)
+
+    /// Install the QR pre-shared key (base64). Enables AES-256-GCM on the audio
+    /// path (TX encrypts, RX decrypts + replay-checks).
+    func setPsk(_ keyB64: String) -> Bool {
+        return keyB64.withCString { sassytalkie_set_psk($0) }
+    }
+
+    /// This build's capability bitmap (hybrid-PQC support).
+    func localCapabilities() -> UInt8 {
+        return sassytalkie_local_capabilities()
+    }
+
+    /// Initiator: begin a path-(a) hybrid PQC handshake. Returns the base64
+    /// initiator message to send to the peer, or nil if no PSK is installed.
+    func hybridHandshakeInit() -> String? {
+        guard let c = sassytalkie_hybrid_handshake_init() else { return nil }
+        defer { sassytalkie_free_string(c) }
+        return String(cString: c)
+    }
+
+    /// Responder: install the session from the peer's base64 initiator message
+    /// and return the base64 responder message to send back, or nil on failure.
+    func hybridHandshakeRespond(_ initB64: String) -> String? {
+        return initB64.withCString { initPtr -> String? in
+            guard let c = sassytalkie_hybrid_handshake_respond(initPtr) else { return nil }
+            defer { sassytalkie_free_string(c) }
+            return String(cString: c)
+        }
+    }
+
+    /// Initiator: complete with the peer's base64 reply, installing the PQ session.
+    func hybridHandshakeComplete(_ respB64: String) -> Bool {
+        return respB64.withCString { sassytalkie_hybrid_handshake_complete($0) }
+    }
+
     // MARK: - Private Properties
-    
+
     private let audioManager = AudioManager()
     private var stateTimer: Timer?
     

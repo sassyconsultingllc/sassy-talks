@@ -83,4 +83,27 @@ bool sassytalkie_bt_set_connected(const char* _Nullable id);
 /// Clear the active BLE connection
 void sassytalkie_bt_clear_connected(void);
 
+// ── Crypto / key agreement (shared core — parity with Android) ──
+
+/// Install a pre-shared key (QR session key) from base64 (32 bytes decoded).
+/// After this, TX is AES-256-GCM encrypted and RX is decrypted + replay-checked.
+bool sassytalkie_set_psk(const char* _Nullable key_b64);
+
+/// This build's capability bitmap (hybrid-PQC support) — same value Android
+/// advertises in its heartbeat caps byte.
+uint8_t sassytalkie_local_capabilities(void);
+
+/// Begin a hybrid PQC handshake. Returns base64 initiator message (must free with
+/// sassytalkie_free_string), or NULL if no PSK is installed / not initialized.
+char* _Nullable sassytalkie_hybrid_handshake_init(void);
+
+/// Responder: given the peer's base64 initiator message, install the session and
+/// return the base64 responder message (must free with sassytalkie_free_string),
+/// or NULL on failure.
+char* _Nullable sassytalkie_hybrid_handshake_respond(const char* _Nullable init_b64);
+
+/// Initiator: complete with the peer's base64 responder message, installing the
+/// post-quantum session. Returns true on success.
+bool sassytalkie_hybrid_handshake_complete(const char* _Nullable resp_b64);
+
 #endif /* SassyTalkie_Bridging_Header_h */

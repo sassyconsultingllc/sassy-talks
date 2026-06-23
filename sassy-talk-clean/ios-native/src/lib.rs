@@ -19,10 +19,36 @@ pub use codec::{OpusEncoder, OpusDecoder};
 pub use protocol::{Packet, PacketType};
 pub use state::{StateMachine, AppState};
 
+// Shared cross-platform crypto/session/PQC from the core crate — the SAME engine
+// Android (android-native re-exports these) and desktop use. iOS previously had
+// NO crypto; these bring it to parity. Re-exported as crate::{crypto, pqc,
+// session} so the FFI/state code reads identically to the other platforms.
+pub use sassytalkie_core::crypto;
+pub use sassytalkie_core::pqc;
+pub use sassytalkie_core::session;
+
 use std::os::raw::{c_char, c_void};
 use std::ffi::{CStr, CString};
 use std::sync::{Mutex, OnceLock};
 use log::info;
+use base64::Engine as _;
+
+/// Base64-decode a C string argument to bytes, or None on null/invalid input.
+unsafe fn decode_b64_arg(p: *const c_char) -> Option<Vec<u8>> {
+    if p.is_null() { return None; }
+    let s = CStr::from_ptr(p).to_str().ok()?;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
+}
+
+/// Base64-encode bytes into a freshly-allocated C string (free with
+/// sassytalkie_free_string), mirroring the JNI handshake return values.
+fn encode_b64_cstring(bytes: &[u8]) -> *mut c_char {
+    let s = base64::engine::general_purpose::STANDARD.encode(bytes);
+    match CString::new(s) {
+        Ok(c) => c.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -91,6 +117,76 @@ pub unsafe extern "C" fn sassytalkie_free_string(s: *mut c_char) {
     if !s.is_null() {
         let _ = CString::from_raw(s);
     }
+}
+
+// ── Crypto / key agreement FFI (mirrors android-native's JNI crypto seam) ──
+
+/// Install a pre-shared key (the QR session key) from base64. Returns true on
+/// success. After this, TX frames are AES-256-GCM encrypted and RX frames are
+/// decrypted (+ replay-checked).
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_set_psk(key_b64: *const c_char) -> bool {
+    let bytes = match decode_b64_arg(key_b64) { Some(b) => b, None => return false };
+    if bytes.len() != 32 { return false; }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    if let Ok(g) = app_state().lock() {
+        if let Some(s) = g.as_ref() { s.set_psk(&key); return true; }
+    }
+    false
+}
+
+/// This build's capability bitmap (hybrid-PQC support) — same value Android
+/// advertises in its heartbeat caps byte.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_local_capabilities() -> u8 {
+    if let Ok(g) = app_state().lock() {
+        if let Some(s) = g.as_ref() { return s.local_capabilities(); }
+    }
+    0
+}
+
+/// Initiator: begin a path-(a) PSK-authenticated hybrid handshake. Returns the
+/// base64 initiator message (free with sassytalkie_free_string), or null if no
+/// PSK is installed / not initialized.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_hybrid_handshake_init() -> *mut c_char {
+    let msg = {
+        let g = match app_state().lock() { Ok(g) => g, Err(_) => return std::ptr::null_mut() };
+        match g.as_ref().and_then(|s| s.hybrid_init()) {
+            Some(m) => m,
+            None => return std::ptr::null_mut(),
+        }
+    };
+    encode_b64_cstring(&msg)
+}
+
+/// Responder: given the peer's base64 initiator message, install the session and
+/// return the base64 responder message (free with sassytalkie_free_string), or
+/// null on failure.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_hybrid_handshake_respond(init_b64: *const c_char) -> *mut c_char {
+    let init_bytes = match decode_b64_arg(init_b64) { Some(b) => b, None => return std::ptr::null_mut() };
+    let resp = {
+        let g = match app_state().lock() { Ok(g) => g, Err(_) => return std::ptr::null_mut() };
+        match g.as_ref().and_then(|s| s.hybrid_respond(&init_bytes)) {
+            Some(r) => r,
+            None => return std::ptr::null_mut(),
+        }
+    };
+    encode_b64_cstring(&resp)
+}
+
+/// Initiator: complete with the peer's base64 responder message, installing the
+/// post-quantum session. Returns true on success. Must follow a
+/// sassytalkie_hybrid_handshake_init on this device.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_hybrid_handshake_complete(resp_b64: *const c_char) -> bool {
+    let resp_bytes = match decode_b64_arg(resp_b64) { Some(b) => b, None => return false };
+    if let Ok(g) = app_state().lock() {
+        if let Some(s) = g.as_ref() { return s.hybrid_complete(&resp_bytes); }
+    }
+    false
 }
 
 /// Set current channel

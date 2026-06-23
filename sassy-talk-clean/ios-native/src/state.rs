@@ -68,6 +68,17 @@ pub struct StateMachine {
     is_transmitting: Arc<AtomicBool>,
     should_stop_tx: Arc<AtomicBool>,
     should_stop_rx: Arc<AtomicBool>,
+
+    // ── Crypto (shared core — parity with Android) ──
+    // Active AEAD session: TX encrypts each Opus frame, RX decrypts. One session
+    // serves both directions (group-PSK model: every peer derives the same key
+    // via from_psk and draws its own random nonce prefix). None = not yet paired
+    // (sends/accepts plaintext until a PSK or handshake installs a session).
+    crypto: Arc<Mutex<Option<crate::crypto::CryptoSession>>>,
+    // The QR pre-shared key, kept so the hybrid PQC handshake can mix it in.
+    psk: Arc<Mutex<Option<[u8; 32]>>>,
+    // Pending path-(a) hybrid handshake (initiator side), between init & complete.
+    pending_hybrid: Arc<Mutex<Option<crate::pqc::PskHybridInitiator>>>,
 }
 
 impl StateMachine {
@@ -100,7 +111,73 @@ impl StateMachine {
             is_transmitting: Arc::new(AtomicBool::new(false)),
             should_stop_tx: Arc::new(AtomicBool::new(false)),
             should_stop_rx: Arc::new(AtomicBool::new(false)),
+            crypto: Arc::new(Mutex::new(None)),
+            psk: Arc::new(Mutex::new(None)),
+            pending_hybrid: Arc::new(Mutex::new(None)),
         })
+    }
+
+    // ── Crypto / key agreement (mirrors android-native's JNI crypto seam) ──
+
+    /// Install a pre-shared key (the QR session key). Sets the active AEAD
+    /// session and remembers the PSK so a later hybrid handshake can mix it in.
+    pub fn set_psk(&self, key: &[u8; 32]) {
+        *self.psk.lock().unwrap() = Some(*key);
+        *self.crypto.lock().unwrap() = Some(crate::crypto::CryptoSession::from_psk(key));
+        info!("Crypto: PSK session installed");
+    }
+
+    /// Replace the active AEAD session (e.g. with a key-exchange / hybrid result).
+    pub fn set_crypto_session(&self, session: crate::crypto::CryptoSession) {
+        *self.crypto.lock().unwrap() = Some(session);
+    }
+
+    /// This build's capability bitmap (hybrid-PQC support) — same value Android
+    /// advertises in its heartbeat.
+    pub fn local_capabilities(&self) -> u8 {
+        crate::pqc::local_capabilities()
+    }
+
+    /// Initiator: begin a path-(a) PSK-authenticated hybrid handshake. Returns the
+    /// initiator message bytes to send, or None if no PSK is installed.
+    pub fn hybrid_init(&self) -> Option<Vec<u8>> {
+        let psk = (*self.psk.lock().unwrap())?;
+        let initiator = crate::pqc::PskHybridInitiator::new(&psk);
+        let msg = initiator.initiator_message().to_bytes();
+        *self.pending_hybrid.lock().unwrap() = Some(initiator);
+        Some(msg)
+    }
+
+    /// Responder: given the peer's initiator message, install the session and
+    /// return the responder message bytes to send back. None on failure.
+    pub fn hybrid_respond(&self, init_bytes: &[u8]) -> Option<Vec<u8>> {
+        let psk = (*self.psk.lock().unwrap())?;
+        let init_msg = crate::pqc::HybridInitiatorMessage::from_bytes(init_bytes).ok()?;
+        let (resp, session) = crate::pqc::psk_hybrid_respond(&psk, &init_msg).ok()?;
+        *self.crypto.lock().unwrap() = Some(session);
+        info!("Crypto: hybrid PQC session installed (responder)");
+        Some(resp.to_bytes())
+    }
+
+    /// Initiator: complete with the peer's responder message, installing the
+    /// session. Must follow a `hybrid_init` on this device.
+    pub fn hybrid_complete(&self, resp_bytes: &[u8]) -> bool {
+        let initiator = match self.pending_hybrid.lock().unwrap().take() {
+            Some(i) => i,
+            None => return false,
+        };
+        let resp_msg = match crate::pqc::HybridResponderMessage::from_bytes(resp_bytes) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        match initiator.complete(&resp_msg) {
+            Ok(session) => {
+                *self.crypto.lock().unwrap() = Some(session);
+                info!("Crypto: hybrid PQC session installed (initiator)");
+                true
+            }
+            Err(_) => false,
+        }
     }
     
     /// Set channel
@@ -172,7 +249,8 @@ impl StateMachine {
         let should_stop = Arc::clone(&self.should_stop_tx);
         let channel = self.current_channel.load(Ordering::SeqCst);
         let device_id = self.device_id;
-        
+        let crypto = Arc::clone(&self.crypto);
+
         thread::spawn(move || {
             info!("TX thread started");
             
@@ -195,9 +273,20 @@ impl StateMachine {
                     }
                 };
                 
+                // Encrypt the Opus frame with the active AEAD session (parity
+                // with Android). If no session is installed yet (not paired),
+                // fall back to plaintext so local testing still works.
+                let payload = match crypto.lock().unwrap().as_mut() {
+                    Some(c) => match c.encrypt(&encoded) {
+                        Ok(ct) => ct,
+                        Err(e) => { error!("Encrypt error: {}", e); continue; }
+                    },
+                    None => encoded,
+                };
+
                 // Create packet
-                let packet = Packet::audio(device_id, channel, encoded);
-                
+                let packet = Packet::audio(device_id, channel, payload);
+
                 // Send
                 if let Ok(bytes) = packet.serialize() {
                     let _ = transport.lock().unwrap().send(&bytes);
@@ -229,7 +318,8 @@ impl StateMachine {
         let should_stop = Arc::clone(&self.should_stop_rx);
         let state = Arc::clone(&self.state);
         let current_channel = Arc::clone(&self.current_channel);
-        
+        let crypto = Arc::clone(&self.crypto);
+
         thread::spawn(move || {
             info!("RX thread started");
             let mut buffer = vec![0u8; 2048];
@@ -256,8 +346,18 @@ impl StateMachine {
                 // Handle audio packets
                 if let PacketType::Audio { channel, data } = packet.packet_type {
                     if channel == current_channel.load(Ordering::SeqCst) {
+                        // Decrypt before decode (parity with Android). A replayed
+                        // or wrong-key frame is rejected here. Plaintext fallback
+                        // only while no session is installed.
+                        let plain = match crypto.lock().unwrap().as_ref() {
+                            Some(c) => match c.decrypt(&data) {
+                                Ok(p) => p,
+                                Err(e) => { warn!("Decrypt error: {}", e); continue; }
+                            },
+                            None => data,
+                        };
                         // Decode
-                        let samples = match decoder.lock().unwrap().decode(&data) {
+                        let samples = match decoder.lock().unwrap().decode(&plain) {
                             Ok(s) => s,
                             Err(e) => {
                                 error!("Decode error: {}", e);
