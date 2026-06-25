@@ -402,3 +402,70 @@ pub async fn leave_cellular_session(state: State<'_, Arc<AppState>>) -> Result<(
 pub async fn get_cellular_status(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     Ok(state.cellular_status().await.unwrap_or_default())
 }
+
+/// Host of the Cloudflare relay. The invite link and the blob fetch are both
+/// pinned to this host so a hostile link can't redirect the fetch elsewhere.
+const RELAY_HOST: &str = "relay.sassyconsultingllc.com";
+
+/// Process-wide HTTP client, built once. A fresh `reqwest::Client` per import
+/// would throw away connection pooling and redo TLS setup each time.
+static SHARE_HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+/// Import an encrypted session invite from a share LINK
+/// (`https://relay.sassyconsultingllc.com/v/<id>#<base64url-key>`): fetch the
+/// opaque blob, decrypt it with the key carried in the URL fragment via the
+/// shared core, then join exactly like a pasted QR. Returns the relay room id.
+///
+/// The decryption key lives ONLY in the `#fragment`, which is never transmitted
+/// to the relay — the worker stores ciphertext it cannot read. This is the
+/// desktop counterpart to Android's `SessionShareLink.importFromShareUri` and
+/// reuses the same `sassytalkie_core::share` decrypt as every other platform.
+#[tauri::command]
+pub async fn import_share_link(
+    state: State<'_, Arc<AppState>>,
+    url: String,
+) -> Result<String, String> {
+    let qr_json = fetch_and_decrypt_share(&url).await?;
+    state.join_cellular(&qr_json).await
+}
+
+/// Resolve a `/v/<id>#<key>` link to the decrypted session QR JSON. Split out
+/// from the command so the fetch+decrypt logic stays free of Tauri state.
+async fn fetch_and_decrypt_share(link: &str) -> Result<String, String> {
+    let parsed = reqwest::Url::parse(link).map_err(|_| "Malformed link".to_string())?;
+    if parsed.scheme() != "https" || parsed.host_str() != Some(RELAY_HOST) {
+        return Err("Not a SassyTalk invite link".to_string());
+    }
+    let id = parsed
+        .path()
+        .strip_prefix("/v/")
+        .ok_or_else(|| "Not a share link".to_string())?;
+    if !sassytalkie_core::share::is_valid_share_id(id) {
+        return Err("Malformed share link".to_string());
+    }
+    let key_b64url = parsed
+        .fragment()
+        .ok_or_else(|| "Missing decryption key in URL fragment".to_string())?;
+
+    let resp = SHARE_HTTP
+        .get_or_init(reqwest::Client::new)
+        .get(format!("https://{RELAY_HOST}/share/{id}"))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+    match resp.status().as_u16() {
+        404 => return Err("Invite already used or expired".to_string()),
+        429 => return Err("Too many requests; try later".to_string()),
+        code if !(200..300).contains(&code) => {
+            return Err(format!("Server returned HTTP {code}"));
+        }
+        _ => {}
+    }
+    let blob = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    sassytalkie_core::share::decrypt_share_blob(&blob, key_b64url)
+}
+

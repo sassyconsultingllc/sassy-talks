@@ -27,6 +27,9 @@ pub use state::{StateMachine, AppState};
 pub use sassytalkie_core::crypto;
 pub use sassytalkie_core::pqc;
 pub use sassytalkie_core::session;
+// `share` — decrypt `/v/<id>#<key>` invite blobs through the same audited
+// AES-GCM path Android and desktop use (parity for link-import).
+pub use sassytalkie_core::share;
 
 use std::os::raw::{c_char, c_void};
 use std::ffi::{CStr, CString};
@@ -152,6 +155,39 @@ pub unsafe extern "C" fn sassytalkie_import_session_qr(qr_json: *const c_char) -
         if let Some(s) = g.as_ref() { return s.import_session_qr(&json).unwrap_or(0); }
     }
     0
+}
+
+/// Decrypt a session-invite share blob (the bytes from `GET /share/<id>`) using
+/// the url-safe-base64 key from the invite link's `#fragment`, via the SHARED
+/// core. Returns the decrypted session-QR JSON (free with
+/// `sassytalkie_free_string`) to hand straight to `sassytalkie_import_session_qr`,
+/// or null on bad input / wrong key / tampered blob.
+///
+/// `blob_ptr`/`blob_len` are the raw relay bytes (`IV‖ciphertext+tag`). The key
+/// never reaches the relay, so a KV dump is useless. This is the iOS half of the
+/// `/v/<id>#<key>` invite import — the exact `core::share` path Android (Kotlin)
+/// and desktop (Tauri) use.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_decrypt_share_blob(
+    blob_ptr: *const u8,
+    blob_len: usize,
+    key_b64url: *const c_char,
+) -> *mut c_char {
+    if blob_ptr.is_null() || blob_len == 0 {
+        return std::ptr::null_mut();
+    }
+    let key = match ffi::helpers::c_string_to_rust(key_b64url) {
+        Some(s) if !s.is_empty() => s,
+        _ => return std::ptr::null_mut(),
+    };
+    let blob = std::slice::from_raw_parts(blob_ptr, blob_len);
+    match share::decrypt_share_blob(blob, &key) {
+        Ok(json) => match CString::new(json) {
+            Ok(c) => c.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
 /// Host a channel: mint a fresh session QR (the JSON another device scans) and

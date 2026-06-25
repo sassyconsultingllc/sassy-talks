@@ -63,6 +63,11 @@ struct ContentView: View {
                     _ = viewModel.importSessionQR(code)
                 }
             }
+            // Universal Link: tapping an invite https://relay…/v/<id>#<key> opens
+            // the app here. Fetch + decrypt + pair via the shared core, no scan.
+            .onOpenURL { url in
+                viewModel.importFromShareURL(url)
+            }
             .sheet(isPresented: $viewModel.showingHostQR) {
                 if let json = viewModel.hostQRJSON {
                     HostQRView(json: json, channel: viewModel.channel)

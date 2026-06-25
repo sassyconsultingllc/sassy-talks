@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Associated Domains — lets a tapped invite link
+        https://relay.sassyconsultingllc.com/v/<id>#<key>
+      open SassyTalkie directly (Universal Link) instead of the browser landing
+      page. Verified by the worker-served /.well-known/apple-app-site-association
+      (cloudflare-worker/src/wellknown.js). The Apple Developer portal App ID
+      must have the Associated Domains capability enabled for this to provision.
+    -->
+    <key>com.apple.developer.associated-domains</key>
+    <array>
+        <string>applinks:relay.sassyconsultingllc.com</string>
+    </array>
+</dict>
+</plist>

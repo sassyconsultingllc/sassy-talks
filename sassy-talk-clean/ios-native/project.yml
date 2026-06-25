@@ -40,6 +40,9 @@ targets:
         MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: "2"
         CODE_SIGN_STYLE: Automatic
+        # Associated Domains (Universal Links for /v/ invite links). The file is
+        # hand-maintained like Info.plist; see SassyTalkie.entitlements.
+        CODE_SIGN_ENTITLEMENTS: SassyTalkie.entitlements
     # NOTE: Do NOT add an `info:` block here. `info.path` makes XcodeGen GENERATE
     # (overwrite) the file on every `xcodegen generate`, and with no `properties`
     # it strips every NS*UsageDescription key — shipping a build that hits

@@ -79,6 +79,81 @@ class SassyTalkieViewModel: ObservableObject {
         return ch
     }
 
+    // MARK: - Invite-link import (parity with Android SessionShareLink)
+
+    private static let relayHost = "relay.sassyconsultingllc.com"
+    private static let relayBase = "https://relay.sassyconsultingllc.com"
+
+    /// Import an encrypted session invite from a tapped Universal Link
+    /// `https://relay.sassyconsultingllc.com/v/<id>#<base64url-key>`: fetch the
+    /// opaque blob from `/share/<id>`, decrypt it through the SHARED Rust core
+    /// (`sassytalkie_decrypt_share_blob`), then import it exactly like a scanned
+    /// QR. The decryption key rides only in the URL fragment and is never sent to
+    /// the relay — the worker stores ciphertext it cannot read.
+    func importFromShareURL(_ url: URL) {
+        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              comps.scheme == "https",
+              comps.host == Self.relayHost,
+              comps.path.hasPrefix("/v/") else {
+            DispatchQueue.main.async { self.statusText = "Not a SassyTalk invite link" }
+            return
+        }
+        let id = String(comps.path.dropFirst("/v/".count))
+        guard Self.isValidShareID(id) else {
+            DispatchQueue.main.async { self.statusText = "Malformed invite link" }
+            return
+        }
+        // base64url has no percent-escapes, so the (already percent-decoded)
+        // fragment is the key verbatim.
+        guard let key = comps.fragment, !key.isEmpty else {
+            DispatchQueue.main.async { self.statusText = "Invite link is missing its key" }
+            return
+        }
+        guard let fetchURL = URL(string: "\(Self.relayBase)/share/\(id)") else { return }
+
+        DispatchQueue.main.async { self.statusText = "Opening invite…" }
+        URLSession.shared.dataTask(with: fetchURL) { [weak self] data, response, error in
+            guard let self = self else { return }
+            if let error = error {
+                DispatchQueue.main.async { self.statusText = "Network error: \(error.localizedDescription)" }
+                return
+            }
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if code == 404 { DispatchQueue.main.async { self.statusText = "Invite already used or expired" }; return }
+            if code == 429 { DispatchQueue.main.async { self.statusText = "Too many requests; try later" }; return }
+            guard (200..<300).contains(code), let blob = data, !blob.isEmpty else {
+                DispatchQueue.main.async { self.statusText = "Server returned HTTP \(code)" }
+                return
+            }
+            // Decrypt via the shared core (same accept/reject as Android & desktop).
+            let json: String? = blob.withUnsafeBytes { raw -> String? in
+                guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return nil }
+                guard let cstr = key.withCString({ keyPtr in
+                    sassytalkie_decrypt_share_blob(base, blob.count, keyPtr)
+                }) else { return nil }
+                defer { sassytalkie_free_string(cstr) }
+                return String(cString: cstr)
+            }
+            guard let sessionJSON = json, !sessionJSON.isEmpty else {
+                DispatchQueue.main.async { self.statusText = "Couldn't decrypt invite (link wrong or expired)" }
+                return
+            }
+            // importSessionQR hops to main, flips isPaired, and connects the relay.
+            if self.importSessionQR(sessionJSON) == 0 {
+                DispatchQueue.main.async { self.statusText = "Invite session was invalid" }
+            }
+        }.resume()
+    }
+
+    /// The worker's share-id alphabet/length (share.js ID_RE): base64url, 16–64.
+    private static func isValidShareID(_ id: String) -> Bool {
+        let len = id.count
+        guard len >= 16, len <= 64 else { return false }
+        return id.allSatisfy { c in
+            (c.isASCII && (c.isLetter || c.isNumber)) || c == "_" || c == "-"
+        }
+    }
+
     /// Host the current channel: mint a fresh QR (installs our own key so the host
     /// is paired too) and publish the JSON to render for a joiner to scan. The QR
     /// is cross-platform — an Android device can scan it to join the same channel.

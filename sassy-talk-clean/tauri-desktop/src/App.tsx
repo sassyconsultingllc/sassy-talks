@@ -412,13 +412,19 @@ export default function App() {
   // ==========================================================================
 
   const joinCellular = async () => {
-    const qr = cellularQr.trim();
-    if (!qr || cellularJoining) return;
+    const input = cellularQr.trim();
+    if (!input || cellularJoining) return;
     setError(null);
     setCellularJoining(true);
     try {
-      // Tauri v2 camelCases command params: Rust `qr_json` -> JS `qrJson`.
-      const room = await invoke<string>('join_cellular_session', { qrJson: qr });
+      // Accept either a raw QR JSON payload or a one-time invite LINK
+      // (https://relay.sassyconsultingllc.com/v/<id>#<key>). A link is fetched
+      // and decrypted natively (import_share_link → shared core); pasted JSON
+      // joins directly. Tauri v2 camelCases params: Rust `qr_json` -> `qrJson`.
+      const isLink = /^https:\/\/relay\.sassyconsultingllc\.com\/v\//i.test(input);
+      const room = isLink
+        ? await invoke<string>('import_share_link', { url: input })
+        : await invoke<string>('join_cellular_session', { qrJson: input });
       setCellularRoom(room);
       Sounds.connectionSuccess();
       // Jump to the Talk view so the user can immediately push-to-talk.
@@ -801,12 +807,13 @@ export default function App() {
           {cellularRoom === null ? (
             <>
               <p className="cellular-hint">
-                Join a session over the internet — no Wi-Fi or Bluetooth needed. Paste the
+                Join a session over the internet — no Wi-Fi or Bluetooth needed. Paste an
+                invite <strong>link</strong> (https://relay.sassyconsultingllc.com/v/…) or the
                 session QR data from the phone app's "Show QR" screen.
               </p>
               <textarea
                 className="cellular-qr-input"
-                placeholder='{"key":"...","session_id":"...","channel":1,"group_name":"...","cohort_id":"..."}'
+                placeholder={'https://relay.sassyconsultingllc.com/v/<id>#<key>\n— or —\n{"key":"...","session_id":"...","channel":1}'}
                 value={cellularQr}
                 onChange={(e) => setCellularQr(e.target.value)}
                 rows={4}

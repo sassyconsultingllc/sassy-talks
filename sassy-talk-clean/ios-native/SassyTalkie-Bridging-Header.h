@@ -101,6 +101,13 @@ uint8_t sassytalkie_import_session_qr(const char* _Nullable qr_json);
 /// group_name may be NULL/empty; duration clamps to 1..=72 hours.
 char* _Nullable sassytalkie_generate_session_qr(uint8_t channel, uint32_t duration_hours, const char* _Nullable group_name);
 
+/// Decrypt a session-invite share blob (the bytes from GET /share/<id>) with the
+/// url-safe-base64 key from the invite link's #fragment, via the shared core.
+/// Returns the decrypted session-QR JSON (must free with sassytalkie_free_string)
+/// to pass to sassytalkie_import_session_qr, or NULL on bad input/wrong key. The
+/// iOS half of the https://relay.sassyconsultingllc.com/v/<id>#<key> import.
+char* _Nullable sassytalkie_decrypt_share_blob(const uint8_t* _Nullable blob_ptr, size_t blob_len, const char* _Nullable key_b64url);
+
 /// Begin a classical X25519 key exchange. Returns our base64 public key (must
 /// free with sassytalkie_free_string). Complete with the function below.
 char* _Nullable sassytalkie_key_exchange_init(void);

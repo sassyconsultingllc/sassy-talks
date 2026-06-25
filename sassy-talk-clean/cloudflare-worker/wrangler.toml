@@ -54,3 +54,14 @@ preview_id = "dec463c8f86549e2a9d4f00b616dbfec"
 #                                still forwards audio; it just skips offline-peer
 #                                wake notifications.
 # Self-hosters: set both with `wrangler secret put NAME` before `wrangler deploy`.
+
+# ── App-link association identifiers (NOT secret — plain config) ──
+# Drive /.well-known/assetlinks.json + /.well-known/apple-app-site-association
+# so a tapped https://relay.../v/<id>#<key> invite opens the app directly. Until
+# these are set the files serve valid-but-empty (links fall back to the /v/
+# landing page); `curl -sI .../.well-known/assetlinks.json` shows
+# X-Wellknown-Configured: false. Uncomment and fill in:
+# [vars]
+#   APPLE_APP_ID = "ABCDE12345.com.sassyconsulting.sassytalkie"   # Apple Team ID + bundle id
+#   ANDROID_CERT_SHA256 = "AA:BB:..:FF"   # Play App Signing SHA-256 (Play Console → App integrity);
+#                                          # comma/space/newline-separate multiple (e.g. + upload key)

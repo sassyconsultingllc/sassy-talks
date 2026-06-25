@@ -8,6 +8,8 @@
 export { PttRoom } from "./ptt-relay.js";
 import { handleShareRoute } from "./share.js";
 import { handlePresenceRoute } from "./presence.js";
+import { handleViewerRoute } from "./viewer.js";
+import { handleWellKnownRoute } from "./wellknown.js";
 // Single source of truth for token verification + key rotation. The /ws path
 // uses the exact same verifier as /presence and /share so they can never drift
 // apart on what tokens they accept (the inline copy this replaced had already
@@ -54,6 +56,19 @@ export default {
     // can trigger a wake push.
     const presenceResp = await handlePresenceRoute(request, env, url);
     if (presenceResp) return presenceResp;
+
+    // Browser landing page for /v/<id> invite links. Recipients with the app
+    // are bounced straight into it by the App Link; everyone else gets a chooser
+    // (open / install) here instead of a bare 404. Never reads the share blob —
+    // the #fragment key is resolved entirely client-side.
+    const viewerResp = handleViewerRoute(request, url);
+    if (viewerResp) return viewerResp;
+
+    // App-ownership association files so /v/ links open the app directly:
+    //   /.well-known/assetlinks.json               (Android App Links)
+    //   /.well-known/apple-app-site-association     (iOS/macOS Universal Links)
+    const wellKnownResp = handleWellKnownRoute(request, env, url);
+    if (wellKnownResp) return wellKnownResp;
 
     // Health check
     if (path === "/" || path === "/health") {

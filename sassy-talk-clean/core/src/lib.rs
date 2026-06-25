@@ -43,3 +43,7 @@ pub mod sealed;
 // definition so iOS, Android, and desktop are byte-identical on the multicast
 // wire (previously lived only in android-native and could drift).
 pub mod wire;
+// `share` — open encrypted session-invite blobs (`/share/<id>` → QR JSON) so the
+// `/v/<id>#<key>` invite-link import path is one audited AES-GCM call site
+// shared by Android, iOS, and desktop instead of three.
+pub mod share;

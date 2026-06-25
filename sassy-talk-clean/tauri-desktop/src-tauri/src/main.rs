@@ -142,6 +142,7 @@ fn main() {
             commands::get_connection_quality,
             // Cellular relay (internet transport)
             commands::join_cellular_session,
+            commands::import_share_link,
             commands::leave_cellular_session,
             commands::get_cellular_status,
         ])

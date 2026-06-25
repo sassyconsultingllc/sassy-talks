@@ -16,14 +16,23 @@ import javax.crypto.spec.SecretKeySpec
 /**
  * Client for the encrypted session-share endpoint.
  *
- * Flow:
- *   1. Generate a fresh AES-256 key and 12-byte IV
- *   2. AES-GCM encrypt the QR JSON payload
- *   3. POST {c, i} to https://relay.sassyconsultingllc.com/share — returns a token
- *   4. Build URL: https://relay.sassyconsultingllc.com/v/<token>#<base64url-key>
+ * Wire protocol — MUST stay in lockstep with cloudflare-worker/src/share.js:
+ *   1. Pull the relay room id (= session_id) out of the QR JSON.
+ *   2. GET  /auth?room=<room>                       → { token }  (room capability)
+ *   3. Generate a fresh AES-256 key + 12-byte IV; AES-GCM encrypt the QR JSON.
+ *   4. POST /share?room=<room>[&ttl=][&burn=1]      body = IV‖ciphertext (raw bytes)
+ *           Authorization: Bearer <token>           → { id, expires_at }
+ *   5. Build URL: https://relay.sassyconsultingllc.com/v/<id>#<base64url-key>
  *
- * The fragment (#) never leaves the recipient's browser → the relay only ever
- * sees ciphertext, and a KV dump would be useless without the URL.
+ * The blob the relay stores is opaque: it's the IV prepended to the AES-GCM
+ * ciphertext. The decryption key lives ONLY in the URL #fragment, which browsers
+ * and apps never transmit to the server — so a KV dump is useless, and the relay
+ * only ever sees ciphertext.
+ *
+ * A previous revision spoke a `/share → {token}`, `/s/<token> → {c,i}` protocol
+ * that the worker never implemented (it always served `/share/<id>` returning a
+ * raw octet-stream and a JSON `{id}`). That mismatch made "Copy Link" fail with
+ * "Server returned no token" and made tapped links never establish a session.
  */
 object SessionShareLink {
 
@@ -32,6 +41,9 @@ object SessionShareLink {
     private const val GCM_TAG_BITS = 128
     private const val IV_LEN = 12
     private val JSON_MEDIA = "application/json".toMediaType()
+    private val OCTET_MEDIA = "application/octet-stream".toMediaType()
+    // The worker's share id is base64url, 16–64 chars (see share.js ID_RE).
+    private val SHARE_ID_RE = Regex("^[A-Za-z0-9_-]{16,64}$")
 
     private val http: OkHttpClient by lazy {
         OkHttpClient.Builder()
@@ -56,57 +68,84 @@ object SessionShareLink {
     }
 
     /**
-     * Encrypt [sessionJson] and POST it. Blocks — call from a coroutine on
-     * Dispatchers.IO, or wrap in [kotlinx.coroutines.withContext].
+     * Encrypt [sessionJson] and upload it as a one-shot invite blob. Blocks —
+     * call from a coroutine on Dispatchers.IO, or wrap in
+     * [kotlinx.coroutines.withContext].
+     *
+     * @param ttlSec optional server-side expiry; null lets the relay apply its
+     *   default (7 days). The blob is also burned on first read when [burn].
+     * @param burn one-time dead-drop semantics: the relay deletes the blob the
+     *   first time it is fetched. Defaults true to match the "one-time link" UX.
      */
-    fun createShare(sessionJson: String, ttlSec: Int? = null): Result {
+    fun createShare(sessionJson: String, ttlSec: Int? = null, burn: Boolean = true): Result {
         if (sessionJson.isEmpty()) return Result.Err("Empty session payload")
+
+        // The relay binds every share blob to a room and requires a capability
+        // token for it. The QR JSON is the serialized SessionKey, whose
+        // session_id IS the relay room id.
+        val roomId = try {
+            JSONObject(sessionJson).optString("session_id")
+        } catch (t: Throwable) {
+            return Result.Err("Malformed session payload")
+        }
+        if (roomId.isBlank()) return Result.Err("Session has no room id")
+
+        val token = when (val t = fetchRoomToken(roomId)) {
+            is TokenResult.Ok -> t.token
+            is TokenResult.Err -> return Result.Err(t.message)
+        }
 
         val keyBytes = ByteArray(32)
         SecureRandom().nextBytes(keyBytes)
         val iv = ByteArray(IV_LEN)
         SecureRandom().nextBytes(iv)
 
-        val ciphertext: ByteArray = try {
+        // blob = IV ‖ (ciphertext+GCM tag). The IV travels with the ciphertext
+        // because the relay hands back exactly these bytes on GET; only the key
+        // is held back in the URL fragment.
+        val blob: ByteArray = try {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(
                 Cipher.ENCRYPT_MODE,
                 SecretKeySpec(keyBytes, "AES"),
                 GCMParameterSpec(GCM_TAG_BITS, iv),
             )
-            cipher.doFinal(sessionJson.toByteArray(Charsets.UTF_8))
+            iv + cipher.doFinal(sessionJson.toByteArray(Charsets.UTF_8))
         } catch (t: Throwable) {
+            keyBytes.fill(0)
             return Result.Err("Encrypt failed: ${t.message}")
         }
 
-        val body = JSONObject().apply {
-            put("c", Base64.encodeToString(ciphertext, Base64.NO_WRAP))
-            put("i", Base64.encodeToString(iv, Base64.NO_WRAP))
-            if (ttlSec != null) put("ttl", ttlSec)
+        val postUrl = buildString {
+            append(RELAY_BASE).append("/share?room=").append(Uri.encode(roomId))
+            if (ttlSec != null) append("&ttl=").append(ttlSec)
+            if (burn) append("&burn=1")
         }
 
         val req = Request.Builder()
-            .url("$RELAY_BASE/share")
-            .post(body.toString().toRequestBody(JSON_MEDIA))
+            .url(postUrl)
+            .header("Authorization", "Bearer $token")
+            .post(blob.toRequestBody(OCTET_MEDIA))
             .build()
 
-        val (token, expiresAt, ttl) = try {
+        val (id, expiresAt) = try {
             http.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) {
+                    keyBytes.fill(0)
                     return Result.Err("Server returned HTTP ${resp.code}")
                 }
                 val json = JSONObject(resp.body?.string() ?: "")
-                Triple(
-                    json.optString("token"),
-                    json.optLong("expires_at", 0L),
-                    json.optInt("ttl", 0),
-                )
+                json.optString("id") to json.optLong("expires_at", 0L)
             }
         } catch (t: Throwable) {
+            keyBytes.fill(0)
             return Result.Err("Network error: ${t.message}")
         }
 
-        if (token.isNullOrBlank()) return Result.Err("Server returned no token")
+        if (id.isNullOrBlank()) {
+            keyBytes.fill(0)
+            return Result.Err("Server returned no share id")
+        }
 
         val keyB64Url = Base64.encodeToString(
             keyBytes,
@@ -116,10 +155,14 @@ object SessionShareLink {
         // in memory longer than needed.
         keyBytes.fill(0)
 
+        val effectiveTtl = if (ttlSec != null) ttlSec
+        else if (expiresAt > 0L) ((expiresAt - System.currentTimeMillis() / 1000L)).toInt()
+        else 0
+
         return Result.Ok(
-            url = "$RELAY_BASE/v/$token#$keyB64Url",
+            url = "$RELAY_BASE/v/$id#$keyB64Url",
             expiresAt = expiresAt,
-            ttlSec = ttl,
+            ttlSec = effectiveTtl,
         )
     }
 
@@ -127,7 +170,7 @@ object SessionShareLink {
      * Resolve a deep-link Uri to a decrypted session JSON, ready to feed into
      * [SassyTalkNative.importSession]. Blocking — call from a coroutine.
      *
-     * Only accepts the encrypted https /v/<token>#<key> form. A previous draft
+     * Only accepts the encrypted https /v/<id>#<key> form. A previous draft
      * supported sassytalk://join#<urlencoded-json>, but that put plaintext
      * session JSON (including the AES-256 room key) into any URL the user
      * tapped — a phishing one-tap force-join into an attacker-controlled
@@ -138,9 +181,9 @@ object SessionShareLink {
         if (uri.scheme == "https" && uri.host == "relay.sassyconsultingllc.com") {
             val path = uri.path ?: ""
             if (!path.startsWith("/v/")) return Result.Err("Not a share URL")
-            val token = path.removePrefix("/v/")
-            if (!token.matches(Regex("^[A-Z2-7]{8,16}$"))) {
-                return Result.Err("Malformed share token")
+            val id = path.removePrefix("/v/")
+            if (!SHARE_ID_RE.matches(id)) {
+                return Result.Err("Malformed share link")
             }
             val keyB64 = uri.fragment
                 ?: return Result.Err("Missing decryption key in URL fragment")
@@ -150,45 +193,79 @@ object SessionShareLink {
             } catch (t: Throwable) {
                 return Result.Err("Invalid key encoding")
             }
-            if (keyBytes.size != 32) return Result.Err("Key must be 32 bytes")
+            // Single wipe point: every exit below (including non-local returns
+            // from inside `use {}`) runs the finally, so the AES key is always
+            // cleared from the heap without a fill(0) scattered at each return.
+            try {
+                if (keyBytes.size != 32) return Result.Err("Key must be 32 bytes")
 
-            val fetchReq = Request.Builder()
-                .url("$RELAY_BASE/s/$token")
-                .get()
-                .build()
+                val fetchReq = Request.Builder()
+                    .url("$RELAY_BASE/share/$id")
+                    .get()
+                    .build()
 
-            val (cB64, iB64) = try {
-                http.newCall(fetchReq).execute().use { resp ->
-                    if (resp.code == 404) return Result.Err("Invite already used or expired")
-                    if (resp.code == 429) return Result.Err("Too many requests; try later")
-                    if (!resp.isSuccessful) return Result.Err("Server returned HTTP ${resp.code}")
-                    val body = JSONObject(resp.body?.string() ?: "")
-                    body.optString("c") to body.optString("i")
+                val blob: ByteArray = try {
+                    http.newCall(fetchReq).execute().use { resp ->
+                        if (resp.code == 404) return Result.Err("Invite already used or expired")
+                        if (resp.code == 429) return Result.Err("Too many requests; try later")
+                        if (!resp.isSuccessful) return Result.Err("Server returned HTTP ${resp.code}")
+                        resp.body?.bytes() ?: ByteArray(0)
+                    }
+                } catch (t: Throwable) {
+                    return Result.Err("Network error: ${t.message}")
                 }
-            } catch (t: Throwable) {
-                return Result.Err("Network error: ${t.message}")
-            }
-            if (cB64.isNullOrEmpty() || iB64.isNullOrEmpty()) {
-                return Result.Err("Server response missing ciphertext")
-            }
+                // blob = IV ‖ ciphertext+tag. Need at least IV + a GCM tag (16 bytes).
+                if (blob.size <= IV_LEN + 16) {
+                    return Result.Err("Server response missing ciphertext")
+                }
 
-            val plain = try {
-                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-                cipher.init(
-                    Cipher.DECRYPT_MODE,
-                    SecretKeySpec(keyBytes, "AES"),
-                    GCMParameterSpec(GCM_TAG_BITS, Base64.decode(iB64, Base64.NO_WRAP)),
-                )
-                String(cipher.doFinal(Base64.decode(cB64, Base64.NO_WRAP)), Charsets.UTF_8)
-            } catch (t: Throwable) {
-                return Result.Err("Decryption failed (key wrong or payload tampered)")
+                val plain = try {
+                    val iv = blob.copyOfRange(0, IV_LEN)
+                    val ct = blob.copyOfRange(IV_LEN, blob.size)
+                    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                    cipher.init(
+                        Cipher.DECRYPT_MODE,
+                        SecretKeySpec(keyBytes, "AES"),
+                        GCMParameterSpec(GCM_TAG_BITS, iv),
+                    )
+                    String(cipher.doFinal(ct), Charsets.UTF_8)
+                } catch (t: Throwable) {
+                    return Result.Err("Decryption failed (key wrong or payload tampered)")
+                }
+
+                return Result.Ok(url = uri.toString(), json = plain)
             } finally {
                 keyBytes.fill(0)
             }
-
-            return Result.Ok(url = uri.toString(), json = plain)
         }
 
         return Result.Err("Unrecognized share URL")
+    }
+
+    private sealed class TokenResult {
+        data class Ok(val token: String) : TokenResult()
+        data class Err(val message: String) : TokenResult()
+    }
+
+    /**
+     * Mint a room capability token from the relay's /auth endpoint — the same
+     * grant used to open the WebSocket / register presence, and the one
+     * /share POST requires. Blocking.
+     */
+    private fun fetchRoomToken(roomId: String): TokenResult {
+        val req = Request.Builder()
+            .url("$RELAY_BASE/auth?room=${Uri.encode(roomId)}")
+            .get()
+            .build()
+        return try {
+            http.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return TokenResult.Err("Auth failed: HTTP ${resp.code}")
+                val token = JSONObject(resp.body?.string() ?: "").optString("token")
+                if (token.isBlank()) TokenResult.Err("Relay issued no token")
+                else TokenResult.Ok(token)
+            }
+        } catch (t: Throwable) {
+            TokenResult.Err("Network error: ${t.message}")
+        }
     }
 }
