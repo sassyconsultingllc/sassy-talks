@@ -56,6 +56,45 @@ curl -s -X POST $RELAY/license/revoke -H "$ADMIN" -d '{"key":"SASSY-..."}'
 curl -s "$RELAY/license/info?key=SASSY-..." -H "$ADMIN"
 ```
 
+### Promo codes
+
+One shared code, capped redemptions, device-bound, same 30-day receipts.
+The gate screen accepts either credential in the same field (license format
+routes to /license/activate, anything else to /license/promo). Stored as
+salted hashes like license keys; low entropy is inherent to shareable codes,
+so caps + expiry are the abuse controls. Redemption is idempotent per device —
+re-entry/revalidation never burns a slot.
+
+```bash
+# Create a promo (custom text, 6-40 chars A-Z 0-9 -), cap + optional expiry
+curl -s -X POST $RELAY/license/promo-create -H "$ADMIN" \
+  -d '{"code":"LAUNCH-2026","max_redemptions":250,"expires_days":90,"note":"launch week"}'
+
+# Or let the server generate one (SASSYTALK-XXXXXX)
+curl -s -X POST $RELAY/license/promo-create -H "$ADMIN" -d '{"max_redemptions":50}'
+
+# Kill a leaked promo (existing devices lapse within 30 days)
+curl -s -X POST $RELAY/license/promo-revoke -H "$ADMIN" -d '{"code":"LAUNCH-2026"}'
+
+# How many redemptions so far?
+curl -s "$RELAY/license/promo-info?code=LAUNCH-2026" -H "$ADMIN"
+```
+
+Play-flavor note: promo unlock is deliberately direct-only. For Play installs
+use Play Console's native promo codes on the `sassytalkie_unlock` product —
+bypassing Play Billing with an in-app code risks a policy strike.
+
+## App Links (production)
+
+`ANDROID_CERT_SHA256` in wrangler.toml `[vars]` currently carries the
+release/upload keystore cert (verifies the direct/sideloaded APK):
+`3C:AA:...:3C:56`. **Play installs are re-signed by Google** — append the Play
+App Signing SHA-256 (Play Console → Test and release → App integrity) as a
+comma-separated second fingerprint and redeploy, or App Links won't verify on
+Play-installed builds. Check with:
+`curl -sI https://relay.sassyconsultingllc.com/.well-known/assetlinks.json`
+(header `X-Wellknown-Configured: true`).
+
 ### Release pipeline
 
 `scripts/ship.sh <version>` now expects:

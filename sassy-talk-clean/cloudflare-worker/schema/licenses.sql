@@ -24,3 +24,26 @@ CREATE TABLE IF NOT EXISTS activations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_activations_key ON activations(key_hash);
+
+-- Promo codes: one shared code, many redemptions, device-bound like licenses.
+-- code_hash = HMAC-SHA256(LICENSE_SALT, "promo."||UPPERCASE(code)).
+CREATE TABLE IF NOT EXISTS promo_codes (
+  code_hash       TEXT PRIMARY KEY,
+  note            TEXT,
+  status          TEXT NOT NULL DEFAULT 'active',   -- active | revoked
+  max_redemptions INTEGER NOT NULL DEFAULT 100,
+  expires_at      TEXT,                             -- ISO8601, NULL = never
+  created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS promo_redemptions (
+  code_hash   TEXT NOT NULL REFERENCES promo_codes(code_hash),
+  device_hash TEXT NOT NULL,
+  device_name TEXT,
+  app_version TEXT,
+  redeemed_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_seen   TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (code_hash, device_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_promo_redemptions_code ON promo_redemptions(code_hash);

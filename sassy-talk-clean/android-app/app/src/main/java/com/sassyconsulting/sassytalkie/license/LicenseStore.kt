@@ -22,6 +22,8 @@ object LicenseStore {
     const val KEY_UNLOCKED = "unlocked"
     const val KEY_LICENSE = "license_key"
     const val KEY_RECEIPT_EXP = "receipt_exp"
+    // "license" | "promo" — which server endpoint refreshes the receipt.
+    const val KEY_KIND = "credential_kind"
 
     @Volatile private var cached: SharedPreferences? = null
 

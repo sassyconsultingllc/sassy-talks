@@ -27,10 +27,20 @@
  *                             already-activated device, never consumes a slot.
  *   POST /license/deactivate  {key, device_id} → {ok} — frees the slot.
  *
+ * Promo codes — one shared code, capped redemptions, device-bound:
+ *   POST /license/promo        {code, device_id, app_version?, device_name?}
+ *                              → same receipt shape as activate. Idempotent per
+ *                              device: re-redeeming refreshes the receipt
+ *                              without consuming another redemption.
+ *
  * Admin endpoints (Authorization: Bearer LICENSE_ADMIN_TOKEN):
- *   POST /license/issue   {count?, email?, note?, max_devices?} → {ok, keys:[...]}
- *   POST /license/revoke  {key} → {ok}
+ *   POST /license/issue        {count?, email?, note?, max_devices?} → {ok, keys:[...]}
+ *   POST /license/revoke       {key} → {ok}
  *   GET  /license/info?key=SASSY-... → license row + active devices
+ *   POST /license/promo-create {code?, max_redemptions?, note?, expires_days?}
+ *                              → {ok, code, ...} (code generated when omitted)
+ *   POST /license/promo-revoke {code} → {ok}
+ *   GET  /license/promo-info?code=... → promo row + redemption count
  *
  * Receipt token format (mirrors relay-auth capability tokens):
  *   "<expSec>.<hexSig>"  where hexSig = HMAC-SHA256(`receipt.${keyHash}.${deviceHash}.${expSec}`, LICENSE_SALT)
@@ -77,14 +87,24 @@ export async function handleLicenseRoute(request, env, url) {
     if (request.method === "POST" && path === "/license/deactivate") {
       return await deactivate(request, env);
     }
+    if (request.method === "POST" && path === "/license/promo") {
+      return await redeemPromo(request, env);
+    }
 
     // ── Admin surface ──
-    if (path === "/license/issue" || path === "/license/revoke" || path === "/license/info") {
+    const ADMIN_PATHS = [
+      "/license/issue", "/license/revoke", "/license/info",
+      "/license/promo-create", "/license/promo-revoke", "/license/promo-info",
+    ];
+    if (ADMIN_PATHS.includes(path)) {
       const denied = await requireAdmin(request, env);
       if (denied) return denied;
       if (request.method === "POST" && path === "/license/issue") return await issue(request, env);
       if (request.method === "POST" && path === "/license/revoke") return await revoke(request, env);
       if (request.method === "GET" && path === "/license/info") return await info(env, url);
+      if (request.method === "POST" && path === "/license/promo-create") return await promoCreate(request, env);
+      if (request.method === "POST" && path === "/license/promo-revoke") return await promoRevoke(request, env);
+      if (request.method === "GET" && path === "/license/promo-info") return await promoInfo(env, url);
     }
 
     return json({ ok: false, error: "Not found" }, 404);
@@ -181,6 +201,113 @@ async function deactivate(request, env) {
   return json({ ok: true });
 }
 
+// ── Promo codes ───────────────────────────────────────────────────────────
+
+async function redeemPromo(request, env) {
+  const body = await readJson(request);
+  if (!body) return json({ ok: false, error: "Malformed JSON body" }, 400);
+
+  const code = normalizePromo(body.code);
+  const deviceId = typeof body.device_id === "string" ? body.device_id.trim() : "";
+  if (!code) return json({ ok: false, error: "Invalid promo code" }, 400);
+  if (!deviceId || deviceId.length > 128) {
+    return json({ ok: false, error: "Missing device_id" }, 400);
+  }
+
+  const codeHash = await hashPromo(code, env);
+  const deviceHash = await hashDevice(deviceId, env);
+
+  const promo = await env.LICENSES.prepare(
+    "SELECT code_hash, status, max_redemptions, expires_at FROM promo_codes WHERE code_hash = ?",
+  ).bind(codeHash).first();
+
+  if (!promo) return json({ ok: false, error: "Unknown promo code" }, 404);
+  if (promo.status !== "active") {
+    return json({ ok: false, error: `Promo code ${promo.status}` }, 403);
+  }
+  if (promo.expires_at && new Date(promo.expires_at).getTime() < Date.now()) {
+    return json({ ok: false, error: "Promo code expired" }, 403);
+  }
+
+  const existing = await env.LICENSES.prepare(
+    "SELECT device_hash FROM promo_redemptions WHERE code_hash = ? AND device_hash = ?",
+  ).bind(codeHash, deviceHash).first();
+
+  if (existing) {
+    // Idempotent refresh — this is also the direct client's revalidation
+    // path, so a revoked/expired promo stops renewing receipts above.
+    await env.LICENSES.prepare(
+      "UPDATE promo_redemptions SET last_seen = datetime('now'), app_version = ? WHERE code_hash = ? AND device_hash = ?",
+    ).bind(str(body.app_version), codeHash, deviceHash).run();
+  } else {
+    const used = await env.LICENSES.prepare(
+      "SELECT COUNT(*) AS n FROM promo_redemptions WHERE code_hash = ?",
+    ).bind(codeHash).first();
+    if ((used?.n ?? 0) >= promo.max_redemptions) {
+      return json({ ok: false, error: "Promo code fully redeemed" }, 403);
+    }
+    await env.LICENSES.prepare(
+      "INSERT INTO promo_redemptions (code_hash, device_hash, device_name, app_version) VALUES (?, ?, ?, ?)",
+    ).bind(codeHash, deviceHash, str(body.device_name), str(body.app_version)).run();
+  }
+
+  const expSec = Math.floor(Date.now() / 1000) + RECEIPT_TTL_SEC;
+  const sig = await hmacSha256Hex(`receipt.promo.${codeHash}.${deviceHash}.${expSec}`, env.LICENSE_SALT);
+  return json({ ok: true, token: `${expSec}.${sig}`, expires_at: expSec });
+}
+
+async function promoCreate(request, env) {
+  const body = (await readJson(request)) ?? {};
+  // Operator-chosen code (e.g. "SASSYVIP2026") or a generated one.
+  const code = body.code != null ? normalizePromo(body.code) : generatePromoCode();
+  if (!code) return json({ ok: false, error: "Invalid promo code format (6-40 chars, A-Z 0-9 -)" }, 400);
+
+  const maxRedemptions = clampInt(body.max_redemptions, 1, 100000, 100);
+  const expiresDays = clampInt(body.expires_days, 1, 3650, 0);
+  const expiresAt = expiresDays
+    ? new Date(Date.now() + expiresDays * 86400_000).toISOString()
+    : null;
+
+  const codeHash = await hashPromo(code, env);
+  const dup = await env.LICENSES.prepare(
+    "SELECT code_hash FROM promo_codes WHERE code_hash = ?",
+  ).bind(codeHash).first();
+  if (dup) return json({ ok: false, error: "Promo code already exists" }, 409);
+
+  await env.LICENSES.prepare(
+    "INSERT INTO promo_codes (code_hash, note, max_redemptions, expires_at) VALUES (?, ?, ?, ?)",
+  ).bind(codeHash, str(body.note), maxRedemptions, expiresAt).run();
+
+  // Like license keys: the raw code appears only in this response.
+  return json({ ok: true, code, max_redemptions: maxRedemptions, expires_at: expiresAt });
+}
+
+async function promoRevoke(request, env) {
+  const body = await readJson(request);
+  const code = normalizePromo(body?.code);
+  if (!code) return json({ ok: false, error: "Invalid promo code" }, 400);
+  const codeHash = await hashPromo(code, env);
+  const res = await env.LICENSES.prepare(
+    "UPDATE promo_codes SET status = 'revoked' WHERE code_hash = ?",
+  ).bind(codeHash).run();
+  if (!res.meta.changes) return json({ ok: false, error: "Unknown promo code" }, 404);
+  return json({ ok: true });
+}
+
+async function promoInfo(env, url) {
+  const code = normalizePromo(url.searchParams.get("code"));
+  if (!code) return json({ ok: false, error: "Invalid promo code" }, 400);
+  const codeHash = await hashPromo(code, env);
+  const promo = await env.LICENSES.prepare(
+    "SELECT code_hash, note, status, max_redemptions, expires_at, created_at FROM promo_codes WHERE code_hash = ?",
+  ).bind(codeHash).first();
+  if (!promo) return json({ ok: false, error: "Unknown promo code" }, 404);
+  const used = await env.LICENSES.prepare(
+    "SELECT COUNT(*) AS n FROM promo_redemptions WHERE code_hash = ?",
+  ).bind(codeHash).first();
+  return json({ ok: true, promo, redemptions: used?.n ?? 0 });
+}
+
 // ── Admin endpoints ───────────────────────────────────────────────────────
 
 async function requireAdmin(request, env) {
@@ -262,8 +389,32 @@ function normalizeKey(raw) {
   return KEY_RE.test(key) ? key : null;
 }
 
+// Promo codes are operator-chosen marketing strings, so the shape is loose:
+// 6-40 chars of A-Z 0-9 and dashes after uppercasing. Low entropy is inherent
+// to shareable codes — redemption caps and expiry are the abuse controls.
+const PROMO_RE = /^[A-Z0-9-]{6,40}$/;
+function normalizePromo(raw) {
+  if (typeof raw !== "string") return null;
+  const code = raw.trim().toUpperCase().replace(/\s+/g, "");
+  // A license key pasted into the promo path is a user mistake, not a promo.
+  if (KEY_RE.test(code)) return null;
+  return PROMO_RE.test(code) ? code : null;
+}
+
+function generatePromoCode() {
+  const bytes = new Uint8Array(6);
+  crypto.getRandomValues(bytes);
+  let tail = "";
+  for (const b of bytes) tail += KEY_ALPHABET[b % 32];
+  return `SASSYTALK-${tail}`;
+}
+
 function hashKey(key, env) {
   return hmacSha256Hex(`lic.${key}`, env.LICENSE_SALT);
+}
+
+function hashPromo(code, env) {
+  return hmacSha256Hex(`promo.${code}`, env.LICENSE_SALT);
 }
 
 function hashDevice(deviceId, env) {

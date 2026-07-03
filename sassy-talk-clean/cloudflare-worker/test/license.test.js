@@ -10,10 +10,14 @@ import { hmacSha256Hex } from "../src/relay-auth.js";
 function mockD1() {
   const licenses = new Map(); // key_hash → row
   const activations = new Map(); // `${key_hash}|${device_hash}` → row
+  const promos = new Map(); // code_hash → row
+  const redemptions = new Map(); // `${code_hash}|${device_hash}` → row
 
   return {
     licenses,
     activations,
+    promos,
+    redemptions,
     prepare(sql) {
       return {
         bind(...args) {
@@ -32,6 +36,23 @@ function mockD1() {
               }
               if (sql.startsWith("SELECT key_hash, email, note, status")) {
                 return licenses.get(args[0]) ?? null;
+              }
+              if (sql.startsWith("SELECT code_hash, status, max_redemptions")) {
+                return promos.get(args[0]) ?? null;
+              }
+              if (sql.startsWith("SELECT device_hash FROM promo_redemptions")) {
+                return redemptions.get(`${args[0]}|${args[1]}`) ?? null;
+              }
+              if (sql.startsWith("SELECT COUNT(*) AS n FROM promo_redemptions")) {
+                let n = 0;
+                for (const k of redemptions.keys()) if (k.startsWith(`${args[0]}|`)) n++;
+                return { n };
+              }
+              if (sql.startsWith("SELECT code_hash FROM promo_codes")) {
+                return promos.get(args[0]) ?? null;
+              }
+              if (sql.startsWith("SELECT code_hash, note, status")) {
+                return promos.get(args[0]) ?? null;
               }
               throw new Error(`mockD1.first: unhandled SQL: ${sql}`);
             },
@@ -67,6 +88,28 @@ function mockD1() {
               }
               if (sql.startsWith("UPDATE licenses SET status = 'revoked'")) {
                 const row = licenses.get(args[0]);
+                if (row) row.status = "revoked";
+                return { meta: { changes: row ? 1 : 0 } };
+              }
+              if (sql.startsWith("INSERT INTO promo_codes")) {
+                promos.set(args[0], {
+                  code_hash: args[0], note: args[1], status: "active",
+                  max_redemptions: args[2], expires_at: args[3], created_at: "now",
+                });
+                return { meta: { changes: 1 } };
+              }
+              if (sql.startsWith("INSERT INTO promo_redemptions")) {
+                redemptions.set(`${args[0]}|${args[1]}`, {
+                  device_name: args[2], app_version: args[3],
+                  redeemed_at: "now", last_seen: "now",
+                });
+                return { meta: { changes: 1 } };
+              }
+              if (sql.startsWith("UPDATE promo_redemptions SET last_seen")) {
+                return { meta: { changes: 1 } };
+              }
+              if (sql.startsWith("UPDATE promo_codes SET status = 'revoked'")) {
+                const row = promos.get(args[0]);
                 if (row) row.status = "revoked";
                 return { meta: { changes: row ? 1 : 0 } };
               }
@@ -223,6 +266,96 @@ describe("license routes", () => {
     const sloppy = ` ${key.toLowerCase()} `;
     const [req, url] = post("/license/activate", { key: sloppy, device_id: "d" });
     expect((await handleLicenseRoute(req, env, url)).status).toBe(200);
+  });
+
+  it("promo: create → redeem → receipt verifies, idempotent per device", async () => {
+    let [req, url] = post("/license/promo-create", { code: "LAUNCH-2026", max_redemptions: 2 }, ADMIN);
+    const created = await (await handleLicenseRoute(req, env, url)).json();
+    expect(created.ok).toBe(true);
+    expect(created.code).toBe("LAUNCH-2026");
+    // Raw code never stored — only its salted hash.
+    for (const hash of env.LICENSES.promos.keys()) {
+      expect(hash).not.toContain("LAUNCH");
+      expect(hash).toMatch(/^[0-9a-f]{64}$/);
+    }
+
+    [req, url] = post("/license/promo", { code: "launch-2026", device_id: "dev-1" });
+    const redeemed = await (await handleLicenseRoute(req, env, url)).json();
+    expect(redeemed.ok).toBe(true);
+    const [expSec, sig] = redeemed.token.split(".");
+    const codeHash = await hmacSha256Hex("promo.LAUNCH-2026", SALT);
+    const devHash = await hmacSha256Hex("dev.dev-1", SALT);
+    expect(sig).toBe(await hmacSha256Hex(`receipt.promo.${codeHash}.${devHash}.${expSec}`, SALT));
+
+    // Same device re-redeems (the client's refresh path) without a new slot.
+    [req, url] = post("/license/promo", { code: "LAUNCH-2026", device_id: "dev-1" });
+    expect((await handleLicenseRoute(req, env, url)).status).toBe(200);
+    expect(env.LICENSES.redemptions.size).toBe(1);
+  });
+
+  it("promo: enforces redemption cap and revocation", async () => {
+    let [req, url] = post("/license/promo-create", { code: "CAPPED-1", max_redemptions: 1 }, ADMIN);
+    await handleLicenseRoute(req, env, url);
+
+    [req, url] = post("/license/promo", { code: "CAPPED-1", device_id: "d1" });
+    expect((await handleLicenseRoute(req, env, url)).status).toBe(200);
+    [req, url] = post("/license/promo", { code: "CAPPED-1", device_id: "d2" });
+    const capped = await handleLicenseRoute(req, env, url);
+    expect(capped.status).toBe(403);
+    expect((await capped.json()).error).toMatch(/fully redeemed/);
+
+    [req, url] = post("/license/promo-revoke", { code: "CAPPED-1" }, ADMIN);
+    expect((await handleLicenseRoute(req, env, url)).status).toBe(200);
+    // Revocation also kills the existing device's refresh path.
+    [req, url] = post("/license/promo", { code: "CAPPED-1", device_id: "d1" });
+    expect((await handleLicenseRoute(req, env, url)).status).toBe(403);
+  });
+
+  it("promo: expiry is enforced", async () => {
+    const codeHash = await hmacSha256Hex("promo.OLD-PROMO", SALT);
+    env.LICENSES.promos.set(codeHash, {
+      code_hash: codeHash, status: "active", max_redemptions: 10,
+      expires_at: "2020-01-01T00:00:00Z",
+    });
+    const [req, url] = post("/license/promo", { code: "OLD-PROMO", device_id: "d1" });
+    const resp = await handleLicenseRoute(req, env, url);
+    expect(resp.status).toBe(403);
+    expect((await resp.json()).error).toMatch(/expired/);
+  });
+
+  it("promo: rejects unknown codes, license-shaped input, and garbage", async () => {
+    let [req, url] = post("/license/promo", { code: "NEVER-MADE", device_id: "d" });
+    expect((await handleLicenseRoute(req, env, url)).status).toBe(404);
+    // A real license key belongs on /license/activate, not the promo path.
+    [req, url] = post("/license/promo", { code: "SASSY-AAAAA-BBBBB-CCCCC-DDDDD", device_id: "d" });
+    expect((await handleLicenseRoute(req, env, url)).status).toBe(400);
+    [req, url] = post("/license/promo", { code: "x", device_id: "d" });
+    expect((await handleLicenseRoute(req, env, url)).status).toBe(400);
+  });
+
+  it("promo: admin info reports redemption count; create is admin-only", async () => {
+    let [req, url] = post("/license/promo-create", { code: "COUNTME" }, ADMIN);
+    await handleLicenseRoute(req, env, url);
+    [req, url] = post("/license/promo", { code: "COUNTME", device_id: "d1" });
+    await handleLicenseRoute(req, env, url);
+
+    const infoUrl = new URL("https://relay.example/license/promo-info?code=COUNTME");
+    const infoReq = new Request(infoUrl, { headers: { Authorization: `Bearer ${ADMIN}` } });
+    const json = await (await handleLicenseRoute(infoReq, env, infoUrl)).json();
+    expect(json.redemptions).toBe(1);
+    expect(json.promo.status).toBe("active");
+
+    [req, url] = post("/license/promo-create", { code: "NOPE-1" }, "bad-token");
+    expect((await handleLicenseRoute(req, env, url)).status).toBe(401);
+  });
+
+  it("promo: generated codes are SASSYTALK-XXXXXX and duplicates 409", async () => {
+    let [req, url] = post("/license/promo-create", {}, ADMIN);
+    const gen = await (await handleLicenseRoute(req, env, url)).json();
+    expect(gen.code).toMatch(/^SASSYTALK-[A-HJ-NP-Z2-9]{6}$/);
+
+    [req, url] = post("/license/promo-create", { code: gen.code }, ADMIN);
+    expect((await handleLicenseRoute(req, env, url)).status).toBe(409);
   });
 
   it("admin info reports devices", async () => {

@@ -58,6 +58,17 @@ object Entitlements {
     // so one successful check per ~15 days keeps a live key permanently warm.
     private const val REFRESH_WHEN_REMAINING_SEC = 15L * 24 * 3600
 
+    // Mirrors the worker's canonical license shape; anything else the user
+    // enters is treated as a promo code (worker enforces promo shape).
+    private val LICENSE_RE = Regex("^SASSY(-[A-HJ-NP-Z2-9]{5}){4}$")
+
+    private fun endpointFor(credential: String, kind: String?): String = when {
+        kind == "promo" -> "/license/promo"
+        kind == "license" -> "/license/validate"
+        LICENSE_RE.matches(credential) -> "/license/activate"
+        else -> "/license/promo"
+    }
+
     private val http = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
@@ -77,12 +88,13 @@ object Entitlements {
     fun refresh(context: Context, onResult: (Boolean) -> Unit = {}) {
         val p = LicenseStore.prefs(context) ?: return onResult(false)
         val key = p.getString(LicenseStore.KEY_LICENSE, null) ?: return onResult(false)
+        val kind = p.getString(LicenseStore.KEY_KIND, null)
         val exp = p.getLong(LicenseStore.KEY_RECEIPT_EXP, 0L)
         val now = System.currentTimeMillis() / 1000
         if (exp - now > REFRESH_WHEN_REMAINING_SEC) return onResult(true)
 
         CoroutineScope(Dispatchers.IO).launch {
-            when (val res = call("/license/validate", key, context)) {
+            when (val res = call(endpointFor(key, kind), key, context)) {
                 is ApiResult.Ok -> {
                     p.edit().putLong(LicenseStore.KEY_RECEIPT_EXP, res.expiresAt).apply()
                     onResult(true)
@@ -123,7 +135,7 @@ object Entitlements {
                 )
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "Enter the license key from your purchase.\nOne key covers up to 3 devices.",
+                    text = "Enter the license key from your purchase\nor a promo code. Licenses cover 3 devices.",
                     fontSize = 14.sp,
                     color = TextGray,
                     textAlign = TextAlign.Center,
@@ -132,7 +144,7 @@ object Entitlements {
                 OutlinedTextField(
                     value = keyInput,
                     onValueChange = { keyInput = it.uppercase() },
-                    placeholder = { Text("SASSY-XXXXX-XXXXX-XXXXX-XXXXX", color = TextGray) },
+                    placeholder = { Text("License key or promo code", color = TextGray) },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters),
                     colors = OutlinedTextFieldDefaults.colors(
@@ -151,15 +163,22 @@ object Entitlements {
                         onClick = {
                             busy = true
                             error = null
+                            val credential = keyInput.trim()
+                            val isLicense = LICENSE_RE.matches(credential)
                             scope.launch {
                                 val res = withContext(Dispatchers.IO) {
-                                    call("/license/activate", keyInput.trim(), context)
+                                    call(
+                                        if (isLicense) "/license/activate" else "/license/promo",
+                                        credential,
+                                        context,
+                                    )
                                 }
                                 busy = false
                                 when (res) {
                                     is ApiResult.Ok -> {
                                         LicenseStore.prefs(context)?.edit()
-                                            ?.putString(LicenseStore.KEY_LICENSE, keyInput.trim())
+                                            ?.putString(LicenseStore.KEY_LICENSE, credential)
+                                            ?.putString(LicenseStore.KEY_KIND, if (isLicense) "license" else "promo")
                                             ?.putLong(LicenseStore.KEY_RECEIPT_EXP, res.expiresAt)
                                             ?.apply()
                                         onUnlocked()
@@ -207,8 +226,11 @@ object Entitlements {
 
     private fun call(path: String, key: String, context: Context): ApiResult {
         return try {
+            // "key" feeds /license/activate|validate, "code" feeds /license/promo —
+            // sending both lets one helper serve every endpoint.
             val body = JSONObject()
                 .put("key", key)
+                .put("code", key)
                 .put("device_id", deviceId(context))
                 .put("device_name", android.os.Build.MODEL)
                 .put("app_version", BuildConfig.VERSION_NAME)
