@@ -45,6 +45,15 @@ use tracing::{debug, info, warn};
 use sassytalkie_core::crypto::CryptoSession;
 
 use super::control;
+use super::liveness::LivenessTracker;
+
+/// Wall-clock millis since the epoch (best-effort).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 /// Relay WebSocket base (scheme + host). Path (`/ws`, `/auth`) appended per call.
 pub const RELAY_WS_BASE: &str = "wss://relay.sassyconsultingllc.com";
@@ -128,6 +137,15 @@ pub struct CellularTransport {
     session_epoch: u64,
     heartbeat_seq: AtomicU32,
 
+    /// PTT-marker sequence (OP_PTT_START_V2 / OP_PTT_STOP_V2 payloads).
+    tx_seq: AtomicU32,
+
+    /// Per-peer liveness derived from inbound control frames (heartbeat, PTT
+    /// markers). The relay multiplexes N peers onto one socket, so peers are
+    /// keyed by the sender epoch embedded in each control frame — the same
+    /// scheme the Android client uses (`relayPeerIdFromFrame`).
+    liveness: Arc<Mutex<LivenessTracker>>,
+
     /// Stats (best-effort, relaxed).
     packets_sent: AtomicU32,
     packets_received: AtomicU32,
@@ -150,6 +168,8 @@ impl CellularTransport {
             state: AtomicU8::new(CellularState::Disconnected as u8),
             session_epoch: control::new_session_epoch(),
             heartbeat_seq: AtomicU32::new(0),
+            tx_seq: AtomicU32::new(0),
+            liveness: Arc::new(Mutex::new(LivenessTracker::new())),
             packets_sent: AtomicU32::new(0),
             packets_received: AtomicU32::new(0),
         })
@@ -345,11 +365,100 @@ impl CellularTransport {
             return;
         }
         if is_control_frame(&bytes) {
-            // Heartbeats / PTT markers / partner-offline — not audio. (A future
-            // pass can feed these to a liveness tracker.)
+            // Heartbeats / PTT markers / partner-offline — not audio. Feed them
+            // to the liveness tracker so peers show up with health/RTT and the
+            // desktop reacts to PTT state, matching the Android client.
+            self.handle_control(&bytes);
             return;
         }
         self.decrypt_and_deliver(&bytes);
+    }
+
+    /// Parse an inbound control frame and update per-peer liveness. Peers are
+    /// keyed by the sender epoch carried in the frame (the relay broadcasts all
+    /// peers down one socket, so there is no per-connection identity here).
+    fn handle_control(&self, bytes: &[u8]) {
+        let Some(decoded) = control::decode(bytes) else { return; };
+        let now = now_ms();
+        match decoded.opcode {
+            control::OP_HEARTBEAT => {
+                if let Some(hb) = control::parse_heartbeat(&decoded.payload) {
+                    let peer = format!("relay:{}", hb.epoch);
+                    let mut lv = self.liveness.lock().unwrap();
+                    lv.on_heartbeat(&peer, hb.epoch, hb.seq, hb.ts_ms, now, hb.state.as_byte());
+                }
+            }
+            control::OP_PTT_START_V2 | control::OP_PTT_STOP_V2 => {
+                // Epoch-prefixed payload: refresh liveness and reflect the
+                // speaking/listening presence so the UI can show who is talking.
+                if decoded.payload.len() >= 8 {
+                    let epoch = u64::from_le_bytes(decoded.payload[0..8].try_into().unwrap());
+                    let peer = format!("relay:{}", epoch);
+                    let presence = if decoded.opcode == control::OP_PTT_START_V2 {
+                        control::PresenceState::Speaking
+                    } else {
+                        control::PresenceState::Listening
+                    };
+                    let mut lv = self.liveness.lock().unwrap();
+                    lv.on_heartbeat(&peer, epoch, 0, now, now, presence.as_byte());
+                }
+            }
+            control::OP_PARTNER_OFFLINE => {
+                // Payload: [peer_id_len:u8][peer_id]. The relay keys this on its
+                // own per-install id, which we never map to the epoch we track,
+                // so we can only log it here (same limitation as Android).
+                if let Some(&len) = decoded.payload.first() {
+                    let len = len as usize;
+                    if decoded.payload.len() >= 1 + len {
+                        if let Ok(name) = std::str::from_utf8(&decoded.payload[1..1 + len]) {
+                            debug!("Cellular: partner offline: {}", name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Announce PTT start over the relay (OP_PTT_START_V2). Lets Android peers
+    /// see the desktop begin transmitting and triggers relay FCM wake for
+    /// offline peers. No-op if not connected.
+    pub fn notify_ptt_start(&self) {
+        if self.state() != CellularState::Connected {
+            return;
+        }
+        let seq = self.tx_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = control::encode_ptt_start_v2(self.session_epoch, seq);
+        let _ = self.outbound_tx.send(frame);
+    }
+
+    /// Announce PTT stop over the relay (OP_PTT_STOP_V2). No-op if not connected.
+    pub fn notify_ptt_stop(&self) {
+        if self.state() != CellularState::Connected {
+            return;
+        }
+        let seq = self.tx_seq.load(Ordering::Relaxed);
+        let frame = control::encode_ptt_stop_v2(self.session_epoch, seq);
+        let _ = self.outbound_tx.send(frame);
+    }
+
+    /// Per-peer liveness snapshot as JSON (for diagnostics / status).
+    pub fn peers_json(&self) -> String {
+        let now = now_ms();
+        let lv = self.liveness.lock().unwrap();
+        let arr: Vec<serde_json::Value> = lv
+            .peer_ids()
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "peer": id,
+                    "health": format!("{:?}", lv.health(id, now)),
+                    "rtt_ms": lv.rtt_ms(id),
+                    "presence": lv.last_presence(id),
+                })
+            })
+            .collect();
+        serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
     }
 
     /// Decrypt an encrypted audio frame and forward the Opus payload to the
@@ -426,12 +535,14 @@ impl CellularTransport {
 
     /// Stats as JSON (for diagnostics / status command).
     pub fn stats_json(&self) -> String {
+        let peer_count = self.liveness.lock().unwrap().peer_ids().len();
         format!(
-            r#"{{"state":"{}","room":"{}","sent":{},"received":{}}}"#,
+            r#"{{"state":"{}","room":"{}","sent":{},"received":{},"peers":{}}}"#,
             self.state().as_str(),
             self.config.room_id,
             self.packets_sent.load(Ordering::Relaxed),
             self.packets_received.load(Ordering::Relaxed),
+            peer_count,
         )
     }
 

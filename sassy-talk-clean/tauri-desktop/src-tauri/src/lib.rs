@@ -282,7 +282,13 @@ impl AppState {
         let audio = self.audio.lock().await;
         audio.start_recording()?;
         drop(audio);
-        
+
+        // Announce PTT start over the relay so Android peers see us begin
+        // transmitting (and offline peers get an FCM wake).
+        if let Some(cell) = self.cellular.lock().await.as_ref() {
+            cell.notify_ptt_start();
+        }
+
         // Start TX thread
         self.start_tx_thread().await;
         
@@ -301,7 +307,12 @@ impl AppState {
         
         // Stop TX thread
         self.stop_tx_thread().await;
-        
+
+        // Announce PTT stop over the relay (end-of-transmission marker).
+        if let Some(cell) = self.cellular.lock().await.as_ref() {
+            cell.notify_ptt_stop();
+        }
+
         // Stop audio recording
         let audio = self.audio.lock().await;
         audio.stop_recording()?;
@@ -335,6 +346,11 @@ impl AppState {
         // Snapshot the active transport at PTT-press time: if a cellular
         // session is joined, audio goes over the relay instead of UDP multicast.
         let cellular = self.cellular.lock().await.clone();
+        // VOX gate: when enabled, only frames whose RMS level clears the
+        // configured threshold go on the wire. Previously these settings were
+        // stored by the commands but never consulted, so VOX was a no-op.
+        let vox_enabled = Arc::clone(&self.vox_enabled);
+        let vox_threshold = Arc::clone(&self.vox_threshold);
 
         let handle = tokio::spawn(async move {
             let mut encoder = match OpusEncoder::new() {
@@ -359,6 +375,12 @@ impl AppState {
                 drop(audio_lock);
                 
                 if samples_read == FRAME_SIZE {
+                    // VOX: skip frames below the speech threshold when enabled.
+                    if vox_enabled.load(Ordering::Relaxed)
+                        && frame_rms_normalized(&buffer) < *vox_threshold.read().await
+                    {
+                        continue;
+                    }
                     // Encode to Opus
                     match encoder.encode(&buffer) {
                         Ok(opus_data) => {
@@ -604,6 +626,17 @@ impl AppState {
         let transport = self.transport.lock().await;
         transport.get_connection_quality()
     }
+}
+
+/// RMS amplitude of a 16-bit PCM frame, normalized to 0.0..=1.0. Used by the
+/// VOX gate to decide whether a frame carries speech.
+fn frame_rms_normalized(samples: &[i16]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    let rms = (sum_sq / samples.len() as f64).sqrt();
+    (rms / i16::MAX as f64) as f32
 }
 
 /// Shared RX pipeline: decode Opus → shared `sassytalkie-core` audio_cache
