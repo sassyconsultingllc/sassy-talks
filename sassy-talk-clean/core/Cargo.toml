@@ -40,7 +40,16 @@ base64 = "0.22"
 # `getrandom` lets us call the crate's system-RNG helpers directly (its rand_core
 # 0.10 CryptoRng is a different trait version from rand 0.8's, so bridging OsRng
 # would be fragile); `zeroize` makes the ML-KEM decapsulation key wipe on drop.
-ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
+# Optional: only the `roadmap` feature (pqc.rs) needs it, so the default build
+# stays lean and doesn't pull ml-kem's edition-2024 transitive deps.
+ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"], optional = true }
+
+[features]
+# Roadmap modules (pqc / channels / emergency) are pure-logic but not yet wired
+# into any production wire path. Off by default so they don't inflate the build
+# or audit surface; enable with `--features roadmap` to build/test them.
+default = []
+roadmap = ["dep:ml-kem"]
 
 [dev-dependencies]
 # In-crate unit tests for audio_cache mix/queue modes already pass on host

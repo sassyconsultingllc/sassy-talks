@@ -36,8 +36,17 @@ pub mod bitrate;
 //                    layered on top of `crypto` without modifying it.
 //   - `channels`   — channel scan / priority-channel preemption state machine.
 //   - `emergency`  — SOS / man-down / emergency-broadcast signalling.
+//
+// Gated behind the default-off `roadmap` feature: none of these are wired into
+// a production wire path yet, and enabling them (esp. `emergency`, which would
+// add new opcodes) requires a coordinated protocol change. Keeping them off by
+// default shrinks the default build + audit surface; build/test them with
+// `cargo build --features roadmap`.
+#[cfg(feature = "roadmap")]
 pub mod pqc;
+#[cfg(feature = "roadmap")]
 pub mod channels;
+#[cfg(feature = "roadmap")]
 pub mod emergency;
 // `sealed` — metadata-resistant blinded room/peer handles so the relay sees
 // only rotating opaque tokens it cannot correlate to identity or across epochs.
