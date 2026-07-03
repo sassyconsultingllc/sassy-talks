@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use log::{info, warn, error};
+use zeroize::Zeroize;
 
 use sassytalkie_core::sealed;
 
@@ -55,14 +56,24 @@ pub fn is_sealed_enabled() -> bool {
 /// Push the sealed context (session key + stable peer id) used to derive
 /// blinded handles. Call after a session is established.
 pub fn set_sealed_context(session_key: [u8; 32], stable_peer_id: String) {
-    *SEALED_CTX.lock().unwrap_or_else(|e| e.into_inner()) = Some((session_key, stable_peer_id));
-    info!("Cellular: sealed context set (peer id len {})", SEALED_CTX.lock().map(|g| g.as_ref().map(|(_, p)| p.len()).unwrap_or(0)).unwrap_or(0));
+    let mut guard = SEALED_CTX.lock().unwrap_or_else(|e| e.into_inner());
+    // Zeroize any prior key before it's dropped so a replaced session key
+    // doesn't linger in freed process memory.
+    if let Some((mut old_key, _)) = guard.take() {
+        old_key.zeroize();
+    }
+    let peer_len = stable_peer_id.len();
+    *guard = Some((session_key, stable_peer_id));
+    info!("Cellular: sealed context set (peer id len {})", peer_len);
 }
 
 /// Clear the sealed context (e.g. on session clear) so a stale key can't blind
-/// a future room.
+/// a future room. The 32-byte session key is zeroized rather than just dropped.
 pub fn clear_sealed_context() {
-    *SEALED_CTX.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let mut guard = SEALED_CTX.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((mut key, _)) = guard.take() {
+        key.zeroize();
+    }
 }
 
 fn now_ms_epoch() -> u64 {
