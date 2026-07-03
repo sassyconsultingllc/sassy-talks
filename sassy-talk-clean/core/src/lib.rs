@@ -27,6 +27,9 @@ pub mod audio_cache;
 pub mod cohort_history;
 pub mod crypto;
 pub mod session;
+// `bitrate` — receiver-side Opus bitrate guard (estimate from frame size,
+// reject out-of-band streams). No wire change; see docs/bitrate-guard-design.md.
+pub mod bitrate;
 
 // ── 2026–2027 roadmap modules (pure logic, cross-platform) ─────────────────
 //   - `pqc`        — hybrid X25519 + ML-KEM-768 post-quantum key agreement,
