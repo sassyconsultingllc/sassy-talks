@@ -1029,6 +1029,57 @@ html, body {
   margin-bottom: var(--spacing-sm);
 }
 
+/* Recent sessions (cohort history) list */
+.cohort-history {
+  margin-top: var(--spacing-md);
+  border-top: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+  padding-top: var(--spacing-sm);
+}
+.cohort-history-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--spacing-xs);
+}
+.cohort-clear-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.cohort-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.cohort-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+  padding: 4px 0;
+  font-size: 0.82rem;
+}
+.cohort-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cohort-meta {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  flex-shrink: 0;
+}
+.cohort-hint {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  line-height: 1.4;
+  margin-top: var(--spacing-xs);
+}
+
 .cellular-qr-input {
   width: 100%;
   background: var(--bg-dark);

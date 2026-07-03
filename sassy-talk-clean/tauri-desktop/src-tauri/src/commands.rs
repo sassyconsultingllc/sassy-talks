@@ -396,9 +396,23 @@ pub async fn leave_cellular_session(state: State<'_, Arc<AppState>>) -> Result<(
     Ok(())
 }
 
-/// Cellular session status as JSON (`{state,room,sent,received}`), or an empty
-/// string when no session is joined.
+/// Cellular session status as JSON (`{state,room,sent,received,peers}`), or an
+/// empty string when no session is joined.
 #[tauri::command]
 pub async fn get_cellular_status(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     Ok(state.cellular_status().await.unwrap_or_default())
+}
+
+/// Recent-sessions (cohort) history as a JSON array. Holds no key material —
+/// it's a display list of past sessions (group name, host, last joined).
+#[tauri::command]
+pub async fn get_cohort_history(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    Ok(state.cohort_history_json())
+}
+
+/// Clear the recent-sessions history.
+#[tauri::command]
+pub async fn clear_cohort_history(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.clear_cohort_history();
+    Ok(())
 }
