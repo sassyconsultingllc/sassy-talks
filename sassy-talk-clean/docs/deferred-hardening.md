@@ -78,3 +78,32 @@ risk is reduced but not eliminated.
 Pick these up in v2.7.x when there's bandwidth for a protocol-version bump
 (item 1) and a structured concurrency audit (item 2). Neither blocks daily
 operation today.
+
+---
+
+## Status update (2026-07-03)
+
+**Item 2 (lock-order audit):** The `docs/audit-2026-07-03.md` pass confirmed
+there is **no live deadlock triangle** — the RX path acquires
+`transport → audio_cache → user_registry → audio` sequentially and replay
+snapshots the cache before taking `audio` last. The previously-unwritten
+convention is now:
+
+1. Documented as the canonical order in `android-native/src/lock_order.rs`
+   (`Transport < AudioCache < UserRegistry < Audio`).
+2. Backed by a `#[cfg(debug_assertions)]` `LockScope` guard (thread-local
+   held-stack) that trips an assertion on any out-of-order acquisition, so a
+   future edit can't silently reintroduce the risk. Adopt it by wrapping nested
+   acquisitions; it compiles to nothing in release builds.
+
+Incremental instrumentation of the ~24 individual `.lock()` sites in
+`audio_pipeline.rs` remains optional follow-up — deliberately not done in bulk
+to avoid perturbing the realtime audio path.
+
+**Item 1 (nonce-prefix widening):** still deferred — it is a hard wire-format
+break. See the note in `docs/audit-2026-07-03.md` (P2-1): SassyTalkie's project
+policy forbids breaking interop with deployed v2.7.5 clients without a
+coordinated, version-negotiated cutover. Recommended path when scheduled: add a
+`v` (nonce-layout) field to the session handshake, negotiate 8+4 vs the current
+4+8 per session, and ship a release that understands both before any device
+emits the new layout.
