@@ -275,22 +275,6 @@ object SassyTalkNative {
 
     // ── QR Auth / Session ──
 
-    fun generateSessionQR(durationHours: Int = 24): String {
-        if (!initialized) return ""
-        return try {
-            val json = nativeGenerateSessionQR(durationHours)
-            // Persist session so it survives app restart
-            if (json.isNotEmpty()) {
-                sessionPrefs()
-                    ?.edit()?.putString("session_json", json)?.apply()
-            }
-            json
-        } catch (e: Exception) {
-            Log.e(TAG, "generateSessionQR failed: ${e.message}")
-            ""
-        }
-    }
-
     fun importSessionFromQR(qrJson: String): Boolean {
         if (!initialized) return false
         return try {
@@ -508,33 +492,10 @@ object SassyTalkNative {
 
     // ── Crypto ──
 
-    fun generatePsk(): String? {
-        if (!initialized) return null
-        return try {
-            nativeGeneratePsk()
-        } catch (e: Exception) { null }
-    }
-
     fun setPsk(pskB64: String): Boolean {
         if (!initialized) return false
         return try {
             nativeSetPsk(pskB64)
-        } catch (e: Exception) { false }
-    }
-
-    /** Start ECDH key exchange, returns local public key as base64 */
-    fun keyExchangeInit(): String? {
-        if (!initialized) return null
-        return try {
-            nativeKeyExchangeInit()
-        } catch (e: Exception) { null }
-    }
-
-    /** Complete ECDH key exchange with remote public key (base64) */
-    fun keyExchangeComplete(remotePubB64: String): Boolean {
-        if (!initialized) return false
-        return try {
-            nativeKeyExchangeComplete(remotePubB64)
         } catch (e: Exception) { false }
     }
 
@@ -861,12 +822,6 @@ object SassyTalkNative {
         }
     }
 
-    /** Get the unique ID of the most recently added history utterance */
-    fun lastHistoryId(): Long {
-        if (!initialized) return -1
-        return try { nativeLastHistoryId() } catch (_: Exception) { -1 }
-    }
-
     /** Sync user info (mute/favorite status) from UserRegistry into the audio cache */
     fun syncCacheUserInfo() {
         if (initialized) {
@@ -1074,7 +1029,6 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeSetPttBufferMode(bufferMode: Boolean)
     @JvmStatic private external fun nativeGetPttBufferMode(): Boolean
     @JvmStatic private external fun nativeReplayById(utteranceId: Long): Boolean
-    @JvmStatic private external fun nativeLastHistoryId(): Long
     @JvmStatic private external fun nativeSetChannel(channel: Byte)
 
     /**
@@ -1108,7 +1062,6 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeDisconnect(): Boolean
 
     // QR Auth / Session
-    @JvmStatic private external fun nativeGenerateSessionQR(durationHours: Int): String
     @JvmStatic private external fun nativeImportSessionFromQR(qrJson: String): Boolean
     @JvmStatic private external fun nativeIsAuthenticated(): Boolean
     @JvmStatic private external fun nativeGetSessionStatus(): String
@@ -1124,10 +1077,7 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeRegisterUser(userId: String, userName: String)
     @JvmStatic private external fun nativeGetFavorites(): String
     @JvmStatic private external fun nativeDeriveUserId(sessionKeyB64: String): String
-    @JvmStatic private external fun nativeGeneratePsk(): String
     @JvmStatic private external fun nativeSetPsk(pskB64: String): Boolean
-    @JvmStatic private external fun nativeKeyExchangeInit(): String
-    @JvmStatic private external fun nativeKeyExchangeComplete(remotePubB64: String): Boolean
     @JvmStatic private external fun nativeCheckPermissions(): String
     @JvmStatic private external fun nativeOnPermissionResult(permission: String, granted: Boolean)
     @JvmStatic private external fun nativeGetMissingPermissions(): String

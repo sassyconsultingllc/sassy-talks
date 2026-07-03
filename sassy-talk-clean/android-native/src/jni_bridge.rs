@@ -1184,23 +1184,6 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     }
 }
 
-/// JNI: Get the ID of the most recently added history utterance
-#[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeLastHistoryId(
-    _env: JNIEnv,
-    _class: JClass,
-) -> jni::sys::jlong {
-    let state = get_jni_state();
-    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-
-    if let Some(ref sm) = guard.state_machine {
-        let cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
-        cache.last_history_id().map(|id| id as i64).unwrap_or(-1)
-    } else {
-        -1
-    }
-}
-
 /// JNI: Set channel (syncs to both Rust pipeline and BT transport)
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetChannel(
@@ -1568,26 +1551,6 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 //==============================================================================
 // SESSION / QR AUTH JNI EXPORTS
 //==============================================================================
-
-/// JNI: Generate a session QR code payload
-#[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGenerateSessionQR<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    duration_hours: jni::sys::jint,
-) -> JObject<'local> {
-    // Legacy: generate for current channel with default name
-    let state = get_jni_state();
-    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    let channel = guard.current_channel.load(std::sync::atomic::Ordering::SeqCst);
-    drop(guard);
-
-    Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGenerateChannelQR(
-        env, _class, channel as jni::sys::jint, duration_hours,
-        std::ptr::null_mut(), // null group_name = use default
-        std::ptr::null_mut(), // null cohort_id = mint fresh
-    )
-}
 
 /// JNI: Generate session QR for a specific channel with optional group name + cohort_id
 #[no_mangle]
@@ -2098,23 +2061,6 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let user_id = crate::users::UserRegistry::derive_user_id(&key_bytes);
 
     env.new_string(&user_id)
-        .map(|s| s.into())
-        .unwrap_or_else(|_| JObject::null())
-}
-
-/// JNI: Generate a fresh pre-shared key (base64 encoded)
-#[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGeneratePsk<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-) -> JObject<'local> {
-    let psk = crate::crypto::generate_psk();
-    let psk_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        &psk,
-    );
-
-    env.new_string(&psk_b64)
         .map(|s| s.into())
         .unwrap_or_else(|_| JObject::null())
 }
