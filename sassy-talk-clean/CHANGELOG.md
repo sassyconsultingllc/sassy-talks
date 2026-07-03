@@ -31,6 +31,13 @@ All notable changes to SassyTalkie. Format loosely follows
 ### Changed
 - Invite deep-links imported while the app is locked now hold at the unlock
   screen (the session still imports and is live immediately after unlock).
+- **Edge-to-edge display** using the modern API: content draws full-bleed
+  behind transparent system bars with proper inset handling (fixes the Play
+  Console "deprecated edge-to-edge APIs" and "may not display for all users"
+  advisories on Android 15+).
+- **Rotation and large screens**: the portrait lock is gone — the app now
+  rotates and resizes on tablets, foldables, and split-screen. A live session
+  (audio engine, transport, PTT) survives rotation without interruption.
 - Release artifacts are flavor-qualified: website APK =
   `app-direct-release.apk`, Play AAB = `app-play-release.aab`; CI and the
   ship pipeline updated to match.

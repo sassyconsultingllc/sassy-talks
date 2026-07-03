@@ -13,11 +13,16 @@ import android.util.Log
 import android.view.KeyEvent
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -115,6 +120,16 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Edge-to-edge with the non-deprecated API (window.statusBarColor /
+        // navigationBarColor are deprecated as of API 35). The app is
+        // always-dark, so force dark bars; the transparent scrim lets the
+        // Compose background draw full-bleed behind them. Content is kept
+        // clear of the bars by safeDrawing padding on the root Box below.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
+
         // Diagnostics overlay toggle — persisted, honoured in release builds.
         DiagnosticsPrefs.init(this)
 
@@ -135,7 +150,14 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    Box(modifier = Modifier.fillMaxSize()) {
+                    // The Surface paints edge-to-edge (behind transparent
+                    // system bars); safeDrawing keeps interactive content out
+                    // of the status/nav bar and display-cutout zones.
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .windowInsetsPadding(WindowInsets.safeDrawing)
+                    ) {
                         AppNavigation(
                             permissionsGranted = permissionsGranted.value,
                             walkieService = walkieService.value,

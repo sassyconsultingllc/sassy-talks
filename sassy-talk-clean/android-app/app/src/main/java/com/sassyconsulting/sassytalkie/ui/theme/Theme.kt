@@ -6,7 +6,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
-import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 
@@ -49,9 +48,11 @@ fun SassyTalkTheme(
     
     if (!view.isInEditMode) {
         SideEffect {
+            // Edge-to-edge: bar colors come from the app content drawing behind
+            // transparent system bars (enableEdgeToEdge() in MainActivity).
+            // window.statusBarColor/navigationBarColor are deprecated in API 35
+            // and deliberately not touched here.
             val window = (view.context as Activity).window
-            window.statusBarColor = DarkerBg.toArgb()
-            window.navigationBarColor = DarkerBg.toArgb()
             WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = false
         }
     }
