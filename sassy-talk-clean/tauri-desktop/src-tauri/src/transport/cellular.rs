@@ -330,14 +330,32 @@ impl CellularTransport {
         }
     }
 
-    /// Route an inbound binary frame: skip control frames, decrypt audio.
+    /// Route an inbound binary frame: unwrap replay frames, skip control
+    /// frames, decrypt audio.
     fn handle_inbound(&self, bytes: Vec<u8>) {
-        if is_control_frame(&bytes) {
-            // Heartbeats / PTT markers / partner-offline / replay headers — not
-            // audio. (A future pass can feed these to a liveness tracker.)
+        // OP_REPLAY_FRAME (0x19) is a catch-up wrapper the relay emits when we
+        // reconnect with ?catchup=1. It is NOT standard TLV: bytes [1..3] are a
+        // peer_id LENGTH (u16 LE), then the peer id, then the original encrypted
+        // audio appended raw. Strip the header and decrypt the inner frame; the
+        // replay header would otherwise corrupt the nonce and fail every frame.
+        if let Some(audio) = unwrap_replay_frame(&bytes) {
+            if !audio.is_empty() {
+                self.decrypt_and_deliver(audio);
+            }
             return;
         }
-        match self.crypto.lock().unwrap().decrypt(&bytes) {
+        if is_control_frame(&bytes) {
+            // Heartbeats / PTT markers / partner-offline — not audio. (A future
+            // pass can feed these to a liveness tracker.)
+            return;
+        }
+        self.decrypt_and_deliver(&bytes);
+    }
+
+    /// Decrypt an encrypted audio frame and forward the Opus payload to the
+    /// audio pipeline. Shared by the live and catch-up (replay) RX paths.
+    fn decrypt_and_deliver(&self, bytes: &[u8]) {
+        match self.crypto.lock().unwrap().decrypt(bytes) {
             Ok(opus) => {
                 self.packets_received.fetch_add(1, Ordering::Relaxed);
                 // Unbounded send to the audio pipeline; only fails if the
@@ -431,6 +449,25 @@ fn https_base() -> String {
     RELAY_WS_BASE.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1)
 }
 
+/// If `b` is an OP_REPLAY_FRAME (0x19) catch-up wrapper, return the inner
+/// encrypted audio slice (nonce + ciphertext + tag). Returns None for any
+/// other frame. Layout (see relay `buildReplayFrame` / core/src/protocol.rs):
+///   [0]      0x19
+///   [1..3]   peer_id_len: u16 LE
+///   [3..]    peer_id bytes
+///   [...]    original encrypted audio frame (to end of message)
+fn unwrap_replay_frame(b: &[u8]) -> Option<&[u8]> {
+    if b.len() < 3 || b[0] != 0x19 {
+        return None;
+    }
+    let peer_id_len = (b[1] as usize) | ((b[2] as usize) << 8);
+    let audio_offset = 3 + peer_id_len;
+    if audio_offset > b.len() {
+        return None;
+    }
+    Some(&b[audio_offset..])
+}
+
 /// Is this a non-audio control frame? Matches the relay/Kotlin classifier:
 /// opcode in 0x10..=0x1F AND a TLV payload length that exactly accounts for the
 /// frame size. Encrypted audio frames begin with a 12-byte random nonce, so the
@@ -500,6 +537,53 @@ mod tests {
         assert!(!is_control_frame(&[]));
         assert!(!is_control_frame(&[0x10]));
         assert!(!is_control_frame(&[0x10, 0x00]));
+    }
+
+    #[test]
+    fn replay_frame_unwraps_to_inner_audio() {
+        // Relay emits [0x19][peer_id_len:u16 LE][peer_id][audio]. With the empty
+        // peer id the relay actually uses (peer_id_len = 0), the audio starts at
+        // offset 3.
+        let audio = b"\x11\x22 encrypted audio payload";
+        let mut frame = vec![0x19u8, 0x00, 0x00];
+        frame.extend_from_slice(audio);
+        assert_eq!(unwrap_replay_frame(&frame), Some(&audio[..]));
+
+        // With a non-empty peer id the audio starts after the id bytes.
+        let peer = b"peerA";
+        let mut framed = vec![0x19u8, peer.len() as u8, 0x00];
+        framed.extend_from_slice(peer);
+        framed.extend_from_slice(audio);
+        assert_eq!(unwrap_replay_frame(&framed), Some(&audio[..]));
+    }
+
+    #[test]
+    fn non_replay_frames_are_not_unwrapped() {
+        assert_eq!(unwrap_replay_frame(&[]), None);
+        assert_eq!(unwrap_replay_frame(&[0x10, 0x00, 0x00]), None);
+        // Truncated: claims a peer id longer than the frame.
+        assert_eq!(unwrap_replay_frame(&[0x19, 0xFF, 0xFF]), None);
+    }
+
+    #[test]
+    fn replay_wrapped_audio_round_trips() {
+        // End-to-end: a peer encrypts audio, the relay wraps it as a replay
+        // frame, and the receiver must recover the exact plaintext.
+        let key = generate_psk();
+        let mut tx = CryptoSession::from_psk(&key);
+        let rx = CryptoSession::from_psk(&key);
+
+        let opus = b"\x04\x05\x06 pretend opus frame";
+        let encrypted = tx.encrypt(opus).unwrap();
+
+        // Simulate relay buildReplayFrame with empty peer id.
+        let mut replay = vec![0x19u8, 0x00, 0x00];
+        replay.extend_from_slice(&encrypted);
+
+        let inner = unwrap_replay_frame(&replay).expect("must unwrap");
+        assert!(!is_control_frame(inner));
+        let recovered = rx.decrypt(inner).unwrap();
+        assert_eq!(&recovered, opus);
     }
 
     #[test]
