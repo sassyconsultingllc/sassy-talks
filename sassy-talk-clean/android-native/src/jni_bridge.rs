@@ -495,7 +495,13 @@ static JNI_STATE: OnceLock<Arc<Mutex<JniAppState>>> = OnceLock::new();
 struct JniAppState {
     state_machine: Option<StateMachine>,
     session_manager: SessionManager,
-    user_registry: UserRegistry,
+    /// Pre-init user registry. Once a StateMachine exists, the canonical
+    /// registry is the StateMachine's (the RX thread reads/writes that one);
+    /// use [`JniAppState::active_user_registry`] rather than touching this
+    /// field directly so mute/favorite/register never split across two
+    /// instances. Kept as a shared handle so the accessor can return an owned
+    /// `Arc` in both the pre-init and running cases.
+    user_registry: Arc<Mutex<UserRegistry>>,
     cohort_history: crate::cohort_history::CohortHistory,
     ptt_pressed: Arc<AtomicBool>,
     current_channel: Arc<AtomicU8>,
@@ -519,7 +525,7 @@ impl JniAppState {
         Self {
             state_machine: None,
             session_manager: SessionManager::new("SassyTalkie"),
-            user_registry: UserRegistry::new(),
+            user_registry: Arc::new(Mutex::new(UserRegistry::new())),
             cohort_history: crate::cohort_history::CohortHistory::new(
                 crate::cohort_history::DEFAULT_HISTORY_CAP,
             ),
@@ -531,6 +537,20 @@ impl JniAppState {
             bt_encoder: VoiceEncoder::new(),
             bt_decoder: VoiceDecoder::new(),
             bt_recording: false,
+        }
+    }
+
+    /// The canonical user registry to read/write for this call.
+    ///
+    /// When a StateMachine exists it owns the registry the RX thread consults
+    /// to filter muted/favorited peers, so ALL JNI user operations
+    /// (register/mute/favorite/list) must go through it. Before init we fall
+    /// back to the local pre-init registry. Returning an owned `Arc` keeps
+    /// callers from holding a borrow of `self` across the lock.
+    fn active_user_registry(&self) -> Arc<Mutex<UserRegistry>> {
+        match self.state_machine.as_ref() {
+            Some(sm) => Arc::clone(sm.get_user_registry()),
+            None => Arc::clone(&self.user_registry),
         }
     }
 
@@ -1433,18 +1453,19 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         return JNI_FALSE;
     }
 
-    // Auto-register sender in UserRegistry
-    guard.user_registry.register_user(&sender_id, &device_name);
+    // Auto-register sender and read mute/favorite from the CANONICAL registry
+    // (the StateMachine's when running) so BT RX filtering and the activity-log
+    // feed match the WiFi/cellular RX path instead of consulting a stale
+    // pre-init copy.
+    let (is_favorite, is_muted) = {
+        let reg_arc = guard.active_user_registry();
+        let mut reg = reg_arc.lock().unwrap_or_else(|e| e.into_inner());
+        reg.register_user(&sender_id, &device_name);
+        (reg.is_favorite(&sender_id), reg.is_muted(&sender_id))
+    };
 
     // Decode ADPCM
     let pcm_samples = guard.bt_decoder.decode(&compressed);
-
-    // Mirror the unified RX path's activity-log feed so BT-received audio
-    // also surfaces in the timeline.
-    let (is_favorite, is_muted) = (
-        guard.user_registry.is_favorite(&sender_id),
-        guard.user_registry.is_muted(&sender_id),
-    );
     audio_pipeline::call_transcription_bridge_public(
         &sender_id,
         &device_name,
@@ -1854,14 +1875,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let state = get_jni_state();
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Read from the StateMachine's registry (where RX thread registers users),
-    // NOT from JniState.user_registry which is a separate instance.
-    let json = if let Some(ref sm) = guard.state_machine {
-        let reg = sm.get_user_registry().lock().unwrap_or_else(|e| e.into_inner());
-        reg.to_json()
-    } else {
-        guard.user_registry.to_json()
-    };
+    // Read from the canonical registry (the StateMachine's when running, where
+    // the RX thread registers users), never a split pre-init copy.
+    let reg_arc = guard.active_user_registry();
+    let json = reg_arc.lock().unwrap_or_else(|e| e.into_inner()).to_json();
     drop(guard);
 
     env.new_string(&json)
@@ -1885,15 +1902,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let state = get_jni_state();
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Write to StateMachine's registry (where RX thread reads), not JniState's copy
-    if let Some(ref sm) = guard.state_machine {
-        let mut reg = sm.get_user_registry().lock().unwrap_or_else(|e| e.into_inner());
-        reg.set_muted(&id, muted == JNI_TRUE);
-    } else {
-        drop(guard);
-        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        guard.user_registry.set_muted(&id, muted == JNI_TRUE);
-    }
+    // Write to the canonical registry (the StateMachine's when running, where
+    // the RX thread reads the mute filter), never a split pre-init copy.
+    let reg_arc = guard.active_user_registry();
+    reg_arc.lock().unwrap_or_else(|e| e.into_inner()).set_muted(&id, muted == JNI_TRUE);
 }
 
 /// JNI: Set user favorite status
@@ -1912,15 +1924,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let state = get_jni_state();
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Write to StateMachine's registry (where RX thread reads), not JniState's copy
-    if let Some(ref sm) = guard.state_machine {
-        let mut reg = sm.get_user_registry().lock().unwrap_or_else(|e| e.into_inner());
-        reg.set_favorite(&id, favorite == JNI_TRUE);
-    } else {
-        drop(guard);
-        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        guard.user_registry.set_favorite(&id, favorite == JNI_TRUE);
-    }
+    // Write to the canonical registry (the StateMachine's when running, where
+    // the RX thread reads the favorite ordering), never a split pre-init copy.
+    let reg_arc = guard.active_user_registry();
+    reg_arc.lock().unwrap_or_else(|e| e.into_inner()).set_favorite(&id, favorite == JNI_TRUE);
 }
 
 //==============================================================================
@@ -2028,13 +2035,16 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     };
 
     let state = get_jni_state();
-    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    guard.user_registry.register_user(&id, &name);
-
-    // Also check muted/favorite status for logging
-    let is_muted = guard.user_registry.is_muted(&id);
-    let is_fav = guard.user_registry.is_favorite(&id);
+    // Register into the canonical registry so a manually-registered user shows
+    // up in the same list the RX thread and nativeGetUsers consult.
+    let reg_arc = guard.active_user_registry();
+    let (is_muted, is_fav) = {
+        let mut reg = reg_arc.lock().unwrap_or_else(|e| e.into_inner());
+        reg.register_user(&id, &name);
+        (reg.is_muted(&id), reg.is_favorite(&id))
+    };
     info!("JNI: Registered user {} ({}) muted={} fav={}", name, id, is_muted, is_fav);
 }
 
@@ -2047,13 +2057,16 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let state = get_jni_state();
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
-    let favs = guard.user_registry.favorites();
-    let others = guard.user_registry.others();
-
-    let json = serde_json::json!({
-        "favorites": favs,
-        "others": others,
-    }).to_string();
+    let reg_arc = guard.active_user_registry();
+    // `favorites()` / `others()` return references borrowed from the registry,
+    // so build the JSON string while the lock is still held.
+    let json = {
+        let reg = reg_arc.lock().unwrap_or_else(|e| e.into_inner());
+        serde_json::json!({
+            "favorites": reg.favorites(),
+            "others": reg.others(),
+        }).to_string()
+    };
 
     drop(guard);
 
@@ -2599,8 +2612,13 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     if let Some(ref sm) = guard.state_machine {
         let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
 
-        // Parse user registry JSON to sync mute/favorite status into cache
-        let users_json = guard.user_registry.to_json();
+        // Sync mute/favorite from the StateMachine's own registry — the same
+        // canonical instance the RX thread and JNI user ops now use.
+        let users_json = sm
+            .get_user_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .to_json();
         if let Ok(users) = serde_json::from_str::<Vec<serde_json::Value>>(&users_json) {
             for u in users {
                 if let (Some(id), Some(name), Some(muted), Some(fav)) = (
