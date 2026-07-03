@@ -31,8 +31,12 @@ set -euo pipefail
 VERSION="${1:?usage: ship.sh <version>  (e.g. 2.7.6)}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APK="$ROOT/android-app/app/build/outputs/bundle/release/extracted/universal.apk"
-AAB="$ROOT/android-app/app/build/outputs/bundle/release/app-release.aab"
+# v2.9.0 flavor split: the website serves the DIRECT flavor APK (license-key
+# gate, no Google Billing); the AAB pushed to Play is the PLAY flavor
+# (Billing paywall). Build with:
+#   ./gradlew assembleDirectRelease bundlePlayRelease
+APK="$ROOT/android-app/app/build/outputs/apk/direct/release/app-direct-release.apk"
+AAB="$ROOT/android-app/app/build/outputs/bundle/playRelease/app-play-release.aab"
 WORKER_CFG="${SASSYCONSULTINGLLC_WORKER_DIR:-/v/Projects/sassyconsultingllc-cloudflare}/wrangler.jsonc"
 
 : "${CLOUDFLARE_ACCOUNT_ID:?CLOUDFLARE_ACCOUNT_ID must be set (Sassy Consulting LLC account)}"

@@ -1,0 +1,298 @@
+/**
+ * license.js — License-key issuance/activation for the direct-distribution
+ * (website APK) build of SassyTalkie.
+ *
+ * The Play build never touches these endpoints (it uses Play Billing). The
+ * direct build activates once, then revalidates opportunistically with a
+ * signed receipt cached on-device.
+ *
+ * Privacy/hardening posture:
+ *   - D1 stores only HMAC-SHA256(LICENSE_SALT, key) — a database leak does
+ *     not yield activatable license keys. Raw keys exist exactly twice: in
+ *     the /license/issue response (shown to the operator once) and on the
+ *     customer's device.
+ *   - Device ids are likewise stored as salted HMACs, never raw ANDROID_IDs.
+ *   - Keys are 100 bits of CSPRNG entropy (crypto.getRandomValues) — online
+ *     guessing is not a realistic threat, so there is no per-IP throttle here;
+ *     Cloudflare WAF rate rules are the backstop if an abuser shows up.
+ *   - Fail-closed: LICENSE_SALT unset → every /license/* request is rejected;
+ *     LICENSE_ADMIN_TOKEN unset → admin routes are rejected.
+ *
+ * Endpoints (all JSON, no CORS — native clients only):
+ *   POST /license/activate    {key, device_id, app_version?, device_name?}
+ *                             → {ok, token, expires_at, devices_used, max_devices}
+ *                             Binds a device slot (up to max_devices).
+ *   POST /license/validate    {key, device_id}
+ *                             → same shape; refreshes the receipt for an
+ *                             already-activated device, never consumes a slot.
+ *   POST /license/deactivate  {key, device_id} → {ok} — frees the slot.
+ *
+ * Admin endpoints (Authorization: Bearer LICENSE_ADMIN_TOKEN):
+ *   POST /license/issue   {count?, email?, note?, max_devices?} → {ok, keys:[...]}
+ *   POST /license/revoke  {key} → {ok}
+ *   GET  /license/info?key=SASSY-... → license row + active devices
+ *
+ * Receipt token format (mirrors relay-auth capability tokens):
+ *   "<expSec>.<hexSig>"  where hexSig = HMAC-SHA256(`receipt.${keyHash}.${deviceHash}.${expSec}`, LICENSE_SALT)
+ * The app treats expSec as its offline-entitlement horizon and revalidates
+ * whenever it has network; the server re-checks revocation on every refresh.
+ */
+
+import { hmacSha256Hex, timingSafeEqualHex } from "./relay-auth.js";
+
+// 30-day receipt: a paid user stays entitled through a month fully offline;
+// a refunded/revoked key stops working within the same window.
+const RECEIPT_TTL_SEC = 30 * 24 * 60 * 60;
+
+const DEFAULT_MAX_DEVICES = 3;
+
+// Crockford-ish alphabet: no 0/O/1/I lookalikes. 32 symbols = 5 bits each;
+// 20 symbols = 100 bits of entropy per key.
+const KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const KEY_RE = /^SASSY(?:-[A-HJ-NP-Z2-9]{5}){4}$/;
+
+/**
+ * Route dispatcher. Returns a Response for /license/* paths, null otherwise
+ * (mirrors handleShareRoute / handlePresenceRoute so the worker's fetch()
+ * chain stays uniform).
+ */
+export async function handleLicenseRoute(request, env, url) {
+  const path = url.pathname;
+  if (!path.startsWith("/license/")) return null;
+
+  if (!env.LICENSE_SALT) {
+    return json({ ok: false, error: "License service not configured" }, 503);
+  }
+  if (!env.LICENSES) {
+    return json({ ok: false, error: "License database not configured" }, 503);
+  }
+
+  try {
+    if (request.method === "POST" && path === "/license/activate") {
+      return await activate(request, env, /* consumeSlot */ true);
+    }
+    if (request.method === "POST" && path === "/license/validate") {
+      return await activate(request, env, /* consumeSlot */ false);
+    }
+    if (request.method === "POST" && path === "/license/deactivate") {
+      return await deactivate(request, env);
+    }
+
+    // ── Admin surface ──
+    if (path === "/license/issue" || path === "/license/revoke" || path === "/license/info") {
+      const denied = await requireAdmin(request, env);
+      if (denied) return denied;
+      if (request.method === "POST" && path === "/license/issue") return await issue(request, env);
+      if (request.method === "POST" && path === "/license/revoke") return await revoke(request, env);
+      if (request.method === "GET" && path === "/license/info") return await info(env, url);
+    }
+
+    return json({ ok: false, error: "Not found" }, 404);
+  } catch (err) {
+    // D1 errors, malformed JSON bodies, etc. Never leak internals to clients.
+    console.error("license route error:", err);
+    return json({ ok: false, error: "Internal error" }, 500);
+  }
+}
+
+// ── Client endpoints ──────────────────────────────────────────────────────
+
+async function activate(request, env, consumeSlot) {
+  const body = await readJson(request);
+  if (!body) return json({ ok: false, error: "Malformed JSON body" }, 400);
+
+  const key = normalizeKey(body.key);
+  const deviceId = typeof body.device_id === "string" ? body.device_id.trim() : "";
+  if (!key) return json({ ok: false, error: "Invalid license key format" }, 400);
+  if (!deviceId || deviceId.length > 128) {
+    return json({ ok: false, error: "Missing device_id" }, 400);
+  }
+
+  const keyHash = await hashKey(key, env);
+  const deviceHash = await hashDevice(deviceId, env);
+
+  const lic = await env.LICENSES.prepare(
+    "SELECT key_hash, status, max_devices FROM licenses WHERE key_hash = ?",
+  ).bind(keyHash).first();
+
+  if (!lic) return json({ ok: false, error: "Unknown license key" }, 404);
+  if (lic.status !== "active") {
+    return json({ ok: false, error: `License ${lic.status}` }, 403);
+  }
+
+  const existing = await env.LICENSES.prepare(
+    "SELECT device_hash FROM activations WHERE key_hash = ? AND device_hash = ?",
+  ).bind(keyHash, deviceHash).first();
+
+  if (existing) {
+    await env.LICENSES.prepare(
+      "UPDATE activations SET last_seen = datetime('now'), app_version = ? WHERE key_hash = ? AND device_hash = ?",
+    ).bind(str(body.app_version), keyHash, deviceHash).run();
+  } else {
+    if (!consumeSlot) {
+      // /validate never creates slots: a wiped device must go through
+      // /activate so slot accounting stays honest.
+      return json({ ok: false, error: "Device not activated" }, 403);
+    }
+    const used = await env.LICENSES.prepare(
+      "SELECT COUNT(*) AS n FROM activations WHERE key_hash = ?",
+    ).bind(keyHash).first();
+    if ((used?.n ?? 0) >= lic.max_devices) {
+      return json(
+        { ok: false, error: "Maximum devices reached", max_devices: lic.max_devices },
+        403,
+      );
+    }
+    await env.LICENSES.prepare(
+      "INSERT INTO activations (key_hash, device_hash, device_name, app_version) VALUES (?, ?, ?, ?)",
+    ).bind(keyHash, deviceHash, str(body.device_name), str(body.app_version)).run();
+  }
+
+  const usedNow = await env.LICENSES.prepare(
+    "SELECT COUNT(*) AS n FROM activations WHERE key_hash = ?",
+  ).bind(keyHash).first();
+
+  const expSec = Math.floor(Date.now() / 1000) + RECEIPT_TTL_SEC;
+  const sig = await hmacSha256Hex(`receipt.${keyHash}.${deviceHash}.${expSec}`, env.LICENSE_SALT);
+
+  return json({
+    ok: true,
+    token: `${expSec}.${sig}`,
+    expires_at: expSec,
+    devices_used: usedNow?.n ?? 1,
+    max_devices: lic.max_devices,
+  });
+}
+
+async function deactivate(request, env) {
+  const body = await readJson(request);
+  if (!body) return json({ ok: false, error: "Malformed JSON body" }, 400);
+  const key = normalizeKey(body.key);
+  const deviceId = typeof body.device_id === "string" ? body.device_id.trim() : "";
+  if (!key || !deviceId) return json({ ok: false, error: "Missing key or device_id" }, 400);
+
+  const keyHash = await hashKey(key, env);
+  const deviceHash = await hashDevice(deviceId, env);
+  const res = await env.LICENSES.prepare(
+    "DELETE FROM activations WHERE key_hash = ? AND device_hash = ?",
+  ).bind(keyHash, deviceHash).run();
+
+  if (!res.meta.changes) return json({ ok: false, error: "Activation not found" }, 404);
+  return json({ ok: true });
+}
+
+// ── Admin endpoints ───────────────────────────────────────────────────────
+
+async function requireAdmin(request, env) {
+  if (!env.LICENSE_ADMIN_TOKEN) {
+    return json({ ok: false, error: "Admin surface not configured" }, 503);
+  }
+  const auth = request.headers.get("Authorization") || "";
+  const presented = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  // Hash both sides before comparing so timingSafeEqualHex's length check
+  // doesn't leak the admin token's length.
+  const a = await hmacSha256Hex(`admin.${presented}`, env.LICENSE_SALT);
+  const b = await hmacSha256Hex(`admin.${env.LICENSE_ADMIN_TOKEN}`, env.LICENSE_SALT);
+  return timingSafeEqualHex(a, b) ? null : json({ ok: false, error: "Unauthorized" }, 401);
+}
+
+async function issue(request, env) {
+  const body = (await readJson(request)) ?? {};
+  const count = clampInt(body.count, 1, 100, 1);
+  const maxDevices = clampInt(body.max_devices, 1, 10, DEFAULT_MAX_DEVICES);
+
+  const keys = [];
+  for (let i = 0; i < count; i++) {
+    const key = generateKey();
+    const keyHash = await hashKey(key, env);
+    await env.LICENSES.prepare(
+      "INSERT INTO licenses (key_hash, email, note, max_devices) VALUES (?, ?, ?, ?)",
+    ).bind(keyHash, str(body.email), str(body.note), maxDevices).run();
+    keys.push(key);
+  }
+  // The only moment raw keys ever leave the worker. Deliver to the customer,
+  // then this response is gone — there is no "look the key up later".
+  return json({ ok: true, keys, max_devices: maxDevices });
+}
+
+async function revoke(request, env) {
+  const body = await readJson(request);
+  const key = normalizeKey(body?.key);
+  if (!key) return json({ ok: false, error: "Invalid license key format" }, 400);
+  const keyHash = await hashKey(key, env);
+  const res = await env.LICENSES.prepare(
+    "UPDATE licenses SET status = 'revoked' WHERE key_hash = ?",
+  ).bind(keyHash).run();
+  if (!res.meta.changes) return json({ ok: false, error: "Unknown license key" }, 404);
+  return json({ ok: true });
+}
+
+async function info(env, url) {
+  const key = normalizeKey(url.searchParams.get("key"));
+  if (!key) return json({ ok: false, error: "Invalid license key format" }, 400);
+  const keyHash = await hashKey(key, env);
+  const lic = await env.LICENSES.prepare(
+    "SELECT key_hash, email, note, status, max_devices, created_at FROM licenses WHERE key_hash = ?",
+  ).bind(keyHash).first();
+  if (!lic) return json({ ok: false, error: "Unknown license key" }, 404);
+  const devices = await env.LICENSES.prepare(
+    "SELECT device_name, app_version, first_seen, last_seen FROM activations WHERE key_hash = ?",
+  ).bind(keyHash).all();
+  return json({ ok: true, license: lic, devices: devices.results });
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+function generateKey() {
+  const bytes = new Uint8Array(20);
+  crypto.getRandomValues(bytes);
+  const groups = [];
+  for (let g = 0; g < 4; g++) {
+    let s = "";
+    for (let i = 0; i < 5; i++) s += KEY_ALPHABET[bytes[g * 5 + i] % 32];
+    groups.push(s);
+  }
+  return `SASSY-${groups.join("-")}`;
+}
+
+/** Uppercase, collapse whitespace, then enforce the canonical shape. */
+function normalizeKey(raw) {
+  if (typeof raw !== "string") return null;
+  const key = raw.trim().toUpperCase().replace(/\s+/g, "");
+  return KEY_RE.test(key) ? key : null;
+}
+
+function hashKey(key, env) {
+  return hmacSha256Hex(`lic.${key}`, env.LICENSE_SALT);
+}
+
+function hashDevice(deviceId, env) {
+  return hmacSha256Hex(`dev.${deviceId}`, env.LICENSE_SALT);
+}
+
+async function readJson(request) {
+  try {
+    return await request.json();
+  } catch {
+    return null;
+  }
+}
+
+function str(v) {
+  return typeof v === "string" ? v.slice(0, 200) : null;
+}
+
+function clampInt(v, min, max, dflt) {
+  const n = Number.parseInt(v, 10);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(max, Math.max(min, n));
+}
+
+function json(body, status = 200) {
+  // Deliberately no CORS headers: these endpoints serve native apps and the
+  // operator's curl, never a browser origin.
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}

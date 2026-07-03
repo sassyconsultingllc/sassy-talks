@@ -25,11 +25,13 @@ import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.SessionShareLink
 import com.sassyconsulting.sassytalkie.TranscriptionBridge
 import com.sassyconsulting.sassytalkie.WalkieService
+import com.sassyconsulting.sassytalkie.license.Entitlements
 import com.sassyconsulting.sassytalkie.ui.theme.*
 import android.widget.Toast
 
 enum class Screen {
     Profile,
+    Gate,
     Auth,
     Main,
     Users,
@@ -63,6 +65,11 @@ fun AppNavigation(
     var nativeReady by remember { mutableStateOf(false) }
     var initFailed by remember { mutableStateOf(false) }
     var bleReady by remember { mutableStateOf(false) }
+    // Entitlement gate (paywall on Play flavor, license key on direct flavor).
+    // Seeded from the encrypted cache for instant startup routing; a silent
+    // refresh below reconciles with Play / the license server when online.
+    var entitled by remember { mutableStateOf(false) }
+    var profileSetState by remember { mutableStateOf(false) }
 
     // AutoConnectManager lives here (singleton for the session) — NOT in MainScreen
     val autoConnect = remember { AutoConnectManager(context) }
@@ -135,6 +142,7 @@ fun AppNavigation(
                 // Determine starting screen: profile setup on first launch
                 val prefs = context.getSharedPreferences("sassy_profile", Context.MODE_PRIVATE)
                 val profileSet = prefs.getBoolean(KEY_PROFILE_SET, false)
+                profileSetState = profileSet
                 val savedName = getSavedProfileName(context)
 
                 // Apply saved profile name to native library
@@ -150,6 +158,14 @@ fun AppNavigation(
                 // If session was restored from disk, skip auth and go straight to main
                 if (sessionRestored && profileSet) {
                     currentScreen = Screen.Main
+                }
+
+                // Entitlement gate overrides all of the above routing while
+                // locked. EncryptedSharedPreferences read — cheap, still on
+                // the IO-adjacent init path.
+                entitled = withContext(Dispatchers.IO) { Entitlements.isUnlockedCached(context) }
+                if (!entitled) {
+                    currentScreen = Screen.Gate
                 }
                 nativeReady = true
 
@@ -215,7 +231,10 @@ fun AppNavigation(
                         // toast left them guessing.
                         val ctx = describeImportedSession(result.json)
                         Toast.makeText(context, ctx, Toast.LENGTH_LONG).show()
-                        currentScreen = Screen.Main
+                        // Invite links don't bypass the entitlement gate: the
+                        // session is imported (so it's live after unlock), but
+                        // a locked build stays parked on the gate screen.
+                        currentScreen = if (entitled) Screen.Main else Screen.Gate
                     } else {
                         Toast.makeText(
                             context,
@@ -229,6 +248,19 @@ fun AppNavigation(
                 }
             }
             onShareConsumed()
+        }
+    }
+
+    // Silent entitlement reconciliation once per launch: restores a Play
+    // purchase after reinstall, slides the direct-license receipt window
+    // forward, and drops the entitlement after a refund/revocation. Runs
+    // after native init so it never delays startup.
+    LaunchedEffect(nativeReady) {
+        if (nativeReady) {
+            Entitlements.refresh(context) { ok ->
+                entitled = ok
+                if (!ok) currentScreen = Screen.Gate
+            }
         }
     }
 
@@ -282,7 +314,11 @@ fun AppNavigation(
     // ── Phase 3: Main navigation ──
 
     // Hardware back button support
-    BackHandler(enabled = currentScreen != Screen.Auth && currentScreen != Screen.Profile) {
+    BackHandler(
+        enabled = currentScreen != Screen.Auth &&
+            currentScreen != Screen.Profile &&
+            currentScreen != Screen.Gate,
+    ) {
         when (currentScreen) {
             Screen.Main -> {
                 walkieService?.releaseMulticastLock()
@@ -297,6 +333,12 @@ fun AppNavigation(
     }
 
     when (currentScreen) {
+        Screen.Gate -> Entitlements.GateScreen(
+            onUnlocked = {
+                entitled = true
+                currentScreen = if (!profileSetState) Screen.Profile else Screen.Auth
+            },
+        )
         Screen.Profile -> ProfileScreen(
             onDone = { currentScreen = Screen.Auth },
             showBackButton = false

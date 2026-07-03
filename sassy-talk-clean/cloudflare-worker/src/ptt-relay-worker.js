@@ -10,6 +10,7 @@ import { handleShareRoute } from "./share.js";
 import { handlePresenceRoute } from "./presence.js";
 import { handleViewerRoute } from "./viewer.js";
 import { handleWellKnownRoute } from "./wellknown.js";
+import { handleLicenseRoute } from "./license.js";
 // Single source of truth for token verification + key rotation. The /ws path
 // uses the exact same verifier as /presence and /share so they can never drift
 // apart on what tokens they accept (the inline copy this replaced had already
@@ -56,6 +57,11 @@ export default {
     // can trigger a wake push.
     const presenceResp = await handlePresenceRoute(request, env, url);
     if (presenceResp) return presenceResp;
+
+    // License activation/validation for the direct-distribution APK build.
+    // Play builds never call these (they use Play Billing client-side).
+    const licenseResp = await handleLicenseRoute(request, env, url);
+    if (licenseResp) return licenseResp;
 
     // Browser landing page for /v/<id> invite links. Recipients with the app
     // are bounced straight into it by the App Link; everyone else gets a chooser

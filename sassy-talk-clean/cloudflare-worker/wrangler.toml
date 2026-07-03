@@ -44,6 +44,14 @@ binding = "SHARES"
 id = "3bd58157c52d43ffafa609502a98d64b"
 preview_id = "dec463c8f86549e2a9d4f00b616dbfec"
 
+# ── D1: license registry for the direct-distribution APK (src/license.js) ──
+# Create once: `wrangler d1 create sassytalkie-licenses`, paste the id below,
+# then apply schema: `wrangler d1 execute sassytalkie-licenses --remote --file=schema/licenses.sql`
+[[d1_databases]]
+binding = "LICENSES"
+database_name = "sassytalkie-licenses"
+database_id = "be46952d-2e07-4c25-b0db-f1bc6d43c50d"
+
 # ── Required secrets (set via `wrangler secret put`, never committed) ──
 #   AUTH_SECRET                — HMAC key for room capability tokens (/auth, /ws,
 #                                /presence, /share). Fail-closed: unset = relay
@@ -53,6 +61,11 @@ preview_id = "dec463c8f86549e2a9d4f00b616dbfec"
 #                                presence.js/fcm.js. Optional: if unset, the relay
 #                                still forwards audio; it just skips offline-peer
 #                                wake notifications.
+#   LICENSE_SALT               — HMAC key for license-key/device hashing and
+#                                receipt tokens (/license/*). Fail-closed: unset =
+#                                license endpoints refuse. `openssl rand -hex 32`.
+#   LICENSE_ADMIN_TOKEN        — Bearer token for /license/issue|revoke|info.
+#                                `openssl rand -hex 32`.
 # Self-hosters: set both with `wrangler secret put NAME` before `wrangler deploy`.
 
 # ── App-link association identifiers (NOT secret — plain config) ──
