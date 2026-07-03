@@ -73,24 +73,25 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- App-link from https://relay.sassyconsultingllc.com/v/* so tapping
-                 a share URL on a phone with the app routes here instead of opening
-                 the browser. autoVerify enables Android App Links once the
-                 .well-known/assetlinks.json is published on the worker. The
-                 ciphertext + one-shot token model means even a leaked URL can
-                 only resolve to a session that was deliberately shared by the
-                 sender — there's no unauthenticated cleartext-payload variant
-                 (the prior sassytalk://join custom-scheme filter was removed
-                 because its fragment-as-session-JSON shape was a phishing
-                 vector: any web page could one-tap force-join an attacker's
-                 room). -->
+            <!-- App-link from https://relay.sassyconsultingllc.com/share/* so
+                 tapping a share URL on a phone with the app routes here instead
+                 of opening the browser. autoVerify enables Android App Links once
+                 the .well-known/assetlinks.json is published on the worker. The
+                 path matches the relay's /share/<id> read route (see
+                 cloudflare-worker/src/share.js); the ciphertext + capability
+                 model means even a leaked URL can only resolve to a session that
+                 was deliberately shared by the sender — there's no
+                 unauthenticated cleartext-payload variant (the prior
+                 sassytalk://join custom-scheme filter was removed because its
+                 fragment-as-session-JSON shape was a phishing vector: any web
+                 page could one-tap force-join an attacker's room). -->
             <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="https"
                       android:host="relay.sassyconsultingllc.com"
-                      android:pathPrefix="/v/" />
+                      android:pathPrefix="/share/" />
             </intent-filter>
         </activity>
 

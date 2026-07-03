@@ -215,7 +215,7 @@ class MainActivity : ComponentActivity() {
         // for the rationale).
         val ok = uri.scheme == "https" &&
             uri.host == "relay.sassyconsultingllc.com" &&
-            (uri.path ?: "").startsWith("/v/")
+            (uri.path ?: "").startsWith("/share/")
         if (ok) pendingShareUri.value = uri
     }
 
