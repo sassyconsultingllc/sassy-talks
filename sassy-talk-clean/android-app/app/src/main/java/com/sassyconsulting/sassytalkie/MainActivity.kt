@@ -145,7 +145,7 @@ class MainActivity : ComponentActivity() {
                         )
                         // Audio + network diagnostics overlay. Driven by
                         // com.sassyconsulting.sassytalkie.debug.AudioTelemetry,
-                        // which the PttAudioPipeline and WalkieService feed.
+                        // which WalkieService feeds from the native pipeline.
                         // Shown in debug builds, OR in any build (incl. release)
                         // when the user enables it via Settings → Diagnostics —
                         // for on-the-go field testing. Tap to collapse/expand.

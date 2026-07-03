@@ -177,10 +177,10 @@ class WalkieService : Service() {
             // On API 34+ the foreground service type must be passed explicitly or
             // the system raises MissingForegroundServiceTypeException and kills us.
             //
-            // FOREGROUND_SERVICE_TYPE_MICROPHONE is OR'd in for API 34+ so the new
-            // PttAudioPipeline (com.sassyconsulting.sassytalkie.audio) can keep
-            // AudioRecord alive in the background. The Rust pipeline historically
-            // captured under mediaPlayback, which API 34 deprecates for mic input.
+            // FOREGROUND_SERVICE_TYPE_MICROPHONE is OR'd in for API 34+ so the
+            // native (Rust/JNI) capture pipeline can keep AudioRecord alive in
+            // the background. The pipeline historically captured under
+            // mediaPlayback, which API 34 deprecates for mic input.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 ServiceCompat.startForeground(
                     this,
@@ -473,8 +473,7 @@ class WalkieService : Service() {
     // surfaces transport state in its NET section. The Rust pipeline owns the
     // canonical transport, so we poll SassyTalkNative once per second and push
     // into the telemetry singleton. Cheap (a few JNI string calls); only runs
-    // for service lifetime. If/when PttAudioPipeline takes over capture, this
-    // keeps working unchanged.
+    // for service lifetime.
 
     private fun startTelemetryBridge() {
         if (telemetryBridgeJob?.isActive == true) return

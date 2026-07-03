@@ -499,7 +499,7 @@ export default function App() {
       <header className="lobby-header">
         <h1>Sassy-Talk</h1>
         <div className="lobby-header-actions">
-          <p className="subtitle">Bluetooth Walkie-Talkie</p>
+          <p className="subtitle">LAN &amp; Internet Walkie-Talkie</p>
           <button className="settings-gear-btn" onClick={() => setShowSettingsModal(true)} title="Quick Settings">
             <IconSettings size={20} />
           </button>

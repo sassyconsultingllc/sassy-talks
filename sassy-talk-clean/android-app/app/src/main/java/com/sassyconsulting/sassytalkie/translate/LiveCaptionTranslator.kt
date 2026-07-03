@@ -34,8 +34,8 @@ import java.util.Locale
  * exposed as [StateFlow]s for the Compose UI.
  *
  * ── Mic-contention caveat ───────────────────────────────────────────────
- * SpeechRecognizer opens its OWN AudioRecord session on the mic. The PTT
- * pipeline (PttAudioPipeline / WalkieService) ALSO uses the mic. Two
+ * SpeechRecognizer opens its OWN AudioRecord session on the mic. The native
+ * PTT capture pipeline (WalkieService) ALSO uses the mic. Two
  * simultaneous capture sessions contend and on many devices one will fail
  * (ERROR_RECOGNIZER_BUSY / ERROR_AUDIO / silent capture). This class does NOT
  * try to share the mic with PTT. Intended usage:
