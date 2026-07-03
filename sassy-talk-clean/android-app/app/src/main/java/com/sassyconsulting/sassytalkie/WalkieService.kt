@@ -391,6 +391,11 @@ class WalkieService : Service() {
         val ble = BleSignalingService(this, adapter)
         val bt = BluetoothTransport(this)
         val coord = PttCoordinator(ble, bt)
+        // Wire the presence sensor so heartbeats report real local presence
+        // (muted / DND / backgrounded / away) instead of always LISTENING. It
+        // was declared lateinit but never assigned, so every heartbeat this
+        // device sent advertised a hardcoded LISTENING state.
+        coord.presenceSensor = PresenceSensor(applicationContext)
 
         // Start BLE
         ble.startServer()

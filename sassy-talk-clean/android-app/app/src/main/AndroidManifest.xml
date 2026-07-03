@@ -67,6 +67,7 @@
             android:exported="true"
             android:launchMode="singleTask"
             android:screenOrientation="portrait"
+            android:configChanges="uiMode|screenSize|smallestScreenSize|screenLayout|keyboardHidden|fontScale"
             android:theme="@style/Theme.SassyTalk">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

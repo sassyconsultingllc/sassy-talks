@@ -483,7 +483,31 @@ class PttCoordinator(
         stopRecvAckJob(deviceAddress)
         // Clear peer speaking indicator (Task 6.2)
         setPeerSpeaking(false)
-        // TODO: Play roger beep
+        // Roger beep: audible end-of-transmission cue when a peer releases PTT.
+        playRogerBeep()
+    }
+
+    /**
+     * Short "roger" acknowledgement tone played when a peer finishes speaking.
+     * Uses ToneGenerator (no extra assets, no Context) on the voice-call stream
+     * so it ducks/routes with the call audio. Best-effort — failures are logged
+     * and swallowed so a missing audio device never crashes the RX path.
+     */
+    private val rogerToneGen: android.media.ToneGenerator? by lazy {
+        try {
+            android.media.ToneGenerator(android.media.AudioManager.STREAM_VOICE_CALL, 70)
+        } catch (t: Throwable) {
+            Log.w(TAG, "ToneGenerator init failed: ${t.message}")
+            null
+        }
+    }
+
+    private fun playRogerBeep() {
+        try {
+            rogerToneGen?.startTone(android.media.ToneGenerator.TONE_PROP_ACK, 150)
+        } catch (t: Throwable) {
+            Log.w(TAG, "roger beep failed: ${t.message}")
+        }
     }
 
     /** Set peerSpeaking = true and arm a 400ms auto-clear timeout. */
