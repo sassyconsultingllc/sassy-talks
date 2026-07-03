@@ -34,6 +34,13 @@ object PresenceClient {
     fun upload(context: Context, roomId: String, fcmToken: String): Boolean {
         if (roomId.isBlank() || fcmToken.isBlank()) return false
         val peerId = InstallId.get(context)
+        // The relay gates /presence on a room capability token; without it the
+        // registration is rejected with 401 and FCM wake never works. Blocking
+        // fetch is fine — callers already run us on a background thread.
+        val capToken = RelayAuth.fetchToken(roomId) ?: run {
+            Log.w(TAG, "presence upload: could not obtain auth token for room")
+            return false
+        }
         val body = JSONObject().apply {
             put("room", roomId)
             put("peer", peerId)
@@ -41,6 +48,7 @@ object PresenceClient {
         }
         val req = Request.Builder()
             .url("${SessionShareLink.RELAY_BASE}/presence")
+            .addHeader("Authorization", "Bearer $capToken")
             .post(body.toString().toRequestBody(JSON_MEDIA))
             .build()
         return try {
@@ -89,12 +97,17 @@ object PresenceClient {
     fun remove(context: Context, roomId: String): Boolean {
         if (roomId.isBlank()) return false
         val peerId = InstallId.get(context)
+        val capToken = RelayAuth.fetchToken(roomId) ?: run {
+            Log.w(TAG, "presence remove: could not obtain auth token for room")
+            return false
+        }
         val body = JSONObject().apply {
             put("room", roomId)
             put("peer", peerId)
         }
         val req = Request.Builder()
             .url("${SessionShareLink.RELAY_BASE}/presence")
+            .addHeader("Authorization", "Bearer $capToken")
             .delete(body.toString().toRequestBody(JSON_MEDIA))
             .build()
         return try {
