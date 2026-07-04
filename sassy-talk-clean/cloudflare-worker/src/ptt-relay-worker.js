@@ -8,6 +8,7 @@
 export { PttRoom } from "./ptt-relay.js";
 import { handleShareRoute } from "./share.js";
 import { handlePresenceRoute } from "./presence.js";
+import { rateLimited, clientIp } from "./rate-limit.js";
 // Single source of truth for token verification + key rotation. The /ws path
 // uses the exact same verifier as /presence and /share so they can never drift
 // apart on what tokens they accept (the inline copy this replaced had already
@@ -43,6 +44,22 @@ export default {
 
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: CORS_HEADERS });
+    }
+
+    // Coarse per-IP edge rate limiting on the abusable paths: the
+    // unauthenticated /auth token mint and the KV-write /presence and /share
+    // POST paths. Best-effort (KV-backed, fail-open) — see rate-limit.js.
+    const ip = clientIp(request);
+    if (path === "/auth" && await rateLimited(env, "auth", ip, 60, 60)) {
+      return jsonResponse({ error: "Rate limited" }, 429);
+    }
+    if (path === "/presence" && request.method !== "OPTIONS"
+        && await rateLimited(env, "presence", ip, 30, 60)) {
+      return jsonResponse({ error: "Rate limited" }, 429);
+    }
+    if (path === "/share" && request.method === "POST"
+        && await rateLimited(env, "share", ip, 20, 60)) {
+      return jsonResponse({ error: "Rate limited" }, 429);
     }
 
     // Encrypted session-share endpoints. End-to-end: the worker never sees

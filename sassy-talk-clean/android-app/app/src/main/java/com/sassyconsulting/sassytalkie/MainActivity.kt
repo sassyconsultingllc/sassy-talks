@@ -145,7 +145,7 @@ class MainActivity : ComponentActivity() {
                         )
                         // Audio + network diagnostics overlay. Driven by
                         // com.sassyconsulting.sassytalkie.debug.AudioTelemetry,
-                        // which the PttAudioPipeline and WalkieService feed.
+                        // which WalkieService feeds from the native pipeline.
                         // Shown in debug builds, OR in any build (incl. release)
                         // when the user enables it via Settings → Diagnostics —
                         // for on-the-go field testing. Tap to collapse/expand.
@@ -215,7 +215,7 @@ class MainActivity : ComponentActivity() {
         // for the rationale).
         val ok = uri.scheme == "https" &&
             uri.host == "relay.sassyconsultingllc.com" &&
-            (uri.path ?: "").startsWith("/v/")
+            (uri.path ?: "").startsWith("/share/")
         if (ok) pendingShareUri.value = uri
     }
 
@@ -236,9 +236,17 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // Full shutdown: stop native + stop service
-        SassyTalkNative.shutdown()
-        stopService(Intent(this, WalkieService::class.java))
+        // Only tear down the backend when the user is actually leaving the app.
+        // A configuration change (dark-mode toggle, locale, font scale, foldable
+        // resize) also destroys and recreates the Activity; shutting down native
+        // and stopping the foreground service on every such change caused an
+        // audio/BT glitch and a needless service stop/restart cycle. Guard on
+        // isFinishing && !isChangingConfigurations so config changes keep the
+        // session alive.
+        if (isFinishing && !isChangingConfigurations) {
+            SassyTalkNative.shutdown()
+            stopService(Intent(this, WalkieService::class.java))
+        }
     }
 
     // ── Permission helpers ──

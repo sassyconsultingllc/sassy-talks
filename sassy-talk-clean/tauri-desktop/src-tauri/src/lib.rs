@@ -112,6 +112,13 @@ pub struct AppState {
     roger_beep: Arc<AtomicBool>,
     vox_enabled: Arc<AtomicBool>,
     vox_threshold: Arc<RwLock<f32>>,
+
+    // Cohort history — a persisted "recent sessions" list (group name, host,
+    // last joined). Deliberately holds NO key material (see the core module's
+    // no-key invariant); it's a display/record aid. Persisted to a JSON file in
+    // the OS app-data dir.
+    cohort_history: Arc<std::sync::Mutex<sassytalkie_core::cohort_history::CohortHistory>>,
+    cohort_path: std::path::PathBuf,
 }
 
 impl AppState {
@@ -129,7 +136,15 @@ impl AppState {
             TransportManager::new(device_id, device_name.clone())
                 .expect("Failed to create transport manager")
         ));
-        
+
+        // Load persisted cohort history (recent-sessions list). Missing/corrupt
+        // file → empty history; never fatal.
+        let cohort_path = cohort_history_path();
+        let cohort_json = std::fs::read_to_string(&cohort_path).unwrap_or_default();
+        let cohort_history = Arc::new(std::sync::Mutex::new(
+            sassytalkie_core::cohort_history::CohortHistory::load_from_json(&cohort_json, 64),
+        ));
+
         Self {
             device_id,
             device_name,
@@ -147,6 +162,8 @@ impl AppState {
             roger_beep: Arc::new(AtomicBool::new(true)),
             vox_enabled: Arc::new(AtomicBool::new(false)),
             vox_threshold: Arc::new(RwLock::new(0.1)),
+            cohort_history,
+            cohort_path,
         }
     }
     
@@ -205,9 +222,9 @@ impl AppState {
     /// Android — that's what makes the desktop wire-compatible. Returns the
     /// relay room id (= QR session_id) on success.
     pub async fn join_cellular(&self, qr_json: &str) -> Result<String, String> {
-        // Derive (channel, PSK CryptoSession, _cohort) + room id from the QR.
+        // Derive (channel, PSK CryptoSession, cohort) + room id from the QR.
         let mut sm = sassytalkie_core::session::SessionManager::new(&self.device_name);
-        let (channel, crypto, _cohort) = sm.import_session(qr_json)?;
+        let (channel, crypto, cohort) = sm.import_session(qr_json)?;
         let room_id = sm
             .get_session_id(channel)
             .ok_or_else(|| "imported session has no session_id".to_string())?;
@@ -242,8 +259,53 @@ impl AppState {
         self.current_channel.store(channel, Ordering::Relaxed);
         *self.connection_status.write().await = ConnectionStatus::Connected;
 
+        // Record this session in the persisted cohort history (no key material).
+        self.record_cohort_join(qr_json, channel, &room_id, cohort);
+
         info!("Joined cellular room '{}' on channel {}", room_id, channel);
         Ok(room_id)
+    }
+
+    /// Append/update the cohort-history record for a just-joined session and
+    /// persist it. Best-effort — a write failure only loses the display record.
+    fn record_cohort_join(&self, qr_json: &str, channel: u8, room_id: &str, cohort_id: String) {
+        let v: serde_json::Value = serde_json::from_str(qr_json).unwrap_or(serde_json::Value::Null);
+        let group_name = v.get("group_name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let host_device = v.get("device").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let json = {
+            let mut h = self.cohort_history.lock().unwrap_or_else(|e| e.into_inner());
+            h.upsert_joiner(
+                channel,
+                &group_name,
+                if cohort_id.is_empty() { None } else { Some(cohort_id.as_str()) },
+                &host_device,
+                room_id,
+                now,
+            );
+            h.to_json()
+        };
+        if let Err(e) = std::fs::write(&self.cohort_path, json) {
+            warn!("Failed to persist cohort history: {}", e);
+        }
+    }
+
+    /// Cohort history (recent sessions) as a JSON array.
+    pub fn cohort_history_json(&self) -> String {
+        self.cohort_history.lock().unwrap_or_else(|e| e.into_inner()).to_json()
+    }
+
+    /// Clear the cohort history and persist the empty list.
+    pub fn clear_cohort_history(&self) {
+        let json = {
+            let mut h = self.cohort_history.lock().unwrap_or_else(|e| e.into_inner());
+            h.clear();
+            h.to_json()
+        };
+        let _ = std::fs::write(&self.cohort_path, json);
     }
 
     /// Leave the cellular relay session (idempotent).
@@ -282,7 +344,13 @@ impl AppState {
         let audio = self.audio.lock().await;
         audio.start_recording()?;
         drop(audio);
-        
+
+        // Announce PTT start over the relay so Android peers see us begin
+        // transmitting (and offline peers get an FCM wake).
+        if let Some(cell) = self.cellular.lock().await.as_ref() {
+            cell.notify_ptt_start();
+        }
+
         // Start TX thread
         self.start_tx_thread().await;
         
@@ -301,7 +369,12 @@ impl AppState {
         
         // Stop TX thread
         self.stop_tx_thread().await;
-        
+
+        // Announce PTT stop over the relay (end-of-transmission marker).
+        if let Some(cell) = self.cellular.lock().await.as_ref() {
+            cell.notify_ptt_stop();
+        }
+
         // Stop audio recording
         let audio = self.audio.lock().await;
         audio.stop_recording()?;
@@ -335,6 +408,11 @@ impl AppState {
         // Snapshot the active transport at PTT-press time: if a cellular
         // session is joined, audio goes over the relay instead of UDP multicast.
         let cellular = self.cellular.lock().await.clone();
+        // VOX gate: when enabled, only frames whose RMS level clears the
+        // configured threshold go on the wire. Previously these settings were
+        // stored by the commands but never consulted, so VOX was a no-op.
+        let vox_enabled = Arc::clone(&self.vox_enabled);
+        let vox_threshold = Arc::clone(&self.vox_threshold);
 
         let handle = tokio::spawn(async move {
             let mut encoder = match OpusEncoder::new() {
@@ -359,6 +437,12 @@ impl AppState {
                 drop(audio_lock);
                 
                 if samples_read == FRAME_SIZE {
+                    // VOX: skip frames below the speech threshold when enabled.
+                    if vox_enabled.load(Ordering::Relaxed)
+                        && frame_rms_normalized(&buffer) < *vox_threshold.read().await
+                    {
+                        continue;
+                    }
                     // Encode to Opus
                     match encoder.encode(&buffer) {
                         Ok(opus_data) => {
@@ -604,6 +688,31 @@ impl AppState {
         let transport = self.transport.lock().await;
         transport.get_connection_quality()
     }
+}
+
+/// Path to the persisted cohort-history JSON in the OS app-data directory.
+/// Creates the parent directory if needed. Falls back to the current dir if no
+/// standard location is discoverable.
+fn cohort_history_path() -> std::path::PathBuf {
+    let base = std::env::var("APPDATA") // Windows
+        .ok()
+        .or_else(|| std::env::var("XDG_DATA_HOME").ok()) // Linux
+        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{}/.local/share", h)))
+        .unwrap_or_else(|| ".".to_string());
+    let dir = std::path::Path::new(&base).join("SassyTalkie");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("cohorts.json")
+}
+
+/// RMS amplitude of a 16-bit PCM frame, normalized to 0.0..=1.0. Used by the
+/// VOX gate to decide whether a frame carries speech.
+fn frame_rms_normalized(samples: &[i16]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    let rms = (sum_sq / samples.len() as f64).sqrt();
+    (rms / i16::MAX as f64) as f32
 }
 
 /// Shared RX pipeline: decode Opus → shared `sassytalkie-core` audio_cache

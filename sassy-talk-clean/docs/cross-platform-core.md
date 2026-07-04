@@ -61,21 +61,20 @@ Already-existing desktop-only opcodes (`OP_READY_ACK`, `OP_PING`, etc.) stay in 
 | Tauri audio_cache consumer | ✓ v2.8 | Wired in `lib.rs` RX loop, single-peer for now |
 | Tauri cohort_history consumer | ☐ | Needs desktop UI for rejoin list |
 | Tauri crypto API unification | ☐ | Tauri's `encrypt(pt, nonce) → (ct, tag)` ≠ Android's `encrypt(pt) → nonce‖ct‖tag` — mechanical refactor |
-| Tauri session consumer | ☐ | Blocked on cellular transport (see below) |
-| **Tauri cellular relay transport** | **☐ blocking** | Desktop currently only has bluetooth.rs + wifi.rs in `transport/`. No WebSocket relay client. Until added, Windows can't join Android sessions over the internet at all. |
+| Tauri session consumer | ✓ v2.8 | `join_cellular_session` via QR import |
+| **Tauri cellular relay transport** | **✓ v2.8** | `transport/cellular.rs` — WebSocket relay client with core `CryptoSession`. Basic internet PTT works; control-plane parity (PTT v2, liveness, catch-up) still pending — see `docs/audit-2026-07-03.md` P1 items. |
 | Codec unification | ☐ | Android: libopus via cc. Tauri: audiopus via audiopus_sys. Either works. |
 | iOS-native | ☐ | Out of scope until iOS revives |
 
-## The actual blocker for Windows-Android interop
+## Windows-Android interop status (updated 2026-07-03)
 
-The shared core gets Windows half the way there — same protocol opcodes, same audio pipeline now. But the desktop **has no cellular transport** (`transport/cellular.rs` doesn't exist). For real Windows-joins-Android-session functionality, the desktop needs:
+Cellular relay transport shipped in v2.8 (`transport/cellular.rs`). Desktop can join Android sessions over the internet via QR/share-link import and encrypted WebSocket relay.
 
-1. A WebSocket client targeting `relay.sassyconsultingllc.com` (matches the Android `cellular_transport.rs` wire format).
-2. A token-auth flow against `/auth` (HMAC-SHA256 capability tokens).
-3. Session import — parse Android's QR JSON (already in `session.rs` ✓), derive AES key, plug into the relay's encrypted frame format.
-4. UI for QR scan (desktop) or paste-link (more practical for desktop).
-
-That's ~2-3 days of focused work. The shared-core groundwork is now in place to support it.
+**Remaining gaps** (see `docs/audit-2026-07-03.md` §7 P1):
+- Desktop skips control frames over cellular (no liveness tracker, no OP_PTT_START_V2 emit)
+- OP_REPLAY catch-up broken on all clients (non-TLV framing mismatch)
+- Android `/presence` and `/share` missing auth tokens
+- UDP desktop path still uses divergent local crypto (LAN-only; not Android-interoperable)
 
 ## Workflow going forward
 

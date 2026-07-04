@@ -63,6 +63,20 @@ export interface CellularStatus {
   room: string;
   sent: number;
   received: number;
+  peers?: number;
+}
+
+// Recent-sessions (cohort) history record. Mirrors
+// sassytalkie_core::cohort_history::CohortRecord. Holds NO key material.
+export interface CohortRecord {
+  cohort_id: string;
+  channel: number;
+  group_name: string;
+  role: string;
+  host_device?: string | null;
+  last_session_id: string;
+  created_at: number;
+  last_joined_at: number;
 }
 
 export type View = 'lobby' | 'walkie' | 'settings';
