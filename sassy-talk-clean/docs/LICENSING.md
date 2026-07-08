@@ -6,7 +6,7 @@ can move website → Play without losing data):
 | Flavor  | Gate                              | Distribution                     | Build task |
 |---------|-----------------------------------|----------------------------------|------------|
 | `play`  | Google Play Billing, one-time IAP `sassytalkie_unlock` | Play Store (AAB) | `bundlePlayRelease` |
-| `direct`| License key → relay worker `/license/*` | Website APK download       | `assembleDirectRelease` |
+| `direct`| License key or promo code → relay worker `/license/*` | Website APK download       | `assembleDirectRelease` |
 
 The gate lives in `Screen.Gate` (AppNavigation.kt) and is provided per-flavor
 by `license/Entitlements.kt` in `src/play/` and `src/direct/`. Entitlement
@@ -15,12 +15,17 @@ state caches in EncryptedSharedPreferences (`license/LicenseStore.kt`).
 ## Play flavor
 
 - Product: one-time in-app product `sassytalkie_unlock` — create it in Play
-  Console → Monetize → In-app products, price $1.99/$2.49 tier, and set the
+  Console → Monetize → In-app products, price **$3.99**, and set the
   app's Play listing itself to FREE (the paywall replaces the up-front price).
 - Restore is automatic (queryPurchasesAsync on gate entry and on every launch
   via the silent refresh); refunds revoke on the next online launch.
 
 ## Direct flavor
+
+Website checkout is **$3.99** via Lemon Squeezy (`/api/checkout` → `sassy-talk`
+product). Paid orders issue a relay-side license key that unlocks the direct
+APK. Friends & family can skip checkout with a **promo code** (same field on
+the activation screen).
 
 Server side is `cloudflare-worker/src/license.js` backed by D1
 (`sassytalkie-licenses`, binding `LICENSES`) + two secrets:

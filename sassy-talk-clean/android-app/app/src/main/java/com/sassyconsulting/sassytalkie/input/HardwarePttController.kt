@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
+import com.sassyconsulting.sassytalkie.PttCoordinator
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -16,8 +17,8 @@ import kotlinx.coroutines.flow.asStateFlow
 /**
  * Hardware push-to-talk controller.
  *
- * Maps two configurable input sources onto [SassyTalkNative.pttStart] /
- * [SassyTalkNative.pttStop]:
+ * Maps two configurable input sources onto the PTT coordinator (or native
+ * fallback when the coordinator is not yet available):
  *
  *  1. **Hardware key PTT** — physical buttons. Rugged/industrial Android
  *     handsets (Sonim, Kyocera DuraForce, CAT, Zebra, RugGear, etc.) expose a
@@ -36,8 +37,8 @@ import kotlinx.coroutines.flow.asStateFlow
  *     reaching us while the app is backgrounded.
  *
  * Design notes:
- *  - **Self-contained.** No new native methods; drives the existing
- *    `pttStart()` / `pttStop()` only.
+ *  - **Self-contained.** Routes through [PttCoordinator] when available so
+ *    BLE wake, RFCOMM pump, and reach watchdog run on every PTT path.
  *  - **Debounced.** A held hardware key emits repeated ACTION_DOWN events
  *    (`getRepeatCount() > 0`); we ignore the repeats so a held button is one
  *    continuous transmission (start on first down, stop on up). The BT media
@@ -133,6 +134,12 @@ class HardwarePttController(context: Context) {
 
     /** Optional listener mirror of [transmitting] for non-Compose callers. */
     var onTransmitChanged: ((Boolean) -> Unit)? = null
+
+    /**
+     * Resolves the active coordinator from the bound [WalkieService]. When
+     * null, [startPtt] / [stopPtt] fall back to native calls.
+     */
+    var pttCoordinatorProvider: (() -> PttCoordinator?)? = null
 
     @Volatile
     private var enabled = false
@@ -424,7 +431,14 @@ class HardwarePttController(context: Context) {
     private fun startPtt(reason: String) {
         if (_transmitting.value) return // guard double-start
         try {
-            SassyTalkNative.pttStart()
+            val coord = pttCoordinatorProvider?.invoke()
+            val started = if (coord != null) {
+                coord.onPttPressed()
+            } else {
+                SassyTalkNative.pttStart()
+                true
+            }
+            if (!started) return
             _transmitting.value = true
             onTransmitChanged?.invoke(true)
             Log.d(TAG, "PTT start ($reason)")
@@ -436,7 +450,12 @@ class HardwarePttController(context: Context) {
     private fun stopPtt(reason: String) {
         if (!_transmitting.value) return // guard double-stop
         try {
-            SassyTalkNative.pttStop()
+            val coord = pttCoordinatorProvider?.invoke()
+            if (coord != null) {
+                coord.onPttReleased()
+            } else {
+                SassyTalkNative.pttStop()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "pttStop failed ($reason): ${e.message}")
         } finally {

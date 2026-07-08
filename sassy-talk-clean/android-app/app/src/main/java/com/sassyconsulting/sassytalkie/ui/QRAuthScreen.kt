@@ -23,15 +23,15 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.google.zxing.BarcodeFormat
-import com.google.zxing.qrcode.QRCodeWriter
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.SessionShareLink
 import com.sassyconsulting.sassytalkie.ui.theme.*
+import com.sassyconsulting.sassytalkie.ui.util.QrBitmap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -56,6 +56,9 @@ fun QRAuthScreen(
     onSessionMutated: () -> Unit = {},
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
+    val qrDisplayPx = with(density) { 160.dp.roundToPx() }
     var selectedTab by remember { mutableIntStateOf(0) }
     var selectedChannel by remember { mutableIntStateOf(1) }
     var groupName by remember { mutableStateOf("") }
@@ -70,6 +73,7 @@ fun QRAuthScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(DarkBg)
+            .imePadding()
             .padding(horizontal = 8.dp, vertical = 4.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
@@ -158,7 +162,11 @@ fun QRAuthScreen(
                     )
                     if (qrJson.isNotEmpty()) {
                         lastGeneratedJson = qrJson
-                        qrBitmap = generateQRBitmap(qrJson, 600)
+                        scope.launch {
+                            qrBitmap = withContext(Dispatchers.Default) {
+                                QrBitmap.generate(qrJson, qrDisplayPx)
+                            }
+                        }
                         hasExistingSession.value = true
                         // Host-side: a new session_id was just minted. Force
                         // the cellular WS to reconnect so the host attaches
@@ -208,7 +216,11 @@ fun QRAuthScreen(
                     val qr = SassyTalkNative.generateChannelQR(channel, durationHours, gName, cohortId)
                     if (qr.isNotEmpty()) {
                         lastGeneratedJson = qr
-                        qrBitmap = generateQRBitmap(qr, 600)
+                        scope.launch {
+                            qrBitmap = withContext(Dispatchers.Default) {
+                                QrBitmap.generate(qr, qrDisplayPx)
+                            }
+                        }
                         hasExistingSession.value = true
                         selectedTab = 0
                         // Same host-side reconnect as the fresh-generate path.
@@ -517,7 +529,12 @@ private fun ShowQRTab(
                             when (result) {
                                 is SessionShareLink.Result.Ok -> {
                                     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                    cm.setPrimaryClip(ClipData.newPlainText("SassyTalk Invite", result.url))
+                                    cm.setPrimaryClip(
+                                        ClipData.newPlainText(
+                                            "SassyTalk Invite",
+                                            "${result.url}\n${result.httpsUrl}",
+                                        ),
+                                    )
                                     Toast.makeText(context, "Invite link copied", Toast.LENGTH_SHORT).show()
                                 }
                                 is SessionShareLink.Result.Err -> {
@@ -564,7 +581,10 @@ private fun ShowQRTab(
                                         type = "text/plain"
                                         putExtra(
                                             Intent.EXTRA_TEXT,
-                                            "Join my SassyTalk session: ${result.url}\n" +
+                                            "Join my SassyTalk session:\n${result.url}\n\n" +
+                                                "Backup link (if the app didn't open):\n${result.httpsUrl}\n\n" +
+                                                "If neither opens the app, copy either link and paste in " +
+                                                "SassyTalk → Authenticate → Enter Code.\n" +
                                                 "(One-time link, expires shortly.)",
                                         )
                                         putExtra(Intent.EXTRA_SUBJECT, "SassyTalk invite")
@@ -716,6 +736,8 @@ private fun EnterCodeTab(
 ) {
     var codeText by remember { mutableStateOf("") }
     var result by remember { mutableStateOf<String?>(null) }
+    var joining by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -733,7 +755,7 @@ private fun EnterCodeTab(
         Spacer(modifier = Modifier.height(12.dp))
 
         Text(
-            text = "Paste a session code received from another device",
+            text = "Paste a session code or invite link from another device",
             color = TextGray,
             fontSize = 14.sp,
             textAlign = TextAlign.Center
@@ -748,7 +770,13 @@ private fun EnterCodeTab(
             modifier = Modifier
                 .fillMaxWidth()
                 .heightIn(min = 120.dp),
-            placeholder = { Text("Paste session code here...", color = TextMuted) },
+            placeholder = {
+                Text(
+                    "Paste invite link or session JSON…",
+                    color = TextMuted,
+                    fontSize = 13.sp,
+                )
+            },
             colors = OutlinedTextFieldDefaults.colors(
                 focusedBorderColor = Teal,
                 unfocusedBorderColor = CardBg,
@@ -784,18 +812,37 @@ private fun EnterCodeTab(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Join button
+        // Join button — accepts raw QR JSON or an encrypted https invite link.
         Button(
             onClick = {
                 val trimmed = codeText.trim()
                 if (trimmed.isEmpty()) {
-                    result = "Please paste a session code first"
+                    result = "Please paste a session code or invite link first"
                     return@Button
                 }
-                val success = SassyTalkNative.importSessionFromQR(trimmed)
-                result = if (success) "Session established!" else "Invalid session code"
-                if (success) {
-                    onAuthenticated()
+                joining = true
+                scope.launch {
+                    val success = if (SessionShareLink.looksLikeShareLink(trimmed)) {
+                        when (val share = withContext(Dispatchers.IO) {
+                            SessionShareLink.importFromShareText(trimmed)
+                        }) {
+                            is SessionShareLink.Result.Ok -> withContext(Dispatchers.IO) {
+                                SassyTalkNative.importSessionFromQR(share.json)
+                            }
+                            is SessionShareLink.Result.Err -> {
+                                result = share.message
+                                joining = false
+                                return@launch
+                            }
+                        }
+                    } else {
+                        SassyTalkNative.importSessionFromQR(trimmed)
+                    }
+                    joining = false
+                    result = if (success) "Session established!" else "Invalid session code"
+                    if (success) {
+                        onAuthenticated()
+                    }
                 }
             },
             colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
@@ -804,11 +851,19 @@ private fun EnterCodeTab(
                 .fillMaxWidth()
                 .height(56.dp)
                 .background(Brush.linearGradient(GradientAccent), RoundedCornerShape(25.dp)),
-            enabled = codeText.isNotBlank()
+            enabled = codeText.isNotBlank() && !joining
         ) {
-            Icon(Icons.Default.VpnKey, contentDescription = null)
+            if (joining) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(20.dp),
+                    color = Color.White,
+                    strokeWidth = 2.dp,
+                )
+            } else {
+                Icon(Icons.Default.VpnKey, contentDescription = null)
+            }
             Spacer(modifier = Modifier.width(8.dp))
-            Text("Join Session", fontSize = 16.sp)
+            Text(if (joining) "Joining…" else "Join Session", fontSize = 16.sp)
         }
 
         if (result != null) {
@@ -823,19 +878,3 @@ private fun EnterCodeTab(
     }
 }
 
-/** Generate a QR code bitmap from a string */
-private fun generateQRBitmap(content: String, size: Int): Bitmap? {
-    return try {
-        val writer = QRCodeWriter()
-        val bitMatrix = writer.encode(content, BarcodeFormat.QR_CODE, size, size)
-        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565)
-        for (x in 0 until size) {
-            for (y in 0 until size) {
-                bitmap.setPixel(x, y, if (bitMatrix[x, y]) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
-            }
-        }
-        bitmap
-    } catch (e: Exception) {
-        null
-    }
-}

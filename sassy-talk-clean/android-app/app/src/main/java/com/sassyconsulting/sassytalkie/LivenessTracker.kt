@@ -53,6 +53,9 @@ class LivenessTracker {
         }
     }
 
+    /** True if we have ever received a heartbeat from this peer. */
+    fun isTracked(peerId: String): Boolean = peers.containsKey(peerId)
+
     /** Get health assessment for a peer. */
     fun health(peerId: String, nowMs: Long): PeerHealth {
         val p = peers[peerId] ?: return PeerHealth.STALE

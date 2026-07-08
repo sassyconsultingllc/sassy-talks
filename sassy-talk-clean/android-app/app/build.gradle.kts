@@ -1,4 +1,4 @@
-﻿import java.util.Properties
+import java.util.Properties
 import java.io.FileInputStream
 
 plugins {
@@ -23,8 +23,8 @@ android {
         applicationId = "com.sassyconsulting.sassytalkie"
         minSdk = 24
         targetSdk = 35
-        versionCode = 47
-        versionName = "2.9.0"
+        versionCode = 52
+        versionName = "3.1.1"
         
         // Feature flag: enable or disable cellular (relay) transport at build time
         buildConfigField("boolean", "ENABLE_CELLULAR_RELAY", "true")
@@ -33,6 +33,8 @@ android {
         // so production builds can't be screen-recorded or screenshotted.
         // Override per-buildType is in the buildTypes blocks below.
         buildConfigField("boolean", "NO_SCREENSHOTS", "false")
+        // Relay worker license endpoints (direct activation + Play promo redemption).
+        buildConfigField("String", "LICENSE_API_BASE", "\"https://relay.sassyconsultingllc.com\"")
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
@@ -51,8 +53,6 @@ android {
         create("direct") {
             dimension = "dist"
             versionNameSuffix = "-direct"
-            // License endpoints live on the relay worker (src/license.js).
-            buildConfigField("String", "LICENSE_API_BASE", "\"https://relay.sassyconsultingllc.com\"")
         }
     }
 
@@ -178,10 +178,11 @@ dependencies {
     // The direct flavor ships zero Google billing code.
     "playImplementation"("com.android.billingclient:billing-ktx:7.1.1")
 
-    implementation("androidx.core:core-ktx:1.12.0")
+    implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.core:core-splashscreen:1.0.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
     implementation("androidx.lifecycle:lifecycle-process:2.6.2")
-    implementation("androidx.activity:activity-compose:1.8.1")
+    implementation("androidx.activity:activity-compose:1.9.3")
     
     // Compose
     implementation(platform("androidx.compose:compose-bom:2023.10.01"))
@@ -234,15 +235,8 @@ dependencies {
     implementation("com.google.firebase:firebase-messaging-ktx")
 
     // Android Keystore-backed EncryptedSharedPreferences for session/key storage.
-    // Plain SharedPreferences is sandboxed to our UID but is cleartext on disk —
-    // any backup or rooted access would leak the session key.
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
-    
-    // AppCompat + Material + ConstraintLayout for legacy XML layouts
-    implementation("androidx.appcompat:appcompat:1.6.1")
-    implementation("com.google.android.material:material:1.9.0")
-    implementation("androidx.constraintlayout:constraintlayout:2.1.4")
-    
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")

@@ -135,7 +135,7 @@ object Entitlements {
                 )
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "Enter the license key from your purchase\nor a promo code. Licenses cover 3 devices.",
+                    text = "Enter your license key from checkout,\nor a friends & family promo code.\nLicenses cover 3 devices.",
                     fontSize = 14.sp,
                     color = TextGray,
                     textAlign = TextAlign.Center,

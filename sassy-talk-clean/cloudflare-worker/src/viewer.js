@@ -152,8 +152,17 @@ const LANDING_HTML = `<!DOCTYPE html>
     background: var(--bg-primary);
     color: var(--text-primary);
     border-color: var(--border-medium);
+    cursor: pointer;
+    font-family: inherit;
   }
   .btn[aria-disabled="true"] { opacity: 0.4; pointer-events: none; }
+  .paste-hint {
+    margin-top: 1rem;
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+    line-height: 1.45;
+    text-align: left;
+  }
   .apk { display: inline-block; margin-top: 0.5rem; font-size: 0.85rem; color: var(--text-tertiary); }
   .apk a { color: var(--accent-primary); text-decoration: none; }
   .note {
@@ -189,8 +198,14 @@ const LANDING_HTML = `<!DOCTYPE html>
     <p class="sub">Open this encrypted, one-time session invite in the SassyTalk app.</p>
 
     <a id="open" class="btn btn-primary" href="#">Open in SassyTalk</a>
+    <button id="copy" type="button" class="btn btn-secondary">Copy invite link</button>
     <a class="btn btn-secondary" href="${PLAY_URL}">Get SassyTalk for Android</a>
     <span class="apk">Sideloading? <a href="${APK_URL}">Download the APK</a></span>
+
+    <p id="paste-hint" class="paste-hint" style="display:none">
+      Link won't open the app? Copy it above, then in SassyTalk go to
+      <strong>Authenticate → Enter Code</strong> and paste the full link.
+    </p>
 
     <p class="note">
       <span class="lock">🔒 End-to-end encrypted.</span>
@@ -202,15 +217,63 @@ const LANDING_HTML = `<!DOCTYPE html>
   <script>
     (function () {
       // The full deep link (including the #key fragment) only exists in the
-      // browser's address bar — reconstruct it client-side. Tapping it re-fires
-      // the Android App Link so an installed, verified app opens directly.
+      // browser's address bar — reconstruct it client-side.
       var open = document.getElementById('open');
+      var copyBtn = document.getElementById('copy');
+      var pasteHint = document.getElementById('paste-hint');
       var hash = location.hash || '';
       var hasKey = hash.length > 1; // more than a bare '#'
+      var fullUrl = location.href;
+
+      function appLinkUrl(href) {
+        try {
+          var u = new URL(href);
+          return 'sassytalk://v' + u.pathname + u.hash;
+        } catch (e) {
+          return href;
+        }
+      }
+
+      function androidIntentUrl(appUrl, httpsFallback) {
+        try {
+          // sassytalk://v/<id>#<key> → intent://v/<id>#Intent;scheme=sassytalk;…
+          var pathAndHash = appUrl.replace(/^sassytalk:\/\//, '');
+          var fallback = encodeURIComponent(httpsFallback);
+          return 'intent://' + pathAndHash.split('#')[0] +
+            '#Intent;scheme=sassytalk;package=com.sassyconsulting.sassytalkie;S.browser_fallback_url=' +
+            fallback + ';end';
+        } catch (e) {
+          return appUrl;
+        }
+      }
+
       if (hasKey) {
-        open.setAttribute('href', location.href);
+        var appUrl = appLinkUrl(fullUrl);
+        // Prefer sassytalk:// — opens the installed app without App Links verification.
+        var isAndroid = /Android/i.test(navigator.userAgent);
+        open.setAttribute('href', isAndroid ? androidIntentUrl(appUrl, fullUrl) : appUrl);
+        open.textContent = 'Open in SassyTalk';
+        pasteHint.style.display = 'block';
+
+        copyBtn.addEventListener('click', function () {
+          var done = function () {
+            copyBtn.textContent = 'Copied!';
+            setTimeout(function () { copyBtn.textContent = 'Copy invite link'; }, 2000);
+          };
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(fullUrl).then(done).catch(function () {
+              window.prompt('Copy this invite link:', fullUrl);
+            });
+          } else {
+            window.prompt('Copy this invite link:', fullUrl);
+            done();
+          }
+        });
       } else {
         open.setAttribute('aria-disabled', 'true');
+        copyBtn.setAttribute('aria-disabled', 'true');
+        copyBtn.style.opacity = '0.4';
+        copyBtn.style.pointerEvents = 'none';
         document.getElementById('warn').style.display = 'block';
       }
     })();

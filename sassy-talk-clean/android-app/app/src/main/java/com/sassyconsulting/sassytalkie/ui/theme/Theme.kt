@@ -53,7 +53,9 @@ fun SassyTalkTheme(
             // window.statusBarColor/navigationBarColor are deprecated in API 35
             // and deliberately not touched here.
             val window = (view.context as Activity).window
-            WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = false
+            val insetsController = WindowCompat.getInsetsController(window, view)
+            insetsController.isAppearanceLightStatusBars = false
+            insetsController.isAppearanceLightNavigationBars = false
         }
     }
 

@@ -6,9 +6,12 @@ import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
@@ -16,9 +19,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.resume
 import com.android.billingclient.api.AcknowledgePurchaseParams
 import com.android.billingclient.api.BillingClient
 import com.android.billingclient.api.BillingClientStateListener
@@ -36,7 +46,8 @@ import com.sassyconsulting.sassytalkie.ui.theme.Teal
 import com.sassyconsulting.sassytalkie.ui.theme.TextGray
 
 /**
- * Play-flavor entitlement gate: one-time Google Play Billing purchase.
+ * Play-flavor entitlement gate: Google Play Billing purchase, with promo-code
+ * redemption for friends & family (relay `/license/promo`).
  *
  * Contract shared with the direct flavor (same fully-qualified name, different
  * source set — AppNavigation compiles against whichever flavor is built):
@@ -49,18 +60,29 @@ object Entitlements {
     private const val TAG = "Entitlements"
     private const val PRODUCT_ID = "sassytalkie_unlock"
 
-    fun isUnlockedCached(context: Context): Boolean =
-        LicenseStore.prefs(context)?.getBoolean(LicenseStore.KEY_UNLOCKED, false) ?: false
+    fun isUnlockedCached(context: Context): Boolean {
+        val p = LicenseStore.prefs(context) ?: return false
+        if (p.getBoolean(LicenseStore.KEY_UNLOCKED, false)) return true
+        return LicensePromo.hasValidReceipt(context)
+    }
 
     /**
-     * Reconnect to Play and reconcile the cached entitlement with the store's
-     * answer. Play's local purchase cache works offline, so an OK response is
-     * authoritative in both directions: purchase found → cache unlock (covers
-     * reinstall/second device), definitively absent → drop it (refund).
-     * Connection failures leave the cache untouched and report the cached state.
+     * Reconcile entitlement: promo receipts refresh against the relay worker;
+     * otherwise reconnect to Play and reconcile the cached purchase.
      */
     fun refresh(context: Context, onResult: (Boolean) -> Unit = {}) {
-        val client = BillingClient.newBuilder(context.applicationContext)
+        val appContext = context.applicationContext
+        if (LicenseStore.prefs(appContext)?.getString(LicenseStore.KEY_KIND, null) == "promo") {
+            if (!LicensePromo.hasValidReceipt(appContext)) {
+                onResult(false)
+                return
+            }
+            LicensePromo.refreshIfNeeded(appContext) { ok ->
+                onResult(ok || LicensePromo.hasValidReceipt(appContext))
+            }
+            return
+        }
+        val client = BillingClient.newBuilder(appContext)
             .setListener { _, _ -> } // refresh never launches a flow
             .enablePendingPurchases(
                 PendingPurchasesParams.newBuilder().enableOneTimeProducts().build(),
@@ -69,7 +91,7 @@ object Entitlements {
         client.startConnection(object : BillingClientStateListener {
             override fun onBillingSetupFinished(result: BillingResult) {
                 if (result.responseCode != BillingClient.BillingResponseCode.OK) {
-                    onResult(isUnlockedCached(context))
+                    onResult(isUnlockedCached(appContext))
                     client.endConnection()
                     return
                 }
@@ -78,7 +100,7 @@ object Entitlements {
                         .setProductType(BillingClient.ProductType.INAPP).build(),
                 ) { qr, purchases ->
                     if (qr.responseCode != BillingClient.BillingResponseCode.OK) {
-                        onResult(isUnlockedCached(context))
+                        onResult(isUnlockedCached(appContext))
                     } else {
                         val owned = purchases.any {
                             it.products.contains(PRODUCT_ID) &&
@@ -87,10 +109,10 @@ object Entitlements {
                         if (owned) {
                             purchases.filter { it.products.contains(PRODUCT_ID) && !it.isAcknowledged }
                                 .forEach { acknowledge(client, it) }
-                            setUnlocked(context, true)
-                        } else if (isUnlockedCached(context)) {
+                            setUnlocked(appContext, true)
+                        } else if (isUnlockedCached(appContext)) {
                             Log.w(TAG, "Play reports no purchase — revoking cached unlock")
-                            setUnlocked(context, false)
+                            setUnlocked(appContext, false)
                         }
                         onResult(owned)
                     }
@@ -105,81 +127,171 @@ object Entitlements {
     @Composable
     fun GateScreen(onUnlocked: () -> Unit) {
         val context = LocalContext.current
+        val appContext = context.applicationContext
+        val scope = rememberCoroutineScope()
         var price by remember { mutableStateOf<String?>(null) }
         var details by remember { mutableStateOf<ProductDetails?>(null) }
         var error by remember { mutableStateOf<String?>(null) }
         var busy by remember { mutableStateOf(false) }
+        var promoInput by remember { mutableStateOf("") }
+        var promoBusy by remember { mutableStateOf(false) }
+        var catalogLoading by remember { mutableStateOf(true) }
+        var catalogAttempt by remember { mutableIntStateOf(0) }
 
         // One BillingClient per gate visit; listener handles the purchase result.
+        val clientHolder = remember { arrayOfNulls<BillingClient>(1) }
         val client = remember {
-            BillingClient.newBuilder(context)
+            BillingClient.newBuilder(appContext)
                 .setListener { result, purchases ->
-                    when (result.responseCode) {
-                        BillingClient.BillingResponseCode.OK -> {
-                            val p = purchases?.firstOrNull {
-                                it.products.contains(PRODUCT_ID) &&
-                                    it.purchaseState == Purchase.PurchaseState.PURCHASED
+                    val billingClient = clientHolder[0] ?: return@setListener
+                    scope.launch(Dispatchers.Main.immediate) {
+                        when (result.responseCode) {
+                            BillingClient.BillingResponseCode.OK -> {
+                                val p = purchases?.firstOrNull {
+                                    it.products.contains(PRODUCT_ID) &&
+                                        it.purchaseState == Purchase.PurchaseState.PURCHASED
+                                }
+                                if (p != null) {
+                                    acknowledge(billingClient, p)
+                                    setUnlocked(appContext, true)
+                                    busy = false
+                                    onUnlocked()
+                                } else {
+                                    busy = false
+                                }
                             }
-                            if (p != null) {
-                                setUnlocked(context, true)
-                                onUnlocked()
+                            BillingClient.BillingResponseCode.USER_CANCELED -> busy = false
+                            BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED -> {
+                                busy = false
+                                refresh(appContext) { unlocked ->
+                                    scope.launch(Dispatchers.Main.immediate) {
+                                        if (unlocked) onUnlocked()
+                                        else error = "Purchase exists but could not be restored"
+                                    }
+                                }
+                            }
+                            else -> {
+                                busy = false
+                                error = "Purchase failed (${result.debugMessage})"
                             }
                         }
-                        BillingClient.BillingResponseCode.USER_CANCELED -> busy = false
-                        else -> { busy = false; error = "Purchase failed (${result.debugMessage})" }
                     }
                 }
                 .enablePendingPurchases(
                     PendingPurchasesParams.newBuilder().enableOneTimeProducts().build(),
                 )
                 .build()
+                .also { clientHolder[0] = it }
         }
 
-        LaunchedEffect(Unit) {
-            client.startConnection(object : BillingClientStateListener {
-                override fun onBillingSetupFinished(result: BillingResult) {
-                    if (result.responseCode != BillingClient.BillingResponseCode.OK) {
-                        error = "Google Play unavailable (${result.debugMessage})"
-                        return
-                    }
-                    // Restore path first: an existing purchase skips the paywall
-                    // without any tap (reinstall / second device).
-                    client.queryPurchasesAsync(
-                        QueryPurchasesParams.newBuilder()
-                            .setProductType(BillingClient.ProductType.INAPP).build(),
-                    ) { qr, purchases ->
-                        val owned = qr.responseCode == BillingClient.BillingResponseCode.OK &&
-                            purchases.any {
-                                it.products.contains(PRODUCT_ID) &&
-                                    it.purchaseState == Purchase.PurchaseState.PURCHASED
-                            }
-                        if (owned) {
-                            purchases.filter { !it.isAcknowledged }.forEach { acknowledge(client, it) }
-                            setUnlocked(context, true)
-                            onUnlocked()
-                        }
-                    }
-                    val params = QueryProductDetailsParams.newBuilder()
-                        .setProductList(
-                            listOf(
-                                QueryProductDetailsParams.Product.newBuilder()
-                                    .setProductId(PRODUCT_ID)
-                                    .setProductType(BillingClient.ProductType.INAPP)
-                                    .build(),
-                            ),
-                        ).build()
-                    client.queryProductDetailsAsync(params) { pr, list ->
-                        if (pr.responseCode == BillingClient.BillingResponseCode.OK) {
-                            details = list.firstOrNull()
-                            price = details?.oneTimePurchaseOfferDetails?.formattedPrice
-                        } else {
-                            error = "Could not load price (${pr.debugMessage})"
-                        }
-                    }
-                }
+        fun applyCatalogResult(
+            product: ProductDetails?,
+            err: String?,
+        ) {
+            catalogLoading = false
+            details = product
+            price = product?.oneTimePurchaseOfferDetails?.formattedPrice
+            if (product == null && err != null) error = err
+        }
 
-                override fun onBillingServiceDisconnected() { /* retried on next gate visit */ }
-            })
+        LaunchedEffect(catalogAttempt) {
+            if (LicensePromo.hasValidReceipt(appContext)) {
+                setUnlocked(appContext, true)
+                onUnlocked()
+                return@LaunchedEffect
+            }
+            catalogLoading = true
+            error = null
+            details = null
+            price = null
+            client.endConnection()
+
+            val timedOut = withTimeoutOrNull(15_000L) {
+                suspendCancellableCoroutine { cont ->
+                    client.startConnection(object : BillingClientStateListener {
+                        override fun onBillingSetupFinished(result: BillingResult) {
+                            if (result.responseCode != BillingClient.BillingResponseCode.OK) {
+                                scope.launch(Dispatchers.Main.immediate) {
+                                    applyCatalogResult(
+                                        null,
+                                        "Google Play unavailable (${result.debugMessage})",
+                                    )
+                                }
+                                if (cont.isActive) cont.resume(Unit)
+                                return
+                            }
+                            // Restore path: existing purchase skips the paywall.
+                            client.queryPurchasesAsync(
+                                QueryPurchasesParams.newBuilder()
+                                    .setProductType(BillingClient.ProductType.INAPP).build(),
+                            ) { qr, purchases ->
+                                val owned = qr.responseCode == BillingClient.BillingResponseCode.OK &&
+                                    purchases.any {
+                                        it.products.contains(PRODUCT_ID) &&
+                                            it.purchaseState == Purchase.PurchaseState.PURCHASED
+                                    }
+                                if (owned) {
+                                    purchases.filter { !it.isAcknowledged }
+                                        .forEach { acknowledge(client, it) }
+                                    scope.launch(Dispatchers.Main.immediate) {
+                                        catalogLoading = false
+                                        setUnlocked(appContext, true)
+                                        onUnlocked()
+                                    }
+                                    if (cont.isActive) cont.resume(Unit)
+                                    return@queryPurchasesAsync
+                                }
+                                val params = QueryProductDetailsParams.newBuilder()
+                                    .setProductList(
+                                        listOf(
+                                            QueryProductDetailsParams.Product.newBuilder()
+                                                .setProductId(PRODUCT_ID)
+                                                .setProductType(BillingClient.ProductType.INAPP)
+                                                .build(),
+                                        ),
+                                    ).build()
+                                client.queryProductDetailsAsync(params) { pr, list ->
+                                    scope.launch(Dispatchers.Main.immediate) {
+                                        when {
+                                            pr.responseCode != BillingClient.BillingResponseCode.OK ->
+                                                applyCatalogResult(
+                                                    null,
+                                                    "Could not load price (${pr.debugMessage})",
+                                                )
+                                            list.isEmpty() ->
+                                                applyCatalogResult(
+                                                    null,
+                                                    "Unlock product not found in Play Store. " +
+                                                        "Confirm \"$PRODUCT_ID\" is published, or tap Restore.",
+                                                )
+                                            else -> applyCatalogResult(list.first(), null)
+                                        }
+                                    }
+                                    if (cont.isActive) cont.resume(Unit)
+                                }
+                            }
+                        }
+
+                        override fun onBillingServiceDisconnected() {
+                            if (cont.isActive) {
+                                scope.launch(Dispatchers.Main.immediate) {
+                                    applyCatalogResult(
+                                        null,
+                                        "Lost connection to Google Play — tap Retry",
+                                    )
+                                }
+                                cont.resume(Unit)
+                            }
+                        }
+                    })
+                }
+            }
+            if (timedOut == null && catalogLoading) {
+                applyCatalogResult(
+                    null,
+                    "Google Play is taking too long. Check your connection and tap Retry.",
+                )
+            }
         }
         DisposableEffect(Unit) { onDispose { client.endConnection() } }
 
@@ -207,44 +319,135 @@ object Entitlements {
                     textAlign = TextAlign.Center,
                 )
                 Spacer(modifier = Modifier.height(32.dp))
-                if (busy) {
-                    CircularProgressIndicator(color = Teal)
-                } else {
-                    Button(
-                        onClick = {
-                            val activity = context as? Activity ?: return@Button
-                            val pd = details ?: return@Button
-                            busy = true
-                            error = null
-                            val flowParams = BillingFlowParams.newBuilder()
-                                .setProductDetailsParamsList(
-                                    listOf(
-                                        BillingFlowParams.ProductDetailsParams.newBuilder()
-                                            .setProductDetails(pd).build(),
-                                    ),
-                                ).build()
-                            client.launchBillingFlow(activity, flowParams)
-                        },
-                        enabled = details != null,
-                        colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
-                        shape = RoundedCornerShape(25.dp),
-                        modifier = Modifier.height(52.dp).width(240.dp),
-                    ) {
+                when {
+                    busy || catalogLoading -> {
+                        CircularProgressIndicator(color = Teal)
+                        Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = price?.let { "Unlock — $it" } ?: "Loading…",
-                            fontSize = 16.sp,
+                            text = if (busy) "Processing purchase…" else "Connecting to Google Play…",
+                            fontSize = 13.sp,
+                            color = TextGray,
                         )
                     }
+                    details != null -> {
+                        Button(
+                            onClick = {
+                                val activity = context as? Activity ?: return@Button
+                                val pd = details ?: return@Button
+                                busy = true
+                                error = null
+                                val flowParams = BillingFlowParams.newBuilder()
+                                    .setProductDetailsParamsList(
+                                        listOf(
+                                            BillingFlowParams.ProductDetailsParams.newBuilder()
+                                                .setProductDetails(pd).build(),
+                                        ),
+                                    ).build()
+                                val launch = client.launchBillingFlow(activity, flowParams)
+                                if (launch.responseCode != BillingClient.BillingResponseCode.OK) {
+                                    busy = false
+                                    error = "Could not start purchase (${launch.debugMessage})"
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                            shape = RoundedCornerShape(25.dp),
+                            modifier = Modifier.height(52.dp).width(240.dp),
+                        ) {
+                            Text(
+                                text = price?.let { "Unlock — $it" } ?: "Unlock",
+                                fontSize = 16.sp,
+                            )
+                        }
+                    }
+                    else -> {
+                        Button(
+                            onClick = { catalogAttempt++ },
+                            colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                            shape = RoundedCornerShape(25.dp),
+                            modifier = Modifier.height(52.dp).width(240.dp),
+                        ) {
+                            Text("Retry", fontSize = 16.sp)
+                        }
+                    }
+                }
+                if (!catalogLoading && !busy) {
                     Spacer(modifier = Modifier.height(8.dp))
                     TextButton(
                         onClick = {
                             error = null
-                            refresh(context) { unlocked ->
-                                if (unlocked) onUnlocked() else error = "No purchase found for this Google account"
+                            busy = true
+                            refresh(appContext) { unlocked ->
+                                scope.launch(Dispatchers.Main.immediate) {
+                                    busy = false
+                                    if (unlocked) onUnlocked()
+                                    else error = "No purchase found for this Google account"
+                                }
                             }
                         },
                     ) {
                         Text("Already purchased? Restore", color = TextGray, fontSize = 13.sp)
+                    }
+                }
+                if (!busy) {
+                    Spacer(modifier = Modifier.height(24.dp))
+                    Text(
+                        text = "Have a promo code?",
+                        fontSize = 13.sp,
+                        color = TextGray,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = promoInput,
+                        onValueChange = { promoInput = it.uppercase() },
+                        placeholder = { Text("Promo code", color = TextGray) },
+                        singleLine = true,
+                        enabled = !promoBusy,
+                        keyboardOptions = KeyboardOptions(
+                            capitalization = KeyboardCapitalization.Characters,
+                        ),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Teal,
+                            unfocusedTextColor = Teal,
+                            focusedBorderColor = PrimaryBlue,
+                            unfocusedBorderColor = TextGray,
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    if (promoBusy) {
+                        CircularProgressIndicator(color = Teal)
+                    } else {
+                        Button(
+                            onClick = {
+                                promoBusy = true
+                                error = null
+                                val code = promoInput.trim()
+                                scope.launch {
+                                    val res = withContext(Dispatchers.IO) {
+                                        LicensePromo.redeemBlocking(appContext, code)
+                                    }
+                                    promoBusy = false
+                                    when (res) {
+                                        LicensePromo.RedeemResult.Ok -> {
+                                            setUnlocked(appContext, true)
+                                            onUnlocked()
+                                        }
+                                        LicensePromo.RedeemResult.InvalidFormat ->
+                                            error = "Enter a valid promo code (6–40 characters)"
+                                        LicensePromo.RedeemResult.NetworkError ->
+                                            error = "Can't reach the license server — check your connection"
+                                        is LicensePromo.RedeemResult.Rejected ->
+                                            error = res.message
+                                    }
+                                }
+                            },
+                            enabled = promoInput.isNotBlank(),
+                            colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                            shape = RoundedCornerShape(25.dp),
+                            modifier = Modifier.height(48.dp).width(240.dp),
+                        ) {
+                            Text("Redeem promo", fontSize = 15.sp)
+                        }
                     }
                 }
                 error?.let {

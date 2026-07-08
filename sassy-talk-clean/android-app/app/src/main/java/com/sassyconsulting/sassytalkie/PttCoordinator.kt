@@ -142,6 +142,9 @@ class PttCoordinator(
     /** True when the last probe round-trip exceeded 400ms or timed out entirely. */
     val audioPathDegraded = MutableStateFlow(false)
 
+    /** True when we expected RECV_ACKs but none arrived within the timeout. */
+    val peerReachFailed = MutableStateFlow(false)
+
     /** Timestamp (ms) when the probe frame was sent; 0 means no probe in-flight. */
     @Volatile private var probeSentMs = 0L
 
@@ -167,6 +170,27 @@ class PttCoordinator(
         replay = 0, extraBufferCapacity = 16
     )
     val peerEvents: kotlinx.coroutines.flow.SharedFlow<PeerEvent> = _peerEvents
+
+    /** Relay JSON `peer_joined` — seed liveness so roster updates don't race heartbeats. */
+    fun onRelayPeerSeen(peerKey: String, deviceName: String) {
+        try {
+            val nowMs = System.currentTimeMillis()
+            liveness.onHeartbeat(peerKey, 1L, 0, nowMs, nowMs, SassyTalkNative.localCapabilities())
+            if (deviceName.isNotBlank()) {
+                SassyTalkNative.registerUser(peerKey, deviceName)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "onRelayPeerSeen($peerKey) failed: ${t.message}")
+        }
+    }
+
+    fun onRelayPeerGone(peerKey: String) {
+        try {
+            liveness.removePeer(peerKey)
+        } catch (t: Throwable) {
+            Log.w(TAG, "onRelayPeerGone($peerKey) failed: ${t.message}")
+        }
+    }
 
     // —— Talk-over indicator (Task 6.2) ——
 
@@ -233,70 +257,47 @@ class PttCoordinator(
         startHeartbeat()
     }
 
+    /**
+     * Lightweight PTT-press hook for notification shade toggle — delegates to [onPttPressed].
+     */
+    fun notifyPttPressed() {
+        onPttPressed()
+    }
+
+    /**
+     * Lightweight PTT-release hook for notification shade toggle — delegates to [onPttReleased].
+     */
+    fun notifyPttReleased() {
+        onPttReleased()
+    }
+
     // —— TX Side (We press PTT) ——
 
     /**
-     * Lightweight PTT-press notification from the UI — updates delivery state only.
-     * Audio and BLE signaling are handled separately by the direct SassyTalkNative calls in MainScreen.
+     * Full TX path: probe, BLE signal, native audio, RFCOMM pump, watchdog.
+     * @return false if press was rejected (no transport / no peers).
      */
-    fun notifyPttPressed() {
-        eotTimeoutJob?.cancel()
-        deliveredResetJob?.cancel()
-        deliveredState.value = DeliveryState.Sending
-        Log.d(TAG, "notifyPttPressed → deliveredState=Sending")
-    }
-
-    /**
-     * Lightweight PTT-release notification from the UI — emits PTT_STOP_V2 and starts EOT_ACK timeout.
-     * Audio stop is handled separately by the direct SassyTalkNative call in MainScreen.
-     */
-    fun notifyPttReleased() {
-        val stopEpoch = if (lastTxEpoch != 0L) lastTxEpoch else selfEpoch
-        val stopSeq = lastTxSeq
-        val pttStopV2 = ControlFrame.encodePttStopV2(stopEpoch, stopSeq)
-        bleSignaling.broadcastControl(pttStopV2)
-        cellularClient?.sendBinary(pttStopV2)
-        Log.d(TAG, "notifyPttReleased: PTT_STOP_V2 epoch=$stopEpoch seq=$stopSeq")
-
-        eotTimeoutJob?.cancel()
-        eotTimeoutJob = scope.launch {
-            delay(2_000L)
-            if (deliveredState.value == DeliveryState.Sending) {
-                deliveredState.value = DeliveryState.Idle
-                Log.d(TAG, "EOT_ACK timeout — deliveredState reset to Idle")
-            }
-        }
-    }
-
-    /**
-     * LEGACY full TX state machine (probe + READY_ACK gate + watchdog + wake).
-     * NOT on the live path: the UI (MainScreen) drives PTT via
-     * `SassyTalkNative.pttStart()` + [notifyPttPressed] directly, so this method
-     * and [onPttReleased] are currently unreferenced. Kept because they encode
-     * the audio-path probe / reaching-peer watchdog logic the indicators expect;
-     * reviving them means routing MainScreen's press through here (and deleting
-     * the duplicate notify* path). Until then, treat this as dead code — don't
-     * assume the `transmitting` double-press guard or watchdog run on a real press.
-     */
-    fun onPttPressed() {
-        if (transmitting.getAndSet(true)) return
+    fun onPttPressed(): Boolean {
+        if (transmitting.getAndSet(true)) return true
 
         val blePeers = bleSignaling.blePeerCount
         val rfcommPeers = btTransport.connectedPeerCount
+        val ipUp = try { SassyTalkNative.isConnected() } catch (_: Throwable) { false }
 
-        Log.i(TAG, "PTT PRESSED \u2014 BLE peers: $blePeers, RFCOMM peers: $rfcommPeers")
+        Log.i(TAG, "PTT PRESSED — BLE peers: $blePeers, RFCOMM peers: $rfcommPeers, ipUp=$ipUp")
 
-        if (blePeers == 0 && rfcommPeers == 0) {
-            Log.w(TAG, "PTT BLOCKED: No peers connected")
+        if (blePeers == 0 && rfcommPeers == 0 && !ipUp) {
+            Log.w(TAG, "PTT BLOCKED: No peers and no IP transport")
             transmitting.set(false)
-            return
+            return false
         }
 
-        // Task 7.1: send sub-audible audio path probe before real audio starts
-        sendAudioProbe()
+        if (rfcommPeers > 0) {
+            sendAudioProbe()
+        }
 
-        // Reset reaching-peer state on press
         _reachingPeer.value = false
+        peerReachFailed.value = false
         lastAckMs = 0L
         startWatchdog()
 
@@ -317,12 +318,12 @@ class PttCoordinator(
 
         // Step 2: Brief wait for ACKs, then start audio regardless
         scope.launch {
-            val preAudioDelay = if (wakeEmitted) {
-                READY_ACK_TIMEOUT_MS + WAKE_PRE_AUDIO_DELAY_MS
-            } else {
-                READY_ACK_TIMEOUT_MS
+            val preAudioDelay = when {
+                blePeers == 0 && rfcommPeers == 0 && ipUp -> 0L
+                wakeEmitted -> READY_ACK_TIMEOUT_MS + WAKE_PRE_AUDIO_DELAY_MS
+                else -> READY_ACK_TIMEOUT_MS
             }
-            delay(preAudioDelay)
+            if (preAudioDelay > 0) delay(preAudioDelay)
             val acks = readyAckCount.get()
             Log.i(TAG, "Got $acks/$blePeers READY_ACKs, proceeding (delay=${preAudioDelay}ms)")
 
@@ -335,6 +336,7 @@ class PttCoordinator(
                 btTransport.startTxPump()
             }
         }
+        return true
     }
 
     /**
@@ -369,6 +371,7 @@ class PttCoordinator(
         // Stop watchdog and reset reaching-peer indicator
         stopWatchdog()
         _reachingPeer.value = false
+        peerReachFailed.value = false
 
         // Stop native audio
         SassyTalkNative.pttStop()
@@ -564,11 +567,6 @@ class PttCoordinator(
                 cellularClient?.sendBinary(frame)
                 Log.d(TAG, "HB seq=$seq broadcast to ${bleSignaling.blePeerCount} peers (relay=${cellularClient != null})")
 
-                // Poll stale status every 1s (heartbeat fires every 2s, check every tick)
-                val peerIds = liveness.peerIds()
-                val stale = peerIds.isNotEmpty() && peerIds.any { liveness.health(it, nowMs) == PeerHealth.STALE }
-                if (anyPeerStale.value != stale) anyPeerStale.value = stale
-
                 delay(HEARTBEAT_INTERVAL_MS)
             }
         }
@@ -591,11 +589,22 @@ class PttCoordinator(
                 val active = allPeers.filter { liveness.health(it, nowMs) != PeerHealth.STALE }.toSet()
                 val previous = peerIds.value
                 if (active != previous) {
-                    val joined = active - previous
-                    val left = previous - active
-                    peerIds.value = active
-                    joined.forEach { _peerEvents.tryEmit(PeerEvent.Joined(it)) }
-                    left.forEach { _peerEvents.tryEmit(PeerEvent.Left(it)) }
+                    try {
+                        val joined = active - previous
+                        val left = previous - active
+                        peerIds.value = active
+                        joined.forEach { _peerEvents.tryEmit(PeerEvent.Joined(it)) }
+                        left.forEach {
+                            _peerEvents.tryEmit(PeerEvent.Left(it))
+                            try {
+                                SassyTalkNative.removeUser(it)
+                            } catch (t: Throwable) {
+                                Log.w(TAG, "removeUser($it) failed: ${t.message}")
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "peer roster update failed: ${t.message}", t)
+                    }
                 }
             }
         }
@@ -653,8 +662,16 @@ class PttCoordinator(
             ControlFrame.OP_PTT_STOP_V2 -> handlePttStopV2(peerId, frame.payload)
             ControlFrame.OP_EOT_ACK -> handleEotAck(peerId, frame.payload)
             ControlFrame.OP_WAKE -> handleWake(peerId, frame.payload)
-            ControlFrame.OP_HYBRID_INIT -> handleHybridInit(peerId, frame.payload)
-            ControlFrame.OP_HYBRID_RESP -> handleHybridResp(peerId, frame.payload)
+            ControlFrame.OP_HYBRID_INIT -> try {
+                handleHybridInit(peerId, frame.payload)
+            } catch (t: Throwable) {
+                Log.e(TAG, "hybrid INIT handler failed: ${t.message}", t)
+            }
+            ControlFrame.OP_HYBRID_RESP -> try {
+                handleHybridResp(peerId, frame.payload)
+            } catch (t: Throwable) {
+                Log.e(TAG, "hybrid RESP handler failed: ${t.message}", t)
+            }
             ControlFrame.OP_PARTNER_OFFLINE -> {
                 if (frame.payload.isNotEmpty()) {
                     val idLen = frame.payload[0].toInt() and 0xFF
@@ -799,6 +816,10 @@ class PttCoordinator(
      */
     private fun maybeAutoHybridHandshake(peerId: String, peerEpoch: Long) {
         if (!hybridPqcAuto) return
+        // Relay-mediated peers use synthetic "relay:…" ids. Auto-upgrading their
+        // session to a pairwise PQC key races with the shared QR PSK and has
+        // been observed to crash or brick audio right as the peer joins.
+        if (peerId.startsWith("relay")) return
         if (SassyTalkNative.localCapabilities() and ControlFrame.CAP_HYBRID_PQC == 0) return
         if (liveness.peerCaps(peerId) and ControlFrame.CAP_HYBRID_PQC == 0) return
 
@@ -1012,19 +1033,29 @@ class PttCoordinator(
         Log.d(TAG, "RECV_ACK from $peerId epoch=$epoch seq=$seq ts=$tsMs")
         lastAckMs = System.currentTimeMillis()
         _reachingPeer.value = true
+        peerReachFailed.value = false
     }
+
+    private fun expectsRecvAck(): Boolean =
+        bleSignaling.blePeerCount > 0 || btTransport.connectedPeerCount > 0
 
     /** Start the watchdog coroutine while PTT is held. */
     private fun startWatchdog() {
         watchdogJob?.cancel()
         watchdogJob = scope.launch {
             Log.d(TAG, "Reaching-peer watchdog started")
+            val pressMs = System.currentTimeMillis()
             while (isActive) {
                 delay(200L)
-                val elapsed = System.currentTimeMillis() - lastAckMs
-                if (lastAckMs > 0L && elapsed > REACHING_PEER_TIMEOUT_MS) {
+                if (!expectsRecvAck()) continue
+                val elapsed = System.currentTimeMillis() - pressMs
+                if (lastAckMs > 0L && System.currentTimeMillis() - lastAckMs > REACHING_PEER_TIMEOUT_MS) {
                     _reachingPeer.value = false
-                    Log.d(TAG, "Reaching-peer: no ACK for ${elapsed}ms → false")
+                    peerReachFailed.value = true
+                    Log.d(TAG, "Reaching-peer: ACK timed out → failed")
+                } else if (lastAckMs == 0L && elapsed > REACHING_PEER_TIMEOUT_MS) {
+                    peerReachFailed.value = true
+                    Log.d(TAG, "Reaching-peer: no ACK within ${elapsed}ms → failed")
                 }
             }
         }

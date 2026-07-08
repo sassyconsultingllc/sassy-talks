@@ -441,7 +441,7 @@ fun SettingsScreen(
             // for same-WiFi peers; turning WiFi off forces relay-only.
             SettingsCard(title = "Network") {
                 Text(
-                    text = "Choose which transports the app uses. Turning Cloudflare Relay off keeps audio LAN-local for peers on the same WiFi — useful to avoid relay traffic when not needed.",
+                    text = "Choose which transports the app uses. The app auto-fails over WiFi → relay → Bluetooth when signal drops, and advises when a better path is available. Turning Cloudflare Relay off keeps audio LAN-local for peers on the same WiFi.",
                     fontSize = 11.sp,
                     color = TextMuted
                 )
@@ -566,7 +566,7 @@ fun SettingsScreen(
  *   - native init status
  *   - session status (channels, active cohorts) from `getSessionStatus`
  *   - cache status from `getCacheStatus`
- *   - current network transport (read from WalkieService.networkType — but
+ *   - current network transport (ConnectivityManager snapshot)
  *     SettingsScreen doesn't bind to WalkieService directly; we read what
  *     ConnectivityManager reports right now instead, which is the same value
  *     the badge shows).

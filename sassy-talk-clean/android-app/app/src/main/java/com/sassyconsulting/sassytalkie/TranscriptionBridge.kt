@@ -69,6 +69,24 @@ object TranscriptionBridge {
     /** Observable feed of timeline entries for Compose UI. */
     val entries: StateFlow<List<TranscriptionEntry>> = _entries.asStateFlow()
 
+    /** Snapshot of native audio-cache status for UI chips (single poller). */
+    data class CacheSnapshot(
+        val mode: String = "Live",
+        val queuedUtterances: Int = 0,
+        val queuedDurationMs: Long = 0L,
+        val currentSpeakerName: String? = null,
+        val historyCount: Int = 0,
+    )
+
+    private val _cacheSnapshot = MutableStateFlow(CacheSnapshot())
+    val cacheSnapshot: StateFlow<CacheSnapshot> = _cacheSnapshot.asStateFlow()
+
+    private var cachePollJob: kotlinx.coroutines.Job? = null
+
+    private val bridgeScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob()
+    )
+
     private val _incomingAudio = MutableStateFlow(false)
     /** True while a remote speaker is actively speaking. */
     val incomingAudio: StateFlow<Boolean> = _incomingAudio.asStateFlow()
@@ -106,7 +124,31 @@ object TranscriptionBridge {
         appContext = context.applicationContext
         createNotificationChannel(context.applicationContext)
         initialized = true
+        startCachePolling()
         Log.i(TAG, "Initialized (timeline mode)")
+    }
+
+    /** Poll native cache status once for all UI consumers (Main + Activity screens). */
+    private fun startCachePolling() {
+        if (cachePollJob?.isActive == true) return
+        cachePollJob = bridgeScope.launch {
+            while (true) {
+                try {
+                    val st = SassyTalkNative.getCacheStatus()
+                    if (st != null) {
+                        _cacheSnapshot.value = CacheSnapshot(
+                            mode = st.optString("mode", "Live"),
+                            queuedUtterances = st.optInt("queued_utterances", 0),
+                            queuedDurationMs = st.optLong("queued_duration_ms", 0L),
+                            currentSpeakerName = st.optString("current_speaker_name", "")
+                                .ifEmpty { null },
+                            historyCount = st.optInt("history_count", 0),
+                        )
+                    }
+                } catch (_: Throwable) { /* JNI may be unavailable in tests */ }
+                delay(500L)
+            }
+        }
     }
 
     private fun createNotificationChannel(context: Context) {
@@ -505,15 +547,12 @@ object TranscriptionBridge {
     private const val TIMELINE_FILE_NAME = "timeline_v1.json"
     private const val PERSIST_DEBOUNCE_MS = 250L
     @Volatile private var persistJob: kotlinx.coroutines.Job? = null
-    private val persistScope = kotlinx.coroutines.CoroutineScope(
-        kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob()
-    )
 
     private fun schedulePersist() {
         val ctx = appContext ?: return
         // Cancel pending; new save will pick up the latest snapshot.
         persistJob?.cancel()
-        persistJob = persistScope.launch {
+        persistJob = bridgeScope.launch {
             delay(PERSIST_DEBOUNCE_MS)
             try {
                 val snapshot = _entries.value

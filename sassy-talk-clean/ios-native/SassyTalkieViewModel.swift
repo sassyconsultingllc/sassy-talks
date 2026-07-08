@@ -91,14 +91,17 @@ class SassyTalkieViewModel: ObservableObject {
     /// QR. The decryption key rides only in the URL fragment and is never sent to
     /// the relay — the worker stores ciphertext it cannot read.
     func importFromShareURL(_ url: URL) {
-        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              comps.scheme == "https",
-              comps.host == Self.relayHost,
-              comps.path.hasPrefix("/v/") else {
+        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
             DispatchQueue.main.async { self.statusText = "Not a SassyTalk invite link" }
             return
         }
-        let id = String(comps.path.dropFirst("/v/".count))
+        let isHttps = comps.scheme == "https" && comps.host == Self.relayHost && comps.path.hasPrefix("/v/")
+        let isApp = comps.scheme == "sassytalk" && comps.host == "v"
+        guard isHttps || isApp else {
+            DispatchQueue.main.async { self.statusText = "Not a SassyTalk invite link" }
+            return
+        }
+        let id = String(comps.path.dropFirst(isApp ? 1 : "/v/".count))
         guard Self.isValidShareID(id) else {
             DispatchQueue.main.async { self.statusText = "Malformed invite link" }
             return

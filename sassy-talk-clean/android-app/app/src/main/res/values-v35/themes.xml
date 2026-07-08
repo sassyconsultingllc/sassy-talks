@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- API 35+: edge-to-edge is enforced by default; disable contrast scrims
+         so our slate background reads through the transparent system bars. -->
+    <style name="Theme.SassyTalk" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#0F172A</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">always</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+    </style>
+</resources>

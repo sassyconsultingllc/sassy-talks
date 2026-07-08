@@ -74,54 +74,6 @@ class WalkieService : Service() {
     // lived coroutine in this service.
     private val serviceScope = CoroutineScope(Dispatchers.Default + kotlinx.coroutines.SupervisorJob())
 
-    // ── v2.7.2: network-type indicator ──
-
-    /** "wifi", "cellular", "ethernet", "vpn", "none" — derived from the
-     *  default network's TransportCapabilities. Updates whenever the
-     *  network changes (toggled WiFi, cellular handoff). Polled by
-     *  MainScreen to render a small badge. */
-    val networkType = kotlinx.coroutines.flow.MutableStateFlow("none")
-    private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
-
-    private fun registerNetworkCallback() {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
-        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: android.net.Network) { refresh() }
-            override fun onLost(network: android.net.Network) { refresh() }
-            override fun onCapabilitiesChanged(
-                network: android.net.Network,
-                caps: android.net.NetworkCapabilities,
-            ) { refresh() }
-
-            private fun refresh() {
-                val net = cm.activeNetwork
-                val caps = net?.let { cm.getNetworkCapabilities(it) }
-                val type = when {
-                    caps == null -> "none"
-                    caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)     -> "wifi"
-                    caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
-                    caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
-                    caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)      -> "vpn"
-                    else -> "other"
-                }
-                networkType.value = type
-            }
-        }
-        try {
-            cm.registerDefaultNetworkCallback(cb)
-            networkCallback = cb
-        } catch (t: Throwable) {
-            Log.w(TAG, "network callback register failed: ${t.message}")
-        }
-    }
-
-    private fun unregisterNetworkCallback() {
-        try {
-            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
-            networkCallback?.let { cm.unregisterNetworkCallback(it) }
-        } catch (_: Throwable) {}
-        networkCallback = null
-    }
     private var cohortSnapshotJob: Job? = null
     private var telemetryBridgeJob: Job? = null
 
@@ -147,10 +99,7 @@ class WalkieService : Service() {
         Log.i(TAG, "Service created")
         createNotificationChannel()
         registerPttToggleReceiver()
-        // v2.7.2: monitor network type so MainScreen can render the badge
-        // and the diagnostic sheet can include "current transport" in its dump.
-        registerNetworkCallback()
-        // Snapshotter is keyed to service lifetime, not multicast. The inner
+        // Snapshotter is keyed to service lifetime, not multicast.
         // getActiveCohortId() guard makes it a no-op when no channel has an
         // active session — so it's safe to run regardless of transport.
         startCohortSnapshotter()
@@ -306,7 +255,6 @@ class WalkieService : Service() {
         releaseMulticastLock()
         releaseWakeLock()
         unregisterPttToggleReceiver()
-        unregisterNetworkCallback()
         // Explicitly remove the ongoing notification so it doesn't linger in the
         // shade after the service itself is gone.
         try {
@@ -353,12 +301,22 @@ class WalkieService : Service() {
 
     private fun handleNotificationPttToggle() {
         try {
+            val coord = pttCoordinator
             if (notificationPttActive) {
-                SassyTalkNative.pttStop()
+                if (coord != null) coord.onPttReleased() else SassyTalkNative.pttStop()
                 notificationPttActive = false
                 updateNotification("Radio standby")
             } else {
-                SassyTalkNative.pttStart()
+                val started = if (coord != null) {
+                    coord.onPttPressed()
+                } else {
+                    SassyTalkNative.pttStart()
+                    true
+                }
+                if (!started) {
+                    updateNotification("Radio standby — no peers")
+                    return
+                }
                 notificationPttActive = true
                 updateNotification("Transmitting…")
             }

@@ -145,7 +145,10 @@ const ACTIVE_SPEAKER_MIN_FRAMES: usize = 2;
 ///
 /// Read via [live_jitter_prebuffer_frames]; never read the constant
 /// directly (it's just the initial value).
-const DEFAULT_LIVE_JITTER_PREBUFFER_FRAMES: usize = 5;
+// 3 frames = 60 ms — enough now that the native RX path does pre-decode
+// reorder + a 20 ms playout pacer; the old default of 5 added ~100 ms of
+// avoidable mouth-to-ear latency on top of those layers.
+const DEFAULT_LIVE_JITTER_PREBUFFER_FRAMES: usize = 3;
 static LIVE_JITTER_PREBUFFER_FRAMES_ATOMIC: AtomicU64 =
     AtomicU64::new(DEFAULT_LIVE_JITTER_PREBUFFER_FRAMES as u64);
 

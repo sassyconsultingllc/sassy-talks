@@ -37,6 +37,8 @@ import javax.crypto.spec.SecretKeySpec
 object SessionShareLink {
 
     const val RELAY_BASE = "https://relay.sassyconsultingllc.com"
+    /** Custom scheme that opens the app directly (no App Links verification). */
+    const val APP_SCHEME = "sassytalk"
 
     private const val GCM_TAG_BITS = 128
     private const val IV_LEN = 12
@@ -59,7 +61,10 @@ object SessionShareLink {
          * decrypted session payload ready to hand to [SassyTalkNative.importSession].
          */
         data class Ok(
+            /** `sassytalk://v/<id>#<key>` — opens the installed app directly. */
             val url: String = "",
+            /** `https://relay…/v/<id>#<key>` — web fallback / Universal Link. */
+            val httpsUrl: String = "",
             val expiresAt: Long = 0L,
             val ttlSec: Int = 0,
             val json: String = "",
@@ -159,12 +164,58 @@ object SessionShareLink {
         else if (expiresAt > 0L) ((expiresAt - System.currentTimeMillis() / 1000L)).toInt()
         else 0
 
+        val httpsUrl = "$RELAY_BASE/v/$id#$keyB64Url"
         return Result.Ok(
-            url = "$RELAY_BASE/v/$id#$keyB64Url",
+            url = buildAppLink(id, keyB64Url),
+            httpsUrl = httpsUrl,
             expiresAt = expiresAt,
             ttlSec = effectiveTtl,
         )
     }
+
+    /** `sassytalk://v/<id>#<key>` — registered custom-scheme deep link. */
+    fun buildAppLink(shareId: String, keyB64Url: String): String =
+        "$APP_SCHEME://v/$shareId#$keyB64Url"
+
+    /** True when [text] looks like an encrypted invite link (not raw QR JSON). */
+    fun looksLikeShareLink(text: String): Boolean {
+        val trimmed = text.trim()
+        return try {
+            val uri = Uri.parse(trimmed)
+            isInviteUri(uri)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun isInviteUri(uri: Uri): Boolean {
+        if (uri.scheme == APP_SCHEME && uri.host == "v") {
+            val id = (uri.path ?: "").removePrefix("/")
+            return SHARE_ID_RE.matches(id)
+        }
+        return uri.scheme == "https" &&
+            uri.host == "relay.sassyconsultingllc.com" &&
+            (uri.path ?: "").startsWith("/v/")
+    }
+
+    private fun parseInviteParts(uri: Uri): Pair<String, String>? {
+        val id = when {
+            uri.scheme == APP_SCHEME && uri.host == "v" ->
+                (uri.path ?: "").removePrefix("/")
+            uri.scheme == "https" && uri.host == "relay.sassyconsultingllc.com" ->
+                (uri.path ?: "").removePrefix("/v/")
+            else -> return null
+        }
+        if (!SHARE_ID_RE.matches(id)) return null
+        val key = uri.fragment?.takeIf { it.isNotEmpty() } ?: return null
+        return id to key
+    }
+
+    /**
+     * Parse a pasted invite URL string. Convenience wrapper around
+     * [importFromShareUri] for the Enter Code tab and clipboard paste paths.
+     */
+    fun importFromShareText(text: String): Result = importFromShareUri(Uri.parse(text.trim()))
 
     /**
      * Resolve a deep-link Uri to a decrypted session JSON, ready to feed into
@@ -177,18 +228,11 @@ object SessionShareLink {
      * session. Removed.
      */
     fun importFromShareUri(uri: Uri): Result {
-        // https relay link — fetch ciphertext, decrypt
-        if (uri.scheme == "https" && uri.host == "relay.sassyconsultingllc.com") {
-            val path = uri.path ?: ""
-            if (!path.startsWith("/v/")) return Result.Err("Not a share URL")
-            val id = path.removePrefix("/v/")
-            if (!SHARE_ID_RE.matches(id)) {
-                return Result.Err("Malformed share link")
-            }
-            val keyB64 = uri.fragment
-                ?: return Result.Err("Missing decryption key in URL fragment")
+        if (!isInviteUri(uri)) return Result.Err("Unrecognized share URL")
+        val (id, keyB64) = parseInviteParts(uri)
+            ?: return Result.Err("Malformed share link")
 
-            val keyBytes = try {
+        val keyBytes = try {
                 Base64.decode(keyB64, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
             } catch (t: Throwable) {
                 return Result.Err("Invalid key encoding")
@@ -233,13 +277,10 @@ object SessionShareLink {
                     return Result.Err("Decryption failed (key wrong or payload tampered)")
                 }
 
-                return Result.Ok(url = uri.toString(), json = plain)
+                return Result.Ok(url = uri.toString(), httpsUrl = "", json = plain)
             } finally {
                 keyBytes.fill(0)
             }
-        }
-
-        return Result.Err("Unrecognized share URL")
     }
 
     private sealed class TokenResult {

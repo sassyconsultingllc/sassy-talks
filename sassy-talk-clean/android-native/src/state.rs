@@ -46,6 +46,7 @@ pub struct StateMachine {
     // resources they reference).
     tx_handle: Mutex<Option<JoinHandle<()>>>,
     rx_handle: Mutex<Option<JoinHandle<()>>>,
+    rx_shared: Arc<Mutex<audio_pipeline::RxSharedState>>,
     device_name: String,
     local_sender_id: String,
 }
@@ -68,6 +69,7 @@ impl StateMachine {
             rx_running: Arc::new(AtomicBool::new(false)),
             tx_handle: Mutex::new(None),
             rx_handle: Mutex::new(None),
+            rx_shared: Arc::new(Mutex::new(audio_pipeline::RxSharedState::new())),
             device_name,
             local_sender_id,
         }
@@ -133,6 +135,7 @@ impl StateMachine {
             Arc::clone(&self.transport),
             Arc::clone(&self.audio_cache),
             Arc::clone(&self.user_registry),
+            Arc::clone(&self.rx_shared),
             self.local_sender_id.clone(),
         ) {
             Ok(rx) => { *self.rx_handle.lock().unwrap() = Some(rx); }
@@ -452,6 +455,10 @@ impl StateMachine {
 
     pub fn get_user_registry(&self) -> &Arc<Mutex<UserRegistry>> {
         &self.user_registry
+    }
+
+    pub fn get_rx_shared(&self) -> &Arc<Mutex<audio_pipeline::RxSharedState>> {
+        &self.rx_shared
     }
 }
 

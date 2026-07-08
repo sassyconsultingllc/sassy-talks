@@ -435,6 +435,16 @@ object SassyTalkNative {
         }
     }
 
+    fun removeUser(userId: String) {
+        if (initialized) {
+            try {
+                nativeRemoveUser(userId)
+            } catch (e: Exception) {
+                Log.e(TAG, "removeUser failed: ${e.message}")
+            }
+        }
+    }
+
     /** Get app state: 0=Init, 1=Ready, 2=Connecting, 3=Connected, 4=TX, 5=RX, 6=Disconnecting, 7=Error */
     fun getAppState(): Int {
         if (!initialized) return 0
@@ -1161,6 +1171,7 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeGetUsers(): String
     @JvmStatic private external fun nativeSetMuted(userId: String, muted: Boolean)
     @JvmStatic private external fun nativeSetFavorite(userId: String, favorite: Boolean)
+    @JvmStatic private external fun nativeRemoveUser(userId: String)
 
     // WiFi status, session, users, permissions
     @JvmStatic private external fun nativeGetAppState(): Byte

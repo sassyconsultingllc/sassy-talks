@@ -168,12 +168,33 @@ class CellularWebSocketClient {
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                // Text message = control (peer_joined, peer_left, welcome, pong, etc.)
                 Log.d(TAG, "Control: $text")
-                // Parse "welcome" message as DO readiness confirmation
-                if (text.contains("\"welcome\"") || text.contains("\"type\":\"welcome\"")) {
-                    Log.i(TAG, "DO welcome received — relay is ready")
-                    onRelayReady?.invoke()
+                try {
+                    val obj = JSONObject(text)
+                    when (obj.optString("type")) {
+                        "welcome" -> {
+                            Log.i(TAG, "DO welcome received — relay is ready")
+                            onRelayReady?.invoke()
+                        }
+                        "peer_joined" -> {
+                            val device = obj.optString("device", "Peer")
+                            val clientId = obj.optString("client_id", "")
+                            val peerKey = when {
+                                clientId.isNotEmpty() -> "relay:$clientId"
+                                device.isNotEmpty() -> "relay:peer:$device"
+                                else -> return
+                            }
+                            pttCoordinator?.onRelayPeerSeen(peerKey, device)
+                        }
+                        "peer_left" -> {
+                            val clientId = obj.optString("client_id", "")
+                            if (clientId.isNotEmpty()) {
+                                pttCoordinator?.onRelayPeerGone("relay:$clientId")
+                            }
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "control parse failed: ${t.message}")
                 }
             }
 

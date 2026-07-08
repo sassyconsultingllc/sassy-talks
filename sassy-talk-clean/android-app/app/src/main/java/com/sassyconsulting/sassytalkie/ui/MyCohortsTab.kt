@@ -187,7 +187,7 @@ private fun CohortRow(
                         when (item.role) {
                             "Hosted" -> Icons.Default.QrCode2
                             "Joined" -> Icons.Default.QrCodeScanner
-                            else -> Icons.Default.Refresh
+                            else -> Icons.Default.Login
                         },
                         contentDescription = null,
                     )

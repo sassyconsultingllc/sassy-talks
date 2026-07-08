@@ -4,6 +4,76 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.1.1] (52) — 2026-07-07
+
+### Added
+- **Play paywall promo redemption.** Friends & family can enter a promo code
+  on the Play build paywall (relay `/license/promo`) without a Google Play
+  purchase. Receipt refresh mirrors the direct-license offline model.
+
+## [3.1.0] (51) — 2026-07-07
+
+### Added
+- **Picture-in-picture.** Leaving the main radio screen while connected
+  auto-enters PiP with channel, transport, and TX/RX status.
+- **Efficient QR rendering.** Shared `QrBitmap` utility generates at display
+  size with bulk pixel writes instead of oversized `setPixel` loops.
+
+### Changed
+- **Edge-to-edge (Android 15).** API 35 theme disables contrast scrims,
+  cutout mode is `always`, navigation bar uses dark icons, and insets are
+  applied once at the activity root (no double-padding on child screens).
+- **Predictive back** enabled for Android 13+.
+- Removed dead legacy XML layout, unused drawables, and WalkieService
+  network-type polling (badge was removed earlier).
+- Profile and auth screens use `imePadding()` for keyboard overlap.
+- PiP overlay live-updates channel/transport; auto-enter enabled on Android 12+.
+- End-session and entitlement refresh use coordinator-safe threading.
+- **Android 12+ splash screen** with branded slate background on cold start.
+- Removed unused AppCompat/Material/ConstraintLayout dependencies (~legacy XML).
+
+## [3.0.2] (50) — 2026-07-07
+
+### Fixed
+- **Paywall infinite loading.** Play billing catalog load now times out after
+  15s, surfaces errors when the unlock product is missing or Play is
+  unavailable, and offers Retry / Restore instead of a stuck "Loading…" button.
+
+## [3.0.1] (49) — 2026-07-07
+
+### Fixed
+- **PTT orchestration.** All transmit paths (on-screen, notification shade,
+  hardware key, Bluetooth media button) now route through `PttCoordinator` so
+  BLE wake, RFCOMM pump, and reach watchdog run consistently.
+- **"Not reaching peer" false alarm.** Main screen now uses the watchdog's
+  `peerReachFailed` signal instead of an inverted reach indicator.
+- **Users tab offline labels.** Registry peers without heartbeats yet show
+  "On channel"; "Out of contact" only when liveness tracking confirms STALE.
+- **Relay WebSocket leak.** Reconnecting cellular relay tears down the
+  previous client before opening a new one.
+- **Peer registry eviction.** Peers are removed from the user registry when
+  they leave the channel.
+- **UI polish.** Centralized cache-status polling, QR generation off the main
+  thread, fixed snackbar overlay layout, hold-vs-tap PTT hint text, and
+  deduplicated incoming-audio vs cache strip display.
+
+## [3.0.0] (48) — 2026-07-07
+
+### Added
+- **Transport Advisor.** The app now scores available encrypted audio planes
+  (WiFi multicast, Cloudflare relay, Bluetooth) and tells you which path is
+  active and whether a better one is reachable. When cellular is down, it
+  confirms Bluetooth fallback; when WiFi returns, it advises switching for
+  lower latency. Advisories appear inline on the main screen and as toasts on
+  meaningful path changes.
+- **Active audio-plane badge.** Connection status now shows the encrypted PTT
+  transport plane (not just the OS network type), color-coded: green = WiFi,
+  orange = relay, cyan = Bluetooth.
+
+### Changed
+- Consolidates the v2.9.0 paywall (Play IAP + direct license key) with the
+  full multi-transport encrypted PTT stack into the shipping 3.0 release.
+
 ## [2.9.0] (47) — 2026-07-03
 
 ### Added

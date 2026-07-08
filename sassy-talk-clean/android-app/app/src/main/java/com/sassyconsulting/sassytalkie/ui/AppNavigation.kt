@@ -21,6 +21,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import com.sassyconsulting.sassytalkie.MainActivity
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.SessionShareLink
 import com.sassyconsulting.sassytalkie.TranscriptionBridge
@@ -59,6 +62,7 @@ fun AppNavigation(
     onRequestPermissions: () -> Unit,
     pendingShareUri: android.net.Uri? = null,
     onShareConsumed: () -> Unit = {},
+    onPipEligibilityChanged: (Boolean) -> Unit = {},
 ) {
     val context = LocalContext.current
     var currentScreen by remember { mutableStateOf(Screen.Auth) }
@@ -244,7 +248,16 @@ fun AppNavigation(
                     }
                 }
                 is SessionShareLink.Result.Err -> {
-                    Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
+                    val hint = if (result.message.contains("fragment", ignoreCase = true)) {
+                        "Copy the full invite link and paste it in Authenticate → Enter Code"
+                    } else {
+                        result.message
+                    }
+                    Toast.makeText(context, hint, Toast.LENGTH_LONG).show()
+                    // App opened but key was stripped — land on Auth so user can paste.
+                    if (result.message.contains("fragment", ignoreCase = true)) {
+                        currentScreen = Screen.Auth
+                    }
                 }
             }
             onShareConsumed()
@@ -256,12 +269,12 @@ fun AppNavigation(
     // forward, and drops the entitlement after a refund/revocation. Runs
     // after native init so it never delays startup.
     LaunchedEffect(nativeReady) {
-        if (nativeReady) {
-            Entitlements.refresh(context) { ok ->
-                entitled = ok
-                if (!ok) currentScreen = Screen.Gate
-            }
+        if (!nativeReady) return@LaunchedEffect
+        val ok = suspendCancellableCoroutine { cont ->
+            Entitlements.refresh(context) { result -> cont.resume(result) }
         }
+        entitled = ok
+        if (!ok) currentScreen = Screen.Gate
     }
 
     // Wait for both native init and the service binding before starting BLE/RFCOMM
@@ -312,6 +325,13 @@ fun AppNavigation(
     }
 
     // ── Phase 3: Main navigation ──
+
+    LaunchedEffect(currentScreen) {
+        onPipEligibilityChanged(currentScreen == Screen.Main)
+        // Allow QR screenshots on non-radio screens (release builds only).
+        val allowCapture = currentScreen != Screen.Main
+        (context as? MainActivity)?.setScreenshotsAllowed(allowCapture)
+    }
 
     // Hardware back button support
     BackHandler(
@@ -371,8 +391,7 @@ fun AppNavigation(
             onShowAbout = { currentScreen = Screen.About },
             onShowSettings = { currentScreen = Screen.Settings },
             onEndSession = {
-                // Clean session kill without restarting app
-                SassyTalkNative.pttStop()
+                walkieService?.pttCoordinator?.onPttReleased()
                 autoConnect.disconnect()
                 walkieService?.releaseMulticastLock()
                 SassyTalkNative.clearSession() // also clears encrypted per-channel session prefs

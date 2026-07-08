@@ -486,7 +486,7 @@ use std::sync::Mutex;
 use crate::state::StateMachine;
 use crate::session::SessionManager;
 use crate::users::UserRegistry;
-use crate::codec::{VoiceEncoder, VoiceDecoder, CODEC_FRAME_SIZE};
+use crate::codec::{VoiceEncoder, CODEC_FRAME_SIZE};
 use crate::audio_pipeline;
 
 /// Global state for JNI mode (when used from Kotlin instead of egui)
@@ -507,9 +507,9 @@ struct JniAppState {
     pending_hybrid_initiator: Option<crate::pqc::PskHybridInitiator>,
     /// BT TX buffer: Kotlin reads encoded frames from here for RFCOMM transmission
     bt_tx_buffer: Arc<Mutex<Option<Vec<u8>>>>,
-    /// BT codec instances (stateful ADPCM, persisted across JNI calls)
+    /// BT codec for TX (Kotlin reads encoded frames for RFCOMM transmission).
+    /// RX decode uses per-sender state inside RxSharedState on the StateMachine.
     bt_encoder: VoiceEncoder,
-    bt_decoder: VoiceDecoder,
     /// Track whether BT mic capture is active for btEncodeFrame
     bt_recording: bool,
 }
@@ -534,7 +534,6 @@ impl JniAppState {
             pending_hybrid_initiator: None,
             bt_tx_buffer: Arc::new(Mutex::new(None)),
             bt_encoder: VoiceEncoder::new(),
-            bt_decoder: VoiceDecoder::new(),
             bt_recording: false,
         }
     }
@@ -1418,7 +1417,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     };
 
     // Unpack wire frame (now decrypted)
-    let (channel, _subchannel, sender_id, device_name, timestamp, compressed) = match audio_pipeline::unpack_wire_frame(&decrypted) {
+    let (channel, subchannel, sender_id, device_name, timestamp, compressed) = match audio_pipeline::unpack_wire_frame(&decrypted) {
         Ok(parsed) => parsed,
         Err(e) => {
             warn!("btDecodeFrame: invalid wire frame: {}", e);
@@ -1426,61 +1425,27 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         }
     };
 
-    // Filter by channel
     let my_channel = guard.current_channel.load(Ordering::SeqCst);
-    if channel != my_channel {
+    let my_subchannel = guard.current_subchannel.load(Ordering::SeqCst);
+
+    if let Some(sm) = guard.state_machine.as_ref() {
+        audio_pipeline::process_incoming_wire_frame(
+            sm.get_rx_shared(),
+            sm.get_audio_cache(),
+            sm.get_user_registry(),
+            &sm.get_local_sender_id(),
+            my_channel,
+            my_subchannel,
+            channel,
+            subchannel,
+            &sender_id,
+            &device_name,
+            timestamp,
+            &compressed,
+            true,
+        );
+    } else {
         return JNI_FALSE;
-    }
-
-    // Validate compressed payload is non-empty (Opus uses variable-length frames)
-    if compressed.is_empty() {
-        warn!("btDecodeFrame: empty compressed payload");
-        return JNI_FALSE;
-    }
-
-    // Auto-register sender in UserRegistry
-    guard.user_registry.register_user(&sender_id, &device_name);
-
-    // Decode ADPCM
-    let pcm_samples = guard.bt_decoder.decode(&compressed);
-
-    // Mirror the unified RX path's activity-log feed so BT-received audio
-    // also surfaces in the timeline.
-    let (is_favorite, is_muted) = (
-        guard.user_registry.is_favorite(&sender_id),
-        guard.user_registry.is_muted(&sender_id),
-    );
-    audio_pipeline::call_transcription_bridge_public(
-        &sender_id,
-        &device_name,
-        &pcm_samples,
-        is_favorite,
-        is_muted,
-        false, // remote — BT-received audio
-    );
-
-    // Feed into audio cache and play
-    if let Some(ref sm) = guard.state_machine {
-        // Feed audio cache
-        let cache = sm.get_audio_cache();
-        let mut cache_lock = cache.lock().unwrap_or_else(|e| e.into_inner());
-        let passthrough = cache_lock.ingest_frame(&sender_id, timestamp, pcm_samples.clone());
-        cache_lock.tick();
-
-        let samples_to_play = if let Some(direct) = passthrough {
-            Some(direct)
-        } else {
-            cache_lock.next_playback_frame().map(|(_, s)| s)
-        };
-        drop(cache_lock);
-
-        if let Some(samples) = samples_to_play {
-            let audio = sm.get_audio();
-            if let Ok(eng) = audio.lock() {
-                let _ = eng.start_playing();
-                let _ = eng.write_audio(&samples);
-            }
-        }
     }
 
     JNI_TRUE
@@ -1925,6 +1890,31 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         drop(guard);
         let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
         guard.user_registry.set_favorite(&id, favorite == JNI_TRUE);
+    }
+}
+
+/// JNI: Remove a user from the registry (peer left / out of contact).
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeRemoveUser<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    user_id: JString<'local>,
+) {
+    let id: String = match env.get_string(&user_id) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        let mut reg = sm.get_user_registry().lock().unwrap_or_else(|e| e.into_inner());
+        reg.remove_user(&id);
+    } else {
+        drop(guard);
+        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.user_registry.remove_user(&id);
     }
 }
 
