@@ -56,6 +56,13 @@ const RECEIPT_TTL_SEC = 30 * 24 * 60 * 60;
 
 const DEFAULT_MAX_DEVICES = 3;
 
+// Per-IP throttle for the unauthenticated, low-entropy promo endpoint. Only
+// failed guesses count (see promoGuessCount), so legit redeems/refreshes never
+// trip it. Fails open when the KV binding is absent — Cloudflare WAF is the
+// outer backstop.
+const PROMO_GUESS_LIMIT = 15;
+const PROMO_GUESS_WINDOW_SEC = 60 * 60;
+
 // Crockford-ish alphabet: no 0/O/1/I lookalikes. 32 symbols = 5 bits each;
 // 20 symbols = 100 bits of entropy per key.
 const KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -154,18 +161,21 @@ async function activate(request, env, consumeSlot) {
       // /activate so slot accounting stays honest.
       return json({ ok: false, error: "Device not activated" }, 403);
     }
-    const used = await env.LICENSES.prepare(
-      "SELECT COUNT(*) AS n FROM activations WHERE key_hash = ?",
-    ).bind(keyHash).first();
-    if ((used?.n ?? 0) >= lic.max_devices) {
+    // Atomic slot claim: the count is evaluated INSIDE the insert, so two
+    // concurrent /activate calls for different devices can't both clear a
+    // separate COUNT check and overrun max_devices (TOCTOU). changes === 0
+    // means the cap was already full.
+    const claimed = await env.LICENSES.prepare(
+      `INSERT INTO activations (key_hash, device_hash, device_name, app_version)
+       SELECT ?, ?, ?, ?
+       WHERE (SELECT COUNT(*) FROM activations WHERE key_hash = ?) < ?`,
+    ).bind(keyHash, deviceHash, str(body.device_name), str(body.app_version), keyHash, lic.max_devices).run();
+    if (!claimed.meta.changes) {
       return json(
         { ok: false, error: "Maximum devices reached", max_devices: lic.max_devices },
         403,
       );
     }
-    await env.LICENSES.prepare(
-      "INSERT INTO activations (key_hash, device_hash, device_name, app_version) VALUES (?, ?, ?, ?)",
-    ).bind(keyHash, deviceHash, str(body.device_name), str(body.app_version)).run();
   }
 
   const usedNow = await env.LICENSES.prepare(
@@ -214,6 +224,13 @@ async function redeemPromo(request, env) {
     return json({ ok: false, error: "Missing device_id" }, 400);
   }
 
+  // Promo codes are low-entropy and this endpoint is unauthenticated, so cap
+  // guessing per source IP. Only failed lookups (below) count toward the limit,
+  // so a legit device's redeem/refresh of a VALID code is never throttled.
+  if ((await promoGuessCount(request, env, 0)) >= PROMO_GUESS_LIMIT) {
+    return json({ ok: false, error: "Too many attempts; try again later" }, 429);
+  }
+
   const codeHash = await hashPromo(code, env);
   const deviceHash = await hashDevice(deviceId, env);
 
@@ -221,7 +238,10 @@ async function redeemPromo(request, env) {
     "SELECT code_hash, status, max_redemptions, expires_at FROM promo_codes WHERE code_hash = ?",
   ).bind(codeHash).first();
 
-  if (!promo) return json({ ok: false, error: "Unknown promo code" }, 404);
+  if (!promo) {
+    await promoGuessCount(request, env, 1);
+    return json({ ok: false, error: "Unknown promo code" }, 404);
+  }
   if (promo.status !== "active") {
     return json({ ok: false, error: `Promo code ${promo.status}` }, 403);
   }
@@ -240,15 +260,16 @@ async function redeemPromo(request, env) {
       "UPDATE promo_redemptions SET last_seen = datetime('now'), app_version = ? WHERE code_hash = ? AND device_hash = ?",
     ).bind(str(body.app_version), codeHash, deviceHash).run();
   } else {
-    const used = await env.LICENSES.prepare(
-      "SELECT COUNT(*) AS n FROM promo_redemptions WHERE code_hash = ?",
-    ).bind(codeHash).first();
-    if ((used?.n ?? 0) >= promo.max_redemptions) {
+    // Atomic redemption claim (see activate): the count is evaluated inside the
+    // insert so concurrent redeems can't overrun max_redemptions (TOCTOU).
+    const claimed = await env.LICENSES.prepare(
+      `INSERT INTO promo_redemptions (code_hash, device_hash, device_name, app_version)
+       SELECT ?, ?, ?, ?
+       WHERE (SELECT COUNT(*) FROM promo_redemptions WHERE code_hash = ?) < ?`,
+    ).bind(codeHash, deviceHash, str(body.device_name), str(body.app_version), codeHash, promo.max_redemptions).run();
+    if (!claimed.meta.changes) {
       return json({ ok: false, error: "Promo code fully redeemed" }, 403);
     }
-    await env.LICENSES.prepare(
-      "INSERT INTO promo_redemptions (code_hash, device_hash, device_name, app_version) VALUES (?, ?, ?, ?)",
-    ).bind(codeHash, deviceHash, str(body.device_name), str(body.app_version)).run();
   }
 
   const expSec = Math.floor(Date.now() / 1000) + RECEIPT_TTL_SEC;
@@ -407,6 +428,28 @@ function generatePromoCode() {
   let tail = "";
   for (const b of bytes) tail += KEY_ALPHABET[b % 32];
   return `SASSYTALK-${tail}`;
+}
+
+/**
+ * Best-effort guess counter for the promo endpoint, keyed by source IP in the
+ * SHARES KV. `delta` 0 reads the current count; 1 records a failed guess.
+ * Never throws and returns 0 when KV is unavailable, so it can only ADD
+ * protection, never block a legitimate redemption.
+ */
+async function promoGuessCount(request, env, delta) {
+  const kv = env.SHARES;
+  if (!kv) return 0;
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const bucket = `promo-rl.${ip}`;
+  try {
+    const n = Number.parseInt((await kv.get(bucket)) || "0", 10) || 0;
+    if (delta > 0) {
+      await kv.put(bucket, String(n + delta), { expirationTtl: PROMO_GUESS_WINDOW_SEC });
+    }
+    return n;
+  } catch {
+    return 0;
+  }
 }
 
 function hashKey(key, env) {

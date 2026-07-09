@@ -73,10 +73,18 @@ database_id = "be46952d-2e07-4c25-b0db-f1bc6d43c50d"
 # so a tapped https://relay.../v/<id>#<key> invite opens the app directly.
 # `curl -sI .../.well-known/assetlinks.json` shows X-Wellknown-Configured.
 [vars]
-# Release/upload keystore cert (app/keystore/release.keystore, alias
-# sassytalkie) — verifies the DIRECT (website/sideload) APK. Play installs are
-# re-signed by Google: append the Play App Signing SHA-256 from Play Console →
-# Test and release → App integrity (comma-separated) or Play-installed apps
-# won't pass App Link verification.
-ANDROID_CERT_SHA256 = "3C:AA:7D:D7:99:6F:D3:17:4E:27:DC:4C:AB:3F:76:D8:B5:21:2E:DB:D1:56:4D:F2:64:EB:46:26:A0:11:3C:56"
-# APPLE_APP_ID = "ABCDE12345.com.sassyconsulting.sassytalkie"   # Apple Team ID + bundle id (pending)
+# Android App Link signing certs (public SHA-256 fingerprints, comma-separated;
+# NOT secret). An installed app's cert must appear here or its /v/ links won't
+# verify. Currently distributing the DIRECT (website/sideload) APK — no Play
+# Console / Play App Signing — so no Google-resigned cert to add.
+#   1st = release/upload keystore (release-new.keystore, alias sassytalkie) — the shipped APK.
+#   2nd = local Android debug keystore (~/.android/debug.keystore, alias androiddebugkey)
+#         so `adb install`-ed debug test builds ALSO open links. Safe to drop this
+#         once only release builds are installed on real devices.
+# If you ever publish via Play with App Signing, ALSO append the Play App Signing
+# SHA-256 from Play Console → Test and release → App integrity.
+ANDROID_CERT_SHA256 = "3C:AA:7D:D7:99:6F:D3:17:4E:27:DC:4C:AB:3F:76:D8:B5:21:2E:DB:D1:56:4D:F2:64:EB:46:26:A0:11:3C:56, EA:CE:43:93:72:D9:FB:8E:F5:C3:FB:33:78:F3:71:7F:3C:67:F3:0A:89:AE:2F:20:82:19:FD:E5:49:DE:36:4A"
+# APPLE_APP_ID / APPLE_TEAM_ID: intentionally UNSET — no Apple Developer account,
+# so iOS Universal Links can't be provisioned. iOS relies on the sassytalk://
+# custom scheme (app must be installed). Enroll in the Apple Developer Program
+# to enable https Universal Links on iOS.

@@ -215,7 +215,15 @@ object SessionShareLink {
      * Parse a pasted invite URL string. Convenience wrapper around
      * [importFromShareUri] for the Enter Code tab and clipboard paste paths.
      */
-    fun importFromShareText(text: String): Result = importFromShareUri(Uri.parse(text.trim()))
+    fun importFromShareText(text: String): Result {
+        // A pasted invite can arrive with surrounding text or a second line
+        // (older builds copied "sassytalk://…\nhttps://…"). Pull the first token
+        // that is a real invite URI so an annotated / multi-line paste still
+        // resolves, instead of failing Base64 on a newline-polluted fragment.
+        val token = text.split(Regex("\\s+")).map { it.trim() }
+            .firstOrNull { looksLikeShareLink(it) } ?: text.trim()
+        return importFromShareUri(Uri.parse(token))
+    }
 
     /**
      * Resolve a deep-link Uri to a decrypted session JSON, ready to feed into
@@ -229,6 +237,13 @@ object SessionShareLink {
      */
     fun importFromShareUri(uri: Uri): Result {
         if (!isInviteUri(uri)) return Result.Err("Unrecognized share URL")
+        // A missing #fragment is the "key was stripped" case (some launchers and
+        // link handlers drop it). Report it distinctly — AppNavigation matches
+        // the word "fragment" to show the paste-the-whole-link recovery and
+        // bounce to Enter Code — instead of the generic "Malformed share link".
+        if (uri.fragment.isNullOrEmpty()) {
+            return Result.Err("Invite link is missing its key fragment")
+        }
         val (id, keyB64) = parseInviteParts(uri)
             ?: return Result.Err("Malformed share link")
 

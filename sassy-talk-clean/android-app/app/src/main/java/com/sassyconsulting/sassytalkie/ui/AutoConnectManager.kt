@@ -18,6 +18,7 @@ import kotlinx.coroutines.withContext
 import com.sassyconsulting.sassytalkie.CellularWebSocketClient
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.WalkieService
+import com.sassyconsulting.sassytalkie.license.Entitlements
 
 enum class ConnectState {
     IDLE,
@@ -136,6 +137,17 @@ class AutoConnectManager(private val context: Context) {
 
     suspend fun autoConnect(walkieService: WalkieService?): Boolean {
         walkieServiceRef = walkieService
+        // Entitlement gate BELOW the UI: a locked user must not get live
+        // transports or audio, even if a share-link import or FCM wake reached
+        // this path while the UI is parked on the paywall. The purchase/gate
+        // screens never call autoConnect, so this blocks only the radio, not the
+        // unlock flow.
+        if (!Entitlements.isUnlockedCached(context)) {
+            Log.i(TAG, "autoConnect: not entitled — refusing to start transports")
+            _state.value = ConnectState.FAILED
+            _statusText.value = "Locked — unlock to connect"
+            return false
+        }
         _state.value = ConnectState.DETECTING
         _statusText.value = "Detecting network..."
 

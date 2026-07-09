@@ -37,6 +37,14 @@ class CellularWebSocketClient {
         private const val POLL_INTERVAL_MS = 2L
         private const val PING_INTERVAL_SEC = 15L
         private const val MAX_RECONNECT_ATTEMPTS = 8
+        // After the fast exponential retries, keep trying at this fixed floor
+        // instead of giving up, so an outage longer than the first 8 attempts
+        // still self-heals once connectivity returns (a successful connect
+        // resets the attempt counter).
+        private const val RECONNECT_FLOOR_MS = 60_000L
+        // The relay force-closes (1008) a socket exceeding ~120 msg/s. Pace the
+        // outbound drain under that so a post-stall burst can't trip it.
+        private const val MAX_SENDS_PER_SEC = 100
 
         /**
          * OkHttpClient is expensive (dispatcher + connection pool + thread pools)
@@ -56,6 +64,11 @@ class CellularWebSocketClient {
     private val isRunning = AtomicBoolean(false)
     private val reconnectAttempts = AtomicInteger(0)
     private var outboundThread: Thread? = null
+
+    // Outbound send-rate window — single-thread state, touched only by the
+    // outbound pump (see paceSend).
+    private var sendWindowStart = 0L
+    private var sendWindowCount = 0
 
     /**
      * Single-slot scheduler for reconnect attempts. Previously each failure
@@ -240,11 +253,14 @@ class CellularWebSocketClient {
      */
     private fun scheduleReconnect(cause: String) {
         val attempt = reconnectAttempts.incrementAndGet()
-        if (attempt > MAX_RECONNECT_ATTEMPTS) {
-            Log.w(TAG, "Max reconnect attempts reached ($cause), giving up")
-            return
+        // Don't give up after the fast retries — fall back to a fixed long
+        // interval so a prolonged outage still recovers on its own once
+        // connectivity returns (a successful connect resets the counter).
+        val delayMs = if (attempt <= MAX_RECONNECT_ATTEMPTS) {
+            minOf(3_000L * (1L shl (attempt - 1).coerceAtMost(4)), 60_000L)
+        } else {
+            RECONNECT_FLOOR_MS
         }
-        val delayMs = minOf(3_000L * (1L shl (attempt - 1).coerceAtMost(4)), 60_000L)
         cancelPendingReconnect()
         pendingReconnect = reconnectScheduler.schedule({
             if (!isConnected.get()) {
@@ -265,6 +281,31 @@ class CellularWebSocketClient {
 
     // ── Outbound pump: polls Rust queue and sends via WebSocket ──
 
+    /**
+     * Throttle outbound sends to [MAX_SENDS_PER_SEC]. Normal 50 fps audio never
+     * hits it; a post-stall burst (many queued frames flushing at once) would
+     * otherwise exceed the relay's ~120 msg/s cap and get the socket 1008-closed.
+     * Runs on the outbound thread, so a short Thread.sleep here is fine.
+     */
+    private fun paceSend() {
+        val now = System.currentTimeMillis()
+        if (now - sendWindowStart >= 1000L) {
+            sendWindowStart = now
+            sendWindowCount = 0
+        }
+        sendWindowCount++
+        if (sendWindowCount > MAX_SENDS_PER_SEC) {
+            val remaining = 1000L - (System.currentTimeMillis() - sendWindowStart)
+            if (remaining > 0) {
+                try { Thread.sleep(remaining) } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+            sendWindowStart = System.currentTimeMillis()
+            sendWindowCount = 1
+        }
+    }
+
     private fun startOutboundPump() {
         if (isRunning.getAndSet(true)) return
 
@@ -281,6 +322,7 @@ class CellularWebSocketClient {
                     while (isRunning.get() && isConnected.get()) {
                         val packet = SassyTalkNative.cellularPollOutbound() ?: break
                         if (packet.isEmpty()) break
+                        paceSend()
                         webSocket?.send(ByteString.of(*packet))
                         sentAny = true
                     }

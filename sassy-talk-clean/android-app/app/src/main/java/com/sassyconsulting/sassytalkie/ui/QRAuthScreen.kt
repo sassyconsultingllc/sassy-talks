@@ -532,7 +532,12 @@ private fun ShowQRTab(
                                     cm.setPrimaryClip(
                                         ClipData.newPlainText(
                                             "SassyTalk Invite",
-                                            "${result.url}\n${result.httpsUrl}",
+                                            // Single canonical link. The https form is the one that's
+                                            // tappable in every messenger AND (once App/Universal Links
+                                            // verify) opens the app directly; sassytalk:// isn't linkified
+                                            // when pasted, and copying both on two lines corrupted the key
+                                            // on paste (the newline landed inside the #fragment).
+                                            result.httpsUrl,
                                         ),
                                     )
                                     Toast.makeText(context, "Invite link copied", Toast.LENGTH_SHORT).show()
@@ -581,11 +586,15 @@ private fun ShowQRTab(
                                         type = "text/plain"
                                         putExtra(
                                             Intent.EXTRA_TEXT,
-                                            "Join my SassyTalk session:\n${result.url}\n\n" +
-                                                "Backup link (if the app didn't open):\n${result.httpsUrl}\n\n" +
-                                                "If neither opens the app, copy either link and paste in " +
-                                                "SassyTalk → Authenticate → Enter Code.\n" +
-                                                "(One-time link, expires shortly.)",
+                                            // Lead with the https link: it's the only form tappable in
+                                            // SMS/chat clients AND it opens the app directly once App/
+                                            // Universal Links verify (else it lands on the web chooser,
+                                            // which itself offers "Open in SassyTalk"). sassytalk:// is
+                                            // omitted from the message because clients don't linkify it.
+                                            "Join my SassyTalk session:\n${result.httpsUrl}\n\n" +
+                                                "One-time encrypted invite, expires shortly. If it opens a " +
+                                                "web page, tap \"Open in SassyTalk\" there — or paste this " +
+                                                "link in SassyTalk → Authenticate → Enter Code.",
                                         )
                                         putExtra(Intent.EXTRA_SUBJECT, "SassyTalk invite")
                                     }

@@ -472,15 +472,20 @@ impl StateMachine {
     /// Start RX thread
     fn start_rx_thread(&self) {
         let audio = Arc::clone(&self.audio);
-        let decoder = Arc::clone(&self.decoder);
         let transport = Arc::clone(&self.transport);
         let should_stop = Arc::clone(&self.should_stop_rx);
         let state = Arc::clone(&self.state);
         let current_channel = Arc::clone(&self.current_channel);
+        let self_sender_id = self.sender_id.clone();
 
         thread::spawn(move || {
             info!("RX thread started");
             let mut buffer = vec![0u8; 2048];
+            // Per-sender Opus decoders. Opus is STATEFUL, so decoding multiple
+            // senders through one shared decoder corrupts audio when their
+            // frames interleave; key a decoder by wire sender_id instead.
+            let mut decoders: std::collections::HashMap<String, OpusDecoder> =
+                std::collections::HashMap::new();
             
             while !should_stop.load(Ordering::SeqCst) {
                 // Receive packet
@@ -497,7 +502,7 @@ impl StateMachine {
                 // so unencrypted/tampered/replayed frames never reach here. iOS and
                 // Android emit byte-identical frames, so an Android sender decodes
                 // here unchanged.
-                let (frame_channel, _subch, _sender, _name, _ts, compressed) =
+                let (frame_channel, _subch, sender, _name, _ts, compressed) =
                     match sassytalkie_core::wire::unpack_wire_frame(&buffer[..size]) {
                         Ok(parts) => parts,
                         Err(e) => {
@@ -506,11 +511,21 @@ impl StateMachine {
                         }
                     };
 
+                // Skip our own multicast loopback (mirrors the relay path at
+                // `sender == self.sender_id`); the LAN multicast socket echoes
+                // our own transmitted frames back to us otherwise.
+                if sender == self_sender_id {
+                    continue;
+                }
+
                 if frame_channel == current_channel.load(Ordering::SeqCst) {
-                    let samples = match decoder.lock().unwrap().decode(&compressed) {
+                    let decoder = decoders
+                        .entry(sender.clone())
+                        .or_insert_with(|| OpusDecoder::new().expect("create Opus decoder"));
+                    let samples = match decoder.decode(&compressed) {
                         Ok(s) => s,
                         Err(e) => {
-                            error!("Decode error: {}", e);
+                            error!("Decode error from {}: {}", sender, e);
                             continue;
                         }
                     };

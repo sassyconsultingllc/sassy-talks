@@ -82,17 +82,30 @@ object Entitlements {
             }
             return
         }
+        // Guarantee onResult fires EXACTLY once. Play Billing may drop the
+        // connection (onBillingServiceDisconnected) or never call back at all;
+        // a missed callback would hang the Restore button's coroutine forever.
+        val done = java.util.concurrent.atomic.AtomicBoolean(false)
         val client = BillingClient.newBuilder(appContext)
             .setListener { _, _ -> } // refresh never launches a flow
             .enablePendingPurchases(
                 PendingPurchasesParams.newBuilder().enableOneTimeProducts().build(),
             )
             .build()
+        val main = android.os.Handler(android.os.Looper.getMainLooper())
+        fun finish(result: Boolean) {
+            if (!done.compareAndSet(false, true)) return
+            main.removeCallbacksAndMessages(null) // cancel the timeout
+            try { client.endConnection() } catch (_: Exception) {}
+            onResult(result)
+        }
+        // Hard timeout: if Play never responds, fall back to the cached state
+        // rather than leaving the caller hanging.
+        main.postDelayed({ finish(isUnlockedCached(appContext)) }, 12_000L)
         client.startConnection(object : BillingClientStateListener {
             override fun onBillingSetupFinished(result: BillingResult) {
                 if (result.responseCode != BillingClient.BillingResponseCode.OK) {
-                    onResult(isUnlockedCached(appContext))
-                    client.endConnection()
+                    finish(isUnlockedCached(appContext))
                     return
                 }
                 client.queryPurchasesAsync(
@@ -100,27 +113,37 @@ object Entitlements {
                         .setProductType(BillingClient.ProductType.INAPP).build(),
                 ) { qr, purchases ->
                     if (qr.responseCode != BillingClient.BillingResponseCode.OK) {
-                        onResult(isUnlockedCached(appContext))
-                    } else {
-                        val owned = purchases.any {
-                            it.products.contains(PRODUCT_ID) &&
-                                it.purchaseState == Purchase.PurchaseState.PURCHASED
-                        }
-                        if (owned) {
-                            purchases.filter { it.products.contains(PRODUCT_ID) && !it.isAcknowledged }
-                                .forEach { acknowledge(client, it) }
-                            setUnlocked(appContext, true)
-                        } else if (isUnlockedCached(appContext)) {
-                            Log.w(TAG, "Play reports no purchase — revoking cached unlock")
-                            setUnlocked(appContext, false)
-                        }
-                        onResult(owned)
+                        finish(isUnlockedCached(appContext))
+                        return@queryPurchasesAsync
                     }
-                    client.endConnection()
+                    val owned = purchases.any {
+                        it.products.contains(PRODUCT_ID) &&
+                            it.purchaseState == Purchase.PurchaseState.PURCHASED
+                    }
+                    if (owned) {
+                        purchases.filter { it.products.contains(PRODUCT_ID) && !it.isAcknowledged }
+                            .forEach { acknowledge(client, it) }
+                        setUnlocked(appContext, true)
+                        clearUnownedSince(appContext)
+                        finish(true)
+                    } else {
+                        // Do NOT revoke on a single unowned result — Play can
+                        // transiently return an empty list. Only drop entitlement
+                        // after the purchase stays unowned past a grace window, so
+                        // a real refund eventually revokes without a transient
+                        // glitch stranding a paying user.
+                        val revokedNow = noteUnownedAndMaybeRevoke(appContext)
+                        finish(if (revokedNow) false else isUnlockedCached(appContext))
+                    }
                 }
             }
 
-            override fun onBillingServiceDisconnected() {}
+            override fun onBillingServiceDisconnected() {
+                // Without handling this the callback contract is violated and the
+                // caller hangs. Fall back to cached state; the timeout backstops
+                // the "never called back at all" case.
+                finish(isUnlockedCached(appContext))
+            }
         })
     }
 
@@ -196,7 +219,8 @@ object Entitlements {
 
         LaunchedEffect(catalogAttempt) {
             if (LicensePromo.hasValidReceipt(appContext)) {
-                setUnlocked(appContext, true)
+                // Promo entitlement is receipt-driven (time-limited); do NOT set
+                // the permanent KEY_UNLOCKED flag or the promo would never expire.
                 onUnlocked()
                 return@LaunchedEffect
             }
@@ -429,7 +453,10 @@ object Entitlements {
                                     promoBusy = false
                                     when (res) {
                                         LicensePromo.RedeemResult.Ok -> {
-                                            setUnlocked(appContext, true)
+                                            // redeemBlocking persisted the time-limited receipt;
+                                            // isUnlockedCached honors it via hasValidReceipt. Do NOT
+                                            // set the permanent KEY_UNLOCKED flag (a 30-day promo
+                                            // would otherwise become permanent).
                                             onUnlocked()
                                         }
                                         LicensePromo.RedeemResult.InvalidFormat ->
@@ -465,6 +492,41 @@ object Entitlements {
 
     private fun setUnlocked(context: Context, value: Boolean) {
         LicenseStore.prefs(context)?.edit()?.putBoolean(LicenseStore.KEY_UNLOCKED, value)?.apply()
+    }
+
+    // A refund shows up as Play reporting the one-time product unowned. Because
+    // an empty queryPurchasesAsync result is also a common TRANSIENT state, we
+    // wait this long (continuously unowned) before dropping the cached unlock.
+    private const val REVOKE_GRACE_SEC = 3L * 24 * 3600
+
+    private fun clearUnownedSince(context: Context) {
+        LicenseStore.prefs(context)?.edit()?.remove(LicenseStore.KEY_UNOWNED_SINCE)?.apply()
+    }
+
+    /**
+     * Debounced refund handling: record the first refresh that saw the purchase
+     * unowned and revoke only after [REVOKE_GRACE_SEC] of *continuous* unowned,
+     * so a transient empty Play query never strands a paying user. Returns true
+     * iff it revoked on this call.
+     */
+    private fun noteUnownedAndMaybeRevoke(context: Context): Boolean {
+        val p = LicenseStore.prefs(context) ?: return false
+        if (!p.getBoolean(LicenseStore.KEY_UNLOCKED, false)) return false // nothing to revoke
+        val now = System.currentTimeMillis() / 1000
+        val since = p.getLong(LicenseStore.KEY_UNOWNED_SINCE, 0L)
+        if (since == 0L) {
+            p.edit().putLong(LicenseStore.KEY_UNOWNED_SINCE, now).apply()
+            return false
+        }
+        if (now - since >= REVOKE_GRACE_SEC) {
+            p.edit()
+                .putBoolean(LicenseStore.KEY_UNLOCKED, false)
+                .remove(LicenseStore.KEY_UNOWNED_SINCE)
+                .apply()
+            Log.w(TAG, "Play reported no purchase for the grace window — revoking cached unlock")
+            return true
+        }
+        return false
     }
 
     private fun acknowledge(client: BillingClient, purchase: Purchase) {

@@ -121,8 +121,8 @@ pub struct CellularTransport {
 
     /// Inbound: the read loop pushes DECRYPTED Opus frames here; the caller
     /// drains them via `take_audio_receiver()` (mirrors UDP transport).
-    inbound_tx: mpsc::UnboundedSender<Vec<u8>>,
-    inbound_rx: Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>>,
+    inbound_tx: mpsc::UnboundedSender<super::AudioFrame>,
+    inbound_rx: Mutex<Option<mpsc::UnboundedReceiver<super::AudioFrame>>>,
 
     /// Lifecycle flag. `false` tears down the supervisor + pumps.
     running: AtomicBool,
@@ -352,14 +352,18 @@ impl CellularTransport {
                 // matching the Android relay payload. Unpack to recover the Opus
                 // for the decode pipeline; drop our own frame echoed by the relay.
                 match wire::unpack_wire_frame(&plain) {
-                    Ok((_ch, _sub, sender, _name, _ts, opus)) => {
+                    Ok((_ch, _sub, sender, _name, ts, opus)) => {
                         if sender == self.config.peer_id {
                             return; // our own loopback
                         }
                         self.packets_received.fetch_add(1, Ordering::Relaxed);
                         // Unbounded send to the audio pipeline; only fails if the
                         // receiver was dropped (transport tearing down).
-                        let _ = self.inbound_tx.send(opus);
+                        let _ = self.inbound_tx.send(super::AudioFrame {
+                            sender,
+                            timestamp: ts,
+                            opus,
+                        });
                     }
                     Err(e) => {
                         debug!("Cellular: wire unpack failed ({} bytes): {}", plain.len(), e);
@@ -427,7 +431,7 @@ impl CellularTransport {
     }
 
     /// Hand out the decrypted-Opus receiver (once). Mirrors UDP transport.
-    pub fn take_audio_receiver(&self) -> Option<mpsc::UnboundedReceiver<Vec<u8>>> {
+    pub fn take_audio_receiver(&self) -> Option<mpsc::UnboundedReceiver<super::AudioFrame>> {
         self.inbound_rx.lock().unwrap().take()
     }
 
@@ -624,8 +628,8 @@ mod tests {
             .expect("timed out waiting for relayed frame")
             .expect("b receiver closed");
 
-        assert_eq!(&received, payload, "decrypted frame must match what A sent");
-        println!("LIVE OK: room={} A→B {} bytes round-tripped through relay", room_id, received.len());
+        assert_eq!(&received.opus, payload, "decrypted frame must match what A sent");
+        println!("LIVE OK: room={} A→B {} bytes round-tripped through relay", room_id, received.opus.len());
 
         a.stop();
         b.stop();

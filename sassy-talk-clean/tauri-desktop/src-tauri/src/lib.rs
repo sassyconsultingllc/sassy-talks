@@ -630,18 +630,22 @@ impl AppState {
 /// so the decode + playback path is identical and lives here once.
 fn spawn_audio_rx_loop(
     audio: Arc<Mutex<AudioEngine>>,
-    mut audio_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut audio_rx: mpsc::UnboundedReceiver<transport::AudioFrame>,
     is_receiving: Arc<AtomicBool>,
     is_transmitting: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut decoder = match OpusDecoder::new() {
-            Ok(d) => d,
-            Err(e) => {
-                error!("Failed to create decoder: {}", e);
-                return;
-            }
-        };
+        // Per-sender decode state. Opus is a STATEFUL codec, so every sender
+        // needs its own decoder — decoding multiple senders through one shared
+        // decoder (the old `remote` hack) corrupts audio when their frames
+        // interleave. `synth_ts` is a fallback clock for transports that carry
+        // no wire timestamp (the legacy per-peer path sends timestamp 0).
+        struct RxPeer {
+            decoder: OpusDecoder,
+            synth_ts: u64,
+        }
+        let mut peers: std::collections::HashMap<String, RxPeer> =
+            std::collections::HashMap::new();
 
         // Start audio playback
         {
@@ -652,19 +656,15 @@ fn spawn_audio_rx_loop(
             }
         }
 
-        // Single-peer for now (1↔1 transports); multi-peer only needs the
-        // sender_id plumbed through `audio_rx` instead of the hardcoded "remote".
         let mut cache = sassytalkie_core::audio_cache::AudioCache::new();
         // Mix mode off by default — preserves classic walkie-talkie semantics
-        // (sequential utterances on overlap).
+        // (sequential utterances on overlap). The cache is already keyed by
+        // sender_id, so it orders/queues multiple speakers correctly once each
+        // gets its own decoder + real timestamp below.
         cache.set_mix_mode_enabled(false);
-        let sender_id = "remote";
-        // Synthetic wire timestamp — increments per 20 ms Opus frame; the cache
-        // uses the per-frame delta for ordering, absolute value is irrelevant.
-        let mut wire_ts: u64 = 0;
         const FRAME_MS: u64 = 20;
 
-        while let Some(opus_data) = audio_rx.recv().await {
+        while let Some(frame) = audio_rx.recv().await {
             // Don't play audio while transmitting
             if is_transmitting.load(Ordering::Relaxed) {
                 continue;
@@ -672,12 +672,18 @@ fn spawn_audio_rx_loop(
 
             is_receiving.store(true, Ordering::Relaxed);
 
-            // Decode Opus to PCM; fall back to PLC if decode errors.
-            let pcm = match decoder.decode(&opus_data) {
+            let peer = peers.entry(frame.sender.clone()).or_insert_with(|| RxPeer {
+                // Decoder params are fixed (48 kHz mono), so this only fails on OOM.
+                decoder: OpusDecoder::new().expect("create Opus decoder"),
+                synth_ts: 0,
+            });
+
+            // Decode Opus to PCM with THIS sender's decoder; PLC on error.
+            let pcm = match peer.decoder.decode(&frame.opus) {
                 Ok(p) => p,
                 Err(e) => {
-                    error!("Decoding error: {}", e);
-                    decoder.decode_plc().unwrap_or_default()
+                    error!("Decoding error from {}: {}", frame.sender, e);
+                    peer.decoder.decode_plc().unwrap_or_default()
                 }
             };
             if pcm.is_empty() {
@@ -685,11 +691,18 @@ fn spawn_audio_rx_loop(
                 continue;
             }
 
-            wire_ts = wire_ts.saturating_add(FRAME_MS);
+            // Real wire timestamp when present; else a per-sender synthetic clock
+            // so the cache can still order this sender's frames by delta.
+            let ts = if frame.timestamp != 0 {
+                frame.timestamp
+            } else {
+                peer.synth_ts = peer.synth_ts.saturating_add(FRAME_MS);
+                peer.synth_ts
+            };
 
             // Live mode → Some(pcm) for immediate playback. Queue/Mix mode →
             // None; frames drain via the loop below on tick().
-            if let Some(samples) = cache.ingest_frame(sender_id, wire_ts, pcm) {
+            if let Some(samples) = cache.ingest_frame(&frame.sender, ts, pcm) {
                 let audio_lock = audio.lock().await;
                 audio_lock.write_samples(&samples);
                 drop(audio_lock);

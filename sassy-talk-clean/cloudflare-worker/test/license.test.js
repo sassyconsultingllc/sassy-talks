@@ -73,6 +73,15 @@ function mockD1() {
                 return { meta: { changes: 1 } };
               }
               if (sql.startsWith("INSERT INTO activations")) {
+                // Atomic guarded insert: args = [key_hash, device_hash, name,
+                // version, key_hash, cap]. Honor the cap like D1's
+                // INSERT..SELECT..WHERE count<cap so enforcement is exercised.
+                const cap = args[5];
+                if (cap !== undefined) {
+                  let n = 0;
+                  for (const k of activations.keys()) if (k.startsWith(`${args[0]}|`)) n++;
+                  if (n >= cap) return { meta: { changes: 0 } };
+                }
                 activations.set(`${args[0]}|${args[1]}`, {
                   device_name: args[2], app_version: args[3],
                   first_seen: "now", last_seen: "now",
@@ -99,6 +108,14 @@ function mockD1() {
                 return { meta: { changes: 1 } };
               }
               if (sql.startsWith("INSERT INTO promo_redemptions")) {
+                // Atomic guarded insert: args = [code_hash, device_hash, name,
+                // version, code_hash, cap]. Honor the cap like D1 does.
+                const cap = args[5];
+                if (cap !== undefined) {
+                  let n = 0;
+                  for (const k of redemptions.keys()) if (k.startsWith(`${args[0]}|`)) n++;
+                  if (n >= cap) return { meta: { changes: 0 } };
+                }
                 redemptions.set(`${args[0]}|${args[1]}`, {
                   device_name: args[2], app_version: args[3],
                   redeemed_at: "now", last_seen: "now",

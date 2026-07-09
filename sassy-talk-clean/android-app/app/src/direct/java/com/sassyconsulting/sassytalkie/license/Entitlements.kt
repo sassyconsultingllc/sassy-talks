@@ -1,8 +1,6 @@
 package com.sassyconsulting.sassytalkie.license
 
-import android.annotation.SuppressLint
 import android.content.Context
-import android.provider.Settings
 import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -100,9 +98,26 @@ object Entitlements {
                     onResult(true)
                 }
                 is ApiResult.Rejected -> {
-                    Log.w(TAG, "License rejected on revalidation: ${res.message}")
-                    p.edit().remove(LicenseStore.KEY_RECEIPT_EXP).apply()
-                    onResult(false)
+                    // A "device not activated" rejection on /validate means the
+                    // slot row is gone (server migration, deactivated elsewhere)
+                    // though the key may still be valid — RE-CLAIM a slot via
+                    // /activate before revoking, so a lost row doesn't strand a
+                    // paying user. Genuine "revoked"/"maximum devices" rejections
+                    // fall through and clear the receipt as before.
+                    val reclaimed = if (endpointFor(key, kind) == "/license/validate" &&
+                        res.message.contains("not activated", ignoreCase = true)) {
+                        call("/license/activate", key, context)
+                    } else {
+                        null
+                    }
+                    if (reclaimed is ApiResult.Ok) {
+                        p.edit().putLong(LicenseStore.KEY_RECEIPT_EXP, reclaimed.expiresAt).apply()
+                        onResult(true)
+                    } else {
+                        Log.w(TAG, "License rejected on revalidation: ${res.message}")
+                        p.edit().remove(LicenseStore.KEY_RECEIPT_EXP).apply()
+                        onResult(false)
+                    }
                 }
                 is ApiResult.NetworkError -> onResult(exp > now) // ride out the receipt
             }
@@ -257,12 +272,8 @@ object Entitlements {
         }
     }
 
-    /**
-     * ANDROID_ID: stable per (app-signing-key, user, device), resets on factory
-     * reset. Exactly the granularity a device-slot count wants. Sent once and
-     * stored server-side only as a salted HMAC.
-     */
-    @SuppressLint("HardwareIds")
-    private fun deviceId(context: Context): String =
-        Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID) ?: "unknown"
+    // Stable per-install id (ANDROID_ID, or a persisted random fallback when it
+    // is null) — the granularity a device-slot count wants. The server stores
+    // only a salted HMAC of it.
+    private fun deviceId(context: Context): String = LicenseStore.deviceId(context)
 }

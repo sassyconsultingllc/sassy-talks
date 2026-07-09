@@ -228,30 +228,25 @@ const LANDING_HTML = `<!DOCTYPE html>
       function appLinkUrl(href) {
         try {
           var u = new URL(href);
-          return 'sassytalk://v' + u.pathname + u.hash;
+          // u.pathname is already "/v/<id>"; the scheme host is "v", so append
+          // only the "/<id>" part — strip the leading "/v" or we'd emit the
+          // doubled "sassytalk://v/v/<id>" that the app rejects. The #fragment
+          // (the AES key) MUST survive: the custom-scheme intent-filter delivers
+          // the whole URL to MainActivity, which reads dataString incl. fragment.
+          return 'sassytalk://v' + u.pathname.replace(/^\/v/, '') + u.hash;
         } catch (e) {
           return href;
         }
       }
 
-      function androidIntentUrl(appUrl, httpsFallback) {
-        try {
-          // sassytalk://v/<id>#<key> → intent://v/<id>#Intent;scheme=sassytalk;…
-          var pathAndHash = appUrl.replace(/^sassytalk:\/\//, '');
-          var fallback = encodeURIComponent(httpsFallback);
-          return 'intent://' + pathAndHash.split('#')[0] +
-            '#Intent;scheme=sassytalk;package=com.sassyconsulting.sassytalkie;S.browser_fallback_url=' +
-            fallback + ';end';
-        } catch (e) {
-          return appUrl;
-        }
-      }
-
       if (hasKey) {
+        // sassytalk://v/<id>#<key> — opens the installed app on Android AND iOS
+        // via the registered custom scheme, no App Links / Universal Links
+        // verification needed, and (unlike an intent:// URL) it preserves the
+        // #fragment key. If the app isn't installed the tap no-ops and the
+        // install buttons below are the fallback.
         var appUrl = appLinkUrl(fullUrl);
-        // Prefer sassytalk:// — opens the installed app without App Links verification.
-        var isAndroid = /Android/i.test(navigator.userAgent);
-        open.setAttribute('href', isAndroid ? androidIntentUrl(appUrl, fullUrl) : appUrl);
+        open.setAttribute('href', appUrl);
         open.textContent = 'Open in SassyTalk';
         pasteHint.style.display = 'block';
 

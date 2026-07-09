@@ -8,7 +8,7 @@
 /// 
 /// Copyright 2025 Sassy Consulting LLC. All rights reserved.
 
-use super::{TransportError, MAX_PACKET_SIZE, PEER_TIMEOUT_SECS};
+use super::{TransportError, MAX_PACKET_SIZE, PEER_TIMEOUT_SECS, AudioFrame};
 use super::liveness::LivenessTracker;
 use super::control;
 use crate::constants::{DEFAULT_MULTICAST_ADDR, DEFAULT_MULTICAST_PORT, PORT_RANGE_START, PORT_RANGE_END, KEEPALIVE_INTERVAL_SECS};
@@ -144,8 +144,8 @@ pub struct TransportManager {
     running: Arc<AtomicBool>,
 
     // Channels for audio data
-    audio_tx: mpsc::UnboundedSender<Vec<u8>>,
-    audio_rx: Arc<RwLock<Option<mpsc::UnboundedReceiver<Vec<u8>>>>>,
+    audio_tx: mpsc::UnboundedSender<AudioFrame>,
+    audio_rx: Arc<RwLock<Option<mpsc::UnboundedReceiver<AudioFrame>>>>,
 
     // Liveness tracking
     liveness: Arc<Mutex<LivenessTracker>>,
@@ -450,12 +450,16 @@ impl TransportManager {
                             }
                         };
                         if let Some(plain) = group_plain {
-                            if let Ok((_ch, _sub, sender, _name, _ts, opus)) =
+                            if let Ok((_ch, _sub, sender, _name, ts, opus)) =
                                 wire::unpack_wire_frame(&plain)
                             {
                                 // Skip our own multicast loopback.
                                 if sender != sender_id_rx {
-                                    let _ = audio_tx.send(opus);
+                                    let _ = audio_tx.send(AudioFrame {
+                                        sender,
+                                        timestamp: ts,
+                                        opus,
+                                    });
                                 }
                             }
                             continue;
@@ -619,8 +623,13 @@ impl TransportManager {
                                         data.clone()
                                     };
                                     
-                                    // Forward audio to audio channel
-                                    let _ = audio_tx.send(decrypted_data);
+                                    // Forward audio to audio channel (legacy
+                                    // per-peer path — no wire timestamp).
+                                    let _ = audio_tx.send(AudioFrame {
+                                        sender: format!("legacy-{:08X}", packet.device_id),
+                                        timestamp: 0,
+                                        opus: decrypted_data,
+                                    });
                                 }
                                 PacketType::EncryptedAudio { channel, nonce, auth_tag, data } => {
                                     // Already-structured encrypted audio
@@ -628,7 +637,11 @@ impl TransportManager {
                                         if engine.is_ready() {
                                             match engine.decrypt(&data, &nonce, &auth_tag) {
                                                 Ok(decrypted) => {
-                                                    let _ = audio_tx.send(decrypted);
+                                                    let _ = audio_tx.send(AudioFrame {
+                                                        sender: format!("legacy-{:08X}", packet.device_id),
+                                                        timestamp: 0,
+                                                        opus: decrypted,
+                                                    });
                                                 }
                                                 Err(e) => {
                                                     warn!("Decryption failed: {:?}", e);
@@ -842,7 +855,7 @@ impl TransportManager {
     }
     
     /// Get received audio receiver
-    pub fn take_audio_receiver(&self) -> Option<mpsc::UnboundedReceiver<Vec<u8>>> {
+    pub fn take_audio_receiver(&self) -> Option<mpsc::UnboundedReceiver<AudioFrame>> {
         self.audio_rx.write().unwrap().take()
     }
     

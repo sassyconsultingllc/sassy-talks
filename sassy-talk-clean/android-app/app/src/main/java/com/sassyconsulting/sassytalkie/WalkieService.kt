@@ -21,6 +21,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.sassyconsulting.sassytalkie.debug.AudioTelemetry
+import com.sassyconsulting.sassytalkie.license.Entitlements
 import com.sassyconsulting.sassytalkie.service.BluetoothTransport
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -172,6 +173,10 @@ class WalkieService : Service() {
      * a chance to bring them up so the wake actually re-attaches the relay.
      */
     private suspend fun kickCellularReconnect() {
+        if (!Entitlements.isUnlockedCached(this)) {
+            Log.i(TAG, "kickCellularReconnect: not entitled — skipping relay connect")
+            return
+        }
         val deadline = System.currentTimeMillis() + 15_000L
         while (System.currentTimeMillis() < deadline) {
             val coord = pttCoordinator
@@ -204,6 +209,10 @@ class WalkieService : Service() {
      * a service binder reference.
      */
     fun forceCellularReconnect() {
+        if (!Entitlements.isUnlockedCached(this)) {
+            Log.i(TAG, "forceCellularReconnect: not entitled — skipping relay connect")
+            return
+        }
         serviceScope.launch {
             // Brief window in case pttCoordinator is mid-initialization — but
             // don't wait long. If the coordinator doesn't exist this is the
@@ -335,6 +344,10 @@ class WalkieService : Service() {
      */
     @android.annotation.SuppressLint("MissingPermission")
     fun initBleTransport() {
+        if (!Entitlements.isUnlockedCached(this)) {
+            Log.i(TAG, "initBleTransport: not entitled — refusing to start BLE/RFCOMM")
+            return
+        }
         if (bleInitialized) {
             Log.i(TAG, "BLE transport already initialized; skipping")
             return

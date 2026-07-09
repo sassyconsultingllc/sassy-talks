@@ -1,8 +1,6 @@
 package com.sassyconsulting.sassytalkie.license
 
-import android.annotation.SuppressLint
 import android.content.Context
-import android.provider.Settings
 import android.util.Log
 import com.sassyconsulting.sassytalkie.BuildConfig
 import kotlinx.coroutines.CoroutineScope
@@ -89,8 +87,11 @@ object LicensePromo {
     }
 
     private fun persist(context: Context, code: String, expiresAt: Long) {
+        // Promo entitlement is RECEIPT-DRIVEN (time-limited): store only the
+        // expiry + kind, and let isUnlockedCached honor it via hasValidReceipt.
+        // Never set the permanent KEY_UNLOCKED flag here — that flag is checked
+        // first and would make a 30-day promo last forever.
         LicenseStore.prefs(context)?.edit()
-            ?.putBoolean(LicenseStore.KEY_UNLOCKED, true)
             ?.putString(LicenseStore.KEY_LICENSE, code)
             ?.putString(LicenseStore.KEY_KIND, "promo")
             ?.putLong(LicenseStore.KEY_RECEIPT_EXP, expiresAt)
@@ -136,7 +137,5 @@ object LicensePromo {
         }
     }
 
-    @SuppressLint("HardwareIds")
-    private fun deviceId(context: Context): String =
-        Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID) ?: "unknown"
+    private fun deviceId(context: Context): String = LicenseStore.deviceId(context)
 }
