@@ -45,6 +45,10 @@ class CellularWebSocketClient {
         // The relay force-closes (1008) a socket exceeding ~120 msg/s. Pace the
         // outbound drain under that so a post-stall burst can't trip it.
         private const val MAX_SENDS_PER_SEC = 100
+        // The relay DO reaps any socket silent for >8s (1001 "Heartbeat stale").
+        // Send a keepalive comfortably under that when nothing else is (see
+        // sendKeepAlive) so a relay-only device doesn't flap-reconnect endlessly.
+        private const val KEEPALIVE_INTERVAL_MS = 4_000L
 
         /**
          * OkHttpClient is expensive (dispatcher + connection pool + thread pools)
@@ -82,6 +86,17 @@ class CellularWebSocketClient {
             Thread(r, "cellular-reconnect").apply { isDaemon = true }
         }
     private var pendingReconnect: ScheduledFuture<*>? = null
+
+    // Relay keepalive — decouples socket liveness from Bluetooth. The real
+    // heartbeat lives on PttCoordinator (only created when BT is initialised),
+    // so a relay-only device would otherwise go silent and get reaped every 8s.
+    private val keepAliveScheduler: ScheduledExecutorService =
+        Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "cellular-keepalive").apply { isDaemon = true }
+        }
+    private var keepAliveTask: ScheduledFuture<*>? = null
+    private val keepAliveEpoch: Long = System.currentTimeMillis()
+    private val keepAliveSeq = AtomicInteger(0)
 
     /** Callback for DO readiness confirmation. */
     var onRelayReady: (() -> Unit)? = null
@@ -152,6 +167,7 @@ class CellularWebSocketClient {
                 reconnectAttempts.set(0)
                 SassyTalkNative.cellularOnConnected()
                 startOutboundPump()
+                startKeepAlive()
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
@@ -349,6 +365,7 @@ class CellularWebSocketClient {
     }
 
     private fun onDisconnected(reason: String) {
+        stopKeepAlive()
         if (isConnected.getAndSet(false)) {
             stopOutboundPump()
             SassyTalkNative.cellularOnDisconnected(reason)
@@ -363,6 +380,53 @@ class CellularWebSocketClient {
     /** Send a heartbeat ping to the relay (JSON control message) */
     fun sendPing() {
         webSocket?.send("""{"type":"ping"}""")
+    }
+
+    // ── Keepalive: keep the relay socket alive independent of Bluetooth ──
+
+    private fun startKeepAlive() {
+        stopKeepAlive()
+        keepAliveTask = keepAliveScheduler.scheduleWithFixedDelay(
+            {
+                try { sendKeepAlive() } catch (e: Exception) {
+                    Log.w(TAG, "keepalive send failed: ${e.message}")
+                }
+            },
+            KEEPALIVE_INTERVAL_MS, KEEPALIVE_INTERVAL_MS, TimeUnit.MILLISECONDS,
+        )
+    }
+
+    private fun stopKeepAlive() {
+        keepAliveTask?.cancel(false)
+        keepAliveTask = null
+    }
+
+    /**
+     * The relay Durable Object closes any socket that goes >8s without a message
+     * ("Heartbeat stale", 1001). The app's real heartbeat lives on PttCoordinator,
+     * which only exists once Bluetooth is initialised — so a relay-only device
+     * (BT off, no permission, or no BT peers) never heartbeats and gets reaped +
+     * reconnected every ~8s. When no PttCoordinator loop is covering liveness,
+     * send a heartbeat ourselves so the socket stays up. It MUST be a binary
+     * control frame (OP_HEARTBEAT) — that's what refreshes the DO's liveness; a
+     * text ping would not, and any binary frame is safely routed to control (not
+     * decoded as audio) by receiving peers.
+     */
+    private fun sendKeepAlive() {
+        if (!isConnected.get()) return
+        // PttCoordinator's own 2s heartbeat already keeps the socket alive when it
+        // exists; only fill the gap when it doesn't. Checked each fire because the
+        // coordinator may be wired shortly after the socket opens.
+        if (pttCoordinator != null) return
+        val frame = ControlFrame.encodeHeartbeat(
+            keepAliveEpoch,
+            keepAliveSeq.getAndIncrement(),
+            System.currentTimeMillis(),
+            PresenceState.IDLE,
+            0,
+            SassyTalkNative.localCapabilities(),
+        )
+        webSocket?.send(ByteString.of(*frame))
     }
 
     /**
