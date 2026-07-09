@@ -265,16 +265,32 @@ class BluetoothTransport(private val context: Context) {
             }
 
             while (running.get()) {
+                val acceptStartNs = System.nanoTime()
                 try {
-                    val socket = serverSocket?.accept(30_000) ?: continue
+                    // Null server socket → nothing to accept on; stop rather than
+                    // spin on `continue`.
+                    val socket = serverSocket?.accept(30_000) ?: break
                     val device = socket.remoteDevice
                     Log.i(TAG, "Accepted connection from ${device.name} (${device.address})")
                     onPeerConnected(device, socket)
                 } catch (e: IOException) {
-                    if (running.get()) {
-                        // Timeout is normal, other errors are not
+                    if (!running.get()) break
+                    // A genuine 30s-elapsed accept throws a "timeout" and we just
+                    // re-arm. But a bad/closed socket makes accept() throw almost
+                    // immediately, and retrying with no delay spins this thread at
+                    // 100% CPU — hundreds of BluetoothSocket.accept() calls/ms
+                    // (battery drain + log flood). If it returned far faster than
+                    // the timeout, treat it as an error and back off before retry.
+                    val elapsedMs = (System.nanoTime() - acceptStartNs) / 1_000_000
+                    if (elapsedMs < 5_000) {
                         if (!e.message.orEmpty().contains("timeout", ignoreCase = true)) {
-                            Log.w(TAG, "Accept error: ${e.message}")
+                            Log.w(TAG, "Accept error (${elapsedMs}ms): ${e.message}")
+                        }
+                        try {
+                            Thread.sleep(1000)
+                        } catch (ie: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            break
                         }
                     }
                 }
