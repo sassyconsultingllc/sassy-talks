@@ -67,6 +67,13 @@ class CellularWebSocketClient {
     private val isConnected = AtomicBoolean(false)
     private val isRunning = AtomicBoolean(false)
     private val reconnectAttempts = AtomicInteger(0)
+    // Set by disconnect(), cleared by an explicit connect(). While true, every
+    // reconnect path is inert. This replaces the old "poison the attempt
+    // counter" trick, which stopped working when scheduleReconnect gained the
+    // never-give-up floor: a torn-down client would resurrect 60s later as a
+    // second socket in the room, stealing outbound frames, duplicating inbound
+    // ones, and flapping the shared native transport state on every DO reap.
+    private val closed = AtomicBoolean(false)
     private var outboundThread: Thread? = null
 
     // Outbound send-rate window — single-thread state, touched only by the
@@ -114,6 +121,15 @@ class CellularWebSocketClient {
 
     /** Connect to the cellular relay. Room must be set first via SassyTalkNative.cellularSetRoom() */
     fun connect(): Boolean {
+        // An explicit connect() revives a client that was disconnect()ed
+        // (WalkieService.forceCellularReconnect does exactly this on room
+        // changes). Fresh backoff state too — otherwise one transient auth
+        // failure right after the forced reconnect lands on the 60s floor
+        // instead of the 3s fast retry, and a share-link joiner sits dead
+        // in the old room for a minute.
+        if (closed.getAndSet(false)) {
+            reconnectAttempts.set(0)
+        }
         if (isConnected.get()) {
             Log.w(TAG, "Already connected")
             return true
@@ -145,6 +161,12 @@ class CellularWebSocketClient {
                 Log.e(TAG, "Auth fetch failed: ${err?.message}")
                 SassyTalkNative.cellularOnError("auth: ${err?.message ?: "unknown"}")
                 scheduleReconnect("auth failure: ${err?.message}")
+                return@authorizeWsUrlAsync
+            }
+            // disconnect() may have raced the auth round-trip — don't open a
+            // socket for a client that was torn down while we were fetching.
+            if (closed.get()) {
+                Log.i(TAG, "Auth completed after disconnect — not opening socket")
                 return@authorizeWsUrlAsync
             }
             openWebSocketAuthenticated(wsUrl)
@@ -253,9 +275,11 @@ class CellularWebSocketClient {
     /** Disconnect from the relay */
     fun disconnect() {
         Log.i(TAG, "Disconnecting")
-        // User-initiated disconnect must not be overridden by an auto-reconnect.
+        // User-initiated disconnect must not be overridden by an auto-reconnect
+        // — including the one onClosed() fires when the close handshake for
+        // THIS disconnect completes a moment from now.
+        closed.set(true)
         cancelPendingReconnect()
-        reconnectAttempts.set(MAX_RECONNECT_ATTEMPTS + 1) // poison the backoff
         stopOutboundPump()
         webSocket?.close(1000, "user disconnect")
         webSocket = null
@@ -268,6 +292,14 @@ class CellularWebSocketClient {
      * one reconnect in flight concurrently.
      */
     private fun scheduleReconnect(cause: String) {
+        // A disconnect()ed client must stay down until someone explicitly
+        // calls connect() on it again. Without this, the graceful-close
+        // callback for the disconnect itself re-arms a reconnect and the
+        // discarded instance comes back as a zombie socket.
+        if (closed.get()) {
+            Log.d(TAG, "Reconnect suppressed ($cause): client is closed")
+            return
+        }
         val attempt = reconnectAttempts.incrementAndGet()
         // Don't give up after the fast retries — fall back to a fixed long
         // interval so a prolonged outage still recovers on its own once
@@ -279,7 +311,7 @@ class CellularWebSocketClient {
         }
         cancelPendingReconnect()
         pendingReconnect = reconnectScheduler.schedule({
-            if (!isConnected.get()) {
+            if (!isConnected.get() && !closed.get()) {
                 Log.i(TAG, "Reconnecting ($cause, attempt $attempt, delay ${delayMs}ms)…")
                 try { connect() } catch (e: Exception) {
                     Log.w(TAG, "Reconnect attempt $attempt threw: ${e.message}")
@@ -414,10 +446,15 @@ class CellularWebSocketClient {
      */
     private fun sendKeepAlive() {
         if (!isConnected.get()) return
-        // PttCoordinator's own 2s heartbeat already keeps the socket alive when it
-        // exists; only fill the gap when it doesn't. Checked each fire because the
-        // coordinator may be wired shortly after the socket opens.
-        if (pttCoordinator != null) return
+        // PttCoordinator's own 2s heartbeat already keeps the socket alive —
+        // but only when the coordinator is actually pumping heartbeats through
+        // THIS client. A bare `pttCoordinator != null` check was wrong: after
+        // tearDownCellularClient() re-wires coord.cellularClient to a new
+        // instance (or the coordinator is shut down), the stale back-reference
+        // kept suppressing our keepalive while no heartbeats flowed on this
+        // socket, and the DO reaped it every 8s ("Heartbeat stale" flap).
+        // Checked each fire because the wiring can change at any time.
+        if (pttCoordinator?.cellularClient === this) return
         val frame = ControlFrame.encodeHeartbeat(
             keepAliveEpoch,
             keepAliveSeq.getAndIncrement(),

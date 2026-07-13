@@ -251,12 +251,28 @@ impl StateMachine {
     /// Called by Kotlin JNI when the cellular WebSocket disconnects
     pub fn on_cellular_disconnected(&self, reason: &str) {
         info!("StateMachine: cellular disconnected: {}", reason);
-        self.stop_audio_threads();
 
-        {
+        // Update transport state first, then decide whether the shared audio
+        // threads still have a live IP path to serve. Stopping them
+        // unconditionally here silenced WiFi multicast audio in BOTH
+        // directions on every relay flap until the next reconnect event —
+        // start_audio_pipeline only runs from connect handlers, and WiFi
+        // never re-fires one because its socket never went down.
+        // (Transport lock is dropped before stop_audio_threads: the audio
+        // threads take that lock, so joining them while holding it would
+        // deadlock.)
+        let ip_still_live = {
             let mut transport = self.transport.lock().unwrap();
             transport.on_cellular_disconnected(reason);
+            transport.has_live_ip_transport()
+        };
+
+        if ip_still_live {
+            info!("StateMachine: cellular down but WiFi path still live — audio pipeline kept running");
+            return;
         }
+
+        self.stop_audio_threads();
 
         let current = *self.state.lock().unwrap();
         if current == AppState::Connected || current == AppState::Transmitting || current == AppState::Receiving {
@@ -311,12 +327,23 @@ impl StateMachine {
     /// Called by Kotlin JNI when Bluetooth RFCOMM disconnects.
     pub fn on_bluetooth_disconnected(&self) {
         info!("StateMachine: Bluetooth disconnected");
-        self.stop_audio_threads();
 
-        {
+        // Same guard as on_cellular_disconnected: BT is a parallel fallback
+        // plane (its audio runs through the Kotlin RFCOMM pump), so a BT peer
+        // dropping must not kill the shared TX/RX threads that carry WiFi and
+        // relay audio.
+        let ip_still_live = {
             let mut transport = self.transport.lock().unwrap();
             transport.on_bluetooth_disconnected();
+            transport.has_live_ip_transport()
+        };
+
+        if ip_still_live {
+            info!("StateMachine: Bluetooth down but an IP path is live — audio pipeline kept running");
+            return;
         }
+
+        self.stop_audio_threads();
 
         let current = *self.state.lock().unwrap();
         if current == AppState::Connected || current == AppState::Transmitting || current == AppState::Receiving {

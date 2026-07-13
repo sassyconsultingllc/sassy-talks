@@ -102,6 +102,12 @@ class AutoConnectManager(private val context: Context) {
 
     private fun tearDownCellularClient() {
         walkieServiceRef?.pttCoordinator?.cellularClient = null
+        // Clear the back-reference too: a discarded client holding a stale
+        // pttCoordinator suppressed its own keepalive (sendKeepAlive checks
+        // it) and kept routing control frames into a coordinator that no
+        // longer knows about it.
+        cellularClient?.pttCoordinator = null
+        cellularClient?.onRelayReady = null
         cellularClient?.disconnect()
         cellularClient = null
     }
@@ -345,8 +351,32 @@ class AutoConnectManager(private val context: Context) {
         unregisterNetworkCallback()
 
         val callback = object : ConnectivityManager.NetworkCallback() {
+            // The request below matches EVERY internet-capable network, so
+            // onLost fires for cellular teardowns too — most commonly
+            // Android's routine linger-expiry of the idle mobile-data network
+            // ~30s after WiFi becomes the default. Treating that as "WiFi
+            // lost" released the MulticastLock (deafening LAN RX) and ran a
+            // full spurious failover while WiFi was healthy. Track which
+            // networks are actually WiFi so onLost can tell them apart.
+            private val wifiNetworks = java.util.Collections.synchronizedSet(mutableSetOf<Network>())
+
+            private fun noteNetwork(network: Network) {
+                val caps = try { cm.getNetworkCapabilities(network) } catch (_: Exception) { null }
+                if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
+                    wifiNetworks.add(network)
+                }
+            }
+
             override fun onLost(network: Network) {
-                Log.w(TAG, "Network lost — activeTransport=$activeTransport")
+                val wasWifi = wifiNetworks.remove(network)
+                // Not a WiFi network (or WiFi is otherwise still up): nothing
+                // about our WiFi path changed — just refresh the advisory.
+                if (!wasWifi || hasWifi()) {
+                    Log.i(TAG, "Non-WiFi network lost (wasWifi=$wasWifi, wifiStillUp=${hasWifi()}) — no failover")
+                    refreshTransportAdvisory()
+                    return
+                }
+                Log.w(TAG, "WiFi network lost — activeTransport=$activeTransport")
 
                 if (activeTransport == "both") {
                     Log.i(TAG, "WiFi lost, relay still active — seamless failover")
@@ -381,6 +411,7 @@ class AutoConnectManager(private val context: Context) {
             }
 
             override fun onAvailable(network: Network) {
+                noteNetwork(network)
                 Log.d(TAG, "Network available — activeTransport=$activeTransport")
                 if (activeTransport != "wifi" && activeTransport != "both") {
                     scope.launch { upgradeToBestIp() }
@@ -390,6 +421,9 @@ class AutoConnectManager(private val context: Context) {
             }
 
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    wifiNetworks.add(network)
+                }
                 refreshTransportAdvisory()
             }
         }

@@ -788,10 +788,17 @@ class PttCoordinator(
     /**
      * Master switch for AUTO-upgrading a 2-party session to PQC. The reactive
      * responder/completer always work; this only governs whether THIS device
-     * initiates unprompted. On a wip branch we default it on so it's live on real
-     * hardware; a caller can flip it off. Note the pairwise-key constraint below.
+     * initiates unprompted.
+     *
+     * OFF until the ACK/3-way confirm lands: the responder installs the
+     * pairwise key the moment INIT arrives (before its RESP is confirmed
+     * delivered), and the RESP rides on a single unacknowledged WS send — the
+     * BLE leg cannot carry the 1.2KB frame at all. Lose that one frame during
+     * a relay flap and the peers sit on mismatched AEAD keys: every audio
+     * frame both directions fails the GCM tag while presence stays green,
+     * until an app restart. Manual/explicit handshakes still work.
      */
-    @Volatile var hybridPqcAuto: Boolean = true
+    @Volatile var hybridPqcAuto: Boolean = false
 
     /** Tracks the (peer → peer-epoch) we've already auto-handshaked, so we
      *  initiate at most once per peer session and re-handshake only on restart. */

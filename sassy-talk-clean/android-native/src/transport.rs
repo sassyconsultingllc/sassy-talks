@@ -340,12 +340,27 @@ impl TransportManager {
         self.cellular.get_ws_url()
     }
 
-    /// Called by Kotlin when WebSocket connects successfully
+    /// Called by Kotlin when WebSocket connects successfully.
+    ///
+    /// Like Bluetooth (see `on_bluetooth_connected`), the relay must NOT steal
+    /// the active slot from an established WiFi path: `send()` routes the
+    /// primary TX by `active` and only mirrors WiFi→relay (there is no
+    /// relay→WiFi mirror), so promoting to Cellular here silenced LAN
+    /// multicast TX for the rest of the session whenever both paths were up.
+    /// With `active` left on Wifi, the dual-path block in `send()` still
+    /// carries every frame to the relay too.
     pub fn on_cellular_connected(&mut self) -> Result<(), String> {
         info!("TransportManager: cellular WebSocket connected");
         self.cellular.on_connected();
-        self.active = ActiveTransport::Cellular;
-        info!("TransportManager: active transport = Cellular");
+        match self.active {
+            ActiveTransport::Wifi | ActiveTransport::WifiDirect => {
+                info!("TransportManager: relay up alongside {:?} — active unchanged (dual-path)", self.active);
+            }
+            _ => {
+                self.active = ActiveTransport::Cellular;
+                info!("TransportManager: active transport = Cellular");
+            }
+        }
         Ok(())
     }
 
@@ -355,8 +370,23 @@ impl TransportManager {
         self.cellular.on_disconnected(reason);
 
         if self.active == ActiveTransport::Cellular {
-            self.active = ActiveTransport::None;
+            // Fall back to a still-live path instead of going dark: leaving
+            // `active = None` here hard-blocked PTT ("No active transport")
+            // through every relay flap even with WiFi multicast fully up.
+            self.active = if self.wifi.get_state() == WifiState::Active {
+                info!("TransportManager: relay down — WiFi multicast still active, promoting to Wifi");
+                ActiveTransport::Wifi
+            } else {
+                ActiveTransport::None
+            };
         }
+    }
+
+    /// True while an IP transport (WiFi multicast or the relay) is live —
+    /// i.e. the shared audio TX/RX threads still have a path to serve.
+    pub fn has_live_ip_transport(&self) -> bool {
+        self.wifi.get_state() == WifiState::Active
+            || self.cellular.get_state() == CellularState::Connected
     }
 
     /// Called by Kotlin when WebSocket receives a binary message
