@@ -108,6 +108,12 @@ pub struct AppState {
     cellular: Arc<Mutex<Option<Arc<transport::CellularTransport>>>>,
     cellular_rx_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
 
+    // ONE AudioCache shared by every RX loop. The core cache's cross-transport
+    // dedup keys on (sender_id, timestamp) and only works if all RX paths
+    // converge on the same instance — a private cache per loop meant a phone
+    // dual-sending on WiFi multicast + relay was played twice here.
+    audio_cache: Arc<Mutex<sassytalkie_core::audio_cache::AudioCache>>,
+
     // Settings
     roger_beep: Arc<AtomicBool>,
     vox_enabled: Arc<AtomicBool>,
@@ -144,6 +150,13 @@ impl AppState {
             rx_thread: Arc::new(Mutex::new(None)),
             cellular: Arc::new(Mutex::new(None)),
             cellular_rx_thread: Arc::new(Mutex::new(None)),
+            audio_cache: Arc::new(Mutex::new({
+                let mut cache = sassytalkie_core::audio_cache::AudioCache::new();
+                // Mix mode off by default — preserves classic walkie-talkie
+                // semantics (sequential utterances on overlap).
+                cache.set_mix_mode_enabled(false);
+                cache
+            })),
             roger_beep: Arc::new(AtomicBool::new(true)),
             vox_enabled: Arc::new(AtomicBool::new(false)),
             vox_threshold: Arc::new(RwLock::new(0.1)),
@@ -246,6 +259,7 @@ impl AppState {
             audio_rx,
             Arc::clone(&self.is_receiving),
             Arc::clone(&self.is_transmitting),
+            Arc::clone(&self.audio_cache),
         );
         *self.cellular_rx_thread.lock().await = Some(handle);
         *self.cellular.lock().await = Some(cell);
@@ -424,6 +438,7 @@ impl AppState {
             audio_rx,
             Arc::clone(&self.is_receiving),
             Arc::clone(&self.is_transmitting),
+            Arc::clone(&self.audio_cache),
         );
 
         *self.rx_thread.lock().await = Some(handle);
@@ -633,6 +648,7 @@ fn spawn_audio_rx_loop(
     mut audio_rx: mpsc::UnboundedReceiver<transport::AudioFrame>,
     is_receiving: Arc<AtomicBool>,
     is_transmitting: Arc<AtomicBool>,
+    cache: Arc<Mutex<sassytalkie_core::audio_cache::AudioCache>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Per-sender decode state. Opus is a STATEFUL codec, so every sender
@@ -656,12 +672,11 @@ fn spawn_audio_rx_loop(
             }
         }
 
-        let mut cache = sassytalkie_core::audio_cache::AudioCache::new();
-        // Mix mode off by default — preserves classic walkie-talkie semantics
-        // (sequential utterances on overlap). The cache is already keyed by
-        // sender_id, so it orders/queues multiple speakers correctly once each
-        // gets its own decoder + real timestamp below.
-        cache.set_mix_mode_enabled(false);
+        // The cache is shared across ALL RX loops (UDP + cellular) — its
+        // (sender_id, timestamp) dedup only catches a dual-sent frame if both
+        // copies land in the same instance. Keyed by sender_id, so it also
+        // orders/queues multiple speakers correctly once each gets its own
+        // decoder + real timestamp below.
         const FRAME_MS: u64 = 20;
 
         while let Some(frame) = audio_rx.recv().await {
@@ -701,18 +716,23 @@ fn spawn_audio_rx_loop(
             };
 
             // Live mode → Some(pcm) for immediate playback. Queue/Mix mode →
-            // None; frames drain via the loop below on tick().
-            if let Some(samples) = cache.ingest_frame(&frame.sender, ts, pcm) {
-                let audio_lock = audio.lock().await;
-                audio_lock.write_samples(&samples);
-                drop(audio_lock);
-            }
+            // None; frames drain via the loop below on tick(). Hold the shared
+            // cache lock across ingest+tick+drain so two RX loops can't
+            // interleave mid-drain.
+            {
+                let mut cache = cache.lock().await;
+                if let Some(samples) = cache.ingest_frame(&frame.sender, ts, pcm) {
+                    let audio_lock = audio.lock().await;
+                    audio_lock.write_samples(&samples);
+                    drop(audio_lock);
+                }
 
-            cache.tick();
-            while let Some((_sender, samples)) = cache.next_playback_frame() {
-                let audio_lock = audio.lock().await;
-                audio_lock.write_samples(&samples);
-                drop(audio_lock);
+                cache.tick();
+                while let Some((_sender, samples)) = cache.next_playback_frame() {
+                    let audio_lock = audio.lock().await;
+                    audio_lock.write_samples(&samples);
+                    drop(audio_lock);
+                }
             }
 
             is_receiving.store(false, Ordering::Relaxed);

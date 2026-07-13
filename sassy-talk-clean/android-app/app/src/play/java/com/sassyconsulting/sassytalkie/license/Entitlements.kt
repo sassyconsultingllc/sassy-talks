@@ -39,6 +39,7 @@ import com.android.billingclient.api.ProductDetails
 import com.android.billingclient.api.Purchase
 import com.android.billingclient.api.QueryProductDetailsParams
 import com.android.billingclient.api.QueryPurchasesParams
+import com.sassyconsulting.sassytalkie.BuildConfig
 import com.sassyconsulting.sassytalkie.ui.theme.DarkBg
 import com.sassyconsulting.sassytalkie.ui.theme.PrimaryBlue
 import com.sassyconsulting.sassytalkie.ui.theme.StatusDisconnected
@@ -61,6 +62,11 @@ object Entitlements {
     private const val PRODUCT_ID = "sassytalkie_unlock"
 
     fun isUnlockedCached(context: Context): Boolean {
+        // Debug builds are always entitled: since the transport gate moved
+        // below the UI (AutoConnectManager.autoConnect), a fresh sideloaded
+        // debug install with no purchase got ZERO connections — dead radio on
+        // every dev device and emulator. Release builds are unaffected.
+        if (BuildConfig.DEBUG) return true
         val p = LicenseStore.prefs(context) ?: return false
         if (p.getBoolean(LicenseStore.KEY_UNLOCKED, false)) return true
         return LicensePromo.hasValidReceipt(context)

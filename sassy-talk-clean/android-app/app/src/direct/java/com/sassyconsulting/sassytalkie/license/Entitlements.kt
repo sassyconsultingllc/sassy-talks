@@ -73,6 +73,11 @@ object Entitlements {
         .build()
 
     fun isUnlockedCached(context: Context): Boolean {
+        // Debug builds are always entitled: since the transport gate moved
+        // below the UI (AutoConnectManager.autoConnect), a fresh sideloaded
+        // debug install with no receipt got ZERO connections — dead radio on
+        // every dev device and emulator. Release builds are unaffected.
+        if (BuildConfig.DEBUG) return true
         val p = LicenseStore.prefs(context) ?: return false
         val exp = p.getLong(LicenseStore.KEY_RECEIPT_EXP, 0L)
         return exp > System.currentTimeMillis() / 1000
