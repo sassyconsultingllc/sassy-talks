@@ -532,12 +532,16 @@ private fun ShowQRTab(
                                     cm.setPrimaryClip(
                                         ClipData.newPlainText(
                                             "SassyTalk Invite",
-                                            // Copy the sassytalk:// custom-scheme link: it opens the
-                                            // installed app DIRECTLY (no App Links verification, which
-                                            // isn't in place for the sideloaded APK and otherwise lands
-                                            // the https form in a browser). Single clean link so paste
-                                            // never corrupts the #fragment key.
-                                            result.url,
+                                            // The https link is the resilient form: it's tappable in
+                                            // every chat client, opens the app DIRECTLY via verified
+                                            // App Links (the relay serves assetlinks.json for both
+                                            // release and debug certs — confirmed verified on-device),
+                                            // and on a phone without the app it lands on the /v/ viewer
+                                            // page whose "Open in SassyTalk" button fires sassytalk://
+                                            // with the #key intact. A bare sassytalk:// string is NOT
+                                            // linkified by most messengers and silently fails to open.
+                                            // Single clean link so paste never corrupts the #fragment.
+                                            result.httpsUrl,
                                         ),
                                     )
                                     Toast.makeText(context, "Invite link copied", Toast.LENGTH_SHORT).show()
@@ -586,15 +590,15 @@ private fun ShowQRTab(
                                         type = "text/plain"
                                         putExtra(
                                             Intent.EXTRA_TEXT,
-                                            // Lead with the sassytalk:// link — it opens the installed
-                                            // app directly on the recipient's device. Some chat clients
-                                            // don't auto-linkify a custom scheme; if it isn't tappable,
-                                            // the recipient copies it into SassyTalk → Authenticate →
-                                            // Enter Code (importFromShareText tolerates the extra text).
-                                            "Join my SassyTalk session:\n${result.url}\n\n" +
-                                                "One-time encrypted invite, expires shortly. Tap the link " +
-                                                "to open SassyTalk — or if it isn't tappable, copy it into " +
-                                                "SassyTalk → Authenticate → Enter Code.",
+                                            // The https link is tappable in every messenger and opens
+                                            // the app directly via verified App Links; without the app
+                                            // it lands on the /v/ viewer page (Open-in-app + install +
+                                            // copy/paste fallbacks). sassytalk:// is omitted: clients
+                                            // don't linkify custom schemes, so it reads as dead text.
+                                            "Join my SassyTalk session:\n${result.httpsUrl}\n\n" +
+                                                "One-time encrypted invite, expires shortly. If it opens a " +
+                                                "web page, tap \"Open in SassyTalk\" there — or paste the " +
+                                                "link in SassyTalk → Authenticate → Enter Code.",
                                         )
                                         putExtra(Intent.EXTRA_SUBJECT, "SassyTalk invite")
                                     }
