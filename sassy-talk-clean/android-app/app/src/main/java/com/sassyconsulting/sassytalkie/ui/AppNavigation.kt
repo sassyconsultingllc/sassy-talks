@@ -66,6 +66,10 @@ fun AppNavigation(
 ) {
     val context = LocalContext.current
     var currentScreen by remember { mutableStateOf(Screen.Auth) }
+    // Bumped after a deep-link import so the Auth screen (whose session read is
+    // a one-shot remember{}) is recomposed from scratch and shows the just-
+    // loaded session instead of the stale pre-import state.
+    var authRefreshNonce by remember { mutableStateOf(0) }
     var nativeReady by remember { mutableStateOf(false) }
     var initFailed by remember { mutableStateOf(false) }
     var bleReady by remember { mutableStateOf(false) }
@@ -213,6 +217,11 @@ fun AppNavigation(
     LaunchedEffect(nativeReady, pendingShareUri) {
         val uri = pendingShareUri
         if (nativeReady && uri != null) {
+            // A tapped sassytalk:// (or https) invite should land on the session
+            // QR-entry screen while the session loads, so the user sees WHICH
+            // session they're joining rather than being dropped straight onto
+            // the radio. (Locked builds stay on the gate.)
+            if (entitled) currentScreen = Screen.Auth
             val result = withContext(Dispatchers.IO) {
                 SessionShareLink.importFromShareUri(uri)
             }
@@ -235,10 +244,15 @@ fun AppNavigation(
                         // toast left them guessing.
                         val ctx = describeImportedSession(result.json)
                         Toast.makeText(context, ctx, Toast.LENGTH_LONG).show()
-                        // Invite links don't bypass the entitlement gate: the
-                        // session is imported (so it's live after unlock), but
-                        // a locked build stays parked on the gate screen.
-                        currentScreen = if (entitled) Screen.Main else Screen.Gate
+                        // Stay on the session QR-entry (Auth) screen with the
+                        // imported session now loaded — it shows the active
+                        // session + Continue so the user confirms before the
+                        // radio goes live. Bump the nonce so the Auth screen
+                        // recomposes and picks up the just-imported session.
+                        // Invite links don't bypass the entitlement gate: a
+                        // locked build stays on the gate.
+                        authRefreshNonce++
+                        currentScreen = if (entitled) Screen.Auth else Screen.Gate
                     } else {
                         Toast.makeText(
                             context,
@@ -363,7 +377,7 @@ fun AppNavigation(
             onDone = { currentScreen = Screen.Auth },
             showBackButton = false
         )
-        Screen.Auth -> QRAuthScreen(
+        Screen.Auth -> key(authRefreshNonce) { QRAuthScreen(
             onAuthenticated = {
                 // Tear down the relay WS so MainScreen's auto-connect re-runs
                 // with the just-imported session_id. Without this, importing
@@ -379,7 +393,7 @@ fun AppNavigation(
                 // attach to the new one shown in the QR.
                 walkieService?.forceCellularReconnect()
             },
-        )
+        ) }
         Screen.Main -> MainScreen(
             onDisconnect = {
                 autoConnect.disconnect()
