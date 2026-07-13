@@ -171,11 +171,19 @@ class PttCoordinator(
     )
     val peerEvents: kotlinx.coroutines.flow.SharedFlow<PeerEvent> = _peerEvents
 
-    /** Relay JSON `peer_joined` — seed liveness so roster updates don't race heartbeats. */
+    /**
+     * Relay JSON `peer_joined`. NOTE: this key is "relay:<serverClientId>",
+     * which is NOT the key real heartbeats arrive under ("relay:<epoch>", see
+     * CellularWebSocketClient.relayPeerIdFromFrame). Seeding a liveness identity
+     * here created a phantom peer that never got heartbeats, went STALE every
+     * ~8s, and — because the stale relay worker mints a new clientId on every
+     * reconnect — churned Joined/Left events (raw-id snackbar spam + a duplicate
+     * roster row). We now only register the friendly NAME (deduped by the Users
+     * list); liveness/presence is driven solely by the genuine epoch heartbeat,
+     * which arrives within ~2s.
+     */
     fun onRelayPeerSeen(peerKey: String, deviceName: String) {
         try {
-            val nowMs = System.currentTimeMillis()
-            liveness.onHeartbeat(peerKey, 1L, 0, nowMs, nowMs, SassyTalkNative.localCapabilities())
             if (deviceName.isNotBlank()) {
                 SassyTalkNative.registerUser(peerKey, deviceName)
             }
@@ -565,7 +573,7 @@ class PttCoordinator(
                 }
                 bleSignaling.broadcastControl(frame)
                 cellularClient?.sendBinary(frame)
-                Log.d(TAG, "HB seq=$seq broadcast to ${bleSignaling.blePeerCount} peers (relay=${cellularClient != null})")
+                if (BuildConfig.DEBUG) Log.d(TAG, "HB seq=$seq broadcast to ${bleSignaling.blePeerCount} peers (relay=${cellularClient != null})")
 
                 delay(HEARTBEAT_INTERVAL_MS)
             }
@@ -711,7 +719,8 @@ class PttCoordinator(
 
         val health = liveness.health(peerId, nowMs)
         val rtt = liveness.rttMs(peerId)
-        Log.d(TAG, "HB from $peerId seq=${hb.seq} epoch=${hb.epoch} state=${hb.state} health=$health rtt=${rtt}ms")
+        // Per-peer, every ~2s — gate behind DEBUG so shipped logcat isn't flooded.
+        if (BuildConfig.DEBUG) Log.d(TAG, "HB from $peerId seq=${hb.seq} epoch=${hb.epoch} state=${hb.state} health=$health rtt=${rtt}ms")
 
         if (epochFlipped) {
             Log.i(TAG, "Peer $peerId epoch changed → re-sending Capabilities")

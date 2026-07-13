@@ -474,7 +474,7 @@ class AutoConnectManager(private val context: Context) {
         _relayReady.value = false
         _state.value = ConnectState.IDLE
         _transportAdvisory.value = null
-        (scope.coroutineContext[Job] as? Job)?.children?.forEach { it.cancel() }
+        scope.coroutineContext[Job]?.children?.forEach { it.cancel() }
     }
 
     fun shutdown() {

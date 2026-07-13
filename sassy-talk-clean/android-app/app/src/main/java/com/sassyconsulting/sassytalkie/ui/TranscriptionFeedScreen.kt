@@ -275,7 +275,7 @@ private fun CacheStatusBar(
 
             // Status text — what's happening right now
             val label = when {
-                status.currentSpeakerName != null ->
+                !status.currentSpeakerName.isNullOrBlank() && status.currentSpeakerName != "null" ->
                     "Playing ${status.currentSpeakerName}" +
                         if (status.queuedUtterances > 0) " · ${status.queuedUtterances} queued" else ""
                 status.queuedUtterances > 0 ->

@@ -182,7 +182,10 @@ class MainActivity : ComponentActivity() {
                         DebugOverlay(
                             modifier = Modifier
                                 .align(Alignment.TopEnd)
-                                .padding(8.dp)
+                                // Clear the top toolbar (channel header +
+                                // QR/refresh/overflow icons) so the overlay
+                                // neither covers nor swallows taps on them.
+                                .padding(top = 80.dp, end = 8.dp)
                                 .width(280.dp),
                         )
                     }

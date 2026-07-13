@@ -285,6 +285,7 @@ class HardwarePttController(context: Context) {
      * Delegate target for `Activity.onKeyUp`. Returns `true` when the event is
      * the configured PTT key (and thus consumed).
      */
+    @Suppress("UNUSED_PARAMETER") // `event` kept for symmetry with onKeyDown + the Activity delegate contract
     fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
         if (!enabled) return false
         if (keyCode != pttKeyCode) return false

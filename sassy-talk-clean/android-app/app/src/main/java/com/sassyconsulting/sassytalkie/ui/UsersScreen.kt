@@ -78,8 +78,18 @@ fun UsersScreen(
         }
     }
 
-    val favorites = users.filter { it.isFavorite }
-    val others = users.filter { !it.isFavorite }
+    // One physical peer can register under multiple ids (relay:<clientId>, its
+    // audio sender_id, a BLE MAC). Collapse rows that resolve to the same
+    // display name, keeping the entry liveness actually tracks so presence /
+    // health stay accurate.
+    val deduped = users
+        .groupBy { it.displayName() }
+        .map { (_, dupes) ->
+            dupes.firstOrNull { liveness?.isTracked(it.id) == true || it.id in activePeerIds }
+                ?: dupes.first()
+        }
+    val favorites = deduped.filter { it.isFavorite }
+    val others = deduped.filter { !it.isFavorite }
 
     Column(
         modifier = Modifier
@@ -387,6 +397,20 @@ private fun SectionHeader(
     }
 }
 
+/**
+ * A human label for a roster entry. Relay/BLE peers can be registered under a
+ * raw transport id (relay:<hex>, a MAC, or a 16-hex sender id) or a blank/"null"
+ * name; never surface those — show a friendly placeholder instead.
+ */
+private fun SassyTalkNative.UserInfo.displayName(): String =
+    name.takeUnless {
+        it.isBlank() ||
+            it == "null" ||
+            it.startsWith("relay:") ||
+            Regex("(?i)^([0-9a-f]{2}:){5}[0-9a-f]{2}$").matches(it) ||
+            Regex("(?i)^[0-9a-f]{16}$").matches(it)
+    } ?: "Nearby device"
+
 @Composable
 private fun UserCard(
     user: SassyTalkNative.UserInfo,
@@ -417,7 +441,7 @@ private fun UserCard(
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = user.name.take(2).uppercase(),
+                    text = user.displayName().take(2).uppercase(),
                     color = if (isMuted) DarkBg else Cyan,
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Bold
@@ -428,7 +452,7 @@ private fun UserCard(
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = user.name,
+                    text = user.displayName(),
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Medium,
                     color = if (isMuted) TextMuted else TextWhite,

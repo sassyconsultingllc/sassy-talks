@@ -120,18 +120,42 @@ fun MainScreen(
     val cacheSnap by TranscriptionBridge.cacheSnapshot.collectAsState()
 
     LaunchedEffect(coord) {
+        // Peers are keyed differently across transports (relay:<epoch> vs
+        // relay:<clientId> vs BLE MAC), so an unresolved id must NEVER leak into
+        // the UI as a raw "relay:1a9618" string. Also coalesce churn: a fast
+        // rejoin cancels the pending "left", and identical messages are
+        // rate-limited so a flapping peer doesn't spam the snackbar.
+        val coalesceMs = 4_000L
+        val pendingLeave = HashMap<String, kotlinx.coroutines.Job>()
+        val lastShownAt = HashMap<String, Long>()
+        suspend fun resolve(peerId: String): String {
+            val users = withContext(Dispatchers.IO) { SassyTalkNative.getUsers() }
+            return users.associate { it.id to it.name }[peerId]
+                ?.takeIf { it.isNotBlank() && it != "null" } ?: "A device"
+        }
+        suspend fun show(msg: String) {
+            val now = System.currentTimeMillis()
+            if (now - (lastShownAt[msg] ?: 0L) > coalesceMs) {
+                lastShownAt[msg] = now
+                snackbarHost.showSnackbar(msg, duration = androidx.compose.material3.SnackbarDuration.Short)
+            }
+        }
         coord?.peerEvents?.collect { ev ->
             try {
-                val users = withContext(Dispatchers.IO) { SassyTalkNative.getUsers() }
-                val byId = users.associate { it.id to it.name }
-                val name = when (ev) {
-                    is com.sassyconsulting.sassytalkie.PeerEvent.Joined ->
-                        byId[ev.peerId] ?: ev.peerId.take(12).ifEmpty { "peer" }
-                    is com.sassyconsulting.sassytalkie.PeerEvent.Left ->
-                        byId[ev.peerId] ?: ev.peerId.take(12).ifEmpty { "peer" }
+                when (ev) {
+                    is com.sassyconsulting.sassytalkie.PeerEvent.Joined -> {
+                        pendingLeave.remove(ev.peerId)?.cancel()
+                        show("${resolve(ev.peerId)} joined")
+                    }
+                    is com.sassyconsulting.sassytalkie.PeerEvent.Left -> {
+                        pendingLeave.remove(ev.peerId)?.cancel()
+                        pendingLeave[ev.peerId] = launch {
+                            kotlinx.coroutines.delay(coalesceMs)
+                            pendingLeave.remove(ev.peerId)
+                            show("${resolve(ev.peerId)} left")
+                        }
+                    }
                 }
-                val verb = if (ev is com.sassyconsulting.sassytalkie.PeerEvent.Joined) "joined" else "left"
-                snackbarHost.showSnackbar("$name $verb")
             } catch (t: Throwable) {
                 android.util.Log.w("MainScreen", "peer event UI failed: ${t.message}")
             }
@@ -183,7 +207,12 @@ fun MainScreen(
     ) {
     Column(
         modifier = Modifier
-            .fillMaxSize()
+            .fillMaxHeight()
+            // Cap + center content on large screens so a 7"+ tablet isn't a
+            // stretched phone with big empty side gaps. No-op on phones (<560dp).
+            .widthIn(max = 560.dp)
+            .fillMaxWidth()
+            .align(Alignment.TopCenter)
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
@@ -323,7 +352,10 @@ fun MainScreen(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     TextButton(onClick = {
-                        scope.launch { autoConnect.autoConnect(walkieService) }
+                        // Match the header Reconnect icon: clear the prior
+                        // FAILED state before re-attempting so the two retry
+                        // paths behave identically.
+                        scope.launch { autoConnect.reset(); autoConnect.autoConnect(walkieService) }
                     }) {
                         Text("Retry", fontSize = 12.sp, color = Cyan)
                     }
@@ -421,7 +453,7 @@ fun MainScreen(
                     Icon(Icons.Default.Warning, contentDescription = null, tint = Color(0xFFFFB300), modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "Reconnecting\u2026 peer out of contact",
+                        text = "Peer offline \u2014 reconnecting\u2026",
                         fontSize = 13.sp,
                         color = Color(0xFFFFB300),
                         fontWeight = FontWeight.Medium
@@ -657,8 +689,12 @@ fun MainScreen(
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
                     text = when {
-                        cacheSnap.currentSpeakerName != null -> "Playing ${cacheSnap.currentSpeakerName}" +
-                            (if (cacheSnap.queuedUtterances > 0) " · ${cacheSnap.queuedUtterances} queued" else "")
+                        // Guard against a blank/"null" speaker name leaking to the
+                        // UI as literal "Playing null" (unresolved relay peer name).
+                        !cacheSnap.currentSpeakerName.isNullOrBlank() &&
+                            cacheSnap.currentSpeakerName != "null" ->
+                            "Playing ${cacheSnap.currentSpeakerName}" +
+                                (if (cacheSnap.queuedUtterances > 0) " · ${cacheSnap.queuedUtterances} queued" else "")
                         cacheSnap.queuedUtterances > 0 -> "${cacheSnap.queuedUtterances} queued"
                         else -> cacheSnap.mode
                     },

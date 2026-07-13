@@ -219,7 +219,7 @@ class CellularWebSocketClient {
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                Log.d(TAG, "Control: $text")
+                if (BuildConfig.DEBUG) Log.d(TAG, "Control: $text")
                 try {
                     val obj = JSONObject(text)
                     when (obj.optString("type")) {

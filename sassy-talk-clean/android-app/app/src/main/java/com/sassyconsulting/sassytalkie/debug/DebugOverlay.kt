@@ -45,7 +45,8 @@ import com.sassyconsulting.sassytalkie.ui.theme.TextMutedToken
  */
 @Composable
 fun DebugOverlay(modifier: Modifier = Modifier) {
-    var expanded by remember { mutableStateOf(true) }
+    // Start collapsed to a compact header strip; tap to expand the full readout.
+    var expanded by remember { mutableStateOf(false) }
     val s by AudioTelemetry.state.collectAsState()
 
     val border = if (s.gateOpen) StatusOnline else TextMutedToken
