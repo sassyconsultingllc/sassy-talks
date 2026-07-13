@@ -158,6 +158,24 @@ object SassyTalkNative {
         }
     }
 
+    /**
+     * Set the per-install unique id, mixed into the native sender identity so
+     * two devices with the SAME display name never derive the same sender_id.
+     * Without this, each side dropped the other's audio as its own echo and
+     * never registered the peer (no audio + no roster row, toast still firing).
+     * Call before transports connect (init path, alongside setDeviceName).
+     */
+    fun setInstallId(installId: String) {
+        if (initialized && installId.isNotBlank()) {
+            try {
+                nativeSetInstallId(installId)
+                Log.i(TAG, "Install id set (${installId.length} chars)")
+            } catch (e: Exception) {
+                Log.e(TAG, "setInstallId failed: ${e.message}")
+            }
+        }
+    }
+
     fun shutdown() {
         if (initialized) {
             try {
@@ -1197,6 +1215,7 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeInitWifi(): Boolean
     @JvmStatic private external fun nativeGetDeviceName(): String
     @JvmStatic private external fun nativeSetDeviceName(name: String)
+    @JvmStatic private external fun nativeSetInstallId(installId: String)
     @JvmStatic private external fun nativeHasWifiPeers(): Boolean
     @JvmStatic private external fun nativeIsEncrypted(): Boolean
     @JvmStatic private external fun nativeConnectWifiMulticast(): Boolean

@@ -49,12 +49,20 @@ pub struct StateMachine {
     rx_shared: Arc<Mutex<audio_pipeline::RxSharedState>>,
     device_name: String,
     local_sender_id: String,
+    // Per-install unique salt mixed into local_sender_id. Without it the id was
+    // a pure hash of the DEVICE NAME, so two devices with the same name (both
+    // left on the default, or same model) derived IDENTICAL sender ids — the
+    // receiver then dropped every frame from the peer as its own echo
+    // (audio_pipeline process_frame: sender_id == local_sender_id) and never
+    // registered them: no audio, no roster entry, while epoch-keyed heartbeat
+    // toasts still fired. Set once at startup from Kotlin's InstallId.
+    install_salt: String,
 }
 
 impl StateMachine {
     pub fn new(ptt: Arc<AtomicBool>, channel: Arc<AtomicU8>, subchannel: Arc<AtomicU8>) -> Self {
         let device_name = "SassyTalkie-Android".to_string();
-        let local_sender_id = crate::users::UserRegistry::derive_user_id(device_name.as_bytes());
+        let local_sender_id = Self::derive_sender_id(&device_name, "");
 
         Self {
             state: Arc::new(Mutex::new(AppState::Initializing)),
@@ -72,7 +80,29 @@ impl StateMachine {
             rx_shared: Arc::new(Mutex::new(audio_pipeline::RxSharedState::new())),
             device_name,
             local_sender_id,
+            install_salt: String::new(),
         }
+    }
+
+    /// Sender-id derivation: device name + per-install salt. The id is opaque
+    /// to receivers (self-echo check, registry/cache key), so mixing the salt
+    /// is fully wire-compatible — it only has to be unique per device and
+    /// stable across restarts (favorites/mute are keyed on it).
+    fn derive_sender_id(name: &str, salt: &str) -> String {
+        let material = format!("{}|{}", name, salt);
+        crate::users::UserRegistry::derive_user_id(material.as_bytes())
+    }
+
+    /// Set the per-install unique id (Kotlin InstallId, stable across restarts,
+    /// unique per install). Re-derives local_sender_id so two devices sharing a
+    /// display name no longer collide. Call BEFORE transports connect.
+    pub fn set_install_id(&mut self, install_id: String) {
+        self.install_salt = install_id;
+        self.local_sender_id = Self::derive_sender_id(&self.device_name, &self.install_salt);
+        info!(
+            "StateMachine: install id set, local_sender_id re-derived to {}",
+            self.local_sender_id
+        );
     }
 
     pub fn initialize(&self) -> Result<(), String> {
@@ -444,7 +474,7 @@ impl StateMachine {
     pub fn set_device_name(&mut self, name: String) {
         info!("StateMachine: device name set to '{}'", name);
         self.device_name = name.clone();
-        self.local_sender_id = crate::users::UserRegistry::derive_user_id(name.as_bytes());
+        self.local_sender_id = Self::derive_sender_id(&name, &self.install_salt);
         // Update transport too
         let mut transport = self.transport.lock().unwrap();
         transport.set_device_name(&name);

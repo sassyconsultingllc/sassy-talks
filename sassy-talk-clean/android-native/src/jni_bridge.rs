@@ -2588,6 +2588,31 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     }
 }
 
+/// JNI: Set the per-install unique id, mixed into local_sender_id so two
+/// devices with the same display name never derive the same sender identity
+/// (which made receivers drop each other's audio as self-echo and never
+/// register the peer). Call before transports connect.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetInstallId(
+    mut env: JNIEnv,
+    _class: JClass,
+    install_id: JString,
+) {
+    let id_str: String = match env.get_string(&install_id) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+
+    info!("JNI: Set install id ({} chars)", id_str.len());
+
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref mut sm) = guard.state_machine {
+        sm.set_install_id(id_str);
+    }
+}
+
 //==============================================================================
 // AUDIO CACHE JNI EXPORTS (DANE.COM-STYLE MULTI-SPEAKER REPLAY)
 //==============================================================================

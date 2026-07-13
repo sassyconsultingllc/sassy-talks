@@ -153,8 +153,15 @@ fun AppNavigation(
                 profileSetState = profileSet
                 val savedName = getSavedProfileName(context)
 
-                // Apply saved profile name to native library
+                // Apply saved profile name to native library. The install id
+                // MUST go in first: the native sender identity is derived from
+                // name + install id, and identical names alone (two defaults,
+                // same model) made devices drop each other's audio as
+                // self-echo and never show in the roster.
                 withContext(Dispatchers.IO) {
+                    SassyTalkNative.setInstallId(
+                        com.sassyconsulting.sassytalkie.InstallId.get(context)
+                    )
                     if (profileSet) {
                         SassyTalkNative.setDeviceName(savedName)
                     } else {

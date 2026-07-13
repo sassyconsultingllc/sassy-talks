@@ -80,13 +80,23 @@ fun UsersScreen(
 
     // One physical peer can register under multiple ids (relay:<clientId>, its
     // audio sender_id, a BLE MAC). Collapse rows that resolve to the same
-    // display name, keeping the entry liveness actually tracks so presence /
-    // health stay accurate.
+    // display name — but ONLY when the group contains a transport-alias id
+    // (relay:*/MAC); two distinct devices that merely share a display name
+    // (both have real sender_ids) must stay separate rows. Keep the entry
+    // liveness actually tracks so presence/health stay accurate.
+    fun isTransportAlias(id: String): Boolean =
+        id.startsWith("relay:") || Regex("(?i)^([0-9a-f]{2}:){5}[0-9a-f]{2}$").matches(id)
     val deduped = users
         .groupBy { it.displayName() }
-        .map { (_, dupes) ->
-            dupes.firstOrNull { liveness?.isTracked(it.id) == true || it.id in activePeerIds }
-                ?: dupes.first()
+        .flatMap { (_, dupes) ->
+            if (dupes.size > 1 && dupes.any { isTransportAlias(it.id) }) {
+                listOf(
+                    dupes.firstOrNull { liveness?.isTracked(it.id) == true || it.id in activePeerIds }
+                        ?: dupes.first()
+                )
+            } else {
+                dupes
+            }
         }
     val favorites = deduped.filter { it.isFavorite }
     val others = deduped.filter { !it.isFavorite }
