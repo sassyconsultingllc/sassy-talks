@@ -29,17 +29,16 @@ object DeviceQuirks {
 
     fun current(): Profile {
         val mfr = Build.MANUFACTURER.lowercase()
-        val model = Build.MODEL.lowercase()
         val device = Build.DEVICE.lowercase()
         return when {
-            mfr.contains("motorola") || device.startsWith("moto") -> motoProfile(model)
-            mfr.contains("samsung") -> samsungProfile(model)
-            mfr.contains("xiaomi") || mfr.contains("redmi") -> xiaomiProfile(model)
+            mfr.contains("motorola") || device.startsWith("moto") -> motoProfile()
+            mfr.contains("samsung") -> samsungProfile()
+            mfr.contains("xiaomi") || mfr.contains("redmi") -> xiaomiProfile()
             else -> defaultProfile
         }
     }
 
-    private fun motoProfile(model: String): Profile = Profile(
+    private fun motoProfile(): Profile = Profile(
         effectsConfig = AudioEffectsManager.Config(
             enableAec = false,
             enableNs = false,
@@ -59,7 +58,7 @@ object DeviceQuirks {
                 "Larger record buffer to absorb HAL stalls."
     )
 
-    private fun samsungProfile(model: String): Profile = Profile(
+    private fun samsungProfile(): Profile = Profile(
         effectsConfig = AudioEffectsManager.Config(
             enableAec = false,
             enableNs = false,
@@ -69,7 +68,7 @@ object DeviceQuirks {
         notes = "Samsung: NS too aggressive on quiet speakers; AGC works fine."
     )
 
-    private fun xiaomiProfile(model: String): Profile = Profile(
+    private fun xiaomiProfile(): Profile = Profile(
         effectsConfig = AudioEffectsManager.Config(
             enableAec = false,
             enableNs = false,

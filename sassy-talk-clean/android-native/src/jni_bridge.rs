@@ -486,7 +486,7 @@ use std::sync::Mutex;
 use crate::state::StateMachine;
 use crate::session::SessionManager;
 use crate::users::UserRegistry;
-use crate::codec::{VoiceEncoder, VoiceDecoder, CODEC_FRAME_SIZE};
+use crate::codec::{VoiceEncoder, CODEC_FRAME_SIZE};
 use crate::audio_pipeline;
 
 /// Global state for JNI mode (when used from Kotlin instead of egui)
@@ -501,11 +501,15 @@ struct JniAppState {
     current_channel: Arc<AtomicU8>,
     current_subchannel: Arc<AtomicU8>,
     pending_key_exchange: Option<crate::crypto::KeyExchange>,
+    /// Pending path-(a) PSK-authenticated hybrid handshake (initiator side),
+    /// held between nativeHybridHandshakeInit and ...Complete. Carries the QR PSK
+    /// + ephemeral X25519/ML-KEM secrets; zeroizes on drop.
+    pending_hybrid_initiator: Option<crate::pqc::PskHybridInitiator>,
     /// BT TX buffer: Kotlin reads encoded frames from here for RFCOMM transmission
     bt_tx_buffer: Arc<Mutex<Option<Vec<u8>>>>,
-    /// BT codec instances (stateful ADPCM, persisted across JNI calls)
+    /// BT codec for TX (Kotlin reads encoded frames for RFCOMM transmission).
+    /// RX decode uses per-sender state inside RxSharedState on the StateMachine.
     bt_encoder: VoiceEncoder,
-    bt_decoder: VoiceDecoder,
     /// Track whether BT mic capture is active for btEncodeFrame
     bt_recording: bool,
 }
@@ -527,9 +531,9 @@ impl JniAppState {
             current_channel,
             current_subchannel,
             pending_key_exchange: None,
+            pending_hybrid_initiator: None,
             bt_tx_buffer: Arc::new(Mutex::new(None)),
             bt_encoder: VoiceEncoder::new(),
-            bt_decoder: VoiceDecoder::new(),
             bt_recording: false,
         }
     }
@@ -1413,7 +1417,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     };
 
     // Unpack wire frame (now decrypted)
-    let (channel, _subchannel, sender_id, device_name, timestamp, compressed) = match audio_pipeline::unpack_wire_frame(&decrypted) {
+    let (channel, subchannel, sender_id, device_name, timestamp, compressed) = match audio_pipeline::unpack_wire_frame(&decrypted) {
         Ok(parsed) => parsed,
         Err(e) => {
             warn!("btDecodeFrame: invalid wire frame: {}", e);
@@ -1421,61 +1425,27 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         }
     };
 
-    // Filter by channel
     let my_channel = guard.current_channel.load(Ordering::SeqCst);
-    if channel != my_channel {
+    let my_subchannel = guard.current_subchannel.load(Ordering::SeqCst);
+
+    if let Some(sm) = guard.state_machine.as_ref() {
+        audio_pipeline::process_incoming_wire_frame(
+            sm.get_rx_shared(),
+            sm.get_audio_cache(),
+            sm.get_user_registry(),
+            &sm.get_local_sender_id(),
+            my_channel,
+            my_subchannel,
+            channel,
+            subchannel,
+            &sender_id,
+            &device_name,
+            timestamp,
+            &compressed,
+            true,
+        );
+    } else {
         return JNI_FALSE;
-    }
-
-    // Validate compressed payload is non-empty (Opus uses variable-length frames)
-    if compressed.is_empty() {
-        warn!("btDecodeFrame: empty compressed payload");
-        return JNI_FALSE;
-    }
-
-    // Auto-register sender in UserRegistry
-    guard.user_registry.register_user(&sender_id, &device_name);
-
-    // Decode ADPCM
-    let pcm_samples = guard.bt_decoder.decode(&compressed);
-
-    // Mirror the unified RX path's activity-log feed so BT-received audio
-    // also surfaces in the timeline.
-    let (is_favorite, is_muted) = (
-        guard.user_registry.is_favorite(&sender_id),
-        guard.user_registry.is_muted(&sender_id),
-    );
-    audio_pipeline::call_transcription_bridge_public(
-        &sender_id,
-        &device_name,
-        &pcm_samples,
-        is_favorite,
-        is_muted,
-        false, // remote — BT-received audio
-    );
-
-    // Feed into audio cache and play
-    if let Some(ref sm) = guard.state_machine {
-        // Feed audio cache
-        let cache = sm.get_audio_cache();
-        let mut cache_lock = cache.lock().unwrap_or_else(|e| e.into_inner());
-        let passthrough = cache_lock.ingest_frame(&sender_id, timestamp, pcm_samples.clone());
-        cache_lock.tick();
-
-        let samples_to_play = if let Some(direct) = passthrough {
-            Some(direct)
-        } else {
-            cache_lock.next_playback_frame().map(|(_, s)| s)
-        };
-        drop(cache_lock);
-
-        if let Some(samples) = samples_to_play {
-            let audio = sm.get_audio();
-            if let Ok(eng) = audio.lock() {
-                let _ = eng.start_playing();
-                let _ = eng.write_audio(&samples);
-            }
-        }
     }
 
     JNI_TRUE
@@ -1923,6 +1893,31 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     }
 }
 
+/// JNI: Remove a user from the registry (peer left / out of contact).
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeRemoveUser<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    user_id: JString<'local>,
+) {
+    let id: String = match env.get_string(&user_id) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        let mut reg = sm.get_user_registry().lock().unwrap_or_else(|e| e.into_inner());
+        reg.remove_user(&id);
+    } else {
+        drop(guard);
+        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.user_registry.remove_user(&id);
+    }
+}
+
 //==============================================================================
 // EXTENDED JNI EXPORTS - BT/WiFi status, permissions, user registration
 //==============================================================================
@@ -2293,6 +2288,156 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     }
 }
 
+/// JNI: This build's capability bitmap (the heartbeat caps byte). Today this is
+/// just hybrid-PQC support; peers AND this with their own to pick the kex suite.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeLocalCapabilities(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jint {
+    crate::pqc::local_capabilities() as jni::sys::jint
+}
+
+/// JNI: Begin a path-(a) PSK-authenticated hybrid (X25519 + ML-KEM-768) handshake
+/// for `channel`. The QR PSK authenticates the pairing; the ephemeral hybrid adds
+/// forward secrecy + post-quantum protection. Returns the initiator message
+/// (X25519 pub || ML-KEM encaps key, base64) to send to the peer, or "" if the
+/// channel has no valid PSK. The peer replies via nativeHybridHandshakeRespond;
+/// finish with nativeHybridHandshakeComplete.
+///
+/// NOTE: this establishes the session crypto locally on completion. Wiring the
+/// init/respond MESSAGE EXCHANGE over a transport (which control opcode carries
+/// them, initiator/responder role assignment) is the remaining Phase-3 step.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHybridHandshakeInit<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    channel: jni::sys::jint,
+) -> JObject<'local> {
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    let psk = match guard.session_manager.get_psk_for_channel(channel as u8) {
+        Some(p) => p,
+        None => {
+            error!("JNI: hybrid init — no valid PSK for channel {}", channel);
+            return JObject::null();
+        }
+    };
+
+    let initiator = crate::pqc::PskHybridInitiator::new(&psk);
+    let msg_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        initiator.initiator_message().to_bytes(),
+    );
+    guard.pending_hybrid_initiator = Some(initiator);
+    drop(guard);
+
+    info!("JNI: hybrid handshake init (channel {})", channel);
+    env.new_string(&msg_b64)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| JObject::null())
+}
+
+/// JNI: Responder side of the path-(a) hybrid handshake. Given the peer's
+/// initiator message (base64) for `channel`, establishes the session crypto and
+/// returns the responder message (X25519 pub || ML-KEM ciphertext, base64) to
+/// send back. Returns "" on failure.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHybridHandshakeRespond<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    channel: jni::sys::jint,
+    init_b64: JString<'local>,
+) -> JObject<'local> {
+    let init_str: String = match env.get_string(&init_b64) {
+        Ok(s) => s.into(),
+        Err(_) => return JObject::null(),
+    };
+    let init_bytes = match base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &init_str,
+    ) {
+        Ok(b) => b,
+        Err(e) => { error!("JNI: hybrid respond — b64 decode failed: {}", e); return JObject::null(); }
+    };
+    let init_msg = match crate::pqc::HybridInitiatorMessage::from_bytes(&init_bytes) {
+        Ok(m) => m,
+        Err(e) => { error!("JNI: hybrid respond — bad initiator msg: {}", e); return JObject::null(); }
+    };
+
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    let psk = match guard.session_manager.get_psk_for_channel(channel as u8) {
+        Some(p) => p,
+        None => { error!("JNI: hybrid respond — no valid PSK for channel {}", channel); return JObject::null(); }
+    };
+
+    match crate::pqc::psk_hybrid_respond(&psk, &init_msg) {
+        Ok((resp, session)) => {
+            if let Some(ref sm) = guard.state_machine {
+                sm.set_crypto_session(session);
+            }
+            let resp_b64 = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                resp.to_bytes(),
+            );
+            drop(guard);
+            info!("JNI: hybrid handshake responded (channel {})", channel);
+            env.new_string(&resp_b64)
+                .map(|s| s.into())
+                .unwrap_or_else(|_| JObject::null())
+        }
+        Err(e) => { error!("JNI: hybrid respond failed: {}", e); JObject::null() }
+    }
+}
+
+/// JNI: Complete the path-(a) hybrid handshake on the initiator side using the
+/// responder's message (base64). Establishes the session crypto. Returns true on
+/// success. Must follow a nativeHybridHandshakeInit on this device.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHybridHandshakeComplete<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    resp_b64: JString<'local>,
+) -> jboolean {
+    let resp_str: String = match env.get_string(&resp_b64) {
+        Ok(s) => s.into(),
+        Err(_) => return JNI_FALSE,
+    };
+    let resp_bytes = match base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &resp_str,
+    ) {
+        Ok(b) => b,
+        Err(e) => { error!("JNI: hybrid complete — b64 decode failed: {}", e); return JNI_FALSE; }
+    };
+    let resp_msg = match crate::pqc::HybridResponderMessage::from_bytes(&resp_bytes) {
+        Ok(m) => m,
+        Err(e) => { error!("JNI: hybrid complete — bad responder msg: {}", e); return JNI_FALSE; }
+    };
+
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    let initiator = match guard.pending_hybrid_initiator.take() {
+        Some(i) => i,
+        None => { error!("JNI: hybrid complete — no pending init (call nativeHybridHandshakeInit first)"); return JNI_FALSE; }
+    };
+
+    match initiator.complete(&resp_msg) {
+        Ok(session) => {
+            if let Some(ref sm) = guard.state_machine {
+                sm.set_crypto_session(session);
+            }
+            info!("JNI: hybrid handshake completed (PQ-protected session established)");
+            JNI_TRUE
+        }
+        Err(e) => { error!("JNI: hybrid complete failed: {}", e); JNI_FALSE }
+    }
+}
+
 /// JNI: Get missing permissions as JSON array of strings
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetMissingPermissions<'local>(
@@ -2440,6 +2585,31 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
     if let Some(ref mut sm) = guard.state_machine {
         sm.set_device_name(name_str);
+    }
+}
+
+/// JNI: Set the per-install unique id, mixed into local_sender_id so two
+/// devices with the same display name never derive the same sender identity
+/// (which made receivers drop each other's audio as self-echo and never
+/// register the peer). Call before transports connect.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetInstallId(
+    mut env: JNIEnv,
+    _class: JClass,
+    install_id: JString,
+) {
+    let id_str: String = match env.get_string(&install_id) {
+        Ok(s) => s.into(),
+        Err(_) => return,
+    };
+
+    info!("JNI: Set install id ({} chars)", id_str.len());
+
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref mut sm) = guard.state_machine {
+        sm.set_install_id(id_str);
     }
 }
 

@@ -230,45 +230,10 @@ impl TransportManager {
         primary_result
     }
 
-    /// Receive data from active transport with decryption
-    pub fn receive(&mut self, buffer: &mut [u8]) -> Result<usize, String> {
-        let raw_data = match self.active {
-            ActiveTransport::Wifi | ActiveTransport::WifiDirect => {
-                let mut wifi_buf = vec![0u8; buffer.len() + 128]; // extra for crypto overhead
-                match self.wifi.receive_audio(&mut wifi_buf) {
-                    Ok(n) if n > 0 => wifi_buf[..n].to_vec(),
-                    Ok(_) => return Ok(0),
-                    Err(e) => {
-                        if !e.contains("would block") && !e.contains("timed out") {
-                            warn!("WiFi receive failed: {}", e);
-                        }
-                        return Ok(0);
-                    }
-                }
-            }
-            ActiveTransport::Cellular => {
-                let mut cell_buf = vec![0u8; buffer.len() + 128];
-                match self.cellular.receive_audio(&mut cell_buf) {
-                    Ok(n) if n > 0 => cell_buf[..n].to_vec(),
-                    Ok(_) => return Ok(0),
-                    Err(e) => {
-                        warn!("Cellular receive failed: {}", e);
-                        return Ok(0);
-                    }
-                }
-            }
-            ActiveTransport::Bluetooth => {
-                // BT RX is handled by Kotlin via btDecodeFrame JNI, not here
-                return Ok(0);
-            }
-            ActiveTransport::None => {
-                return Ok(0);
-            }
-        };
-
-        // MANDATORY DECRYPTION: drop unencrypted or tampered packets
+    /// Decrypt a raw transport payload into `buffer`. Returns 0 on failure/drop.
+    fn decrypt_into(&self, raw_data: &[u8], buffer: &mut [u8]) -> Result<usize, String> {
         if let Some(ref crypto) = self.crypto {
-            match crypto.decrypt(&raw_data) {
+            match crypto.decrypt(raw_data) {
                 Ok(plaintext) => {
                     let copy_len = plaintext.len().min(buffer.len());
                     buffer[..copy_len].copy_from_slice(&plaintext[..copy_len]);
@@ -276,14 +241,81 @@ impl TransportManager {
                 }
                 Err(e) => {
                     error!("Decryption failed (dropping packet): {}", e);
-                    Ok(0) // Drop packet silently instead of propagating error
+                    Ok(0)
                 }
             }
         } else {
-            // No crypto session — drop all incoming data
             warn!("RX: No encryption session, dropping {} bytes", raw_data.len());
             Ok(0)
         }
+    }
+
+    /// Non-blocking WiFi multicast poll. Returns decrypted bytes written to
+    /// `buffer`, or 0 if nothing waiting. Safe to call regardless of which
+    /// transport is marked `active` — needed for dual-path RX when both WiFi
+    /// and the cellular relay are live simultaneously.
+    pub fn poll_wifi_into(&mut self, buffer: &mut [u8]) -> Result<usize, String> {
+        use crate::wifi_transport::WifiState;
+        if self.wifi.get_state() != WifiState::Active {
+            return Ok(0);
+        }
+        let mut wifi_buf = vec![0u8; buffer.len() + 128];
+        match self.wifi.receive_audio(&mut wifi_buf) {
+            Ok(n) if n > 0 => self.decrypt_into(&wifi_buf[..n], buffer),
+            Ok(_) => Ok(0),
+            Err(e) => {
+                if !e.contains("would block") && !e.contains("timed out") {
+                    warn!("WiFi receive failed: {}", e);
+                }
+                Ok(0)
+            }
+        }
+    }
+
+    /// Non-blocking cellular relay poll. Returns decrypted bytes written to
+    /// `buffer`, or 0 if nothing waiting.
+    pub fn poll_cellular_into(&mut self, buffer: &mut [u8]) -> Result<usize, String> {
+        if self.cellular.get_state() != CellularState::Connected {
+            return Ok(0);
+        }
+        let mut cell_buf = vec![0u8; buffer.len() + 128];
+        match self.cellular.receive_audio(&mut cell_buf) {
+            Ok(n) if n > 0 => self.decrypt_into(&cell_buf[..n], buffer),
+            Ok(_) => Ok(0),
+            Err(e) => {
+                warn!("Cellular receive failed: {}", e);
+                Ok(0)
+            }
+        }
+    }
+
+    /// Receive data from active transport with decryption
+    pub fn receive(&mut self, buffer: &mut [u8]) -> Result<usize, String> {
+        // Legacy single-source receive — prefer poll_wifi_into +
+        // poll_cellular_into from the RX thread so both paths are drained.
+        let raw_data = match self.active {
+            ActiveTransport::Wifi | ActiveTransport::WifiDirect => {
+                match self.poll_wifi_into(buffer)? {
+                    0 if self.cellular.get_state() == CellularState::Connected => {
+                        self.poll_cellular_into(buffer)?
+                    }
+                    n => n,
+                }
+            }
+            ActiveTransport::Cellular => {
+                match self.poll_cellular_into(buffer)? {
+                    0 => self.poll_wifi_into(buffer)?,
+                    n => n,
+                }
+            }
+            ActiveTransport::Bluetooth => {
+                return Ok(0);
+            }
+            ActiveTransport::None => {
+                return Ok(0);
+            }
+        };
+        Ok(raw_data)
     }
 
     // ── Cellular operations (WebSocket relay, works anywhere with internet) ──
@@ -308,12 +340,27 @@ impl TransportManager {
         self.cellular.get_ws_url()
     }
 
-    /// Called by Kotlin when WebSocket connects successfully
+    /// Called by Kotlin when WebSocket connects successfully.
+    ///
+    /// Like Bluetooth (see `on_bluetooth_connected`), the relay must NOT steal
+    /// the active slot from an established WiFi path: `send()` routes the
+    /// primary TX by `active` and only mirrors WiFi→relay (there is no
+    /// relay→WiFi mirror), so promoting to Cellular here silenced LAN
+    /// multicast TX for the rest of the session whenever both paths were up.
+    /// With `active` left on Wifi, the dual-path block in `send()` still
+    /// carries every frame to the relay too.
     pub fn on_cellular_connected(&mut self) -> Result<(), String> {
         info!("TransportManager: cellular WebSocket connected");
         self.cellular.on_connected();
-        self.active = ActiveTransport::Cellular;
-        info!("TransportManager: active transport = Cellular");
+        match self.active {
+            ActiveTransport::Wifi | ActiveTransport::WifiDirect => {
+                info!("TransportManager: relay up alongside {:?} — active unchanged (dual-path)", self.active);
+            }
+            _ => {
+                self.active = ActiveTransport::Cellular;
+                info!("TransportManager: active transport = Cellular");
+            }
+        }
         Ok(())
     }
 
@@ -323,8 +370,23 @@ impl TransportManager {
         self.cellular.on_disconnected(reason);
 
         if self.active == ActiveTransport::Cellular {
-            self.active = ActiveTransport::None;
+            // Fall back to a still-live path instead of going dark: leaving
+            // `active = None` here hard-blocked PTT ("No active transport")
+            // through every relay flap even with WiFi multicast fully up.
+            self.active = if self.wifi.get_state() == WifiState::Active {
+                info!("TransportManager: relay down — WiFi multicast still active, promoting to Wifi");
+                ActiveTransport::Wifi
+            } else {
+                ActiveTransport::None
+            };
         }
+    }
+
+    /// True while an IP transport (WiFi multicast or the relay) is live —
+    /// i.e. the shared audio TX/RX threads still have a path to serve.
+    pub fn has_live_ip_transport(&self) -> bool {
+        self.wifi.get_state() == WifiState::Active
+            || self.cellular.get_state() == CellularState::Connected
     }
 
     /// Called by Kotlin when WebSocket receives a binary message
@@ -349,10 +411,22 @@ impl TransportManager {
 
     // ── Bluetooth operations (Kotlin-managed RFCOMM, Rust handles codec) ──
 
-    /// Called by Kotlin when BT RFCOMM connects
+    /// Called by Kotlin when BT RFCOMM connects.
+    ///
+    /// Bluetooth is the FALLBACK plane: it only takes the active audio slot when
+    /// no IP transport (WiFi multicast / relay) is carrying audio. Otherwise a BT
+    /// peer wandering into range while we're on WiFi would silently steal `active`
+    /// and stop WiFi TX, since `send()` routes by `active`. BT's own audio path
+    /// (Kotlin `btEncodeFrame`/`btDecodeFrame` pump) runs in parallel regardless
+    /// of this flag, so promoting it is unnecessary while an IP path is healthy —
+    /// and harmful, because it would knock IP peers off the air.
     pub fn on_bluetooth_connected(&mut self) {
-        info!("TransportManager: Bluetooth RFCOMM connected");
-        self.active = ActiveTransport::Bluetooth;
+        if self.active == ActiveTransport::None {
+            self.active = ActiveTransport::Bluetooth;
+            info!("TransportManager: Bluetooth RFCOMM connected — now the active path (no IP transport up)");
+        } else {
+            info!("TransportManager: Bluetooth RFCOMM connected — IP path still active, BT runs in parallel");
+        }
     }
 
     /// Called by Kotlin when BT RFCOMM disconnects

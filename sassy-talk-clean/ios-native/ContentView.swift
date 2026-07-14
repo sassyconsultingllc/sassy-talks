@@ -38,6 +38,14 @@ struct ContentView: View {
             .navigationTitle("SassyTalkie")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    // Lock = pairing state. Tap to (re)scan a host's QR. Until
+                    // paired, encryption (mandatory) has no key so no audio flows.
+                    Button(action: { viewModel.showingScanner = true }) {
+                        Image(systemName: viewModel.isPaired ? "lock.fill" : "lock.open")
+                            .foregroundColor(viewModel.isPaired ? .stOnline : .stCoral)
+                    }
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button(action: { viewModel.showingSettings.toggle() }) {
                         Image(systemName: "gear")
@@ -47,6 +55,23 @@ struct ContentView: View {
             }
             .sheet(isPresented: $viewModel.showingSettings) {
                 SettingsView(viewModel: viewModel)
+            }
+            .sheet(isPresented: $viewModel.showingScanner) {
+                QRScannerView { code in
+                    // Returns 0 on a malformed/expired QR; the scanner dismisses
+                    // either way and the user can retry from the lock button.
+                    _ = viewModel.importSessionQR(code)
+                }
+            }
+            // Universal Link: tapping an invite https://relay…/v/<id>#<key> opens
+            // the app here. Fetch + decrypt + pair via the shared core, no scan.
+            .onOpenURL { url in
+                viewModel.importFromShareURL(url)
+            }
+            .sheet(isPresented: $viewModel.showingHostQR) {
+                if let json = viewModel.hostQRJSON {
+                    HostQRView(json: json, channel: viewModel.channel)
+                }
             }
         }
     }
@@ -82,10 +107,24 @@ struct ContentView: View {
                 Circle()
                     .fill(viewModel.statusColor)
                     .frame(width: 12, height: 12)
-                
+
                 Text(viewModel.statusText)
                     .font(.headline)
                     .foregroundColor(.stTextPrimary)
+            }
+
+            // Encryption / pairing status. Encryption is mandatory: until a QR is
+            // scanned there is no session key, so the device can neither transmit
+            // nor decode. Tap to open the scanner.
+            Button(action: { viewModel.showingScanner = true }) {
+                HStack(spacing: 6) {
+                    Image(systemName: viewModel.isPaired ? "lock.fill" : "lock.open")
+                    Text(viewModel.isPaired
+                         ? "Encrypted · ch \(String(format: "%02d", viewModel.channel))"
+                         : "Tap to scan pairing QR")
+                        .font(.caption)
+                }
+                .foregroundColor(viewModel.isPaired ? .stOnline : .stCoral)
             }
 
             // State indicator

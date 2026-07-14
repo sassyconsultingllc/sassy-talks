@@ -46,14 +46,23 @@ pub struct StateMachine {
     // resources they reference).
     tx_handle: Mutex<Option<JoinHandle<()>>>,
     rx_handle: Mutex<Option<JoinHandle<()>>>,
+    rx_shared: Arc<Mutex<audio_pipeline::RxSharedState>>,
     device_name: String,
     local_sender_id: String,
+    // Per-install unique salt mixed into local_sender_id. Without it the id was
+    // a pure hash of the DEVICE NAME, so two devices with the same name (both
+    // left on the default, or same model) derived IDENTICAL sender ids — the
+    // receiver then dropped every frame from the peer as its own echo
+    // (audio_pipeline process_frame: sender_id == local_sender_id) and never
+    // registered them: no audio, no roster entry, while epoch-keyed heartbeat
+    // toasts still fired. Set once at startup from Kotlin's InstallId.
+    install_salt: String,
 }
 
 impl StateMachine {
     pub fn new(ptt: Arc<AtomicBool>, channel: Arc<AtomicU8>, subchannel: Arc<AtomicU8>) -> Self {
         let device_name = "SassyTalkie-Android".to_string();
-        let local_sender_id = crate::users::UserRegistry::derive_user_id(device_name.as_bytes());
+        let local_sender_id = Self::derive_sender_id(&device_name, "");
 
         Self {
             state: Arc::new(Mutex::new(AppState::Initializing)),
@@ -68,9 +77,32 @@ impl StateMachine {
             rx_running: Arc::new(AtomicBool::new(false)),
             tx_handle: Mutex::new(None),
             rx_handle: Mutex::new(None),
+            rx_shared: Arc::new(Mutex::new(audio_pipeline::RxSharedState::new())),
             device_name,
             local_sender_id,
+            install_salt: String::new(),
         }
+    }
+
+    /// Sender-id derivation: device name + per-install salt. The id is opaque
+    /// to receivers (self-echo check, registry/cache key), so mixing the salt
+    /// is fully wire-compatible — it only has to be unique per device and
+    /// stable across restarts (favorites/mute are keyed on it).
+    fn derive_sender_id(name: &str, salt: &str) -> String {
+        let material = format!("{}|{}", name, salt);
+        crate::users::UserRegistry::derive_user_id(material.as_bytes())
+    }
+
+    /// Set the per-install unique id (Kotlin InstallId, stable across restarts,
+    /// unique per install). Re-derives local_sender_id so two devices sharing a
+    /// display name no longer collide. Call BEFORE transports connect.
+    pub fn set_install_id(&mut self, install_id: String) {
+        self.install_salt = install_id;
+        self.local_sender_id = Self::derive_sender_id(&self.device_name, &self.install_salt);
+        info!(
+            "StateMachine: install id set, local_sender_id re-derived to {}",
+            self.local_sender_id
+        );
     }
 
     pub fn initialize(&self) -> Result<(), String> {
@@ -133,6 +165,7 @@ impl StateMachine {
             Arc::clone(&self.transport),
             Arc::clone(&self.audio_cache),
             Arc::clone(&self.user_registry),
+            Arc::clone(&self.rx_shared),
             self.local_sender_id.clone(),
         ) {
             Ok(rx) => { *self.rx_handle.lock().unwrap() = Some(rx); }
@@ -248,12 +281,28 @@ impl StateMachine {
     /// Called by Kotlin JNI when the cellular WebSocket disconnects
     pub fn on_cellular_disconnected(&self, reason: &str) {
         info!("StateMachine: cellular disconnected: {}", reason);
-        self.stop_audio_threads();
 
-        {
+        // Update transport state first, then decide whether the shared audio
+        // threads still have a live IP path to serve. Stopping them
+        // unconditionally here silenced WiFi multicast audio in BOTH
+        // directions on every relay flap until the next reconnect event —
+        // start_audio_pipeline only runs from connect handlers, and WiFi
+        // never re-fires one because its socket never went down.
+        // (Transport lock is dropped before stop_audio_threads: the audio
+        // threads take that lock, so joining them while holding it would
+        // deadlock.)
+        let ip_still_live = {
             let mut transport = self.transport.lock().unwrap();
             transport.on_cellular_disconnected(reason);
+            transport.has_live_ip_transport()
+        };
+
+        if ip_still_live {
+            info!("StateMachine: cellular down but WiFi path still live — audio pipeline kept running");
+            return;
         }
+
+        self.stop_audio_threads();
 
         let current = *self.state.lock().unwrap();
         if current == AppState::Connected || current == AppState::Transmitting || current == AppState::Receiving {
@@ -308,12 +357,23 @@ impl StateMachine {
     /// Called by Kotlin JNI when Bluetooth RFCOMM disconnects.
     pub fn on_bluetooth_disconnected(&self) {
         info!("StateMachine: Bluetooth disconnected");
-        self.stop_audio_threads();
 
-        {
+        // Same guard as on_cellular_disconnected: BT is a parallel fallback
+        // plane (its audio runs through the Kotlin RFCOMM pump), so a BT peer
+        // dropping must not kill the shared TX/RX threads that carry WiFi and
+        // relay audio.
+        let ip_still_live = {
             let mut transport = self.transport.lock().unwrap();
             transport.on_bluetooth_disconnected();
+            transport.has_live_ip_transport()
+        };
+
+        if ip_still_live {
+            info!("StateMachine: Bluetooth down but an IP path is live — audio pipeline kept running");
+            return;
         }
+
+        self.stop_audio_threads();
 
         let current = *self.state.lock().unwrap();
         if current == AppState::Connected || current == AppState::Transmitting || current == AppState::Receiving {
@@ -414,7 +474,7 @@ impl StateMachine {
     pub fn set_device_name(&mut self, name: String) {
         info!("StateMachine: device name set to '{}'", name);
         self.device_name = name.clone();
-        self.local_sender_id = crate::users::UserRegistry::derive_user_id(name.as_bytes());
+        self.local_sender_id = Self::derive_sender_id(&name, &self.install_salt);
         // Update transport too
         let mut transport = self.transport.lock().unwrap();
         transport.set_device_name(&name);
@@ -452,6 +512,10 @@ impl StateMachine {
 
     pub fn get_user_registry(&self) -> &Arc<Mutex<UserRegistry>> {
         &self.user_registry
+    }
+
+    pub fn get_rx_shared(&self) -> &Arc<Mutex<audio_pipeline::RxSharedState>> {
+        &self.rx_shared
     }
 }
 

@@ -1,4 +1,4 @@
-﻿import java.util.Properties
+import java.util.Properties
 import java.io.FileInputStream
 
 plugins {
@@ -23,8 +23,8 @@ android {
         applicationId = "com.sassyconsulting.sassytalkie"
         minSdk = 24
         targetSdk = 35
-        versionCode = 45
-        versionName = "2.8.0"
+        versionCode = 56
+        versionName = "3.1.4"
         
         // Feature flag: enable or disable cellular (relay) transport at build time
         buildConfigField("boolean", "ENABLE_CELLULAR_RELAY", "true")
@@ -33,9 +33,26 @@ android {
         // so production builds can't be screen-recorded or screenshotted.
         // Override per-buildType is in the buildTypes blocks below.
         buildConfigField("boolean", "NO_SCREENSHOTS", "false")
+        // Relay worker license endpoints (direct activation + Play promo redemption).
+        buildConfigField("String", "LICENSE_API_BASE", "\"https://relay.sassyconsultingllc.com\"")
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
+        }
+    }
+
+    // Distribution flavors. Same applicationId for both so a user can migrate
+    // website APK → Play without losing data; the entitlement gate is the only
+    // code that differs (see src/play/... and src/direct/... Entitlements.kt).
+    flavorDimensions += "dist"
+    productFlavors {
+        create("play") {
+            dimension = "dist"
+            isDefault = true
+        }
+        create("direct") {
+            dimension = "dist"
+            versionNameSuffix = "-direct"
         }
     }
 
@@ -157,10 +174,15 @@ android {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.12.0")
+    // Play flavor only: Google Play Billing for the one-time unlock purchase.
+    // The direct flavor ships zero Google billing code.
+    "playImplementation"("com.android.billingclient:billing-ktx:7.1.1")
+
+    implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.core:core-splashscreen:1.0.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
     implementation("androidx.lifecycle:lifecycle-process:2.6.2")
-    implementation("androidx.activity:activity-compose:1.8.1")
+    implementation("androidx.activity:activity-compose:1.9.3")
     
     // Compose
     implementation(platform("androidx.compose:compose-bom:2023.10.01"))
@@ -213,15 +235,8 @@ dependencies {
     implementation("com.google.firebase:firebase-messaging-ktx")
 
     // Android Keystore-backed EncryptedSharedPreferences for session/key storage.
-    // Plain SharedPreferences is sandboxed to our UID but is cleartext on disk —
-    // any backup or rooted access would leak the session key.
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
-    
-    // AppCompat + Material + ConstraintLayout for legacy XML layouts
-    implementation("androidx.appcompat:appcompat:1.6.1")
-    implementation("com.google.android.material:material:1.9.0")
-    implementation("androidx.constraintlayout:constraintlayout:2.1.4")
-    
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")

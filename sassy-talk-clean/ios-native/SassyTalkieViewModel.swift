@@ -21,6 +21,13 @@ class SassyTalkieViewModel: ObservableObject {
     @Published var isConnected: Bool = false
     @Published var statusText: String = "Initializing..."
     @Published var showingSettings: Bool = false
+    @Published var showingScanner: Bool = false
+    @Published var showingHostQR: Bool = false
+    /// The QR JSON to render when hosting a channel (nil unless hosting).
+    @Published var hostQRJSON: String? = nil
+    /// True once a QR session is installed — audio is encrypted (mandatory) and
+    /// cross-platform on the paired channel. Until then TX refuses to send.
+    @Published var isPaired: Bool = false
     
     var version: String {
         let cString = sassytalkie_get_version()
@@ -42,9 +49,182 @@ class SassyTalkieViewModel: ObservableObject {
         }
     }
     
+    // MARK: - Crypto / PQC (parity with Android SassyTalkNative)
+
+    /// Install the QR pre-shared key (base64). Enables AES-256-GCM on the audio
+    /// path (TX encrypts, RX decrypts + replay-checks).
+    func setPsk(_ keyB64: String) -> Bool {
+        return keyB64.withCString { sassytalkie_set_psk($0) }
+    }
+
+    /// Import a scanned QR session (the host's QR JSON). Switches to the QR's
+    /// channel and installs its key using the SAME validation as Android, so the
+    /// pairing is genuinely cross-platform. Returns the channel (1-8) on success,
+    /// 0 on a malformed/expired QR. After success, audio is AES-256-GCM encrypted
+    /// both ways and an Android peer on that channel can hear this device.
+    @discardableResult
+    func importSessionQR(_ json: String) -> Int {
+        let ch = json.withCString { Int(sassytalkie_import_session_qr($0)) }
+        if ch > 0 {
+            DispatchQueue.main.async {
+                self.channel = UInt8(ch)
+                self.isPaired = true
+                self.showingScanner = false
+                self.statusText = "Paired · ch \(ch)"
+                // Bring up the relay for remote peers (room id was just set by
+                // the import). Local WiFi peers already work via multicast.
+                self.relayClient.connect()
+            }
+        }
+        return ch
+    }
+
+    // MARK: - Invite-link import (parity with Android SessionShareLink)
+
+    private static let relayHost = "relay.sassyconsultingllc.com"
+    private static let relayBase = "https://relay.sassyconsultingllc.com"
+
+    /// Import an encrypted session invite from a tapped Universal Link
+    /// `https://relay.sassyconsultingllc.com/v/<id>#<base64url-key>`: fetch the
+    /// opaque blob from `/share/<id>`, decrypt it through the SHARED Rust core
+    /// (`sassytalkie_decrypt_share_blob`), then import it exactly like a scanned
+    /// QR. The decryption key rides only in the URL fragment and is never sent to
+    /// the relay — the worker stores ciphertext it cannot read.
+    func importFromShareURL(_ url: URL) {
+        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            DispatchQueue.main.async { self.statusText = "Not a SassyTalk invite link" }
+            return
+        }
+        let isHttps = comps.scheme == "https" && comps.host == Self.relayHost && comps.path.hasPrefix("/v/")
+        let isApp = comps.scheme == "sassytalk" && comps.host == "v"
+        guard isHttps || isApp else {
+            DispatchQueue.main.async { self.statusText = "Not a SassyTalk invite link" }
+            return
+        }
+        let id = String(comps.path.dropFirst(isApp ? 1 : "/v/".count))
+        guard Self.isValidShareID(id) else {
+            DispatchQueue.main.async { self.statusText = "Malformed invite link" }
+            return
+        }
+        // base64url has no percent-escapes, so the (already percent-decoded)
+        // fragment is the key verbatim.
+        guard let key = comps.fragment, !key.isEmpty else {
+            DispatchQueue.main.async { self.statusText = "Invite link is missing its key" }
+            return
+        }
+        guard let fetchURL = URL(string: "\(Self.relayBase)/share/\(id)") else { return }
+
+        DispatchQueue.main.async { self.statusText = "Opening invite…" }
+        URLSession.shared.dataTask(with: fetchURL) { [weak self] data, response, error in
+            guard let self = self else { return }
+            if let error = error {
+                DispatchQueue.main.async { self.statusText = "Network error: \(error.localizedDescription)" }
+                return
+            }
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if code == 404 { DispatchQueue.main.async { self.statusText = "Invite already used or expired" }; return }
+            if code == 429 { DispatchQueue.main.async { self.statusText = "Too many requests; try later" }; return }
+            guard (200..<300).contains(code), let blob = data, !blob.isEmpty else {
+                DispatchQueue.main.async { self.statusText = "Server returned HTTP \(code)" }
+                return
+            }
+            // Decrypt via the shared core (same accept/reject as Android & desktop).
+            let json: String? = blob.withUnsafeBytes { raw -> String? in
+                guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return nil }
+                guard let cstr = key.withCString({ keyPtr in
+                    sassytalkie_decrypt_share_blob(base, blob.count, keyPtr)
+                }) else { return nil }
+                defer { sassytalkie_free_string(cstr) }
+                return String(cString: cstr)
+            }
+            guard let sessionJSON = json, !sessionJSON.isEmpty else {
+                DispatchQueue.main.async { self.statusText = "Couldn't decrypt invite (link wrong or expired)" }
+                return
+            }
+            // importSessionQR hops to main, flips isPaired, and connects the relay.
+            if self.importSessionQR(sessionJSON) == 0 {
+                DispatchQueue.main.async { self.statusText = "Invite session was invalid" }
+            }
+        }.resume()
+    }
+
+    /// The worker's share-id alphabet/length (share.js ID_RE): base64url, 16–64.
+    private static func isValidShareID(_ id: String) -> Bool {
+        let len = id.count
+        guard len >= 16, len <= 64 else { return false }
+        return id.allSatisfy { c in
+            (c.isASCII && (c.isLetter || c.isNumber)) || c == "_" || c == "-"
+        }
+    }
+
+    /// Host the current channel: mint a fresh QR (installs our own key so the host
+    /// is paired too) and publish the JSON to render for a joiner to scan. The QR
+    /// is cross-platform — an Android device can scan it to join the same channel.
+    func hostChannel(durationHours: UInt32 = 24, groupName: String = "") {
+        let ch = channel
+        let json: String? = groupName.withCString { gp in
+            guard let c = sassytalkie_generate_session_qr(ch, durationHours, gp) else { return nil }
+            defer { sassytalkie_free_string(c) }
+            return String(cString: c)
+        }
+        if let json = json {
+            DispatchQueue.main.async {
+                self.isPaired = true
+                self.hostQRJSON = json
+                self.showingHostQR = true
+                self.statusText = "Hosting · ch \(ch)"
+                // Host the relay room too so remote joiners can reach us.
+                self.relayClient.connect()
+            }
+        }
+    }
+
+    /// This build's capability bitmap (hybrid-PQC support).
+    func localCapabilities() -> UInt8 {
+        return sassytalkie_local_capabilities()
+    }
+
+    /// Begin a classical X25519 key exchange. Returns our base64 public key, or nil.
+    func keyExchangeInit() -> String? {
+        guard let c = sassytalkie_key_exchange_init() else { return nil }
+        defer { sassytalkie_free_string(c) }
+        return String(cString: c)
+    }
+
+    /// Complete the classical key exchange with the peer's base64 public key.
+    func keyExchangeComplete(_ remoteB64: String) -> Bool {
+        return remoteB64.withCString { sassytalkie_key_exchange_complete($0) }
+    }
+
+    /// Initiator: begin a path-(a) hybrid PQC handshake. Returns the base64
+    /// initiator message to send to the peer, or nil if no PSK is installed.
+    func hybridHandshakeInit() -> String? {
+        guard let c = sassytalkie_hybrid_handshake_init() else { return nil }
+        defer { sassytalkie_free_string(c) }
+        return String(cString: c)
+    }
+
+    /// Responder: install the session from the peer's base64 initiator message
+    /// and return the base64 responder message to send back, or nil on failure.
+    func hybridHandshakeRespond(_ initB64: String) -> String? {
+        return initB64.withCString { initPtr -> String? in
+            guard let c = sassytalkie_hybrid_handshake_respond(initPtr) else { return nil }
+            defer { sassytalkie_free_string(c) }
+            return String(cString: c)
+        }
+    }
+
+    /// Initiator: complete with the peer's base64 reply, installing the PQ session.
+    func hybridHandshakeComplete(_ respB64: String) -> Bool {
+        return respB64.withCString { sassytalkie_hybrid_handshake_complete($0) }
+    }
+
     // MARK: - Private Properties
-    
+
     private let audioManager = AudioManager()
+    /// Cloudflare relay client for remote peers. Auto-joins on pairing (mirrors
+    /// Android's AutoConnectManager bringing the relay up alongside WiFi).
+    private let relayClient = RelayClient()
     private var stateTimer: Timer?
     
     // MARK: - Initialization
@@ -71,6 +251,7 @@ class SassyTalkieViewModel: ObservableObject {
     
     deinit {
         stateTimer?.invalidate()
+        relayClient.disconnect()
         sassytalkie_shutdown()
     }
     

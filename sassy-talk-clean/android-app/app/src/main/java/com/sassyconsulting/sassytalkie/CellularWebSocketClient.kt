@@ -37,6 +37,18 @@ class CellularWebSocketClient {
         private const val POLL_INTERVAL_MS = 2L
         private const val PING_INTERVAL_SEC = 15L
         private const val MAX_RECONNECT_ATTEMPTS = 8
+        // After the fast exponential retries, keep trying at this fixed floor
+        // instead of giving up, so an outage longer than the first 8 attempts
+        // still self-heals once connectivity returns (a successful connect
+        // resets the attempt counter).
+        private const val RECONNECT_FLOOR_MS = 60_000L
+        // The relay force-closes (1008) a socket exceeding ~120 msg/s. Pace the
+        // outbound drain under that so a post-stall burst can't trip it.
+        private const val MAX_SENDS_PER_SEC = 100
+        // The relay DO reaps any socket silent for >8s (1001 "Heartbeat stale").
+        // Send a keepalive comfortably under that when nothing else is (see
+        // sendKeepAlive) so a relay-only device doesn't flap-reconnect endlessly.
+        private const val KEEPALIVE_INTERVAL_MS = 4_000L
 
         /**
          * OkHttpClient is expensive (dispatcher + connection pool + thread pools)
@@ -55,7 +67,19 @@ class CellularWebSocketClient {
     private val isConnected = AtomicBoolean(false)
     private val isRunning = AtomicBoolean(false)
     private val reconnectAttempts = AtomicInteger(0)
+    // Set by disconnect(), cleared by an explicit connect(). While true, every
+    // reconnect path is inert. This replaces the old "poison the attempt
+    // counter" trick, which stopped working when scheduleReconnect gained the
+    // never-give-up floor: a torn-down client would resurrect 60s later as a
+    // second socket in the room, stealing outbound frames, duplicating inbound
+    // ones, and flapping the shared native transport state on every DO reap.
+    private val closed = AtomicBoolean(false)
     private var outboundThread: Thread? = null
+
+    // Outbound send-rate window — single-thread state, touched only by the
+    // outbound pump (see paceSend).
+    private var sendWindowStart = 0L
+    private var sendWindowCount = 0
 
     /**
      * Single-slot scheduler for reconnect attempts. Previously each failure
@@ -69,6 +93,17 @@ class CellularWebSocketClient {
             Thread(r, "cellular-reconnect").apply { isDaemon = true }
         }
     private var pendingReconnect: ScheduledFuture<*>? = null
+
+    // Relay keepalive — decouples socket liveness from Bluetooth. The real
+    // heartbeat lives on PttCoordinator (only created when BT is initialised),
+    // so a relay-only device would otherwise go silent and get reaped every 8s.
+    private val keepAliveScheduler: ScheduledExecutorService =
+        Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "cellular-keepalive").apply { isDaemon = true }
+        }
+    private var keepAliveTask: ScheduledFuture<*>? = null
+    private val keepAliveEpoch: Long = System.currentTimeMillis()
+    private val keepAliveSeq = AtomicInteger(0)
 
     /** Callback for DO readiness confirmation. */
     var onRelayReady: (() -> Unit)? = null
@@ -86,6 +121,15 @@ class CellularWebSocketClient {
 
     /** Connect to the cellular relay. Room must be set first via SassyTalkNative.cellularSetRoom() */
     fun connect(): Boolean {
+        // An explicit connect() revives a client that was disconnect()ed
+        // (WalkieService.forceCellularReconnect does exactly this on room
+        // changes). Fresh backoff state too — otherwise one transient auth
+        // failure right after the forced reconnect lands on the 60s floor
+        // instead of the 3s fast retry, and a share-link joiner sits dead
+        // in the old room for a minute.
+        if (closed.getAndSet(false)) {
+            reconnectAttempts.set(0)
+        }
         if (isConnected.get()) {
             Log.w(TAG, "Already connected")
             return true
@@ -119,6 +163,12 @@ class CellularWebSocketClient {
                 scheduleReconnect("auth failure: ${err?.message}")
                 return@authorizeWsUrlAsync
             }
+            // disconnect() may have raced the auth round-trip — don't open a
+            // socket for a client that was torn down while we were fetching.
+            if (closed.get()) {
+                Log.i(TAG, "Auth completed after disconnect — not opening socket")
+                return@authorizeWsUrlAsync
+            }
             openWebSocketAuthenticated(wsUrl)
         }
 
@@ -139,6 +189,7 @@ class CellularWebSocketClient {
                 reconnectAttempts.set(0)
                 SassyTalkNative.cellularOnConnected()
                 startOutboundPump()
+                startKeepAlive()
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
@@ -168,12 +219,33 @@ class CellularWebSocketClient {
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                // Text message = control (peer_joined, peer_left, welcome, pong, etc.)
-                Log.d(TAG, "Control: $text")
-                // Parse "welcome" message as DO readiness confirmation
-                if (text.contains("\"welcome\"") || text.contains("\"type\":\"welcome\"")) {
-                    Log.i(TAG, "DO welcome received — relay is ready")
-                    onRelayReady?.invoke()
+                if (BuildConfig.DEBUG) Log.d(TAG, "Control: $text")
+                try {
+                    val obj = JSONObject(text)
+                    when (obj.optString("type")) {
+                        "welcome" -> {
+                            Log.i(TAG, "DO welcome received — relay is ready")
+                            onRelayReady?.invoke()
+                        }
+                        "peer_joined" -> {
+                            val device = obj.optString("device", "Peer")
+                            val clientId = obj.optString("client_id", "")
+                            val peerKey = when {
+                                clientId.isNotEmpty() -> "relay:$clientId"
+                                device.isNotEmpty() -> "relay:peer:$device"
+                                else -> return
+                            }
+                            pttCoordinator?.onRelayPeerSeen(peerKey, device)
+                        }
+                        "peer_left" -> {
+                            val clientId = obj.optString("client_id", "")
+                            if (clientId.isNotEmpty()) {
+                                pttCoordinator?.onRelayPeerGone("relay:$clientId")
+                            }
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "control parse failed: ${t.message}")
                 }
             }
 
@@ -203,9 +275,11 @@ class CellularWebSocketClient {
     /** Disconnect from the relay */
     fun disconnect() {
         Log.i(TAG, "Disconnecting")
-        // User-initiated disconnect must not be overridden by an auto-reconnect.
+        // User-initiated disconnect must not be overridden by an auto-reconnect
+        // — including the one onClosed() fires when the close handshake for
+        // THIS disconnect completes a moment from now.
+        closed.set(true)
         cancelPendingReconnect()
-        reconnectAttempts.set(MAX_RECONNECT_ATTEMPTS + 1) // poison the backoff
         stopOutboundPump()
         webSocket?.close(1000, "user disconnect")
         webSocket = null
@@ -218,15 +292,26 @@ class CellularWebSocketClient {
      * one reconnect in flight concurrently.
      */
     private fun scheduleReconnect(cause: String) {
-        val attempt = reconnectAttempts.incrementAndGet()
-        if (attempt > MAX_RECONNECT_ATTEMPTS) {
-            Log.w(TAG, "Max reconnect attempts reached ($cause), giving up")
+        // A disconnect()ed client must stay down until someone explicitly
+        // calls connect() on it again. Without this, the graceful-close
+        // callback for the disconnect itself re-arms a reconnect and the
+        // discarded instance comes back as a zombie socket.
+        if (closed.get()) {
+            Log.d(TAG, "Reconnect suppressed ($cause): client is closed")
             return
         }
-        val delayMs = minOf(3_000L * (1L shl (attempt - 1).coerceAtMost(4)), 60_000L)
+        val attempt = reconnectAttempts.incrementAndGet()
+        // Don't give up after the fast retries — fall back to a fixed long
+        // interval so a prolonged outage still recovers on its own once
+        // connectivity returns (a successful connect resets the counter).
+        val delayMs = if (attempt <= MAX_RECONNECT_ATTEMPTS) {
+            minOf(3_000L * (1L shl (attempt - 1).coerceAtMost(4)), 60_000L)
+        } else {
+            RECONNECT_FLOOR_MS
+        }
         cancelPendingReconnect()
         pendingReconnect = reconnectScheduler.schedule({
-            if (!isConnected.get()) {
+            if (!isConnected.get() && !closed.get()) {
                 Log.i(TAG, "Reconnecting ($cause, attempt $attempt, delay ${delayMs}ms)…")
                 try { connect() } catch (e: Exception) {
                     Log.w(TAG, "Reconnect attempt $attempt threw: ${e.message}")
@@ -244,6 +329,31 @@ class CellularWebSocketClient {
 
     // ── Outbound pump: polls Rust queue and sends via WebSocket ──
 
+    /**
+     * Throttle outbound sends to [MAX_SENDS_PER_SEC]. Normal 50 fps audio never
+     * hits it; a post-stall burst (many queued frames flushing at once) would
+     * otherwise exceed the relay's ~120 msg/s cap and get the socket 1008-closed.
+     * Runs on the outbound thread, so a short Thread.sleep here is fine.
+     */
+    private fun paceSend() {
+        val now = System.currentTimeMillis()
+        if (now - sendWindowStart >= 1000L) {
+            sendWindowStart = now
+            sendWindowCount = 0
+        }
+        sendWindowCount++
+        if (sendWindowCount > MAX_SENDS_PER_SEC) {
+            val remaining = 1000L - (System.currentTimeMillis() - sendWindowStart)
+            if (remaining > 0) {
+                try { Thread.sleep(remaining) } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+            sendWindowStart = System.currentTimeMillis()
+            sendWindowCount = 1
+        }
+    }
+
     private fun startOutboundPump() {
         if (isRunning.getAndSet(true)) return
 
@@ -260,6 +370,7 @@ class CellularWebSocketClient {
                     while (isRunning.get() && isConnected.get()) {
                         val packet = SassyTalkNative.cellularPollOutbound() ?: break
                         if (packet.isEmpty()) break
+                        paceSend()
                         webSocket?.send(ByteString.of(*packet))
                         sentAny = true
                     }
@@ -286,6 +397,7 @@ class CellularWebSocketClient {
     }
 
     private fun onDisconnected(reason: String) {
+        stopKeepAlive()
         if (isConnected.getAndSet(false)) {
             stopOutboundPump()
             SassyTalkNative.cellularOnDisconnected(reason)
@@ -300,6 +412,58 @@ class CellularWebSocketClient {
     /** Send a heartbeat ping to the relay (JSON control message) */
     fun sendPing() {
         webSocket?.send("""{"type":"ping"}""")
+    }
+
+    // ── Keepalive: keep the relay socket alive independent of Bluetooth ──
+
+    private fun startKeepAlive() {
+        stopKeepAlive()
+        keepAliveTask = keepAliveScheduler.scheduleWithFixedDelay(
+            {
+                try { sendKeepAlive() } catch (e: Exception) {
+                    Log.w(TAG, "keepalive send failed: ${e.message}")
+                }
+            },
+            KEEPALIVE_INTERVAL_MS, KEEPALIVE_INTERVAL_MS, TimeUnit.MILLISECONDS,
+        )
+    }
+
+    private fun stopKeepAlive() {
+        keepAliveTask?.cancel(false)
+        keepAliveTask = null
+    }
+
+    /**
+     * The relay Durable Object closes any socket that goes >8s without a message
+     * ("Heartbeat stale", 1001). The app's real heartbeat lives on PttCoordinator,
+     * which only exists once Bluetooth is initialised — so a relay-only device
+     * (BT off, no permission, or no BT peers) never heartbeats and gets reaped +
+     * reconnected every ~8s. When no PttCoordinator loop is covering liveness,
+     * send a heartbeat ourselves so the socket stays up. It MUST be a binary
+     * control frame (OP_HEARTBEAT) — that's what refreshes the DO's liveness; a
+     * text ping would not, and any binary frame is safely routed to control (not
+     * decoded as audio) by receiving peers.
+     */
+    private fun sendKeepAlive() {
+        if (!isConnected.get()) return
+        // PttCoordinator's own 2s heartbeat already keeps the socket alive —
+        // but only when the coordinator is actually pumping heartbeats through
+        // THIS client. A bare `pttCoordinator != null` check was wrong: after
+        // tearDownCellularClient() re-wires coord.cellularClient to a new
+        // instance (or the coordinator is shut down), the stale back-reference
+        // kept suppressing our keepalive while no heartbeats flowed on this
+        // socket, and the DO reaped it every 8s ("Heartbeat stale" flap).
+        // Checked each fire because the wiring can change at any time.
+        if (pttCoordinator?.cellularClient === this) return
+        val frame = ControlFrame.encodeHeartbeat(
+            keepAliveEpoch,
+            keepAliveSeq.getAndIncrement(),
+            System.currentTimeMillis(),
+            PresenceState.IDLE,
+            0,
+            SassyTalkNative.localCapabilities(),
+        )
+        webSocket?.send(ByteString.of(*frame))
     }
 
     /**

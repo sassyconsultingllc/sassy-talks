@@ -35,6 +35,7 @@ pub mod cellular_transport;
 // / `crate::audio_cache::*` import paths in the rest of android-native keep
 // working without a sweeping change.
 pub use sassytalkie_core::crypto;
+pub use sassytalkie_core::pqc;
 pub use sassytalkie_core::audio_cache;
 pub use sassytalkie_core::cohort_history;
 pub use sassytalkie_core::protocol;

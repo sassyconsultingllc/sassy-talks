@@ -133,6 +133,33 @@ fn combine_secrets(x25519_shared: &[u8], mlkem_shared: &[u8]) -> Zeroizing<[u8; 
     key
 }
 
+/// HKDF domain-separation tag for the PSK-authenticated hybrid combiner (path a).
+/// Distinct from both the pskless hybrid tag and crypto.rs's AEAD tag.
+const HYBRID_PSK_HKDF_INFO: &[u8] = b"sassytalkie-psk-hybrid-pqc-v1";
+
+/// Path (a) combiner: mix the QR pre-shared key in WITH the ephemeral hybrid
+/// secrets. `ikm = psk || x25519_shared || mlkem_shared`, run through HKDF-SHA256.
+///
+/// This is a PSK-authenticated key agreement: the QR PSK proves both sides
+/// scanned the same invite (authentication + binds the session to the pairing),
+/// while the ephemeral X25519+ML-KEM halves add forward secrecy AND post-quantum
+/// protection. The result is secure if the PSK is secret AND at least one of the
+/// two ephemeral primitives holds — and crucially, a LATER compromise of the PSK
+/// does not expose past sessions, because the ephemeral secrets are gone (forward
+/// secrecy). Concatenation (not XOR) keeps the combiner a sound dual/tri-PRF.
+fn combine_secrets_with_psk(psk: &[u8; 32], x25519_shared: &[u8], mlkem_shared: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut ikm = Zeroizing::new(Vec::with_capacity(32 + x25519_shared.len() + mlkem_shared.len()));
+    ikm.extend_from_slice(psk);
+    ikm.extend_from_slice(x25519_shared);
+    ikm.extend_from_slice(mlkem_shared);
+
+    let hk = Hkdf::<Sha256>::new(None, &ikm);
+    let mut key = Zeroizing::new([0u8; 32]);
+    hk.expand(HYBRID_PSK_HKDF_INFO, &mut *key)
+        .expect("HKDF expand of 32 bytes cannot fail");
+    key
+}
+
 /// The initiator's public handshake message: X25519 public key followed by the
 /// ML-KEM-768 encapsulation key. This is what the initiator transmits first.
 #[derive(Clone)]
@@ -315,6 +342,81 @@ pub fn respond(initiator: &HybridInitiatorMessage) -> Result<(HybridResponderMes
     Ok((response, CryptoSession::from_psk(&key)))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Path (a): QR-PSK-authenticated hybrid handshake.
+//
+// The primary Android pairing flow shares a static 32-byte PSK via the QR code.
+// On its own that PSK gives authentication but no forward secrecy and no quantum
+// resistance. These types run an ephemeral hybrid handshake ON TOP of that PSK
+// bootstrap so the live session key is forward-secret + PQ-protected while still
+// bound to the QR pairing. Mirrors `HybridKeyExchange`/`respond` but feeds the
+// PSK into the combiner (see `combine_secrets_with_psk`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Initiator side of the PSK-authenticated hybrid handshake. Wraps a
+/// `HybridKeyExchange` and carries the QR PSK (zeroized on drop) until the
+/// responder's reply arrives.
+pub struct PskHybridInitiator {
+    psk: Zeroizing<[u8; 32]>,
+    hkx: HybridKeyExchange,
+}
+
+impl PskHybridInitiator {
+    /// Start a PSK-authenticated hybrid exchange. `psk` is the QR pre-shared key.
+    pub fn new(psk: &[u8; 32]) -> Self {
+        Self { psk: Zeroizing::new(*psk), hkx: HybridKeyExchange::new() }
+    }
+
+    /// The public message to send to the responder (identical wire shape to the
+    /// pskless hybrid initiator message — the PSK is never transmitted).
+    pub fn initiator_message(&self) -> HybridInitiatorMessage {
+        self.hkx.initiator_message()
+    }
+
+    /// Complete on the initiator side using the responder's reply. Consumes self.
+    pub fn complete(self, response: &HybridResponderMessage) -> Result<CryptoSession, String> {
+        // Destructure to move the one-shot secrets out (HybridKeyExchange has no
+        // Drop impl, so this is allowed and the moved fields still zeroize).
+        let PskHybridInitiator { psk, hkx } = self;
+        let HybridKeyExchange { x25519_secret, mlkem_dk, .. } = hkx;
+
+        let their_public = PublicKey::from(response.x25519_public);
+        let x25519_shared = x25519_secret.diffie_hellman(&their_public);
+
+        let ct = decode_mlkem_ciphertext(&response.mlkem_ciphertext)?;
+        let mlkem_shared = mlkem_dk.decapsulate(&ct);
+
+        let key = combine_secrets_with_psk(&psk, x25519_shared.as_bytes(), mlkem_shared.as_slice());
+        info!("PSK-authenticated hybrid key agreement completed (initiator)");
+        Ok(CryptoSession::from_psk(&key))
+    }
+}
+
+/// Responder side of the PSK-authenticated hybrid handshake, in one shot. Given
+/// the QR PSK and the initiator's message, encapsulates + DHs, mixes in the PSK,
+/// and returns the reply to send back plus the established session.
+pub fn psk_hybrid_respond(
+    psk: &[u8; 32],
+    initiator: &HybridInitiatorMessage,
+) -> Result<(HybridResponderMessage, CryptoSession), String> {
+    let our_secret = EphemeralSecret::random_from_rng(OsRng);
+    let our_x25519_public = *PublicKey::from(&our_secret).as_bytes();
+    let their_public = PublicKey::from(initiator.x25519_public);
+    let x25519_shared = our_secret.diffie_hellman(&their_public);
+
+    let ek = decode_mlkem_encaps_key(&initiator.mlkem_encaps_key)?;
+    let (ct, mlkem_shared) = ek.encapsulate();
+
+    let key = combine_secrets_with_psk(psk, x25519_shared.as_bytes(), mlkem_shared.as_slice());
+    info!("PSK-authenticated hybrid key agreement completed (responder)");
+
+    let response = HybridResponderMessage {
+        x25519_public: our_x25519_public,
+        mlkem_ciphertext: ct.as_slice().to_vec(),
+    };
+    Ok((response, CryptoSession::from_psk(&key)))
+}
+
 /// Decode a serialized ML-KEM-768 encapsulation key, length-checking first so a
 /// hostile/truncated buffer is rejected with a clear error rather than a panic.
 fn decode_mlkem_encaps_key(bytes: &[u8]) -> Result<EncapsulationKey<MlKem768>, String> {
@@ -361,6 +463,17 @@ pub enum KexSuite {
     Hybrid,
 }
 
+/// Capability bit, carried in the heartbeat capabilities bitmap, advertising that
+/// this peer can speak the hybrid X25519 + ML-KEM-768 key exchange.
+///
+/// The capabilities byte is transmitted as 0 by every existing build (see
+/// `ControlFrame.encodeHeartbeat(..., 0)`), so introducing this bit is strictly
+/// backward-compatible: a peer that doesn't set it advertises hybrid=false, and
+/// `negotiate` then lands both sides on `Classical` — exactly today's behavior.
+/// Upgraded peers set the bit and transparently gain PQ protection with each
+/// other while still interoperating with old peers.
+pub const CAP_HYBRID_PQC: u8 = 0x01;
+
 impl KexSuite {
     /// Select the suite for a handshake given whether each side supports hybrid.
     ///
@@ -375,10 +488,26 @@ impl KexSuite {
         }
     }
 
+    /// Negotiate directly from the two peers' raw capability bitmaps (the byte
+    /// carried in the heartbeat). Reads [`CAP_HYBRID_PQC`] from each side and
+    /// applies the same both-must-support rule as [`negotiate`].
+    pub fn from_capabilities(local_caps: u8, peer_caps: u8) -> KexSuite {
+        KexSuite::negotiate(
+            local_caps & CAP_HYBRID_PQC != 0,
+            peer_caps & CAP_HYBRID_PQC != 0,
+        )
+    }
+
     /// Whether this suite is the post-quantum hybrid one.
     pub fn is_hybrid(self) -> bool {
         matches!(self, KexSuite::Hybrid)
     }
+}
+
+/// The local capabilities byte this build advertises in its heartbeat. Today
+/// that is just hybrid-PQC support; future capability bits OR into this.
+pub fn local_capabilities() -> u8 {
+    CAP_HYBRID_PQC
 }
 
 /// Explicit classical fallback: perform a plain X25519 ECDH and return both the
@@ -465,6 +594,72 @@ mod tests {
         let mut resp_session = resp_session;
         let ct = resp_session.encrypt(b"frame").unwrap();
         assert!(init_session.decrypt(&ct).is_err(), "tampered X25519 key must break the key");
+    }
+
+    #[test]
+    fn test_psk_hybrid_round_trip() {
+        // Path (a): both sides derive the identical session from the same QR PSK
+        // plus the ephemeral hybrid handshake; a frame must cross both ways.
+        let psk = crate::crypto::generate_psk();
+        let initiator = PskHybridInitiator::new(&psk);
+        let init_msg = initiator.initiator_message();
+
+        let (resp_msg, mut resp_session) = psk_hybrid_respond(&psk, &init_msg).unwrap();
+        let mut init_session = initiator.complete(&resp_msg).unwrap();
+
+        let ct = init_session.encrypt(b"psk+pq audio frame").unwrap();
+        assert_eq!(resp_session.decrypt(&ct).unwrap(), b"psk+pq audio frame");
+        let ct2 = resp_session.encrypt(b"reverse").unwrap();
+        assert_eq!(init_session.decrypt(&ct2).unwrap(), b"reverse");
+    }
+
+    #[test]
+    fn test_psk_binding_wrong_psk_diverges() {
+        // Same hybrid handshake material, but a different PSK on the responder →
+        // the derived keys diverge, so the session can't decrypt. Proves the QR
+        // PSK is genuinely authenticating the pairing (not just the hybrid DH).
+        let psk_a = crate::crypto::generate_psk();
+        let psk_b = crate::crypto::generate_psk();
+        let initiator = PskHybridInitiator::new(&psk_a);
+        let init_msg = initiator.initiator_message();
+
+        let (resp_msg, mut resp_session) = psk_hybrid_respond(&psk_b, &init_msg).unwrap();
+        let init_session = initiator.complete(&resp_msg).unwrap();
+
+        let ct = resp_session.encrypt(b"frame").unwrap();
+        assert!(init_session.decrypt(&ct).is_err(), "different PSK must break the session");
+    }
+
+    #[test]
+    fn test_psk_changes_the_derived_key() {
+        // The PSK combiner must actually fold the PSK in: same ephemeral secrets,
+        // different PSK ⇒ different key; and PSK path ≠ pskless path.
+        let x = [7u8; 32];
+        let m = [9u8; 32];
+        let with_a = combine_secrets_with_psk(&[3u8; 32], &x, &m);
+        let with_b = combine_secrets_with_psk(&[4u8; 32], &x, &m);
+        let pskless = combine_secrets(&x, &m);
+        assert_ne!(*with_a, *with_b, "different PSK must change the key");
+        assert_ne!(*with_a, *pskless, "PSK path must differ from pskless path");
+    }
+
+    #[test]
+    fn test_negotiate_from_capability_bitmaps() {
+        let none = 0u8;
+        let hybrid = CAP_HYBRID_PQC;
+        // Both advertise hybrid → Hybrid.
+        assert_eq!(KexSuite::from_capabilities(hybrid, hybrid), KexSuite::Hybrid);
+        // Either side missing the bit → Classical (backward-compatible fallback).
+        assert_eq!(KexSuite::from_capabilities(hybrid, none), KexSuite::Classical);
+        assert_eq!(KexSuite::from_capabilities(none, hybrid), KexSuite::Classical);
+        // The all-zero capabilities every existing build sends → Classical.
+        assert_eq!(KexSuite::from_capabilities(none, none), KexSuite::Classical);
+        // Unrelated capability bits set alongside hybrid must not disturb it.
+        assert_eq!(KexSuite::from_capabilities(hybrid | 0x80, hybrid | 0x40), KexSuite::Hybrid);
+        // Unrelated bits WITHOUT the hybrid bit must not be misread as hybrid.
+        assert_eq!(KexSuite::from_capabilities(0xFE, 0xFE), KexSuite::Classical);
+        // This build advertises hybrid support.
+        assert!(local_capabilities() & CAP_HYBRID_PQC != 0);
     }
 
     #[test]

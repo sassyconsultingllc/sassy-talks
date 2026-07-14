@@ -6,21 +6,30 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.net.Uri
 import android.util.Log
+import android.util.Rational
 import android.view.KeyEvent
 import android.view.WindowManager
+import android.app.PictureInPictureParams
 import androidx.activity.ComponentActivity
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -33,6 +42,8 @@ import com.sassyconsulting.sassytalkie.debug.DiagnosticsPrefs
 import com.sassyconsulting.sassytalkie.input.HardwarePttController
 import com.sassyconsulting.sassytalkie.ui.theme.SassyTalkTheme
 import com.sassyconsulting.sassytalkie.ui.AppNavigation
+import com.sassyconsulting.sassytalkie.ui.PipRadioOverlay
+import com.sassyconsulting.sassytalkie.ui.theme.BgDark
 
 /**
  * Main activity — handles permission sequencing and foreground service lifecycle.
@@ -56,12 +67,14 @@ class MainActivity : ComponentActivity() {
     val permissionsGranted = mutableStateOf(false)
     val walkieService = mutableStateOf<WalkieService?>(null)
     val pendingShareUri = mutableStateOf<android.net.Uri?>(null)
+    val inPictureInPictureMode = mutableStateOf(false)
+    /** True while the main radio screen is active — enables auto-PiP on home press. */
+    val pipEligible = mutableStateOf(false)
 
     // ── Hardware push-to-talk ──
-    // Routes physical PTT buttons + Bluetooth PTT accessories (media buttons)
-    // to SassyTalkNative.pttStart()/pttStop(). Created in onCreate, armed in
-    // onStart, disarmed in onStop. Key events are delegated from the
-    // onKeyDown/onKeyUp overrides below.
+    // Routes physical PTT buttons + Bluetooth PTT accessories through the
+    // PttCoordinator (BLE wake, RFCOMM pump, reach watchdog). Created in
+    // onCreate, armed in onStart, disarmed in onStop.
     private val hardwarePtt: HardwarePttController by lazy { HardwarePttController(this) }
 
     private val requiredPermissions: Array<String>
@@ -113,17 +126,26 @@ class MainActivity : ComponentActivity() {
     // ── Activity lifecycle ──
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        installSplashScreen()
         super.onCreate(savedInstanceState)
+
+        // Edge-to-edge with the non-deprecated API (window.statusBarColor /
+        // navigationBarColor are deprecated as of API 35). The app is
+        // always-dark, so force dark bars; the transparent scrim lets the
+        // Compose background draw full-bleed behind them. Content is kept
+        // clear of the bars by safeDrawing padding on the root Box below.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
 
         // Diagnostics overlay toggle — persisted, honoured in release builds.
         DiagnosticsPrefs.init(this)
 
-        // Block screenshots, screen recording, and app preview in recent apps
+        // Block screenshots on the live radio screen; Auth/QR screens re-enable
+        // capture via setScreenshotsAllowed() so users can photograph QR codes.
         if (BuildConfig.NO_SCREENSHOTS) {
-            window.setFlags(
-                WindowManager.LayoutParams.FLAG_SECURE,
-                WindowManager.LayoutParams.FLAG_SECURE
-            )
+            setScreenshotsAllowed(false)
         }
 
         // Capture the initial deep-link URI if we were launched via VIEW intent.
@@ -131,33 +153,41 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             SassyTalkTheme {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
+                val pipActive by inPictureInPictureMode
+                val hwTransmitting by hardwarePtt.transmitting.collectAsState()
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(BgDark)
+                        .windowInsetsPadding(WindowInsets.safeDrawing),
                 ) {
-                    Box(modifier = Modifier.fillMaxSize()) {
+                    if (pipActive) {
+                        PipRadioOverlay(isTransmitting = hwTransmitting)
+                    } else {
                         AppNavigation(
                             permissionsGranted = permissionsGranted.value,
                             walkieService = walkieService.value,
                             onRequestPermissions = { requestAllPermissions() },
                             pendingShareUri = pendingShareUri.value,
                             onShareConsumed = { pendingShareUri.value = null },
+                            onPipEligibilityChanged = { eligible ->
+                                pipEligible.value = eligible
+                                updatePipAutoEnter()
+                            },
                         )
-                        // Audio + network diagnostics overlay. Driven by
-                        // com.sassyconsulting.sassytalkie.debug.AudioTelemetry,
-                        // which the PttAudioPipeline and WalkieService feed.
-                        // Shown in debug builds, OR in any build (incl. release)
-                        // when the user enables it via Settings → Diagnostics —
-                        // for on-the-go field testing. Tap to collapse/expand.
-                        val diagOn by DiagnosticsPrefs.overlayEnabled.collectAsState()
-                        if (BuildConfig.DEBUG || diagOn) {
-                            DebugOverlay(
-                                modifier = Modifier
-                                    .align(Alignment.TopEnd)
-                                    .padding(8.dp)
-                                    .width(280.dp)
-                            )
-                        }
+                    }
+                    val diagOn by DiagnosticsPrefs.overlayEnabled.collectAsState()
+                    if (!pipActive && (BuildConfig.DEBUG || diagOn)) {
+                        DebugOverlay(
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                // Clear the top toolbar (channel header +
+                                // QR/refresh/overflow icons) so the overlay
+                                // neither covers nor swallows taps on them.
+                                .padding(top = 80.dp, end = 8.dp)
+                                .width(280.dp),
+                        )
                     }
                 }
             }
@@ -178,6 +208,8 @@ class MainActivity : ComponentActivity() {
         }
         bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
 
+        hardwarePtt.pttCoordinatorProvider = { walkieService.value?.pttCoordinator }
+
         // Arm hardware/BT PTT while the Activity is in the foreground. The
         // controller registers its MediaSession here so BT PTT pucks keep
         // working when we're subsequently backgrounded behind WalkieService.
@@ -192,13 +224,55 @@ class MainActivity : ComponentActivity() {
         try { hardwarePtt.disable() } catch (e: Exception) {
             Log.w(TAG, "hardwarePtt disable failed: ${e.message}")
         }
-        SassyTalkNative.pttStop()
+        walkieService.value?.pttCoordinator?.onPttReleased() ?: SassyTalkNative.pttStop()
         // Don't stop the service here — it should keep running in the background
         // so audio keeps working when the screen is off.
         // Only unbind so we don't leak the connection.
         try {
             unbindService(serviceConnection)
         } catch (_: Exception) { }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        updatePipAutoEnter()
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (!pipEligible.value || inPictureInPictureMode.value) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        try {
+            enterPictureInPictureMode(buildPipParams())
+        } catch (e: Exception) {
+            Log.w(TAG, "enterPictureInPictureMode failed: ${e.message}")
+        }
+    }
+
+    private fun buildPipParams(): PictureInPictureParams {
+        val builder = PictureInPictureParams.Builder()
+            .setAspectRatio(Rational(2, 3))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setAutoEnterEnabled(pipEligible.value)
+        }
+        return builder.build()
+    }
+
+    private fun updatePipAutoEnter() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+        try {
+            setPictureInPictureParams(buildPipParams())
+        } catch (e: Exception) {
+            Log.w(TAG, "setPictureInPictureParams failed: ${e.message}")
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration,
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        inPictureInPictureMode.value = isInPictureInPictureMode
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -208,15 +282,35 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun captureShareIntent(i: Intent?) {
-        val uri = i?.data ?: return
-        if (i.action != Intent.ACTION_VIEW) return
-        // Only accept the encrypted https share-link form — the manifest no
-        // longer registers any cleartext-payload scheme (see SessionShareLink
-        // for the rationale).
-        val ok = uri.scheme == "https" &&
+        if (i?.action != Intent.ACTION_VIEW) return
+        // Prefer dataString — it preserves the #fragment on some Android builds
+        // where Intent.getData() drops it during App Link dispatch.
+        val raw = i.dataString ?: i.data?.toString() ?: return
+        val uri = Uri.parse(raw)
+        val ok = (uri.scheme == "https" &&
             uri.host == "relay.sassyconsultingllc.com" &&
-            (uri.path ?: "").startsWith("/v/")
+            (uri.path ?: "").startsWith("/v/")) ||
+            (uri.scheme == SessionShareLink.APP_SCHEME &&
+                uri.host == "v" &&
+                (uri.path ?: "").length > 1)
         if (ok) pendingShareUri.value = uri
+    }
+
+    /**
+     * Release builds block screenshots on the live radio screen (FLAG_SECURE).
+     * Auth / QR screens allow capture so remote users can photograph a QR code
+     * when invite links fail.
+     */
+    fun setScreenshotsAllowed(allowed: Boolean) {
+        if (!BuildConfig.NO_SCREENSHOTS) return
+        if (allowed) {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        } else {
+            window.setFlags(
+                WindowManager.LayoutParams.FLAG_SECURE,
+                WindowManager.LayoutParams.FLAG_SECURE,
+            )
+        }
     }
 
     // ── Hardware key delegation ──

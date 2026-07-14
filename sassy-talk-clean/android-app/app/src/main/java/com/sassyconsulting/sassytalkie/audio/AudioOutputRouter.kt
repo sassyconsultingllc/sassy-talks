@@ -1,7 +1,9 @@
 package com.sassyconsulting.sassytalkie.audio
 
 import android.content.Context
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.os.Build
 import androidx.core.content.getSystemService
 
 /**
@@ -17,7 +19,7 @@ import androidx.core.content.getSystemService
  * volume. UI should reflect that.
  *
  * Lifecycle: call engageCommMode() when receive session opens, release() on
- * close. Saves and restores prior mode/speaker state.
+ * close. Saves and restores prior mode/output-device state.
  */
 class AudioOutputRouter(context: Context) {
 
@@ -26,21 +28,43 @@ class AudioOutputRouter(context: Context) {
 
     private var savedMode: Int = AudioManager.MODE_NORMAL
     private var savedSpeakerOn: Boolean = false
+    private var savedCommDevice: AudioDeviceInfo? = null
     private var active = false
 
     fun engageCommMode(forceSpeaker: Boolean = true) {
         if (active) return
         savedMode = am.mode
-        savedSpeakerOn = am.isSpeakerphoneOn
         am.mode = AudioManager.MODE_IN_COMMUNICATION
-        am.isSpeakerphoneOn = forceSpeaker
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // isSpeakerphoneOn is deprecated in API 31 and increasingly a no-op
+            // on newer OEM builds; setCommunicationDevice is the reliable way to
+            // force the built-in speaker under MODE_IN_COMMUNICATION.
+            savedCommDevice = am.communicationDevice
+            if (forceSpeaker) {
+                am.availableCommunicationDevices
+                    .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                    ?.let { am.setCommunicationDevice(it) }
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            savedSpeakerOn = am.isSpeakerphoneOn
+            @Suppress("DEPRECATION")
+            am.isSpeakerphoneOn = forceSpeaker
+        }
         active = true
     }
 
     fun release() {
         if (!active) return
         am.mode = savedMode
-        am.isSpeakerphoneOn = savedSpeakerOn
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val prev = savedCommDevice
+            if (prev != null) am.setCommunicationDevice(prev) else am.clearCommunicationDevice()
+            savedCommDevice = null
+        } else {
+            @Suppress("DEPRECATION")
+            am.isSpeakerphoneOn = savedSpeakerOn
+        }
         active = false
     }
 

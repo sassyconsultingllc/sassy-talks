@@ -81,11 +81,13 @@ jobs:
           RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
           RELEASE_KEY_ALIAS:      ${{ secrets.RELEASE_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD:   ${{ secrets.RELEASE_KEY_PASSWORD }}
-        run: ./gradlew bundleRelease
+        # Play flavor only: the AAB that ships to Google Play carries the
+        # Billing paywall. The direct (license-key) flavor is built locally.
+        run: ./gradlew bundlePlayRelease
 
       - name: Verify AAB is signed with release keystore (not debug)
         run: |
-          AAB="sassy-talk-clean/android-app/app/build/outputs/bundle/release/app-release.aab"
+          AAB="sassy-talk-clean/android-app/app/build/outputs/bundle/playRelease/app-play-release.aab"
           test -s "$AAB" || { echo "::error::AAB not produced"; exit 1; }
           # Pull the signing cert subject and fail if it's the Android debug cert.
           tmpdir=$(mktemp -d)
@@ -103,7 +105,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sassy-talkie-release-aab
-          path: sassy-talk-clean/android-app/app/build/outputs/bundle/release/*.aab
+          path: sassy-talk-clean/android-app/app/build/outputs/bundle/playRelease/*.aab
           retention-days: 30
 
       - name: Publish to Google Play
@@ -117,7 +119,7 @@ jobs:
         with:
           serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
           packageName: com.sassyconsulting.sassytalkie
-          releaseFiles: sassy-talk-clean/android-app/app/build/outputs/bundle/release/app-release.aab
+          releaseFiles: sassy-talk-clean/android-app/app/build/outputs/bundle/playRelease/app-play-release.aab
           track: ${{ inputs.play_track }}
           status: completed
           changesNotSentForReview: false

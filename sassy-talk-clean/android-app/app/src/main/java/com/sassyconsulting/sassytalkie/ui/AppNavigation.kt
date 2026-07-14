@@ -21,15 +21,20 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import com.sassyconsulting.sassytalkie.MainActivity
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.SessionShareLink
 import com.sassyconsulting.sassytalkie.TranscriptionBridge
 import com.sassyconsulting.sassytalkie.WalkieService
+import com.sassyconsulting.sassytalkie.license.Entitlements
 import com.sassyconsulting.sassytalkie.ui.theme.*
 import android.widget.Toast
 
 enum class Screen {
     Profile,
+    Gate,
     Auth,
     Main,
     Users,
@@ -57,12 +62,22 @@ fun AppNavigation(
     onRequestPermissions: () -> Unit,
     pendingShareUri: android.net.Uri? = null,
     onShareConsumed: () -> Unit = {},
+    onPipEligibilityChanged: (Boolean) -> Unit = {},
 ) {
     val context = LocalContext.current
     var currentScreen by remember { mutableStateOf(Screen.Auth) }
+    // Bumped after a deep-link import so the Auth screen (whose session read is
+    // a one-shot remember{}) is recomposed from scratch and shows the just-
+    // loaded session instead of the stale pre-import state.
+    var authRefreshNonce by remember { mutableStateOf(0) }
     var nativeReady by remember { mutableStateOf(false) }
     var initFailed by remember { mutableStateOf(false) }
     var bleReady by remember { mutableStateOf(false) }
+    // Entitlement gate (paywall on Play flavor, license key on direct flavor).
+    // Seeded from the encrypted cache for instant startup routing; a silent
+    // refresh below reconciles with Play / the license server when online.
+    var entitled by remember { mutableStateOf(false) }
+    var profileSetState by remember { mutableStateOf(false) }
 
     // AutoConnectManager lives here (singleton for the session) — NOT in MainScreen
     val autoConnect = remember { AutoConnectManager(context) }
@@ -83,7 +98,7 @@ fun AppNavigation(
                     text = "Permissions Required",
                     fontSize = 24.sp,
                     fontWeight = FontWeight.Bold,
-                    color = Orange
+                    color = Teal
                 )
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
@@ -95,7 +110,7 @@ fun AppNavigation(
                 Spacer(modifier = Modifier.height(32.dp))
                 Button(
                     onClick = onRequestPermissions,
-                    colors = ButtonDefaults.buttonColors(containerColor = Orange),
+                    colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
                     shape = RoundedCornerShape(25.dp),
                     modifier = Modifier.height(52.dp).width(220.dp)
                 ) {
@@ -135,10 +150,18 @@ fun AppNavigation(
                 // Determine starting screen: profile setup on first launch
                 val prefs = context.getSharedPreferences("sassy_profile", Context.MODE_PRIVATE)
                 val profileSet = prefs.getBoolean(KEY_PROFILE_SET, false)
+                profileSetState = profileSet
                 val savedName = getSavedProfileName(context)
 
-                // Apply saved profile name to native library
+                // Apply saved profile name to native library. The install id
+                // MUST go in first: the native sender identity is derived from
+                // name + install id, and identical names alone (two defaults,
+                // same model) made devices drop each other's audio as
+                // self-echo and never show in the roster.
                 withContext(Dispatchers.IO) {
+                    SassyTalkNative.setInstallId(
+                        com.sassyconsulting.sassytalkie.InstallId.get(context)
+                    )
                     if (profileSet) {
                         SassyTalkNative.setDeviceName(savedName)
                     } else {
@@ -150,6 +173,14 @@ fun AppNavigation(
                 // If session was restored from disk, skip auth and go straight to main
                 if (sessionRestored && profileSet) {
                     currentScreen = Screen.Main
+                }
+
+                // Entitlement gate overrides all of the above routing while
+                // locked. EncryptedSharedPreferences read — cheap, still on
+                // the IO-adjacent init path.
+                entitled = withContext(Dispatchers.IO) { Entitlements.isUnlockedCached(context) }
+                if (!entitled) {
+                    currentScreen = Screen.Gate
                 }
                 nativeReady = true
 
@@ -193,6 +224,11 @@ fun AppNavigation(
     LaunchedEffect(nativeReady, pendingShareUri) {
         val uri = pendingShareUri
         if (nativeReady && uri != null) {
+            // A tapped sassytalk:// (or https) invite should land on the session
+            // QR-entry screen while the session loads, so the user sees WHICH
+            // session they're joining rather than being dropped straight onto
+            // the radio. (Locked builds stay on the gate.)
+            if (entitled) currentScreen = Screen.Auth
             val result = withContext(Dispatchers.IO) {
                 SessionShareLink.importFromShareUri(uri)
             }
@@ -215,7 +251,15 @@ fun AppNavigation(
                         // toast left them guessing.
                         val ctx = describeImportedSession(result.json)
                         Toast.makeText(context, ctx, Toast.LENGTH_LONG).show()
-                        currentScreen = Screen.Main
+                        // Stay on the session QR-entry (Auth) screen with the
+                        // imported session now loaded — it shows the active
+                        // session + Continue so the user confirms before the
+                        // radio goes live. Bump the nonce so the Auth screen
+                        // recomposes and picks up the just-imported session.
+                        // Invite links don't bypass the entitlement gate: a
+                        // locked build stays on the gate.
+                        authRefreshNonce++
+                        currentScreen = if (entitled) Screen.Auth else Screen.Gate
                     } else {
                         Toast.makeText(
                             context,
@@ -225,11 +269,33 @@ fun AppNavigation(
                     }
                 }
                 is SessionShareLink.Result.Err -> {
-                    Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
+                    val hint = if (result.message.contains("fragment", ignoreCase = true)) {
+                        "Copy the full invite link and paste it in Authenticate → Enter Code"
+                    } else {
+                        result.message
+                    }
+                    Toast.makeText(context, hint, Toast.LENGTH_LONG).show()
+                    // App opened but key was stripped — land on Auth so user can paste.
+                    if (result.message.contains("fragment", ignoreCase = true)) {
+                        currentScreen = Screen.Auth
+                    }
                 }
             }
             onShareConsumed()
         }
+    }
+
+    // Silent entitlement reconciliation once per launch: restores a Play
+    // purchase after reinstall, slides the direct-license receipt window
+    // forward, and drops the entitlement after a refund/revocation. Runs
+    // after native init so it never delays startup.
+    LaunchedEffect(nativeReady) {
+        if (!nativeReady) return@LaunchedEffect
+        val ok = suspendCancellableCoroutine { cont ->
+            Entitlements.refresh(context) { result -> cont.resume(result) }
+        }
+        entitled = ok
+        if (!ok) currentScreen = Screen.Gate
     }
 
     // Wait for both native init and the service binding before starting BLE/RFCOMM
@@ -266,7 +332,7 @@ fun AppNavigation(
                 }
             } else {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    CircularProgressIndicator(color = Orange)
+                    CircularProgressIndicator(color = Teal)
                     Spacer(modifier = Modifier.height(16.dp))
                     Text(
                         text = "Starting radio...",
@@ -281,8 +347,19 @@ fun AppNavigation(
 
     // ── Phase 3: Main navigation ──
 
+    LaunchedEffect(currentScreen) {
+        onPipEligibilityChanged(currentScreen == Screen.Main)
+        // Allow QR screenshots on non-radio screens (release builds only).
+        val allowCapture = currentScreen != Screen.Main
+        (context as? MainActivity)?.setScreenshotsAllowed(allowCapture)
+    }
+
     // Hardware back button support
-    BackHandler(enabled = currentScreen != Screen.Auth && currentScreen != Screen.Profile) {
+    BackHandler(
+        enabled = currentScreen != Screen.Auth &&
+            currentScreen != Screen.Profile &&
+            currentScreen != Screen.Gate,
+    ) {
         when (currentScreen) {
             Screen.Main -> {
                 walkieService?.releaseMulticastLock()
@@ -297,11 +374,17 @@ fun AppNavigation(
     }
 
     when (currentScreen) {
+        Screen.Gate -> Entitlements.GateScreen(
+            onUnlocked = {
+                entitled = true
+                currentScreen = if (!profileSetState) Screen.Profile else Screen.Auth
+            },
+        )
         Screen.Profile -> ProfileScreen(
             onDone = { currentScreen = Screen.Auth },
             showBackButton = false
         )
-        Screen.Auth -> QRAuthScreen(
+        Screen.Auth -> key(authRefreshNonce) { QRAuthScreen(
             onAuthenticated = {
                 // Tear down the relay WS so MainScreen's auto-connect re-runs
                 // with the just-imported session_id. Without this, importing
@@ -317,7 +400,7 @@ fun AppNavigation(
                 // attach to the new one shown in the QR.
                 walkieService?.forceCellularReconnect()
             },
-        )
+        ) }
         Screen.Main -> MainScreen(
             onDisconnect = {
                 autoConnect.disconnect()
@@ -329,8 +412,7 @@ fun AppNavigation(
             onShowAbout = { currentScreen = Screen.About },
             onShowSettings = { currentScreen = Screen.Settings },
             onEndSession = {
-                // Clean session kill without restarting app
-                SassyTalkNative.pttStop()
+                walkieService?.pttCoordinator?.onPttReleased()
                 autoConnect.disconnect()
                 walkieService?.releaseMulticastLock()
                 SassyTalkNative.clearSession() // also clears encrypted per-channel session prefs
@@ -355,6 +437,7 @@ fun AppNavigation(
         )
         Screen.Settings -> SettingsScreen(
             onBack = { currentScreen = Screen.Main },
+            walkieService = walkieService,
             onTransportPrefsChanged = {
                 // Tear the active transports down so MainScreen's auto-connect
                 // re-evaluates with the new toggle state. The connection

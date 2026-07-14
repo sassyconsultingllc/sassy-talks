@@ -72,6 +72,11 @@ pub struct AudioEngine {
     /// ~6 billion years.
     write_seq: Arc<AtomicU64>,
 
+    /// Serializes every AudioTrack.write() call. The RX thread and the BT
+    /// JNI path can both produce PCM concurrently; interleaved writes
+    /// without a gate produce the classic garbled/choppy playback artifact.
+    track_write_mutex: Arc<Mutex<()>>,
+
     /// Single-owner playback session lock.
     ///
     /// Held for the duration of one continuous playback (one queue utterance
@@ -119,6 +124,7 @@ impl AudioEngine {
             effects: Arc::new(Mutex::new(None)),
             last_write_at_ms: Arc::new(AtomicU64::new(0)),
             write_seq: Arc::new(AtomicU64::new(0)),
+            track_write_mutex: Arc::new(Mutex::new(())),
             playback_lock: Arc::new(Mutex::new(())),
             rx_gain_x100: Arc::new(AtomicI32::new(100)),
             rx_muted: Arc::new(AtomicBool::new(false)),
@@ -449,6 +455,8 @@ impl AudioEngine {
         if self.rx_muted.load(Ordering::Relaxed) {
             return Ok(buffer.len());
         }
+        // One writer at a time — RX thread + BT JNI must not interleave.
+        let _write_guard = self.track_write_mutex.lock().unwrap();
         let play = match self.player.lock().unwrap().as_ref() {
             Some(p) => Arc::clone(p),
             None => return Err("Player not initialized".to_string()),

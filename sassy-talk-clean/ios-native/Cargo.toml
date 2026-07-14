@@ -14,6 +14,11 @@ name = "sassytalkie_ios"
 crate-type = ["staticlib"]
 
 [dependencies]
+# Shared cross-platform core — the SAME crypto/session/PQC engine Android and
+# desktop use (re-exported in lib.rs as crate::{crypto, pqc, session}). Mirrors
+# android-native's dependency on the core so iOS stops being a plaintext fork.
+sassytalkie-core = { path = "../core" }
+
 # Audio codec — pinned to the same resolvable release the desktop crate uses
 # (plain "0.3" selects nothing on crates.io; only 0.3.0-rc.0 is published).
 audiopus = { version = "0.3.0-rc.0", default-features = false }
@@ -30,6 +35,9 @@ socket2 = "0.5"
 aes-gcm = "0.10"
 rand = "0.8"
 sha2 = "0.10"
+# base64 for the crypto FFI (PSK + handshake messages cross the C ABI as base64
+# strings, mirroring the Android JNI seam).
+base64 = "0.22"
 
 # Concurrency
 parking_lot = "0.12"

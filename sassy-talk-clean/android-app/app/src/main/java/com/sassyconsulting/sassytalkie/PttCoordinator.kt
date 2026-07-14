@@ -1,5 +1,6 @@
 package com.sassyconsulting.sassytalkie
 
+import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -76,7 +77,7 @@ class PttCoordinator(
         }
         // Immediate heartbeat push
         val now = System.currentTimeMillis()
-        val frame = ControlFrame.encodeHeartbeat(selfEpoch, hbSeq.getAndIncrement(), now, currentPresenceState(), 0)
+        val frame = ControlFrame.encodeHeartbeat(selfEpoch, hbSeq.getAndIncrement(), now, currentPresenceState(), 0, SassyTalkNative.localCapabilities())
         bleSignaling.broadcastControl(frame)
         cellularClient?.sendBinary(frame)
     }
@@ -141,6 +142,9 @@ class PttCoordinator(
     /** True when the last probe round-trip exceeded 400ms or timed out entirely. */
     val audioPathDegraded = MutableStateFlow(false)
 
+    /** True when we expected RECV_ACKs but none arrived within the timeout. */
+    val peerReachFailed = MutableStateFlow(false)
+
     /** Timestamp (ms) when the probe frame was sent; 0 means no probe in-flight. */
     @Volatile private var probeSentMs = 0L
 
@@ -166,6 +170,35 @@ class PttCoordinator(
         replay = 0, extraBufferCapacity = 16
     )
     val peerEvents: kotlinx.coroutines.flow.SharedFlow<PeerEvent> = _peerEvents
+
+    /**
+     * Relay JSON `peer_joined`. NOTE: this key is "relay:<serverClientId>",
+     * which is NOT the key real heartbeats arrive under ("relay:<epoch>", see
+     * CellularWebSocketClient.relayPeerIdFromFrame). Seeding a liveness identity
+     * here created a phantom peer that never got heartbeats, went STALE every
+     * ~8s, and — because the stale relay worker mints a new clientId on every
+     * reconnect — churned Joined/Left events (raw-id snackbar spam + a duplicate
+     * roster row). We now only register the friendly NAME (deduped by the Users
+     * list); liveness/presence is driven solely by the genuine epoch heartbeat,
+     * which arrives within ~2s.
+     */
+    fun onRelayPeerSeen(peerKey: String, deviceName: String) {
+        try {
+            if (deviceName.isNotBlank()) {
+                SassyTalkNative.registerUser(peerKey, deviceName)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "onRelayPeerSeen($peerKey) failed: ${t.message}")
+        }
+    }
+
+    fun onRelayPeerGone(peerKey: String) {
+        try {
+            liveness.removePeer(peerKey)
+        } catch (t: Throwable) {
+            Log.w(TAG, "onRelayPeerGone($peerKey) failed: ${t.message}")
+        }
+    }
 
     // —— Talk-over indicator (Task 6.2) ——
 
@@ -232,70 +265,47 @@ class PttCoordinator(
         startHeartbeat()
     }
 
+    /**
+     * Lightweight PTT-press hook for notification shade toggle — delegates to [onPttPressed].
+     */
+    fun notifyPttPressed() {
+        onPttPressed()
+    }
+
+    /**
+     * Lightweight PTT-release hook for notification shade toggle — delegates to [onPttReleased].
+     */
+    fun notifyPttReleased() {
+        onPttReleased()
+    }
+
     // —— TX Side (We press PTT) ——
 
     /**
-     * Lightweight PTT-press notification from the UI — updates delivery state only.
-     * Audio and BLE signaling are handled separately by the direct SassyTalkNative calls in MainScreen.
+     * Full TX path: probe, BLE signal, native audio, RFCOMM pump, watchdog.
+     * @return false if press was rejected (no transport / no peers).
      */
-    fun notifyPttPressed() {
-        eotTimeoutJob?.cancel()
-        deliveredResetJob?.cancel()
-        deliveredState.value = DeliveryState.Sending
-        Log.d(TAG, "notifyPttPressed → deliveredState=Sending")
-    }
-
-    /**
-     * Lightweight PTT-release notification from the UI — emits PTT_STOP_V2 and starts EOT_ACK timeout.
-     * Audio stop is handled separately by the direct SassyTalkNative call in MainScreen.
-     */
-    fun notifyPttReleased() {
-        val stopEpoch = if (lastTxEpoch != 0L) lastTxEpoch else selfEpoch
-        val stopSeq = lastTxSeq
-        val pttStopV2 = ControlFrame.encodePttStopV2(stopEpoch, stopSeq)
-        bleSignaling.broadcastControl(pttStopV2)
-        cellularClient?.sendBinary(pttStopV2)
-        Log.d(TAG, "notifyPttReleased: PTT_STOP_V2 epoch=$stopEpoch seq=$stopSeq")
-
-        eotTimeoutJob?.cancel()
-        eotTimeoutJob = scope.launch {
-            delay(2_000L)
-            if (deliveredState.value == DeliveryState.Sending) {
-                deliveredState.value = DeliveryState.Idle
-                Log.d(TAG, "EOT_ACK timeout — deliveredState reset to Idle")
-            }
-        }
-    }
-
-    /**
-     * LEGACY full TX state machine (probe + READY_ACK gate + watchdog + wake).
-     * NOT on the live path: the UI (MainScreen) drives PTT via
-     * `SassyTalkNative.pttStart()` + [notifyPttPressed] directly, so this method
-     * and [onPttReleased] are currently unreferenced. Kept because they encode
-     * the audio-path probe / reaching-peer watchdog logic the indicators expect;
-     * reviving them means routing MainScreen's press through here (and deleting
-     * the duplicate notify* path). Until then, treat this as dead code — don't
-     * assume the `transmitting` double-press guard or watchdog run on a real press.
-     */
-    fun onPttPressed() {
-        if (transmitting.getAndSet(true)) return
+    fun onPttPressed(): Boolean {
+        if (transmitting.getAndSet(true)) return true
 
         val blePeers = bleSignaling.blePeerCount
         val rfcommPeers = btTransport.connectedPeerCount
+        val ipUp = try { SassyTalkNative.isConnected() } catch (_: Throwable) { false }
 
-        Log.i(TAG, "PTT PRESSED \u2014 BLE peers: $blePeers, RFCOMM peers: $rfcommPeers")
+        Log.i(TAG, "PTT PRESSED — BLE peers: $blePeers, RFCOMM peers: $rfcommPeers, ipUp=$ipUp")
 
-        if (blePeers == 0 && rfcommPeers == 0) {
-            Log.w(TAG, "PTT BLOCKED: No peers connected")
+        if (blePeers == 0 && rfcommPeers == 0 && !ipUp) {
+            Log.w(TAG, "PTT BLOCKED: No peers and no IP transport")
             transmitting.set(false)
-            return
+            return false
         }
 
-        // Task 7.1: send sub-audible audio path probe before real audio starts
-        sendAudioProbe()
+        if (rfcommPeers > 0) {
+            sendAudioProbe()
+        }
 
-        // Reset reaching-peer state on press
         _reachingPeer.value = false
+        peerReachFailed.value = false
         lastAckMs = 0L
         startWatchdog()
 
@@ -316,12 +326,12 @@ class PttCoordinator(
 
         // Step 2: Brief wait for ACKs, then start audio regardless
         scope.launch {
-            val preAudioDelay = if (wakeEmitted) {
-                READY_ACK_TIMEOUT_MS + WAKE_PRE_AUDIO_DELAY_MS
-            } else {
-                READY_ACK_TIMEOUT_MS
+            val preAudioDelay = when {
+                blePeers == 0 && rfcommPeers == 0 && ipUp -> 0L
+                wakeEmitted -> READY_ACK_TIMEOUT_MS + WAKE_PRE_AUDIO_DELAY_MS
+                else -> READY_ACK_TIMEOUT_MS
             }
-            delay(preAudioDelay)
+            if (preAudioDelay > 0) delay(preAudioDelay)
             val acks = readyAckCount.get()
             Log.i(TAG, "Got $acks/$blePeers READY_ACKs, proceeding (delay=${preAudioDelay}ms)")
 
@@ -334,6 +344,7 @@ class PttCoordinator(
                 btTransport.startTxPump()
             }
         }
+        return true
     }
 
     /**
@@ -368,6 +379,7 @@ class PttCoordinator(
         // Stop watchdog and reset reaching-peer indicator
         stopWatchdog()
         _reachingPeer.value = false
+        peerReachFailed.value = false
 
         // Stop native audio
         SassyTalkNative.pttStop()
@@ -553,6 +565,7 @@ class PttCoordinator(
                     tsMs   = nowMs,
                     state  = currentPresenceState(),
                     rttMs  = 0,
+                    caps   = SassyTalkNative.localCapabilities(),
                 )
                 // Track sent heartbeat for RTT measurement per peer
                 for (peerId in bleSignaling.blePeerAddresses) {
@@ -560,12 +573,7 @@ class PttCoordinator(
                 }
                 bleSignaling.broadcastControl(frame)
                 cellularClient?.sendBinary(frame)
-                Log.d(TAG, "HB seq=$seq broadcast to ${bleSignaling.blePeerCount} peers (relay=${cellularClient != null})")
-
-                // Poll stale status every 1s (heartbeat fires every 2s, check every tick)
-                val peerIds = liveness.peerIds()
-                val stale = peerIds.isNotEmpty() && peerIds.any { liveness.health(it, nowMs) == PeerHealth.STALE }
-                if (anyPeerStale.value != stale) anyPeerStale.value = stale
+                if (BuildConfig.DEBUG) Log.d(TAG, "HB seq=$seq broadcast to ${bleSignaling.blePeerCount} peers (relay=${cellularClient != null})")
 
                 delay(HEARTBEAT_INTERVAL_MS)
             }
@@ -589,11 +597,22 @@ class PttCoordinator(
                 val active = allPeers.filter { liveness.health(it, nowMs) != PeerHealth.STALE }.toSet()
                 val previous = peerIds.value
                 if (active != previous) {
-                    val joined = active - previous
-                    val left = previous - active
-                    peerIds.value = active
-                    joined.forEach { _peerEvents.tryEmit(PeerEvent.Joined(it)) }
-                    left.forEach { _peerEvents.tryEmit(PeerEvent.Left(it)) }
+                    try {
+                        val joined = active - previous
+                        val left = previous - active
+                        peerIds.value = active
+                        joined.forEach { _peerEvents.tryEmit(PeerEvent.Joined(it)) }
+                        left.forEach {
+                            _peerEvents.tryEmit(PeerEvent.Left(it))
+                            try {
+                                SassyTalkNative.removeUser(it)
+                            } catch (t: Throwable) {
+                                Log.w(TAG, "removeUser($it) failed: ${t.message}")
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "peer roster update failed: ${t.message}", t)
+                    }
                 }
             }
         }
@@ -651,6 +670,16 @@ class PttCoordinator(
             ControlFrame.OP_PTT_STOP_V2 -> handlePttStopV2(peerId, frame.payload)
             ControlFrame.OP_EOT_ACK -> handleEotAck(peerId, frame.payload)
             ControlFrame.OP_WAKE -> handleWake(peerId, frame.payload)
+            ControlFrame.OP_HYBRID_INIT -> try {
+                handleHybridInit(peerId, frame.payload)
+            } catch (t: Throwable) {
+                Log.e(TAG, "hybrid INIT handler failed: ${t.message}", t)
+            }
+            ControlFrame.OP_HYBRID_RESP -> try {
+                handleHybridResp(peerId, frame.payload)
+            } catch (t: Throwable) {
+                Log.e(TAG, "hybrid RESP handler failed: ${t.message}", t)
+            }
             ControlFrame.OP_PARTNER_OFFLINE -> {
                 if (frame.payload.isNotEmpty()) {
                     val idLen = frame.payload[0].toInt() and 0xFF
@@ -681,12 +710,17 @@ class PttCoordinator(
         // Detect epoch change → peer restarted → re-send our Capabilities
         val epochFlipped = liveness.epochChanged(peerId, hb.epoch)
 
-        liveness.onHeartbeat(peerId, hb.epoch, hb.seq, hb.tsMs, nowMs)
+        liveness.onHeartbeat(peerId, hb.epoch, hb.seq, hb.tsMs, nowMs, hb.caps)
         liveness.updatePresence(peerId, hb.state)
+
+        // Opportunistically upgrade a 2-party session to post-quantum (path a).
+        // We now know this peer's caps + epoch, which is everything the gate needs.
+        maybeAutoHybridHandshake(peerId, hb.epoch)
 
         val health = liveness.health(peerId, nowMs)
         val rtt = liveness.rttMs(peerId)
-        Log.d(TAG, "HB from $peerId seq=${hb.seq} epoch=${hb.epoch} state=${hb.state} health=$health rtt=${rtt}ms")
+        // Per-peer, every ~2s — gate behind DEBUG so shipped logcat isn't flooded.
+        if (BuildConfig.DEBUG) Log.d(TAG, "HB from $peerId seq=${hb.seq} epoch=${hb.epoch} state=${hb.state} health=$health rtt=${rtt}ms")
 
         if (epochFlipped) {
             Log.i(TAG, "Peer $peerId epoch changed → re-sending Capabilities")
@@ -700,6 +734,7 @@ class PttCoordinator(
             tsMs   = nowMs,
             state  = currentPresenceState(),
             rttMs  = rtt.coerceAtLeast(0),
+            caps   = SassyTalkNative.localCapabilities(),
         )
         bleSignaling.sendControl(peerId, echo)
     }
@@ -730,6 +765,7 @@ class PttCoordinator(
             tsMs  = nowMs,
             state = currentPresenceState(),
             rttMs = liveness.rttMs(peerId).coerceAtLeast(0),
+            caps  = SassyTalkNative.localCapabilities(),
         )
         bleSignaling.broadcastControl(hb)
         cellularClient?.sendBinary(hb)
@@ -739,6 +775,146 @@ class PttCoordinator(
         if (epochFlipped) {
             scope.launch { sendCapabilitiesToPeer(peerId) }
         }
+    }
+
+    // —— Hybrid PQC handshake (path a) — Phase 3 wire exchange ——
+    //
+    // The QR PSK already authenticates the pairing; this exchange layers an
+    // ephemeral X25519 + ML-KEM-768 handshake on top so the live session key
+    // gains forward secrecy + post-quantum protection. The native side does all
+    // the crypto (SassyTalkNative.hybridHandshake*); here we just carry the two
+    // ~1.2 KB messages between peers as OP_HYBRID_INIT / OP_HYBRID_RESP frames.
+    //
+    // CAUTION — pairwise vs group: the established key is shared by exactly the
+    // two handshaking peers and REPLACES the channel's group-PSK session, so it
+    // is only correct 2-party. Do NOT auto-start it on a channel with 3+ peers
+    // (a pairwise key would lock the others out). Group PQC = MLS, a later track.
+    // The reactive handlers below are always safe; only the INITIATOR action
+    // ([startHybridHandshake]) needs the 2-party + both-support guard, which the
+    // caller applies before invoking it. Default behavior is unchanged until a
+    // caller chooses to upgrade a 2-party session.
+
+    /**
+     * Master switch for AUTO-upgrading a 2-party session to PQC. The reactive
+     * responder/completer always work; this only governs whether THIS device
+     * initiates unprompted.
+     *
+     * OFF until the ACK/3-way confirm lands: the responder installs the
+     * pairwise key the moment INIT arrives (before its RESP is confirmed
+     * delivered), and the RESP rides on a single unacknowledged WS send — the
+     * BLE leg cannot carry the 1.2KB frame at all. Lose that one frame during
+     * a relay flap and the peers sit on mismatched AEAD keys: every audio
+     * frame both directions fails the GCM tag while presence stays green,
+     * until an app restart. Manual/explicit handshakes still work.
+     */
+    @Volatile var hybridPqcAuto: Boolean = false
+
+    /** Tracks the (peer → peer-epoch) we've already auto-handshaked, so we
+     *  initiate at most once per peer session and re-handshake only on restart. */
+    private val hybridHandshakeEpoch = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * Auto-initiate a hybrid PQC upgrade with [peerId] (whose session epoch is
+     * [peerEpoch]) when ALL of these hold:
+     *   - the feature is enabled ([hybridPqcAuto]),
+     *   - both sides advertise CAP_HYBRID_PQC,
+     *   - exactly one other peer is active (2-party — a pairwise key would lock
+     *     out a 3+ group on the shared channel),
+     *   - WE are the deterministic initiator: the smaller session epoch starts,
+     *     so of the two peers exactly one fires (epochs are random 64-bit, ties
+     *     are negligible),
+     *   - we haven't already handshaked this peer at this epoch.
+     *
+     * CAVEAT (production hardening): install is per-side — the responder installs
+     * on RESP, the initiator on completing. If the RESP frame is lost the two can
+     * diverge until the next epoch/re-pair; a robust rollout adds an ACK/retry or
+     * a 3-way confirm. The crypto itself is verified (core pqc tests).
+     */
+    private fun maybeAutoHybridHandshake(peerId: String, peerEpoch: Long) {
+        if (!hybridPqcAuto) return
+        // Relay-mediated peers use synthetic "relay:…" ids. Auto-upgrading their
+        // session to a pairwise PQC key races with the shared QR PSK and has
+        // been observed to crash or brick audio right as the peer joins.
+        if (peerId.startsWith("relay")) return
+        if (SassyTalkNative.localCapabilities() and ControlFrame.CAP_HYBRID_PQC == 0) return
+        if (liveness.peerCaps(peerId) and ControlFrame.CAP_HYBRID_PQC == 0) return
+
+        // 2-party only: count currently-active (non-stale) peers.
+        val now = System.currentTimeMillis()
+        val activePeers = liveness.peerIds().count { liveness.health(it, now) != PeerHealth.STALE }
+        if (activePeers != 1) return
+
+        // Deterministic single initiator: the smaller epoch starts.
+        if (selfEpoch >= peerEpoch) return
+
+        // Once per (peer, peerEpoch).
+        if (hybridHandshakeEpoch[peerId] == peerEpoch) return
+        hybridHandshakeEpoch[peerId] = peerEpoch
+
+        Log.i(TAG, "auto-hybrid: initiating PQC upgrade with $peerId (selfEpoch=$selfEpoch < peerEpoch=$peerEpoch)")
+        if (!startHybridHandshake(peerId, SassyTalkNative.getChannel())) {
+            // Failed to send (no PSK / caps gone) — clear so we retry next HB.
+            hybridHandshakeEpoch.remove(peerId)
+        }
+    }
+
+    /** Responder side: a peer sent us OP_HYBRID_INIT. Establish the session and
+     *  reply with OP_HYBRID_RESP. Idempotent-ish — a duplicate INIT just re-keys. */
+    private fun handleHybridInit(peerId: String, payload: ByteArray) {
+        val (channel, initMsg) = ControlFrame.parseHybridFrame(payload) ?: run {
+            Log.w(TAG, "hybrid INIT from $peerId: malformed payload"); return
+        }
+        val initB64 = Base64.encodeToString(initMsg, Base64.NO_WRAP)
+        val respB64 = SassyTalkNative.hybridHandshakeRespond(channel, initB64)
+        if (respB64 == null) {
+            Log.w(TAG, "hybrid INIT from $peerId ch=$channel: respond failed (no PSK / bad msg)")
+            return
+        }
+        val respMsg = Base64.decode(respB64, Base64.NO_WRAP)
+        val frame = ControlFrame.encodeHybridFrame(ControlFrame.OP_HYBRID_RESP, channel, respMsg)
+        bleSignaling.sendControl(peerId, frame)
+        cellularClient?.sendBinary(frame)
+        Log.i(TAG, "hybrid handshake: responded to $peerId ch=$channel — PQ session installed")
+    }
+
+    /** Initiator side: the peer replied with OP_HYBRID_RESP. Complete + install. */
+    private fun handleHybridResp(peerId: String, payload: ByteArray) {
+        val (_, respMsg) = ControlFrame.parseHybridFrame(payload) ?: run {
+            Log.w(TAG, "hybrid RESP from $peerId: malformed payload"); return
+        }
+        val respB64 = Base64.encodeToString(respMsg, Base64.NO_WRAP)
+        if (SassyTalkNative.hybridHandshakeComplete(respB64)) {
+            Log.i(TAG, "hybrid handshake: completed with $peerId — PQ session installed")
+        } else {
+            Log.w(TAG, "hybrid handshake: complete failed with $peerId")
+        }
+    }
+
+    /**
+     * Initiator entry point: start a hybrid PQC upgrade with [peerId] on
+     * [channel]. Sends OP_HYBRID_INIT; the peer replies via OP_HYBRID_RESP and we
+     * finish in [handleHybridResp]. Returns true if the init frame was sent.
+     *
+     * The CALLER must ensure this is a 2-party session and that both sides
+     * advertise CAP_HYBRID_PQC (check `SassyTalkNative.localCapabilities()` and
+     * `liveness.peerCaps(peerId)`), and must pick a single initiator (e.g. the
+     * peer with the smaller stable id) to avoid a double handshake.
+     */
+    fun startHybridHandshake(peerId: String, channel: Int): Boolean {
+        if (SassyTalkNative.localCapabilities() and ControlFrame.CAP_HYBRID_PQC == 0) return false
+        if (liveness.peerCaps(peerId) and ControlFrame.CAP_HYBRID_PQC == 0) {
+            Log.d(TAG, "hybrid start skipped: $peerId doesn't advertise hybrid support")
+            return false
+        }
+        val initB64 = SassyTalkNative.hybridHandshakeInit(channel) ?: run {
+            Log.w(TAG, "hybrid start: init failed for ch=$channel (no PSK?)"); return false
+        }
+        val initMsg = Base64.decode(initB64, Base64.NO_WRAP)
+        val frame = ControlFrame.encodeHybridFrame(ControlFrame.OP_HYBRID_INIT, channel, initMsg)
+        bleSignaling.sendControl(peerId, frame)
+        cellularClient?.sendBinary(frame)
+        Log.i(TAG, "hybrid handshake: INIT sent to $peerId ch=$channel")
+        return true
     }
 
     // —— RECV_ACK — Receiver side (Task 4.2) ——
@@ -873,19 +1049,29 @@ class PttCoordinator(
         Log.d(TAG, "RECV_ACK from $peerId epoch=$epoch seq=$seq ts=$tsMs")
         lastAckMs = System.currentTimeMillis()
         _reachingPeer.value = true
+        peerReachFailed.value = false
     }
+
+    private fun expectsRecvAck(): Boolean =
+        bleSignaling.blePeerCount > 0 || btTransport.connectedPeerCount > 0
 
     /** Start the watchdog coroutine while PTT is held. */
     private fun startWatchdog() {
         watchdogJob?.cancel()
         watchdogJob = scope.launch {
             Log.d(TAG, "Reaching-peer watchdog started")
+            val pressMs = System.currentTimeMillis()
             while (isActive) {
                 delay(200L)
-                val elapsed = System.currentTimeMillis() - lastAckMs
-                if (lastAckMs > 0L && elapsed > REACHING_PEER_TIMEOUT_MS) {
+                if (!expectsRecvAck()) continue
+                val elapsed = System.currentTimeMillis() - pressMs
+                if (lastAckMs > 0L && System.currentTimeMillis() - lastAckMs > REACHING_PEER_TIMEOUT_MS) {
                     _reachingPeer.value = false
-                    Log.d(TAG, "Reaching-peer: no ACK for ${elapsed}ms → false")
+                    peerReachFailed.value = true
+                    Log.d(TAG, "Reaching-peer: ACK timed out → failed")
+                } else if (lastAckMs == 0L && elapsed > REACHING_PEER_TIMEOUT_MS) {
+                    peerReachFailed.value = true
+                    Log.d(TAG, "Reaching-peer: no ACK within ${elapsed}ms → failed")
                 }
             }
         }

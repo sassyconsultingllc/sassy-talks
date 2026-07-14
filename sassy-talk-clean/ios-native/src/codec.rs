@@ -55,7 +55,14 @@ impl OpusEncoder {
         
         encoder.set_complexity(10)
             .map_err(|e| CodecError::EncoderError(format!("{:?}", e)))?;
-        
+
+        // In-band FEC + expected packet-loss for cross-platform loss recovery,
+        // matching the Android encoder (see tauri-desktop/src/codec.rs).
+        encoder.set_inband_fec(true)
+            .map_err(|e| CodecError::EncoderError(format!("{:?}", e)))?;
+        encoder.set_packet_loss_perc(10)
+            .map_err(|e| CodecError::EncoderError(format!("{:?}", e)))?;
+
         Ok(Self {
             encoder,
             frame_size: FRAME_SIZE,

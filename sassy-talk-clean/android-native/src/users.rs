@@ -69,6 +69,16 @@ impl UserRegistry {
         }
     }
 
+    /// Remove a peer who left the session (out of contact / explicit disconnect).
+    pub fn remove_user(&mut self, id: &str) -> bool {
+        if self.users.remove(id).is_some() {
+            info!("UserRegistry: removed {}", id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Get all users as JSON array
     pub fn to_json(&self) -> String {
         let profiles: Vec<&UserProfile> = self.users.values().collect();
@@ -143,5 +153,14 @@ mod tests {
         let json = reg.to_json();
         assert!(json.contains("Alice"));
         assert!(json.contains("\"is_muted\":true"));
+    }
+
+    #[test]
+    fn test_remove_user() {
+        let mut reg = UserRegistry::new();
+        reg.register_user("abc", "Alice");
+        assert!(reg.remove_user("abc"));
+        assert!(!reg.remove_user("abc"));
+        assert!(reg.to_json().contains("[]") || !reg.to_json().contains("Alice"));
     }
 }

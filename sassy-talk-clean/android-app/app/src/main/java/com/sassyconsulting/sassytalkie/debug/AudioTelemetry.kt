@@ -54,6 +54,20 @@ object AudioTelemetry {
         val rttMs: Int? = null,
         val lastHeartbeatAgoMs: Long? = null,
 
+        // Session / relay (for audio troubleshooting)
+        val relayRoom: String = "",
+        val cellularState: String = "",
+        val wsRelayConnected: Boolean = false,
+        val cellularSent: Long = 0,
+        val cellularReceived: Long = 0,
+        val inboundQueue: Int = 0,
+        val outboundQueue: Int = 0,
+        val droppedPackets: Long = 0,
+        val activeChannel: Int = 0,
+        val peerCount: Int = 0,
+        val usersInRegistry: Int = 0,
+        val roomMatch: Boolean = true,
+
         // Device
         val deviceLabel: String = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}",
         val quirkNotes: String = "",
@@ -123,6 +137,37 @@ object AudioTelemetry {
                 lastHeartbeatAgoMs = hbAgoMs,
             )
         }
+
+    /** Relay room, cellular queue stats, and peer roster — polled ~1 Hz from WalkieService. */
+    fun updateRelay(
+        relayRoom: String,
+        cellularState: String,
+        wsRelayConnected: Boolean,
+        sent: Long,
+        received: Long,
+        inboundQ: Int,
+        outboundQ: Int,
+        dropped: Long,
+        activeChannel: Int,
+        peerCount: Int,
+        usersInRegistry: Int,
+        roomMatch: Boolean,
+    ) = _state.update {
+        it.copy(
+            relayRoom = relayRoom,
+            cellularState = cellularState,
+            wsRelayConnected = wsRelayConnected,
+            cellularSent = sent,
+            cellularReceived = received,
+            inboundQueue = inboundQ,
+            outboundQueue = outboundQ,
+            droppedPackets = dropped,
+            activeChannel = activeChannel,
+            peerCount = peerCount,
+            usersInRegistry = usersInRegistry,
+            roomMatch = roomMatch,
+        )
+    }
 
     fun updateQuirkNotes(notes: String) = _state.update { it.copy(quirkNotes = notes) }
 

@@ -35,6 +35,36 @@ struct SettingsView: View {
                     }
                 }
 
+                // Cross-platform pairing. Encryption is mandatory, so a channel is
+                // silent until host + joiner share a key: one device hosts (shows a
+                // QR) and the other scans it. The QR works across iOS, Android, and
+                // desktop. Dismiss settings first, then drive the sheet from the
+                // root view (avoids presenting a sheet over this sheet).
+                Section(header: Text("PAIRING"),
+                        footer: Text(viewModel.isPaired
+                                     ? "Encrypted on channel \(String(format: "%02d", viewModel.channel))."
+                                     : "Not paired — host or join a channel to enable audio.")) {
+                    Button(action: {
+                        presentationMode.wrappedValue.dismiss()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                            viewModel.hostChannel()
+                        }
+                    }) {
+                        Label("Host This Channel (show QR)", systemImage: "qrcode")
+                            .foregroundColor(.stTeal)
+                    }
+
+                    Button(action: {
+                        presentationMode.wrappedValue.dismiss()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                            viewModel.showingScanner = true
+                        }
+                    }) {
+                        Label("Scan QR to Join", systemImage: "qrcode.viewfinder")
+                            .foregroundColor(.stTeal)
+                    }
+                }
+
                 Section(header: Text("AUDIO")) {
                     Text("Audio configuration is automatic")
                         .font(.caption)

@@ -19,8 +19,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sassyconsulting.sassytalkie.SassyTalkNative
+import com.sassyconsulting.sassytalkie.TranscriptionBridge
 import com.sassyconsulting.sassytalkie.ui.theme.*
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -66,16 +66,14 @@ private data class CacheStatusSnapshot(
     val historyCount: Int = 0,
 )
 
-private fun pollCacheStatus(): CacheStatusSnapshot {
-    val json = SassyTalkNative.getCacheStatus() ?: return CacheStatusSnapshot()
-    return CacheStatusSnapshot(
-        mode = json.optString("mode", "Live"),
-        queuedUtterances = json.optInt("queued_utterances", 0),
-        queuedDurationMs = json.optLong("queued_duration_ms", 0L),
-        currentSpeakerName = json.optString("current_speaker_name", "").ifEmpty { null },
-        historyCount = json.optInt("history_count", 0),
+private fun TranscriptionBridge.CacheSnapshot.toUi(): CacheStatusSnapshot =
+    CacheStatusSnapshot(
+        mode = mode,
+        queuedUtterances = queuedUtterances,
+        queuedDurationMs = queuedDurationMs,
+        currentSpeakerName = currentSpeakerName,
+        historyCount = historyCount,
     )
-}
 
 @Composable
 fun TranscriptionFeedScreen(
@@ -88,18 +86,7 @@ fun TranscriptionFeedScreen(
     val others = entries.filter { !it.isFavorite && !it.isMuted }
     val timeFormatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
 
-    // ── Cache status polling ──
-    // Polled at 2 Hz while this screen is in the composition. Cheap (one JNI
-    // call → ~10 µs lock + JSON build), and the user is actively watching the
-    // timeline so anything slower than 500 ms feels laggy when a queued
-    // utterance finishes and the next one starts.
-    var cacheStatus by remember { mutableStateOf(CacheStatusSnapshot()) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            cacheStatus = pollCacheStatus()
-            delay(500L)
-        }
-    }
+    val cacheStatus = TranscriptionBridge.cacheSnapshot.collectAsState().value.toUi()
 
     val snackbarHost = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
@@ -288,7 +275,7 @@ private fun CacheStatusBar(
 
             // Status text — what's happening right now
             val label = when {
-                status.currentSpeakerName != null ->
+                !status.currentSpeakerName.isNullOrBlank() && status.currentSpeakerName != "null" ->
                     "Playing ${status.currentSpeakerName}" +
                         if (status.queuedUtterances > 0) " · ${status.queuedUtterances} queued" else ""
                 status.queuedUtterances > 0 ->

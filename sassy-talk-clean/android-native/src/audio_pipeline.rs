@@ -8,10 +8,11 @@
 ///
 /// Also handles the TranscriptionBridge callback to Kotlin for speech-to-text.
 
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use log::{error, info, warn};
 
 use crate::audio::AudioEngine;
@@ -130,81 +131,14 @@ pub fn call_transcription_bridge_public(
     call_transcription_bridge(sender_id, device_name, pcm, is_favorite, is_muted, is_self);
 }
 
-/// Maximum sender ID length on the wire
-const MAX_SENDER_ID_LEN: usize = 32;
-
-/// Maximum device name length on the wire
-const MAX_DEVICE_NAME_LEN: usize = 64;
-
-/// Encapsulate an audio frame for transport over the wire.
-///
-/// Format: [channel:1][subchannel:1][sender_id_len:1][sender_id:N][name_len:1][device_name:M][timestamp:8][compressed_audio]
-/// subchannel: 0=Main, 1=A, 2=B
-pub fn pack_wire_frame(channel: u8, subchannel: u8, sender_id: &str, device_name: &str, timestamp: u64, compressed: &[u8]) -> Vec<u8> {
-    let id_bytes = sender_id.as_bytes();
-    let id_len = id_bytes.len().min(MAX_SENDER_ID_LEN);
-    let name_bytes = device_name.as_bytes();
-    let name_len = name_bytes.len().min(MAX_DEVICE_NAME_LEN);
-    let mut packet = Vec::with_capacity(2 + 1 + id_len + 1 + name_len + 8 + compressed.len());
-    packet.push(channel);
-    packet.push(subchannel);
-    packet.push(id_len as u8);
-    packet.extend_from_slice(&id_bytes[..id_len]);
-    packet.push(name_len as u8);
-    packet.extend_from_slice(&name_bytes[..name_len]);
-    packet.extend_from_slice(&timestamp.to_le_bytes());
-    packet.extend_from_slice(compressed);
-    packet
-}
-
-/// Parse a wire frame back into its components.
-///
-/// Returns (channel, subchannel, sender_id, device_name, timestamp, compressed_audio) or error.
-pub fn unpack_wire_frame(data: &[u8]) -> Result<(u8, u8, String, String, u64, Vec<u8>), String> {
-    // Minimum: channel(1) + subchannel(1) + id_len(1) + name_len(1) + timestamp(8) = 12
-    if data.len() < 12 {
-        return Err(format!("Wire frame too short: {} bytes", data.len()));
-    }
-
-    let channel = data[0];
-    let subchannel = data[1];
-    let id_len = data[2] as usize;
-
-    if id_len > MAX_SENDER_ID_LEN || data.len() < 3 + id_len + 1 {
-        return Err(format!("Invalid sender_id length: {}", id_len));
-    }
-
-    let sender_id = String::from_utf8_lossy(&data[3..3 + id_len]).to_string();
-
-    let name_len_offset = 3 + id_len;
-    let name_len = data[name_len_offset] as usize;
-
-    if name_len > MAX_DEVICE_NAME_LEN || data.len() < name_len_offset + 1 + name_len + 8 {
-        return Err(format!("Invalid device_name length: {}", name_len));
-    }
-
-    let name_start = name_len_offset + 1;
-    let device_name = String::from_utf8_lossy(&data[name_start..name_start + name_len]).to_string();
-
-    let ts_offset = name_start + name_len;
-    let timestamp = u64::from_le_bytes([
-        data[ts_offset], data[ts_offset + 1], data[ts_offset + 2], data[ts_offset + 3],
-        data[ts_offset + 4], data[ts_offset + 5], data[ts_offset + 6], data[ts_offset + 7],
-    ]);
-
-    let audio_offset = ts_offset + 8;
-    let compressed = data[audio_offset..].to_vec();
-
-    Ok((channel, subchannel, sender_id, device_name, timestamp, compressed))
-}
-
-/// Get current time in milliseconds since epoch
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+// The audio wire frame now lives in `sassytalkie-core` (core::wire) so iOS,
+// Android, and desktop stay byte-identical on the multicast wire — it used to be
+// defined only here, leaving the other consumers nothing to build against. The
+// format, bounds checks, and MAX_* limits moved verbatim; re-exported under the
+// original names so every call site (and test) in this crate is unchanged.
+pub use sassytalkie_core::wire::{
+    pack_wire_frame, unpack_wire_frame, now_ms, MAX_SENDER_ID_LEN, MAX_DEVICE_NAME_LEN,
+};
 
 /// Spawn the TX thread: captures mic audio, encodes, encrypts, and sends while PTT is held.
 ///
@@ -247,6 +181,11 @@ pub fn spawn_tx_thread(
             let mut pcm_buffer = vec![0i16; CODEC_FRAME_SIZE];
             let mut was_transmitting = false;
             let mut idle_ticks = 0u32;
+            // Monotonic wire timestamps for the current PTT press. Wall-clock
+            // now_ms() can repeat within the same millisecond on fast devices,
+            // which makes the cross-transport dedup layer drop real frames.
+            let mut tx_frame_index: u64 = 0;
+            let mut tx_stream_epoch_ms: u64 = 0;
 
             // Buffer for burst-send mode: accumulates wire frames during PTT
             let mut tx_frame_buffer: Vec<Vec<u8>> = Vec::new();
@@ -320,6 +259,8 @@ pub fn spawn_tx_thread(
                     match eng.start_recording() {
                         Ok(()) => {
                             was_transmitting = true;
+                            tx_frame_index = 0;
+                            tx_stream_epoch_ms = now_ms();
                             info!("TX: started recording (PTT pressed)");
                         }
                         Err(e) => {
@@ -405,7 +346,8 @@ pub fn spawn_tx_thread(
                 // Pack wire frame (includes device name for receiver display)
                 let channel = current_channel.load(Ordering::SeqCst);
                 let subch = current_subchannel.load(Ordering::SeqCst);
-                let timestamp = now_ms();
+                let timestamp = tx_stream_epoch_ms.saturating_add(tx_frame_index.saturating_mul(20));
+                tx_frame_index += 1;
                 let wire_data = pack_wire_frame(channel, subch, &local_sender_id, &local_device_name, timestamp, &compressed);
 
                 if PTT_BUFFER_MODE.load(Ordering::SeqCst) {
@@ -429,6 +371,294 @@ pub fn spawn_tx_thread(
         })
 }
 
+// ── RX playout helpers ──────────────────────────────────────────────────────
+
+/// Pace AudioTrack writes at one 20 ms frame per tick. Without this, a burst
+/// of relay packets is decoded and written as fast as the CPU loop runs —
+/// AudioTrack underruns once the burst is drained, which sounds choppy/garbled.
+struct PlayoutPacer {
+    next_playout: Instant,
+    frame_period: Duration,
+}
+
+impl PlayoutPacer {
+    fn new() -> Self {
+        Self {
+            next_playout: Instant::now(),
+            frame_period: Duration::from_millis(20),
+        }
+    }
+
+    fn wait_before_write(&mut self) {
+        let now = Instant::now();
+        if now < self.next_playout {
+            thread::sleep(self.next_playout - now);
+        } else {
+            // More than ~200 ms behind — snap forward instead of playing back
+            // a multi-second backlog at 20 ms/frame (sounds slowed-down).
+            let behind = now.saturating_duration_since(self.next_playout);
+            if behind > Duration::from_millis(200) {
+                self.next_playout = now;
+            }
+        }
+        self.next_playout += self.frame_period;
+    }
+}
+
+/// Per-sender pre-decode reorder buffer. Opus is stateful — decoding in network
+/// arrival order when frames arrive out-of-order (common on cellular relay)
+/// produces garbled PCM that the post-decode jitter buffer cannot fix.
+struct SenderDecodeState {
+    decoder: VoiceDecoder,
+    last_decoded_ts: Option<u64>,
+    pending: BTreeMap<u64, Vec<u8>>,
+    /// Set when we're blocked waiting for the next in-sequence timestamp.
+    reorder_wait_since: Option<Instant>,
+}
+
+impl SenderDecodeState {
+    fn new() -> Self {
+        Self {
+            decoder: VoiceDecoder::new(),
+            last_decoded_ts: None,
+            pending: BTreeMap::new(),
+            reorder_wait_since: None,
+        }
+    }
+
+    /// Buffer one compressed frame and decode every in-sequence frame now ready.
+    fn ingest(&mut self, timestamp: u64, compressed: Vec<u8>, frame_period_ms: u64, max_plc_frames: u64, reorder_wait_ms: u64) -> Vec<(u64, Vec<i16>)> {
+        if let Some(last) = self.last_decoded_ts {
+            if timestamp <= last {
+                return vec![]; // duplicate or already-decoded
+            }
+        }
+        const MAX_PENDING: usize = 32;
+        if self.pending.len() >= MAX_PENDING {
+            self.pending.pop_first();
+        }
+        self.pending.insert(timestamp, compressed);
+        self.drain_decodable(frame_period_ms, max_plc_frames, reorder_wait_ms)
+    }
+
+    fn drain_decodable(&mut self, frame_period_ms: u64, max_plc_frames: u64, reorder_wait_ms: u64) -> Vec<(u64, Vec<i16>)> {
+        let mut out = Vec::new();
+        loop {
+            let expected_ts = match self.last_decoded_ts {
+                Some(last) => last.saturating_add(frame_period_ms),
+                None => match self.pending.keys().next().copied() {
+                    Some(t) => t,
+                    None => break,
+                },
+            };
+
+            if let Some(compressed) = self.pending.remove(&expected_ts) {
+                self.reorder_wait_since = None;
+                let pcm = self.decoder.decode(&compressed);
+                self.last_decoded_ts = Some(expected_ts);
+                out.push((expected_ts, pcm));
+                continue;
+            }
+
+            // Expected frame missing — wait briefly for reorder, then repair.
+            let earliest = match self.pending.keys().next().copied() {
+                Some(t) => t,
+                None => break,
+            };
+
+            if earliest <= expected_ts {
+                break;
+            }
+
+            let wait_start = *self.reorder_wait_since.get_or_insert_with(Instant::now);
+            if wait_start.elapsed() < Duration::from_millis(reorder_wait_ms) {
+                break; // still hoping the missing frame arrives
+            }
+            self.reorder_wait_since = None;
+
+            let gap_frames = (earliest - expected_ts) / frame_period_ms;
+            if gap_frames == 0 {
+                break;
+            }
+
+            if gap_frames == 1 {
+                let next_pkt = match self.pending.get(&earliest) {
+                    Some(p) => p.clone(),
+                    None => break,
+                };
+                let fec_pcm = self.decoder.decode_fec_from_next(&next_pkt);
+                self.last_decoded_ts = Some(expected_ts);
+                out.push((expected_ts, fec_pcm));
+                continue;
+            }
+
+            if gap_frames >= 2 && gap_frames <= max_plc_frames {
+                for i in 0..gap_frames {
+                    let synth_ts = expected_ts + frame_period_ms * i;
+                    let plc_pcm = self.decoder.decode_plc();
+                    self.last_decoded_ts = Some(synth_ts);
+                    out.push((synth_ts, plc_pcm));
+                }
+                continue;
+            }
+
+            if gap_frames > max_plc_frames {
+                self.decoder.reset();
+                self.last_decoded_ts = None;
+                info!("RX: large gap of {} frames — decoder reset, resync at ts={}", gap_frames, earliest);
+                continue;
+            }
+
+            break;
+        }
+        out
+    }
+}
+
+/// Shared RX decode + playout queue. The dedicated RX thread drains playout
+/// with a 20 ms pacer; the BT JNI path enqueues here instead of writing to
+/// AudioTrack directly (which raced the RX thread and garbled playback).
+pub struct RxSharedState {
+    sender_states: HashMap<String, SenderDecodeState>,
+    playout_queue: VecDeque<Vec<i16>>,
+}
+
+/// Cap playout backlog at ~1 s. Beyond that, drop oldest frames to stay near
+/// live instead of playing seconds-late audio after a network burst.
+const MAX_PLAYOUT_QUEUE_FRAMES: usize = 48;
+
+pub const RX_FRAME_PERIOD_MS: u64 = 20;
+pub const RX_MAX_PLC_FRAMES: u64 = 4;
+pub const RX_REORDER_WAIT_MS: u64 = 40;
+
+impl RxSharedState {
+    pub fn new() -> Self {
+        Self {
+            sender_states: HashMap::new(),
+            playout_queue: VecDeque::new(),
+        }
+    }
+
+    fn enqueue_playout(&mut self, samples: Vec<i16>) {
+        while self.playout_queue.len() >= MAX_PLAYOUT_QUEUE_FRAMES {
+            self.playout_queue.pop_front();
+        }
+        self.playout_queue.push_back(samples);
+    }
+
+    /// Decode one compressed wire frame and feed PCM into the audio cache.
+    /// Any frames ready for immediate playout are pushed onto the shared queue.
+    pub fn ingest_wire_frame(
+        &mut self,
+        cache: &mut AudioCache,
+        sender_id: &str,
+        timestamp: u64,
+        compressed: Vec<u8>,
+    ) -> Vec<(u64, Vec<i16>)> {
+        let state = self
+            .sender_states
+            .entry(sender_id.to_string())
+            .or_insert_with(SenderDecodeState::new);
+        let decoded = state.ingest(
+            timestamp,
+            compressed,
+            RX_FRAME_PERIOD_MS,
+            RX_MAX_PLC_FRAMES,
+            RX_REORDER_WAIT_MS,
+        );
+        for (frame_ts, pcm) in &decoded {
+            if let Some(samples) = cache.ingest_frame(sender_id, *frame_ts, pcm.clone()) {
+                self.enqueue_playout(samples);
+            }
+        }
+        decoded
+    }
+
+    /// Pull queue/jitter-drain frames from the cache into the playout queue.
+    pub fn drain_cache_playout(&mut self, cache: &mut AudioCache) {
+        while let Some((_sender, samples)) = cache.next_playback_frame() {
+            self.enqueue_playout(samples);
+        }
+    }
+
+    pub fn pop_playout(&mut self) -> Option<Vec<i16>> {
+        self.playout_queue.pop_front()
+    }
+
+    pub fn playout_pending(&self) -> usize {
+        self.playout_queue.len()
+    }
+}
+
+/// Process one decrypted wire frame through the full RX path (decode → cache →
+/// playout queue). Used by both the RX thread and the BT JNI callback.
+pub fn process_incoming_wire_frame(
+    rx_shared: &Arc<Mutex<RxSharedState>>,
+    audio_cache: &Arc<Mutex<AudioCache>>,
+    user_registry: &Arc<Mutex<UserRegistry>>,
+    local_sender_id: &str,
+    my_channel: u8,
+    my_subchannel: u8,
+    channel: u8,
+    subchannel: u8,
+    sender_id: &str,
+    device_name: &str,
+    timestamp: u64,
+    compressed: &[u8],
+    invoke_transcription: bool,
+) {
+    if sender_id == local_sender_id {
+        return;
+    }
+    if channel != my_channel {
+        return;
+    }
+    if compressed.is_empty() {
+        return;
+    }
+
+    if subchannel != my_subchannel {
+        let mut reg = user_registry.lock().unwrap();
+        reg.register_user(sender_id, device_name);
+        return;
+    }
+
+    {
+        let mut reg = user_registry.lock().unwrap();
+        reg.register_user(sender_id, device_name);
+    }
+    {
+        let reg = user_registry.lock().unwrap();
+        let is_fav = reg.is_favorite(sender_id);
+        let is_muted = reg.is_muted(sender_id);
+        let mut cache = audio_cache.lock().unwrap();
+        cache.update_user_info(sender_id, device_name, is_fav, is_muted);
+    }
+
+    let decoded = {
+        let mut rx = rx_shared.lock().unwrap();
+        let mut cache = audio_cache.lock().unwrap();
+        let frames = rx.ingest_wire_frame(
+            &mut cache,
+            sender_id,
+            timestamp,
+            compressed.to_vec(),
+        );
+        cache.tick();
+        rx.drain_cache_playout(&mut cache);
+        frames
+    };
+
+    if invoke_transcription {
+        let reg = user_registry.lock().unwrap();
+        let is_favorite = reg.is_favorite(sender_id);
+        let is_muted = reg.is_muted(sender_id);
+        for (_ts, pcm) in decoded {
+            call_transcription_bridge(sender_id, device_name, &pcm, is_favorite, is_muted, false);
+        }
+    }
+}
+
 /// Spawn the RX thread: receives, decrypts, decodes, feeds into AudioCache, and plays back.
 ///
 /// Also calls the TranscriptionBridge callback if available.
@@ -440,6 +670,7 @@ pub fn spawn_rx_thread(
     transport: Arc<Mutex<TransportManager>>,
     audio_cache: Arc<Mutex<AudioCache>>,
     user_registry: Arc<Mutex<UserRegistry>>,
+    rx_shared: Arc<Mutex<RxSharedState>>,
     local_sender_id: String,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
@@ -447,174 +678,79 @@ pub fn spawn_rx_thread(
         .spawn(move || {
             info!("RX thread started");
 
-            // Per-sender state. Opus decoder is stateful (range encoder
-            // state + frame history for PLC/FEC) so mixing two senders'
-            // bitstreams through one decoder produces glitches. One
-            // decoder per sender_id; lazily created on first packet.
-            let mut decoders: std::collections::HashMap<String, VoiceDecoder> = std::collections::HashMap::new();
-            // Per-sender last wire timestamp (ms). Used to detect frame
-            // gaps without changing the wire format — each frame's
-            // timestamp is a u64 epoch-ms, and Opus frames are 20 ms, so
-            // `(now - prev) / 20 - 1` is the lost-frame count.
-            let mut last_ts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-
             let mut recv_buffer = vec![0u8; 2048];
+            let mut cell_buffer = vec![0u8; 2048];
             let mut playback_started = false;
-
-            // Frame period in ms — must match codec.rs CODEC_FRAME_SIZE / CODEC_SAMPLE_RATE.
-            const FRAME_PERIOD_MS: u64 = 20;
-            // Cap PLC fill: more than this means the gap is too big to
-            // paper over usefully; reset the decoder so its state doesn't
-            // drift further from what the sender now has.
-            const MAX_PLC_FRAMES: u64 = 4;
+            let mut pacer = PlayoutPacer::new();
 
             while rx_running.load(Ordering::SeqCst) {
-                // Receive from transport (decrypted inside TransportManager::receive)
-                let bytes_received = {
-                    let mut tm = transport.lock().unwrap();
-                    match tm.receive(&mut recv_buffer) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            if !e.contains("would block") && !e.contains("No active transport") {
-                                warn!("RX: receive failed: {}", e);
-                            }
-                            0
+                let mut received_any = false;
+
+                // Drain WiFi AND cellular every iteration — dual-path TX means
+                // both queues can have audio regardless of `active` transport.
+                loop {
+                    let (wifi_n, cell_n) = {
+                        let mut tm = transport.lock().unwrap();
+                        let w = tm.poll_wifi_into(&mut recv_buffer).unwrap_or(0);
+                        let c = tm.poll_cellular_into(&mut cell_buffer).unwrap_or(0);
+                        (w, c)
+                    };
+
+                    if wifi_n == 0 && cell_n == 0 {
+                        break;
+                    }
+
+                    let my_channel = current_channel.load(Ordering::SeqCst);
+                    let my_subchannel = current_subchannel.load(Ordering::SeqCst);
+
+                    for (bytes_received, buf) in [
+                        (wifi_n, recv_buffer.as_slice()),
+                        (cell_n, cell_buffer.as_slice()),
+                    ] {
+                        if bytes_received == 0 {
+                            continue;
                         }
+                        received_any = true;
+
+                        let (channel, subchannel, sender_id, device_name, timestamp, compressed) =
+                            match unpack_wire_frame(&buf[..bytes_received]) {
+                                Ok(parsed) => parsed,
+                                Err(e) => {
+                                    warn!("RX: invalid wire frame: {}", e);
+                                    continue;
+                                }
+                            };
+
+                        process_incoming_wire_frame(
+                            &rx_shared,
+                            &audio_cache,
+                            &user_registry,
+                            &local_sender_id,
+                            my_channel,
+                            my_subchannel,
+                            channel,
+                            subchannel,
+                            &sender_id,
+                            &device_name,
+                            timestamp,
+                            &compressed,
+                            true,
+                        );
                     }
-                };
-
-                if bytes_received == 0 {
-                    // No data available. Tick the audio cache to check for completed utterances
-                    // and drain playback queue.
-                    let commits;
-                    let maybe_frame;
-                    {
-                        let mut cache = audio_cache.lock().unwrap();
-                        cache.tick();
-                        commits = cache.take_newly_committed_ids();
-                        maybe_frame = cache.next_playback_frame();
-                    }
-                    dispatch_committed_utterances(&commits);
-
-                    if let Some((_sender, samples)) = maybe_frame {
-                        if !playback_started {
-                            let eng = audio.lock().unwrap();
-                            let _ = eng.start_playing();
-                            playback_started = true;
-                        }
-                        let eng = audio.lock().unwrap();
-                        let _ = eng.write_audio(&samples);
-                    }
-
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
                 }
 
-                // Unpack wire frame (now includes device_name)
-                let (channel, subchannel, sender_id, device_name, timestamp, compressed) = match unpack_wire_frame(&recv_buffer[..bytes_received]) {
-                    Ok(parsed) => parsed,
-                    Err(e) => {
-                        warn!("RX: invalid wire frame: {}", e);
-                        continue;
-                    }
-                };
-
-                // Drop our own packets (multicast delivers to sender too)
-                if sender_id == local_sender_id {
-                    continue;
-                }
-
-                // Filter by channel + subchannel
-                let my_channel = current_channel.load(Ordering::SeqCst);
-                if channel != my_channel {
-                    continue;
-                }
-                let my_subchannel = current_subchannel.load(Ordering::SeqCst);
-                if subchannel != my_subchannel {
-                    // Different subchannel — still register user (they're on same channel)
-                    // but don't play audio
-                    {
-                        let mut reg = user_registry.lock().unwrap();
-                        reg.register_user(&sender_id, &device_name);
-                    }
-                    continue;
-                }
-
-                // Validate compressed payload is non-empty (Opus uses variable-length frames)
-                if compressed.is_empty() {
-                    warn!("RX: empty compressed payload, dropping");
-                    continue;
-                }
-
-                // Auto-register the sender in UserRegistry so we have their name
-                // and sync to AudioCache for mute/favorite filtering
-                {
-                    let mut reg = user_registry.lock().unwrap();
-                    reg.register_user(&sender_id, &device_name);
-                }
-                {
-                    let reg = user_registry.lock().unwrap();
-                    let is_fav = reg.is_favorite(&sender_id);
-                    let is_muted = reg.is_muted(&sender_id);
+                let commits = {
+                    let mut rx = rx_shared.lock().unwrap();
                     let mut cache = audio_cache.lock().unwrap();
-                    cache.update_user_info(&sender_id, &device_name, is_fav, is_muted);
-                }
-
-                // Per-sender decoder + gap detection. `prev_ts` is the
-                // sender's last wire timestamp; the difference / 20 ms
-                // gives the lost-frame count between then and now.
-                let prev_ts = last_ts.get(&sender_id).copied();
-                let decoder = decoders.entry(sender_id.clone()).or_insert_with(VoiceDecoder::new);
-                let gap_frames: u64 = match prev_ts {
-                    Some(p) if timestamp > p + FRAME_PERIOD_MS => {
-                        ((timestamp - p) / FRAME_PERIOD_MS).saturating_sub(1)
-                    }
-                    _ => 0,
-                };
-
-                // Repair the gap before decoding the current frame.
-                if gap_frames == 1 {
-                    // Single lost frame — Opus in-band FEC can rebuild it from
-                    // the current (successor) packet's redundancy data.
-                    let fec_pcm = decoder.decode_fec_from_next(&compressed);
-                    let synth_ts = prev_ts.unwrap() + FRAME_PERIOD_MS;
-                    let mut cache = audio_cache.lock().unwrap();
-                    let _ = cache.ingest_frame(&sender_id, synth_ts, fec_pcm);
-                } else if gap_frames >= 2 && gap_frames <= MAX_PLC_FRAMES {
-                    // Multi-frame gap — pure PLC for each missing slot.
-                    for i in 1..=gap_frames {
-                        let plc_pcm = decoder.decode_plc();
-                        let synth_ts = prev_ts.unwrap() + FRAME_PERIOD_MS * i;
-                        let mut cache = audio_cache.lock().unwrap();
-                        let _ = cache.ingest_frame(&sender_id, synth_ts, plc_pcm);
-                    }
-                } else if gap_frames > MAX_PLC_FRAMES {
-                    // Gap too big — don't pollute with stale-history PLC.
-                    // Reset the decoder so it doesn't carry forward stale
-                    // state into the next frame's decode.
-                    decoder.reset();
-                    info!("RX: large gap of {} frames from {}; decoder reset", gap_frames, sender_id);
-                }
-
-                // Decode the current real frame and update last-ts.
-                let pcm_samples = decoder.decode(&compressed);
-                last_ts.insert(sender_id.clone(), timestamp);
-
-                // Feed into audio cache (multi-speaker mixer / live jitter buffer)
-                let (passthrough, commits, maybe_queue_frame) = {
-                    let mut cache = audio_cache.lock().unwrap();
-                    let pass = cache.ingest_frame(&sender_id, timestamp, pcm_samples.clone());
                     cache.tick();
                     let commits = cache.take_newly_committed_ids();
-                    let qframe = cache.next_playback_frame().map(|(_, s)| s);
-                    (pass, commits, qframe)
+                    rx.drain_cache_playout(&mut cache);
+                    commits
                 };
                 dispatch_committed_utterances(&commits);
 
-                // Play audio: either passthrough (Live mode) or from queue
-                let samples_to_play = passthrough.or(maybe_queue_frame);
-
-                if let Some(samples) = samples_to_play {
+                if let Some(samples) = rx_shared.lock().unwrap().pop_playout() {
+                    pacer.wait_before_write();
                     if !playback_started {
                         let eng = audio.lock().unwrap();
                         let _ = eng.start_playing();
@@ -624,16 +760,12 @@ pub fn spawn_rx_thread(
                     let _ = eng.write_audio(&samples);
                 }
 
-                // Invoke TranscriptionBridge callback to Kotlin with the actual device name
-                let (is_favorite, is_muted) = {
-                    let reg = user_registry.lock().unwrap();
-                    (reg.is_favorite(&sender_id), reg.is_muted(&sender_id))
-                };
-
-                call_transcription_bridge(&sender_id, &device_name, &pcm_samples, is_favorite, is_muted, false /* remote */);
+                let playout_empty = rx_shared.lock().unwrap().playout_pending() == 0;
+                if !received_any && playout_empty {
+                    thread::sleep(Duration::from_millis(5));
+                }
             }
 
-            // Cleanup
             if playback_started {
                 let eng = audio.lock().unwrap();
                 let _ = eng.stop_playing();

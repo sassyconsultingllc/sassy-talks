@@ -1,8 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- Slate chrome; edge-to-edge is configured in values-v28/v35 and
+         MainActivity.enableEdgeToEdge(). -->
     <style name="Theme.SassyTalk" parent="android:Theme.Material.NoActionBar">
-        <item name="android:statusBarColor">#12121F</item>
-        <item name="android:navigationBarColor">#12121F</item>
-        <item name="android:windowBackground">#1A1A2E</item>
+        <item name="android:windowBackground">#0F172A</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+
+    <style name="Theme.SassyTalk.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">#0F172A</item>
+        <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher</item>
+        <item name="postSplashScreenTheme">@style/Theme.SassyTalk</item>
     </style>
 </resources>

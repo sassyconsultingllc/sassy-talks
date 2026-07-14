@@ -53,18 +53,50 @@ class AudioManager: NSObject {
     
     func startRecording() throws {
         guard !isRecording else { return }
-        
-        let format = AVAudioFormat(
+
+        // Format the Rust core expects: 48 kHz mono int16.
+        let target = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
             sampleRate: sampleRate,
             channels: channelCount,
             interleaved: false
         )!
-        
-        inputNode.installTap(onBus: 0, bufferSize: frameSize, format: format) { [weak self] buffer, time in
-            self?.processInputBuffer(buffer)
+
+        // Install the tap with the input node's ACTUAL hardware format, never a
+        // hardcoded 48 kHz one. With .allowBluetooth the input route can be an
+        // 8/16 kHz SCO headset (and the node is usually float32); passing a
+        // mismatched format makes installTap raise an Obj-C NSException that
+        // Swift's do/catch cannot catch — a hard crash on PTT. Convert whatever
+        // the hardware delivers to `target` before handing it to Rust.
+        let hwFormat = inputNode.inputFormat(forBus: 0)
+        let converter = AVAudioConverter(from: hwFormat, to: target)
+
+        inputNode.installTap(onBus: 0, bufferSize: frameSize, format: hwFormat) { [weak self] buffer, _ in
+            guard let self = self else { return }
+            guard let converter = converter else {
+                // Converter unavailable — best effort with the raw buffer.
+                self.processInputBuffer(buffer)
+                return
+            }
+            let ratio = target.sampleRate / hwFormat.sampleRate
+            let capacity = AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up)) + 1
+            guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return }
+            var fed = false
+            var convError: NSError?
+            let status = converter.convert(to: out, error: &convError) { _, inputStatus in
+                if fed {
+                    inputStatus.pointee = .noDataNow
+                    return nil
+                }
+                fed = true
+                inputStatus.pointee = .haveData
+                return buffer
+            }
+            if status != .error, convError == nil, out.frameLength > 0 {
+                self.processInputBuffer(out)
+            }
         }
-        
+
         try audioEngine.start()
         isRecording = true
         print("🎤 Recording started")

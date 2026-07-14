@@ -92,7 +92,8 @@ fun ProfileScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(DarkBg)
-            .safeDrawingPadding(),
+            .imePadding()
+            .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         // Scrollable content — so the Save button below is always reachable
@@ -251,7 +252,7 @@ fun ProfileScreen(
         }
 
         // Sticky Save bar — always visible, raised slightly above content
-        // and respects the IME via safeDrawingPadding on the outer Column.
+        // and respects the IME via imePadding on the outer Column.
         Surface(
             modifier = Modifier.fillMaxWidth(),
             color = DarkBg,

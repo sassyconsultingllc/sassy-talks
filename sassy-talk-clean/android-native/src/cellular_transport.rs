@@ -22,8 +22,13 @@ use sassytalkie_core::sealed;
 /// relay jitter spikes without dropping frames during normal speech.
 const MAX_QUEUE_SIZE: usize = 128;
 
-/// Max single packet size (encrypted audio frame + overhead)
-const MAX_PACKET_SIZE: usize = 1500;
+/// Max single packet size (encrypted audio frame + overhead).
+/// MUST match `wifi_transport::MAX_PACKET_SIZE` (1400): a transmitted frame is
+/// mirrored to BOTH the WiFi multicast and the relay, so if this were larger a
+/// 1401–1500-byte frame would reach relay peers but be silently dropped for
+/// WiFi peers — asymmetric delivery. Bound by the WiFi UDP MTU, the smaller of
+/// the two, since that is the path that can't fragment.
+const MAX_PACKET_SIZE: usize = 1400;
 
 /// Relay server base URL
 pub const RELAY_URL: &str = "wss://relay.sassyconsultingllc.com/ws";

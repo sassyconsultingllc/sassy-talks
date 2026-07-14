@@ -44,6 +44,14 @@ binding = "SHARES"
 id = "3bd58157c52d43ffafa609502a98d64b"
 preview_id = "dec463c8f86549e2a9d4f00b616dbfec"
 
+# ── D1: license registry for the direct-distribution APK (src/license.js) ──
+# Create once: `wrangler d1 create sassytalkie-licenses`, paste the id below,
+# then apply schema: `wrangler d1 execute sassytalkie-licenses --remote --file=schema/licenses.sql`
+[[d1_databases]]
+binding = "LICENSES"
+database_name = "sassytalkie-licenses"
+database_id = "be46952d-2e07-4c25-b0db-f1bc6d43c50d"
+
 # ── Required secrets (set via `wrangler secret put`, never committed) ──
 #   AUTH_SECRET                — HMAC key for room capability tokens (/auth, /ws,
 #                                /presence, /share). Fail-closed: unset = relay
@@ -53,4 +61,30 @@ preview_id = "dec463c8f86549e2a9d4f00b616dbfec"
 #                                presence.js/fcm.js. Optional: if unset, the relay
 #                                still forwards audio; it just skips offline-peer
 #                                wake notifications.
+#   LICENSE_SALT               — HMAC key for license-key/device hashing and
+#                                receipt tokens (/license/*). Fail-closed: unset =
+#                                license endpoints refuse. `openssl rand -hex 32`.
+#   LICENSE_ADMIN_TOKEN        — Bearer token for /license/issue|revoke|info.
+#                                `openssl rand -hex 32`.
 # Self-hosters: set both with `wrangler secret put NAME` before `wrangler deploy`.
+
+# ── App-link association identifiers (NOT secret — plain config) ──
+# Drive /.well-known/assetlinks.json + /.well-known/apple-app-site-association
+# so a tapped https://relay.../v/<id>#<key> invite opens the app directly.
+# `curl -sI .../.well-known/assetlinks.json` shows X-Wellknown-Configured.
+[vars]
+# Android App Link signing certs (public SHA-256 fingerprints, comma-separated;
+# NOT secret). An installed app's cert must appear here or its /v/ links won't
+# verify. Currently distributing the DIRECT (website/sideload) APK — no Play
+# Console / Play App Signing — so no Google-resigned cert to add.
+#   1st = release/upload keystore (release-new.keystore, alias sassytalkie) — the shipped APK.
+#   2nd = local Android debug keystore (~/.android/debug.keystore, alias androiddebugkey)
+#         so `adb install`-ed debug test builds ALSO open links. Safe to drop this
+#         once only release builds are installed on real devices.
+# If you ever publish via Play with App Signing, ALSO append the Play App Signing
+# SHA-256 from Play Console → Test and release → App integrity.
+ANDROID_CERT_SHA256 = "3C:AA:7D:D7:99:6F:D3:17:4E:27:DC:4C:AB:3F:76:D8:B5:21:2E:DB:D1:56:4D:F2:64:EB:46:26:A0:11:3C:56, EA:CE:43:93:72:D9:FB:8E:F5:C3:FB:33:78:F3:71:7F:3C:67:F3:0A:89:AE:2F:20:82:19:FD:E5:49:DE:36:4A"
+# APPLE_APP_ID / APPLE_TEAM_ID: intentionally UNSET — no Apple Developer account,
+# so iOS Universal Links can't be provisioned. iOS relies on the sassytalk://
+# custom scheme (app must be installed). Enroll in the Apple Developer Program
+# to enable https Universal Links on iOS.

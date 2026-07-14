@@ -33,6 +33,21 @@ pub use constants::{
     PORT_RANGE_END,
 };
 
+/// One received audio frame handed to the decode pipeline. Carries the sender
+/// identity + wire timestamp so the RX side can key a PER-SENDER Opus decoder
+/// (Opus is stateful) and order frames by their real timestamp, instead of
+/// decoding every sender through one decoder in raw arrival order.
+#[derive(Debug, Clone)]
+pub struct AudioFrame {
+    /// Wire `sender_id` (or a synthetic id for the legacy per-peer path).
+    pub sender: String,
+    /// Wire timestamp in ms; 0 when the transport carries none (legacy path),
+    /// in which case the RX loop synthesizes a per-sender clock.
+    pub timestamp: u64,
+    /// Raw Opus payload.
+    pub opus: Vec<u8>,
+}
+
 /// Transport error types
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {

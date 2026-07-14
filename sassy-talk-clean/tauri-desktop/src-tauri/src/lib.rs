@@ -108,6 +108,12 @@ pub struct AppState {
     cellular: Arc<Mutex<Option<Arc<transport::CellularTransport>>>>,
     cellular_rx_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
 
+    // ONE AudioCache shared by every RX loop. The core cache's cross-transport
+    // dedup keys on (sender_id, timestamp) and only works if all RX paths
+    // converge on the same instance — a private cache per loop meant a phone
+    // dual-sending on WiFi multicast + relay was played twice here.
+    audio_cache: Arc<Mutex<sassytalkie_core::audio_cache::AudioCache>>,
+
     // Settings
     roger_beep: Arc<AtomicBool>,
     vox_enabled: Arc<AtomicBool>,
@@ -144,6 +150,13 @@ impl AppState {
             rx_thread: Arc::new(Mutex::new(None)),
             cellular: Arc::new(Mutex::new(None)),
             cellular_rx_thread: Arc::new(Mutex::new(None)),
+            audio_cache: Arc::new(Mutex::new({
+                let mut cache = sassytalkie_core::audio_cache::AudioCache::new();
+                // Mix mode off by default — preserves classic walkie-talkie
+                // semantics (sequential utterances on overlap).
+                cache.set_mix_mode_enabled(false);
+                cache
+            })),
             roger_beep: Arc::new(AtomicBool::new(true)),
             vox_enabled: Arc::new(AtomicBool::new(false)),
             vox_threshold: Arc::new(RwLock::new(0.1)),
@@ -212,6 +225,16 @@ impl AppState {
             .get_session_id(channel)
             .ok_or_else(|| "imported session has no session_id".to_string())?;
 
+        // Install the same PSK into the UDP/multicast transport so the LAN audio
+        // plane uses the shared core::wire + core::crypto path and interoperates
+        // with Android/iOS phones on the same WiFi — independent of, and before,
+        // the relay dial (so LAN works even if the relay is unreachable).
+        if let Some(psk) = sm.get_psk_for_channel(channel) {
+            self.transport.lock().await.set_session_psk(&psk);
+            self.current_channel.store(channel, Ordering::Relaxed);
+            self.transport.lock().await.set_channel(channel);
+        }
+
         // Replace any prior cellular session cleanly.
         self.leave_cellular().await;
 
@@ -221,6 +244,7 @@ impl AppState {
             peer_id: format!("{:08X}", self.device_id),
         };
         let cell = transport::CellularTransport::new(config, crypto);
+        cell.set_channel(channel); // stamp the right channel into relay wire frames
 
         // Await the first dial so auth/connect failures surface to the caller.
         cell.connect().await?;
@@ -235,6 +259,7 @@ impl AppState {
             audio_rx,
             Arc::clone(&self.is_receiving),
             Arc::clone(&self.is_transmitting),
+            Arc::clone(&self.audio_cache),
         );
         *self.cellular_rx_thread.lock().await = Some(handle);
         *self.cellular.lock().await = Some(cell);
@@ -413,6 +438,7 @@ impl AppState {
             audio_rx,
             Arc::clone(&self.is_receiving),
             Arc::clone(&self.is_transmitting),
+            Arc::clone(&self.audio_cache),
         );
 
         *self.rx_thread.lock().await = Some(handle);
@@ -448,8 +474,15 @@ impl AppState {
         let channel = channel.clamp(1, 16);
         self.current_channel.store(channel, Ordering::Relaxed);
 
-        let transport = self.transport.lock().await;
-        transport.set_channel(channel);
+        {
+            let transport = self.transport.lock().await;
+            transport.set_channel(channel);
+        }
+        // Keep the relay's wire-frame channel in sync so its payload stays
+        // byte-compatible with the phone after a channel change.
+        if let Some(cell) = self.cellular.lock().await.as_ref() {
+            cell.set_channel(channel);
+        }
     }
     
     /// Get audio devices
@@ -612,18 +645,23 @@ impl AppState {
 /// so the decode + playback path is identical and lives here once.
 fn spawn_audio_rx_loop(
     audio: Arc<Mutex<AudioEngine>>,
-    mut audio_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut audio_rx: mpsc::UnboundedReceiver<transport::AudioFrame>,
     is_receiving: Arc<AtomicBool>,
     is_transmitting: Arc<AtomicBool>,
+    cache: Arc<Mutex<sassytalkie_core::audio_cache::AudioCache>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut decoder = match OpusDecoder::new() {
-            Ok(d) => d,
-            Err(e) => {
-                error!("Failed to create decoder: {}", e);
-                return;
-            }
-        };
+        // Per-sender decode state. Opus is a STATEFUL codec, so every sender
+        // needs its own decoder — decoding multiple senders through one shared
+        // decoder (the old `remote` hack) corrupts audio when their frames
+        // interleave. `synth_ts` is a fallback clock for transports that carry
+        // no wire timestamp (the legacy per-peer path sends timestamp 0).
+        struct RxPeer {
+            decoder: OpusDecoder,
+            synth_ts: u64,
+        }
+        let mut peers: std::collections::HashMap<String, RxPeer> =
+            std::collections::HashMap::new();
 
         // Start audio playback
         {
@@ -634,19 +672,14 @@ fn spawn_audio_rx_loop(
             }
         }
 
-        // Single-peer for now (1↔1 transports); multi-peer only needs the
-        // sender_id plumbed through `audio_rx` instead of the hardcoded "remote".
-        let mut cache = sassytalkie_core::audio_cache::AudioCache::new();
-        // Mix mode off by default — preserves classic walkie-talkie semantics
-        // (sequential utterances on overlap).
-        cache.set_mix_mode_enabled(false);
-        let sender_id = "remote";
-        // Synthetic wire timestamp — increments per 20 ms Opus frame; the cache
-        // uses the per-frame delta for ordering, absolute value is irrelevant.
-        let mut wire_ts: u64 = 0;
+        // The cache is shared across ALL RX loops (UDP + cellular) — its
+        // (sender_id, timestamp) dedup only catches a dual-sent frame if both
+        // copies land in the same instance. Keyed by sender_id, so it also
+        // orders/queues multiple speakers correctly once each gets its own
+        // decoder + real timestamp below.
         const FRAME_MS: u64 = 20;
 
-        while let Some(opus_data) = audio_rx.recv().await {
+        while let Some(frame) = audio_rx.recv().await {
             // Don't play audio while transmitting
             if is_transmitting.load(Ordering::Relaxed) {
                 continue;
@@ -654,12 +687,18 @@ fn spawn_audio_rx_loop(
 
             is_receiving.store(true, Ordering::Relaxed);
 
-            // Decode Opus to PCM; fall back to PLC if decode errors.
-            let pcm = match decoder.decode(&opus_data) {
+            let peer = peers.entry(frame.sender.clone()).or_insert_with(|| RxPeer {
+                // Decoder params are fixed (48 kHz mono), so this only fails on OOM.
+                decoder: OpusDecoder::new().expect("create Opus decoder"),
+                synth_ts: 0,
+            });
+
+            // Decode Opus to PCM with THIS sender's decoder; PLC on error.
+            let pcm = match peer.decoder.decode(&frame.opus) {
                 Ok(p) => p,
                 Err(e) => {
-                    error!("Decoding error: {}", e);
-                    decoder.decode_plc().unwrap_or_default()
+                    error!("Decoding error from {}: {}", frame.sender, e);
+                    peer.decoder.decode_plc().unwrap_or_default()
                 }
             };
             if pcm.is_empty() {
@@ -667,21 +706,33 @@ fn spawn_audio_rx_loop(
                 continue;
             }
 
-            wire_ts = wire_ts.saturating_add(FRAME_MS);
+            // Real wire timestamp when present; else a per-sender synthetic clock
+            // so the cache can still order this sender's frames by delta.
+            let ts = if frame.timestamp != 0 {
+                frame.timestamp
+            } else {
+                peer.synth_ts = peer.synth_ts.saturating_add(FRAME_MS);
+                peer.synth_ts
+            };
 
             // Live mode → Some(pcm) for immediate playback. Queue/Mix mode →
-            // None; frames drain via the loop below on tick().
-            if let Some(samples) = cache.ingest_frame(sender_id, wire_ts, pcm) {
-                let audio_lock = audio.lock().await;
-                audio_lock.write_samples(&samples);
-                drop(audio_lock);
-            }
+            // None; frames drain via the loop below on tick(). Hold the shared
+            // cache lock across ingest+tick+drain so two RX loops can't
+            // interleave mid-drain.
+            {
+                let mut cache = cache.lock().await;
+                if let Some(samples) = cache.ingest_frame(&frame.sender, ts, pcm) {
+                    let audio_lock = audio.lock().await;
+                    audio_lock.write_samples(&samples);
+                    drop(audio_lock);
+                }
 
-            cache.tick();
-            while let Some((_sender, samples)) = cache.next_playback_frame() {
-                let audio_lock = audio.lock().await;
-                audio_lock.write_samples(&samples);
-                drop(audio_lock);
+                cache.tick();
+                while let Some((_sender, samples)) = cache.next_playback_frame() {
+                    let audio_lock = audio.lock().await;
+                    audio_lock.write_samples(&samples);
+                    drop(audio_lock);
+                }
             }
 
             is_receiving.store(false, Ordering::Relaxed);

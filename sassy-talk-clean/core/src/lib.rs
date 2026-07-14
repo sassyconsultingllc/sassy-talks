@@ -39,3 +39,11 @@ pub mod emergency;
 // `sealed` — metadata-resistant blinded room/peer handles so the relay sees
 // only rotating opaque tokens it cannot correlate to identity or across epochs.
 pub mod sealed;
+// `wire` — the audio data-plane frame (pack/unpack_wire_frame). Single shared
+// definition so iOS, Android, and desktop are byte-identical on the multicast
+// wire (previously lived only in android-native and could drift).
+pub mod wire;
+// `share` — open encrypted session-invite blobs (`/share/<id>` → QR JSON) so the
+// `/v/<id>#<key>` invite-link import path is one audited AES-GCM call site
+// shared by Android, iOS, and desktop instead of three.
+pub mod share;

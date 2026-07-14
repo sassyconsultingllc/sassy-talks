@@ -127,7 +127,16 @@ class BluetoothTransport(private val context: Context) {
     )
 
     private val connectedPeers = ConcurrentHashMap<String, ConnectedPeer>()
+    // Transport lifecycle flag: gates the per-peer RX threads and the
+    // dead-peer monitor. True from startAcceptThread() until shutdown().
+    // Deliberately NOT tied to accept-loop health — a failed server socket
+    // must not kill RX for outbound-connected peers.
     private val running = AtomicBoolean(false)
+    // Accept-loop guard: true only while the bt-accept thread is alive, so a
+    // later startAcceptThread() can restart it after a failure. Previously
+    // `running` doubled as this guard, and an accept-loop exit with `running`
+    // still true made startAcceptThread a permanent no-op.
+    private val acceptLoopActive = AtomicBoolean(false)
     private val txPumpRunning = AtomicBoolean(false)
     private val peerCount = AtomicInteger(0)
 
@@ -246,38 +255,66 @@ class BluetoothTransport(private val context: Context) {
      * Start accepting incoming RFCOMM connections.
      */
     fun startAcceptThread() {
-        if (running.getAndSet(true)) return
+        running.set(true)
+        if (acceptLoopActive.getAndSet(true)) return
 
         Thread {
             Thread.currentThread().name = "bt-accept"
             Log.i(TAG, "Accept thread started")
 
             try {
-                serverSocket = btAdapter?.listenUsingRfcommWithServiceRecord(SERVICE_NAME, SPP_UUID)
-                    ?: run {
-                        // Insecure fallback
-                        btAdapter?.listenUsingInsecureRfcommWithServiceRecord(SERVICE_NAME, SPP_UUID)
+                while (running.get()) {
+                    // (Re)create the server socket whenever we don't have one —
+                    // covers first entry, a dead/closed socket after an error,
+                    // and an adapter that was off at startup but is on now.
+                    if (serverSocket == null) {
+                        serverSocket = try {
+                            btAdapter?.listenUsingRfcommWithServiceRecord(SERVICE_NAME, SPP_UUID)
+                                ?: btAdapter?.listenUsingInsecureRfcommWithServiceRecord(SERVICE_NAME, SPP_UUID)
+                        } catch (e: IOException) {
+                            Log.e(TAG, "Failed to create server socket: ${e.message}")
+                            null
+                        }
+                        if (serverSocket == null) {
+                            // No adapter / listen failed. Keep the transport
+                            // alive (outbound RFCOMM peers still need RX) and
+                            // retry listening on a slow cadence.
+                            Thread.sleep(5_000)
+                            continue
+                        }
+                        Log.i(TAG, "RFCOMM server socket listening")
                     }
-            } catch (e: IOException) {
-                Log.e(TAG, "Failed to create server socket: ${e.message}")
-                running.set(false)
-                return@Thread
-            }
 
-            while (running.get()) {
-                try {
-                    val socket = serverSocket?.accept(30_000) ?: continue
-                    val device = socket.remoteDevice
-                    Log.i(TAG, "Accepted connection from ${device.name} (${device.address})")
-                    onPeerConnected(device, socket)
-                } catch (e: IOException) {
-                    if (running.get()) {
-                        // Timeout is normal, other errors are not
-                        if (!e.message.orEmpty().contains("timeout", ignoreCase = true)) {
-                            Log.w(TAG, "Accept error: ${e.message}")
+                    val acceptStartNs = System.nanoTime()
+                    try {
+                        val socket = serverSocket?.accept(30_000) ?: continue
+                        val device = socket.remoteDevice
+                        Log.i(TAG, "Accepted connection from ${device.name} (${device.address})")
+                        onPeerConnected(device, socket)
+                    } catch (e: IOException) {
+                        if (!running.get()) break
+                        // A genuine 30s-elapsed accept throws a "timeout" and we
+                        // just re-arm. But a bad/closed socket makes accept()
+                        // throw almost immediately, and retrying with no delay
+                        // spins this thread at 100% CPU. If it returned far
+                        // faster than the timeout, the socket is likely dead —
+                        // drop it so the top of the loop re-listens, and back
+                        // off before retrying.
+                        val elapsedMs = (System.nanoTime() - acceptStartNs) / 1_000_000
+                        if (elapsedMs < 5_000) {
+                            if (!e.message.orEmpty().contains("timeout", ignoreCase = true)) {
+                                Log.w(TAG, "Accept error (${elapsedMs}ms): ${e.message} — recreating server socket")
+                            }
+                            try { serverSocket?.close() } catch (_: IOException) {}
+                            serverSocket = null
+                            Thread.sleep(1000)
                         }
                     }
                 }
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } finally {
+                acceptLoopActive.set(false)
             }
 
             Log.i(TAG, "Accept thread stopped")
@@ -425,7 +462,19 @@ class BluetoothTransport(private val context: Context) {
             output = socket.outputStream
         )
 
-        connectedPeers[addr] = peer
+        // Dedup the symmetric-connect race. BLE discovery fires on BOTH peers, so
+        // each may dial RFCOMM at the same instant: our outgoing connectTo() and
+        // their connection landing on our accept thread can both reach this method
+        // for the same address. putIfAbsent picks one winner atomically; the loser
+        // closes its socket and bails. The previous `connectedPeers[addr] = peer`
+        // overwrote the entry, leaking the first socket + its RX thread and
+        // double-playing every received frame.
+        val existing = connectedPeers.putIfAbsent(addr, peer)
+        if (existing != null) {
+            Log.i(TAG, "Duplicate RFCOMM link to ${device.name ?: addr} — closing late socket")
+            try { socket.close() } catch (_: IOException) {}
+            return
+        }
         peerCount.set(connectedPeers.size)
         refreshState()
 
