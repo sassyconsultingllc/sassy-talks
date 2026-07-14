@@ -4,6 +4,21 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.1.5] (57) — 2026-07-14
+
+### Added
+- **In-app diagnostics panel.** Settings toggle shows live relay room, cellular
+  stats, peer counts, and copyable debug dump for remote join troubleshooting.
+
+### Fixed
+- **Remote invite links.** `sassytalk://` deep links, https invite URL import,
+  and Enter Code tab paste fallback; screenshots allowed on auth/QR screens.
+- **Relay join stability.** Disabled auto PQC on relay peers; zombie socket and
+  transport-steal fixes; same-name self-echo no longer drops peer audio.
+
+### Changed
+- Fresh native rebuild (`libsassytalkie.so`) from `main` merge.
+
 ## [3.1.1] (52) — 2026-07-07
 
 ### Added
