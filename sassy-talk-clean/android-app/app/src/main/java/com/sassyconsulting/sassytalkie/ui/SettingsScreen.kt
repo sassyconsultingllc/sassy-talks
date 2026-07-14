@@ -57,6 +57,7 @@ private const val KEY_SEALED_SENDER = "sealed_sender"
 fun SettingsScreen(
     onBack: () -> Unit,
     onTransportPrefsChanged: () -> Unit = {},
+    walkieService: com.sassyconsulting.sassytalkie.WalkieService? = null,
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE) }
@@ -480,13 +481,11 @@ fun SettingsScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // v2.7.0: Diagnostics — Test Relay reachability. Lets the user
-            // isolate "is the relay up?" from "are my peers there?" without
-            // having to interpret the connection-status badge or guess.
-            // v2.7.2 will expand this card with a full diagnostic-info sheet.
+            // Diagnostics — live overlay + one-shot dump for support threads.
             SettingsCard(title = "Diagnostics") {
                 Text(
-                    text = "Quick probe of the Cloudflare relay (relay.sassyconsultingllc.com). A 200 response means the relay is up; non-200 or timeout means try Bluetooth/WiFi-only or check connectivity.",
+                    text = "Use the live panel while testing audio on the main radio screen. " +
+                        "Tap the panel header to expand. Copy the full dump to paste into support.",
                     fontSize = 11.sp,
                     color = TextMuted,
                 )
@@ -535,19 +534,19 @@ fun SettingsScreen(
                     Text("Show Diagnostic Info", fontSize = 14.sp)
                 }
                 if (showDiag) {
-                    DiagnosticInfoDialog(onDismiss = { showDiag = false })
+                    DiagnosticInfoDialog(
+                        walkieService = walkieService,
+                        onDismiss = { showDiag = false },
+                    )
                 }
 
-                // Live diagnostics HUD — a floating audio/network telemetry
-                // overlay for on-the-go field testing. Honoured in release
-                // builds (default off) so the shipped APK can be probed live.
                 Spacer(modifier = Modifier.height(12.dp))
                 val overlayOn by com.sassyconsulting.sassytalkie.debug.DiagnosticsPrefs
                     .overlayEnabled.collectAsState()
                 SettingsToggle(
                     icon = Icons.Default.Visibility,
-                    title = "Live diagnostics overlay",
-                    description = "Floating audio/network HUD over the app (works in release)",
+                    title = "Show diagnostics panel",
+                    description = "Live HUD on the radio screen: transport, relay room, queues, peers",
                     checked = overlayOn,
                     onCheckedChange = {
                         com.sassyconsulting.sassytalkie.debug.DiagnosticsPrefs.setOverlayEnabled(it)
@@ -576,13 +575,19 @@ fun SettingsScreen(
  * tokens. The dump is safe to paste into a support thread.
  */
 @Composable
-private fun DiagnosticInfoDialog(onDismiss: () -> Unit) {
+private fun DiagnosticInfoDialog(
+    walkieService: com.sassyconsulting.sassytalkie.WalkieService?,
+    onDismiss: () -> Unit,
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var dump by remember { mutableStateOf("Collecting…") }
 
     LaunchedEffect(Unit) {
-        dump = withContext(Dispatchers.IO) { collectDiagnosticDump(context) }
+        dump = withContext(Dispatchers.IO) {
+            com.sassyconsulting.sassytalkie.debug.DiagnosticsCollector
+                .buildTextDump(context, walkieService) + "\n--- Relay probe ---\n" + probeRelay()
+        }
     }
 
     AlertDialog(
@@ -619,60 +624,8 @@ private fun DiagnosticInfoDialog(onDismiss: () -> Unit) {
     )
 }
 
-private suspend fun collectDiagnosticDump(context: Context): String {
-    val sb = StringBuilder()
-    fun line(k: String, v: Any?) { sb.append(String.format("%-22s : %s%n", k, v)) }
-    try {
-        line("App", "SassyTalkie")
-        line("versionName", com.sassyconsulting.sassytalkie.BuildConfig.VERSION_NAME)
-        line("versionCode", com.sassyconsulting.sassytalkie.BuildConfig.VERSION_CODE)
-        line("buildType", com.sassyconsulting.sassytalkie.BuildConfig.BUILD_TYPE)
-        line("relayEnabled", com.sassyconsulting.sassytalkie.BuildConfig.ENABLE_CELLULAR_RELAY)
-        line("Device", "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
-        line("Android", "${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
-        line("Native init", SassyTalkNative.isInitialized())
-        line("Authenticated", SassyTalkNative.isAuthenticated())
-        line("Encrypted", SassyTalkNative.isEncrypted())
-        line("Transport", SassyTalkNative.getTransportName())
-        // Network type — derive from ConnectivityManager right here so this
-        // works even if the user has never opened MainScreen.
-        try {
-            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
-                    as android.net.ConnectivityManager
-            val net = cm.activeNetwork
-            val caps = net?.let { cm.getNetworkCapabilities(it) }
-            val t = when {
-                caps == null -> "none"
-                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)     -> "wifi"
-                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
-                else -> "other"
-            }
-            line("Network", t)
-        } catch (_: Throwable) { line("Network", "unknown") }
-
-        line("---", "--- Session ---")
-        val sessJson = SassyTalkNative.getSessionStatus()
-        sb.append(prettyOrRaw(sessJson)).append('\n')
-
-        line("---", "--- Cache ---")
-        val cacheJson = SassyTalkNative.getCacheStatus()
-        sb.append(cacheJson?.toString(2) ?: "(no cache status)").append('\n')
-
-        line("---", "--- Relay probe ---")
-        sb.append(probeRelay()).append('\n')
-    } catch (t: Throwable) {
-        sb.append("\nFAILED to collect: ").append(t.javaClass.simpleName).append(": ").append(t.message)
-    }
-    return sb.toString()
-}
-
-private fun prettyOrRaw(json: String?): String {
-    if (json.isNullOrBlank()) return "(empty)"
-    return try { org.json.JSONObject(json).toString(2) } catch (_: Throwable) { json }
-}
-
 /**
- * v2.7.0: probe the Cloudflare relay's /auth endpoint with a throwaway room
+ * Probe the Cloudflare relay's /auth endpoint with a throwaway room ID.
  * ID and report HTTP status + round-trip ms. Blocking — caller must run on
  * Dispatchers.IO. Returns a single-line summary suitable for inline display.
  *

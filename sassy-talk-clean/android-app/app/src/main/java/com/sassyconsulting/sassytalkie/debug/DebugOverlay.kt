@@ -77,6 +77,10 @@ fun DebugOverlay(modifier: Modifier = Modifier) {
                 Spacer(Modifier.height(4.dp))
                 Divider()
                 Spacer(Modifier.height(4.dp))
+                RelaySection(s)
+                Spacer(Modifier.height(4.dp))
+                Divider()
+                Spacer(Modifier.height(4.dp))
                 DeviceSection(s)
             }
         }
@@ -140,6 +144,31 @@ private fun NetSection(s: AudioTelemetry.State) {
         "  hb=${s.lastHeartbeatAgoMs?.let { "${it}ms ago" } ?: "--"}  " +
             "rx ${fmt1(s.rxKbpsAvg)} kbps"
     )
+}
+
+@Composable
+private fun RelaySection(s: AudioTelemetry.State) {
+    Mono("SESSION / RELAY")
+    val roomColor = if (s.roomMatch) TextSecondary else StatusErrorToken
+    Mono("  room=${s.relayRoom.ifEmpty { "--" }}", color = roomColor)
+    if (!s.roomMatch) {
+        Mono("  ROOM MISMATCH — reconnect or re-import session", color = StatusErrorToken)
+    }
+    Mono(
+        "  cell=${s.cellularState.ifEmpty { "--" }}  ws=${if (s.wsRelayConnected) "up" else "down"}  " +
+            "ch=${s.activeChannel}",
+    )
+    Mono(
+        "  sent=${s.cellularSent}  rx=${s.cellularReceived}  " +
+            "q in/out=${s.inboundQueue}/${s.outboundQueue}",
+    )
+    if (s.droppedPackets > 0) {
+        Mono("  dropped=${s.droppedPackets}", color = StatusWarning)
+    }
+    Mono("  peers=${s.peerCount}  users=${s.usersInRegistry}")
+    if (s.cellularReceived > 0 && s.usersInRegistry == 0) {
+        Mono("  RX pkts but no users — check PSK / device name", color = StatusWarning)
+    }
 }
 
 @Composable

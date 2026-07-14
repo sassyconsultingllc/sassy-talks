@@ -448,13 +448,22 @@ class WalkieService : Service() {
             while (isActive) {
                 try {
                     val path = SassyTalkNative.getTransportName().ifBlank { "offline" }
-                    val wsState = if (SassyTalkNative.isConnected()) "connected" else "idle"
+                    val wsState = if (pttCoordinator?.cellularClient?.isConnected() == true) {
+                        "connected"
+                    } else if (SassyTalkNative.isConnected()) {
+                        "transport-up"
+                    } else {
+                        "idle"
+                    }
                     AudioTelemetry.updateNetwork(
                         path = path,
                         wsState = wsState,
                         rttMs = null,
                         hbAgoMs = null,
                     )
+                    com.sassyconsulting.sassytalkie.debug.DiagnosticsCollector
+                        .pushLiveTelemetry(this@WalkieService)
+                    AudioTelemetry.tickPerSecond()
                 } catch (_: Throwable) { /* native not yet initialized */ }
                 delay(1_000)
             }

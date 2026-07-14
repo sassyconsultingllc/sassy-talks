@@ -437,6 +437,7 @@ fun AppNavigation(
         )
         Screen.Settings -> SettingsScreen(
             onBack = { currentScreen = Screen.Main },
+            walkieService = walkieService,
             onTransportPrefsChanged = {
                 // Tear the active transports down so MainScreen's auto-connect
                 // re-evaluates with the new toggle state. The connection
