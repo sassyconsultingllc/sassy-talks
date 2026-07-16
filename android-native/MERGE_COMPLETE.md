@@ -21,26 +21,26 @@ Your beautiful egui UI has been fully integrated with working Bluetooth backends
    - JVM initialization added
    - PTT button → real Bluetooth transmission
    - Connection status monitoring
-   - **Location:** `V:\Projects\sassytalkie\sassy-talks\sassy-talk-clean\android-native\src\lib.rs`
+   - **Location:** `V:\Projects\sassytalkie\sassy-talks\android-native\src\lib.rs`
 
 2. **src/bluetooth.rs** - COPIED
    - Complete Bluetooth manager
    - RFCOMM connection handling
    - Device pairing support
    - Audio data transmission
-   - **Location:** `V:\Projects\sassytalkie\sassy-talks\sassy-talk-clean\android-native\src\bluetooth.rs`
+   - **Location:** `V:\Projects\sassytalkie\sassy-talks\android-native\src\bluetooth.rs`
 
 3. **Cargo.toml** - UPDATED
    - Added `jni = "0.21"` dependency
    - Added Bluetooth permissions (BLUETOOTH, BLUETOOTH_ADMIN, BLUETOOTH_CONNECT, BLUETOOTH_SCAN)
    - All dependencies configured
-   - **Location:** `V:\Projects\sassytalkie\sassy-talks\sassy-talk-clean\android-native\Cargo.toml`
+   - **Location:** `V:\Projects\sassytalkie\sassy-talks\android-native\Cargo.toml`
 
 ### ⚠️ File Needing Manual Copy
 
 4. **src/jni_bridge.rs** - AVAILABLE IN OUTPUTS (25 KB)
    - **Source:** Download from Claude's outputs → `jni_bridge.rs`
-   - **Destination:** `V:\Projects\sassytalkie\sassy-talks\sassy-talk-clean\android-native\src\jni_bridge.rs`
+   - **Destination:** `V:\Projects\sassytalkie\sassy-talks\android-native\src\jni_bridge.rs`
    - **Action Required:** Copy this file manually to complete the integration
 
 ---
@@ -168,7 +168,7 @@ User Presses PTT Button
 
 ### 2. Build APK (5-10 minutes)
 ```bash
-cd V:\Projects\sassytalkie\sassy-talks\sassy-talk-clean\android-native
+cd V:\Projects\sassytalkie\sassy-talks\android-native
 cargo ndk -t aarch64-linux-android -o ./jniLibs build --release
 ./gradlew assembleRelease
 ```

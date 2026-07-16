@@ -4,7 +4,7 @@
 name: Build iOS
 
 # Builds the SassyTalkie iOS app (SwiftUI shell over the Rust FFI core in
-# sassy-talk-clean/ios-native, generated with XcodeGen from project.yml).
+# ios-native, generated with XcodeGen from project.yml).
 #
 # Two modes:
 #   * push / PR / plain dispatch → unsigned simulator build. Verifies the whole
@@ -31,12 +31,12 @@ on:
   push:
     branches: [main]
     paths:
-      - 'sassy-talk-clean/ios-native/**'
-      - 'sassy-talk-clean/core/**'
+      - 'ios-native/**'
+      - 'core/**'
   pull_request:
     paths:
-      - 'sassy-talk-clean/ios-native/**'
-      - 'sassy-talk-clean/core/**'
+      - 'ios-native/**'
+      - 'core/**'
 
 jobs:
   build-ios:
@@ -49,7 +49,7 @@ jobs:
       CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     defaults:
       run:
-        working-directory: sassy-talk-clean/ios-native
+        working-directory: ios-native
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -76,8 +76,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            sassy-talk-clean/ios-native/target
-          key: ${{ runner.os }}-ios-cargo-${{ hashFiles('sassy-talk-clean/ios-native/Cargo.lock') }}
+            ios-native/target
+          key: ${{ runner.os }}-ios-cargo-${{ hashFiles('ios-native/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-ios-cargo-
 
       - name: Install tooling (xcodegen, cbindgen, xcpretty)

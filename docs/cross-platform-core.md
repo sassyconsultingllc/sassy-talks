@@ -5,7 +5,7 @@
 -->
 # sassytalkie-core — cross-platform core crate
 
-Created in the v2.7.x cycle to end the Android-↔-Windows feature drift. Lives at `sassy-talk-clean/core/` and is depended on by both `android-native/` and `tauri-desktop/src-tauri/` via local `path = "../core"` references.
+Created in the v2.7.x cycle to end the Android-↔-Windows feature drift. Lives at `core/` and is depended on by both `android-native/` and `tauri-desktop/src-tauri/` via local `path = "../core"` references.
 
 ## What's in core
 

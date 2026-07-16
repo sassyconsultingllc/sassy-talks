@@ -5,23 +5,33 @@
 -->
 # Sassy Talk(s)
 
-Short overview
+One source tree. Edit files here — there is no nested `sassy-talk-clean/` copy and no parallel stub apps at the repo root.
 
-This repository contains multiple app artifacts and platform-specific builds for the Sassy Talk(s) project. Key folders:
+## Layout
 
-- `sassy-talk-clean/` — main app sources (web/tauri/desktop, Android, iOS, native components).
-- `v1.1.0-lobby/` — standalone lobby GUI (web/React/TypeScript) kept as a separate top-level snapshot.
+| Path | What it is |
+|------|------------|
+| `android-app/` | Production Android app (Compose). Build + ship from here. |
+| `android-native/` | Rust JNI / native audio+transport for Android |
+| `ios-native/` | iOS native + Rust |
+| `tauri-desktop/` | Desktop (Tauri) |
+| `core/` | Shared Rust core (`sassytalkie-core`) |
+| `cloudflare-worker/` | PTT relay worker |
+| `scripts/` | Commit helpers + `ship.sh` release pipeline |
+| `docs/` | Design / handoff / legal |
 
-Status (2026-01-18):
+## Android build
 
-- `v1.1.0-lobby` is not merged into the main codebase; it contains a ready-to-review GUI implementation.
-- A full workspace inventory was saved to `v:\Projects\sassytalkie\file-inventory.txt`.
-- Next steps: create branch `merge/lobby-into-main`, generate diffs for GUI files, apply selected changes, run builds/tests, and open a PR.
+```powershell
+cd android-app
+.\gradlew.bat assembleDirectRelease bundlePlayRelease
+```
 
-Quick pointers
+- **Direct APK** (website / license key): `android-app/app/build/outputs/apk/direct/release/app-direct-release.apk`
+- **Play AAB** (Billing): `android-app/app/build/outputs/bundle/playRelease/app-play-release.aab`
 
-- GUI sources to inspect: `v1.1.0-lobby/src` (components, hooks, services, styles, assets).
-- Primary desktop/web entrypoints: `sassy-talk-clean/tauri-desktop/src` and `sassy-talk-clean/tauri-desktop/src-tauri`.
-- Android/iOS native code is in `sassy-talk-clean/android-app` and `sassy-talk-clean/ios-native`.
+Ship with `scripts/ship.sh <version>` after both artifacts exist.
 
-If you want, I can (a) create the `merge/lobby-into-main` branch, (b) generate diffs limited to GUI files, or (c) apply selected files into a branch for testing.
+## Do not resurrect dual trees
+
+A previous layout kept incomplete `android-app/` / `tauri-desktop/` / `cloudflare-worker/` stubs beside a nested `sassy-talk-clean/` tree. Agents patched the stubs; the real app diverged; regressions followed. **Never reintroduce a second copy of these projects.**

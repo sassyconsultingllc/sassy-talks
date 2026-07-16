@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
-// CodeMark: SCLLC1-sassytalkie-AVLNIMD4PFJM
+// CodeMark: SCLLC1-sassytalkie-A6XSZ4VDBSXO
 /// Transport Manager - UDP Multicast Communication with Encryption
 /// 
 /// Features:
@@ -11,12 +11,19 @@
 /// 
 /// Copyright 2025 Sassy Consulting LLC. All rights reserved.
 
-use super::{TransportError, MAX_PACKET_SIZE, PEER_TIMEOUT_SECS};
+use super::{TransportError, MAX_PACKET_SIZE, PEER_TIMEOUT_SECS, AudioFrame};
 use super::liveness::LivenessTracker;
 use super::control;
 use crate::constants::{DEFAULT_MULTICAST_ADDR, DEFAULT_MULTICAST_PORT, PORT_RANGE_START, PORT_RANGE_END, KEEPALIVE_INTERVAL_SECS};
 use crate::protocol::{Packet, PacketType};
 use crate::security::CryptoEngine;
+// Shared cross-platform crypto + audio wire frame. The desktop audio plane now
+// matches Android/iOS: the WHOLE core::wire frame is sealed with the QR-PSK
+// CryptoSession (AES-256-GCM, nonce||ct||tag) and multicast on the shared group,
+// instead of the legacy per-peer X25519 ECDH + bincode Packet path (kept only as
+// a desktop↔desktop fallback when no QR session is installed).
+use sassytalkie_core::crypto::CryptoSession;
+use sassytalkie_core::wire;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -45,7 +52,11 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             multicast_addr: DEFAULT_MULTICAST_ADDR.to_string(),
-            use_random_port: true,  // Default to random port for security
+            // MUST be the shared fixed port (5555) to interoperate with the
+            // Android/iOS phones — UDP multicast delivery is port-specific, so a
+            // random port silently isolates the desktop from the phone group.
+            // App-layer AES-256-GCM is the security boundary, not port obscurity.
+            use_random_port: false,
             fixed_port: DEFAULT_MULTICAST_PORT,
             encryption_enabled: true,  // Default to encrypted
         }
@@ -72,7 +83,7 @@ impl PeerInfo {
     pub fn is_active(&self) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         now - self.last_seen < PEER_TIMEOUT_SECS
     }
@@ -112,18 +123,32 @@ pub struct TransportManager {
     // Peer tracking
     peers: Arc<RwLock<HashMap<u32, PeerInfo>>>,
     
-    // Encryption engines per peer
+    // Encryption engines per peer (legacy desktop↔desktop X25519 ECDH path).
     crypto_engines: Arc<RwLock<HashMap<u32, CryptoEngine>>>,
+
+    // Shared GROUP session installed from the QR PSK (core::crypto). When present
+    // this is the canonical audio cipher: the whole core::wire frame is sealed
+    // with it and multicast to the group, byte-identical to Android/iOS. `None`
+    // until a QR session is imported (then the legacy per-peer path is bypassed).
+    group_crypto: Arc<RwLock<Option<CryptoSession>>>,
+
+    // Stable per-install sender id placed in every core::wire frame (<= 32 bytes).
+    sender_id: String,
     
     // Our public key for sharing
     our_public_key: Arc<RwLock<Option<[u8; 32]>>>,
-    
+
+    // Our session identity engine — holds the static secret behind our_public_key.
+    // Reused to derive EVERY per-peer session key (derive_peer_session), so both
+    // sides agree on the shared key. Immutable for the session (no lock needed).
+    identity: Arc<CryptoEngine>,
+
     // Control
     running: Arc<AtomicBool>,
 
     // Channels for audio data
-    audio_tx: mpsc::UnboundedSender<Vec<u8>>,
-    audio_rx: Arc<RwLock<Option<mpsc::UnboundedReceiver<Vec<u8>>>>>,
+    audio_tx: mpsc::UnboundedSender<AudioFrame>,
+    audio_rx: Arc<RwLock<Option<mpsc::UnboundedReceiver<AudioFrame>>>>,
 
     // Liveness tracking
     liveness: Arc<Mutex<LivenessTracker>>,
@@ -195,7 +220,9 @@ impl TransportManager {
         // Create audio channel
         let (audio_tx, audio_rx) = mpsc::unbounded_channel();
         
-        // Generate our keypair for encryption
+        // Generate our session keypair for encryption. We KEEP this engine (as
+        // `identity`) — it holds the static secret behind `our_public` and is reused
+        // to derive every per-peer session key.
         let mut crypto = CryptoEngine::new();
         let our_public = crypto.generate_keypair();
 
@@ -212,7 +239,10 @@ impl TransportManager {
             config: Arc::new(RwLock::new(config)),
             peers: Arc::new(RwLock::new(HashMap::new())),
             crypto_engines: Arc::new(RwLock::new(HashMap::new())),
+            group_crypto: Arc::new(RwLock::new(None)),
+            sender_id: format!("desk-{:08x}", device_id),
             our_public_key: Arc::new(RwLock::new(Some(our_public))),
+            identity: Arc::new(crypto),
             running: Arc::new(AtomicBool::new(false)),
             audio_tx,
             audio_rx: Arc::new(RwLock::new(Some(audio_rx))),
@@ -385,10 +415,21 @@ impl TransportManager {
         let device_id_rx = self.device_id;
         let config = Arc::clone(&self.config);
         let liveness_rx = Arc::clone(&self.liveness);
-        
-        tokio::spawn(async move {
+        let identity_rx = Arc::clone(&self.identity);
+        let group_crypto_rx = Arc::clone(&self.group_crypto);
+        let sender_id_rx = self.sender_id.clone();
+
+        // Dedicated OS thread, NOT a tokio task: recv_from on the socket2 socket
+        // is a blocking syscall (the socket is non-blocking, so it returns
+        // WouldBlock and we poll). Running that poll on a tokio worker monopolized
+        // a runtime thread and forced a busy-sleep. On its own thread it can block
+        // freely without starving the async runtime. Everything it touches
+        // (RwLocks, the unbounded mpsc sender) is sync, so no runtime is needed.
+        std::thread::Builder::new()
+            .name("transport-rx".into())
+            .spawn(move || {
             let mut buf = vec![std::mem::MaybeUninit::<u8>::uninit(); MAX_PACKET_SIZE];
-            
+
             while running_rx.load(Ordering::Relaxed) {
                 match socket_rx.recv_from(&mut buf) {
                     Ok((size, src_addr)) => {
@@ -396,6 +437,36 @@ impl TransportManager {
                         let received = unsafe {
                             std::slice::from_raw_parts(buf.as_ptr() as *const u8, size)
                         };
+
+                        // ── Cross-platform GROUP audio plane (Android/iOS) ──
+                        // With a QR session PSK installed, a datagram that decrypts
+                        // under it (valid GCM tag) IS a shared core::wire frame.
+                        // Try this FIRST: sealed audio has a random first byte and
+                        // would otherwise be misclassified as a control frame. The
+                        // 128-bit GCM tag makes false positives (a legacy/control
+                        // frame "decrypting") astronomically unlikely.
+                        let group_plain = {
+                            let guard = group_crypto_rx.read().unwrap();
+                            match guard.as_ref() {
+                                Some(crypto) => crypto.decrypt(received).ok(),
+                                None => None,
+                            }
+                        };
+                        if let Some(plain) = group_plain {
+                            if let Ok((_ch, _sub, sender, _name, ts, opus)) =
+                                wire::unpack_wire_frame(&plain)
+                            {
+                                // Skip our own multicast loopback.
+                                if sender != sender_id_rx {
+                                    let _ = audio_tx.send(AudioFrame {
+                                        sender,
+                                        timestamp: ts,
+                                        opus,
+                                    });
+                                }
+                            }
+                            continue;
+                        }
 
                         // Control frames have first byte >= 0x10; handle before Packet deserialize
                         if received.first().copied().unwrap_or(0) >= 0x10 {
@@ -434,14 +505,21 @@ impl TransportManager {
                             
                             match packet.packet_type {
                                 PacketType::Discovery { device_name, channel } => {
+                                    // Skip (don't panic) if the source isn't an IP
+                                    // socket — recv_from on our UDP socket always
+                                    // yields one, but as_socket() returns Option.
+                                    let src = match src_addr.as_socket() {
+                                        Some(a) => a,
+                                        None => continue,
+                                    };
                                     // Update peer info
                                     let peer = PeerInfo {
                                         device_id: packet.device_id,
                                         device_name,
-                                        address: src_addr.as_socket().unwrap(),
+                                        address: src,
                                         last_seen: SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
-                                            .unwrap()
+                                            .unwrap_or_default()
                                             .as_secs(),
                                         channel,
                                         public_key: None,
@@ -451,14 +529,18 @@ impl TransportManager {
                                     peers.write().unwrap().insert(packet.device_id, peer);
                                 }
                                 PacketType::DiscoveryWithKey { device_name, channel, public_key } => {
+                                    let src = match src_addr.as_socket() {
+                                        Some(a) => a,
+                                        None => continue,
+                                    };
                                     // Handle discovery with public key
-                                    let peer = PeerInfo {
+                                    let mut peer = PeerInfo {
                                         device_id: packet.device_id,
                                         device_name,
-                                        address: src_addr.as_socket().unwrap(),
+                                        address: src,
                                         last_seen: SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
-                                            .unwrap()
+                                            .unwrap_or_default()
                                             .as_secs(),
                                         channel,
                                         public_key: public_key.map(|k| hex::encode(k)),
@@ -478,14 +560,18 @@ impl TransportManager {
                                             let key_exchange_succeeded = {
                                                 let mut engines = crypto_engines.write().unwrap();
                                                 if !engines.contains_key(&packet.device_id) {
-                                                    let mut engine = CryptoEngine::new();
-                                                    let _ = engine.generate_keypair();
-                                                    if engine.key_exchange(&peer_public).is_ok() {
-                                                        info!("Key exchange completed with peer {:08X}", packet.device_id);
-                                                        engines.insert(packet.device_id, engine);
-                                                        true
-                                                    } else {
-                                                        false
+                                                    // Derive the per-peer key from OUR advertised identity
+                                                    // secret + the peer's public key (symmetric ECDH).
+                                                    match identity_rx.derive_peer_session(&peer_public) {
+                                                        Ok(engine) => {
+                                                            info!("Key exchange completed with peer {:08X}", packet.device_id);
+                                                            engines.insert(packet.device_id, engine);
+                                                            true
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("Key derivation failed for peer {:08X}: {:?}", packet.device_id, e);
+                                                            false
+                                                        }
                                                     }
                                                 } else {
                                                     false
@@ -493,13 +579,16 @@ impl TransportManager {
                                                 // `engines` (crypto_engines write guard) is dropped here
                                             };
 
-                                            // Now safe to acquire peers without holding crypto_engines
-                                            if key_exchange_succeeded {
-                                                let mut peers_w = peers.write().unwrap();
-                                                if let Some(p) = peers_w.get_mut(&packet.device_id) {
-                                                    p.key_exchanged = true;
-                                                }
-                                            }
+                                            // Mark the peer as encrypted iff we now hold a ready
+                                            // engine for it. The OLD code did get_mut() BEFORE the
+                                            // peer was inserted below (always a no-op on first
+                                            // contact), and the unconditional insert at the end of
+                                            // this arm then overwrote key_exchanged with false — so
+                                            // it was never actually true. Set it on the `peer` we're
+                                            // about to insert instead. (engines write guard already
+                                            // dropped above, so this read can't self-deadlock.)
+                                            peer.key_exchanged = key_exchange_succeeded
+                                                || crypto_engines.read().unwrap().contains_key(&packet.device_id);
                                         }
                                     }
                                     
@@ -537,8 +626,13 @@ impl TransportManager {
                                         data.clone()
                                     };
                                     
-                                    // Forward audio to audio channel
-                                    let _ = audio_tx.send(decrypted_data);
+                                    // Forward audio to audio channel (legacy
+                                    // per-peer path — no wire timestamp).
+                                    let _ = audio_tx.send(AudioFrame {
+                                        sender: format!("legacy-{:08X}", packet.device_id),
+                                        timestamp: 0,
+                                        opus: decrypted_data,
+                                    });
                                 }
                                 PacketType::EncryptedAudio { channel, nonce, auth_tag, data } => {
                                     // Already-structured encrypted audio
@@ -546,7 +640,11 @@ impl TransportManager {
                                         if engine.is_ready() {
                                             match engine.decrypt(&data, &nonce, &auth_tag) {
                                                 Ok(decrypted) => {
-                                                    let _ = audio_tx.send(decrypted);
+                                                    let _ = audio_tx.send(AudioFrame {
+                                                        sender: format!("legacy-{:08X}", packet.device_id),
+                                                        timestamp: 0,
+                                                        opus: decrypted,
+                                                    });
                                                 }
                                                 Err(e) => {
                                                     warn!("Decryption failed: {:?}", e);
@@ -560,7 +658,7 @@ impl TransportManager {
                                     if let Some(peer) = peers.write().unwrap().get_mut(&packet.device_id) {
                                         peer.last_seen = SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
-                                            .unwrap()
+                                            .unwrap_or_default()
                                             .as_secs();
                                     }
                                 }
@@ -572,11 +670,12 @@ impl TransportManager {
                                     if encryption_enabled {
                                         let mut engines = crypto_engines.write().unwrap();
                                         if !engines.contains_key(&packet.device_id) {
-                                            let mut engine = CryptoEngine::new();
-                                            let _ = engine.generate_keypair();
-                                            if engine.key_exchange(&public_key).is_ok() {
-                                                info!("Key exchange completed with peer {:08X}", packet.device_id);
-                                                engines.insert(packet.device_id, engine);
+                                            match identity_rx.derive_peer_session(&public_key) {
+                                                Ok(engine) => {
+                                                    info!("Key exchange completed with peer {:08X}", packet.device_id);
+                                                    engines.insert(packet.device_id, engine);
+                                                }
+                                                Err(e) => warn!("Key derivation failed for peer {:08X}: {:?}", packet.device_id, e),
                                             }
                                         }
                                     }
@@ -590,9 +689,7 @@ impl TransportManager {
                                         if encryption_enabled {
                                             let mut engines = crypto_engines.write().unwrap();
                                             if !engines.contains_key(&packet.device_id) {
-                                                let mut engine = CryptoEngine::new();
-                                                let _ = engine.generate_keypair();
-                                                if engine.key_exchange(&public_key).is_ok() {
+                                                if let Ok(engine) = identity_rx.derive_peer_session(&public_key) {
                                                     engines.insert(packet.device_id, engine);
                                                 }
                                             }
@@ -603,16 +700,19 @@ impl TransportManager {
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No data available, sleep briefly
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        // No data available — blocking sleep on this dedicated
+                        // thread (does not occupy a tokio worker). 2ms keeps
+                        // inbound latency low without spinning the CPU.
+                        std::thread::sleep(Duration::from_millis(2));
                     }
                     Err(e) => {
                         error!("Receive error: {}", e);
                     }
                 }
             }
-        });
-        
+        })
+        .map_err(|e| TransportError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
         info!("✓ Transport manager started");
         Ok(())
     }
@@ -622,66 +722,143 @@ impl TransportManager {
         info!("Stopping transport manager");
         self.running.store(false, Ordering::Relaxed);
     }
-    
+
+    /// Install the shared GROUP session key (the QR PSK), switching the audio
+    /// plane to the cross-platform `core::wire` + `core::crypto` path. After this,
+    /// `send_audio` seals whole wire frames with this key and multicasts them, and
+    /// the RX loop decrypts inbound group frames — byte-identical to Android/iOS.
+    pub fn set_session_psk(&self, key: &[u8; 32]) {
+        *self.group_crypto.write().unwrap() = Some(CryptoSession::from_psk(key));
+        info!("Transport: group session installed (core::wire audio plane active)");
+    }
+
     /// Send audio data (with encryption if enabled)
     pub fn send_audio(&self, audio_data: &[u8]) -> Result<(), TransportError> {
         let channel = *self.current_channel.read().unwrap();
-        let config = self.config.read().unwrap();
-        
-        let packet = if config.encryption_enabled {
-            // SECURITY NOTE (CRITICAL-3): This transport uses UDP multicast, so a single
-            // encrypted packet is broadcast to all peers. True per-peer encryption would
-            // require unicast sends (one encrypted copy per peer, each using that peer's
-            // shared session key). With multicast, all peers receiving the packet must be
-            // able to decrypt it with the same key, which means a compromised peer exposes
-            // all audio in the session.
-            //
-            // The correct architectural fix is to switch to per-peer unicast:
-            //
-            //   for (peer_id, engine) in engines.iter() {
-            //       let encrypted = engine.encrypt(audio_data, &nonce);
-            //       unicast_send(peer_id, encrypted);
-            //   }
-            //
-            // Until unicast is implemented, we encrypt with the first available peer engine
-            // and broadcast. We iterate all engines here (rather than short-circuiting with
-            // `.next()`) to make the single-key limitation explicit and auditable.
-            let nonce = CryptoEngine::generate_nonce();
-            let engines = self.crypto_engines.read().unwrap();
 
-            // Find the first ready engine across ALL peer engines (not just the first
-            // engine in the map — we check is_ready() on each to be explicit).
-            let maybe_encrypted = engines
-                .iter()
-                .find(|(_, e)| e.is_ready())
-                .and_then(|(_, engine)| engine.encrypt(audio_data, &nonce).ok());
-
-            if let Some((ciphertext, auth_tag)) = maybe_encrypted {
-                // Pack: nonce (12) + auth_tag (16) + ciphertext
-                let mut encrypted_payload = Vec::with_capacity(28 + ciphertext.len());
-                encrypted_payload.extend_from_slice(&nonce);
-                encrypted_payload.extend_from_slice(&auth_tag);
-                encrypted_payload.extend_from_slice(&ciphertext);
-                Packet::audio(self.device_id, channel, encrypted_payload)
-            } else {
-                // No ready engine yet (no completed key exchange) — send plain.
-                Packet::audio(self.device_id, channel, audio_data.to_vec())
+        // ── Cross-platform GROUP path (matches Android/iOS) ──
+        // With a QR session PSK installed, seal the WHOLE core::wire frame with the
+        // group CryptoSession and multicast ONE copy to the group — byte-identical
+        // to the Android/iOS multicast audio plane. Bypasses the legacy per-peer
+        // X25519 path entirely.
+        let group_sealed = {
+            let mut guard = self.group_crypto.write().unwrap();
+            match guard.as_mut() {
+                Some(crypto) => {
+                    let frame = wire::pack_wire_frame(
+                        channel,
+                        wire::SUBCH_MAIN,
+                        &self.sender_id,
+                        &self.device_name,
+                        wire::now_ms(),
+                        audio_data,
+                    );
+                    Some(crypto.encrypt(&frame).map_err(TransportError::EncryptionError)?)
+                }
+                None => None,
             }
-        } else {
-            Packet::audio(self.device_id, channel, audio_data.to_vec())
         };
-        
-        let data = packet.serialize()
-            .map_err(|e| TransportError::SerializationError(e))?;
-        
-        self.socket.send_to(&data, &self.multicast_addr.into())
-            .map_err(|e| TransportError::IoError(e))?;
-        
-        Ok(())
+        if let Some(sealed) = group_sealed {
+            self.socket
+                .send_to(&sealed, &self.multicast_addr.into())
+                .map_err(TransportError::IoError)?;
+            return Ok(());
+        }
+
+        let encryption_enabled = self.config.read().unwrap().encryption_enabled;
+
+        if !encryption_enabled {
+            // Plaintext mode keeps the single multicast send.
+            let packet = Packet::audio(self.device_id, channel, audio_data.to_vec());
+            let data = packet.serialize().map_err(TransportError::SerializationError)?;
+            self.socket.send_to(&data, &self.multicast_addr.into())
+                .map_err(TransportError::IoError)?;
+            return Ok(());
+        }
+
+        // Per-peer unicast (fixes CRITICAL-3): each peer derived a DIFFERENT
+        // pairwise session key, so a single multicast packet encrypted under one
+        // peer's key was undecryptable by everyone else. We now encrypt one copy
+        // per ready peer with THAT peer's engine + a unique counter nonce and
+        // unicast it to the peer's address. Side benefit: a compromised peer's
+        // key no longer exposes the whole room's audio.
+        let engines = self.crypto_engines.read().unwrap();
+        let peers = self.peers.read().unwrap();
+
+        let mut sent_any = false;
+        let mut last_err: Option<TransportError> = None;
+        let mut had_ready_peer = false;
+
+        for (peer_id, engine) in engines.iter() {
+            if !engine.is_ready() {
+                continue;
+            }
+            // Need the peer's address to unicast. An engine without a known
+            // address (key exchanged but no discovery address yet) is skipped.
+            let addr = match peers.get(peer_id) {
+                Some(p) => p.address,
+                None => continue,
+            };
+            had_ready_peer = true;
+
+            // Unique (key, nonce) per frame for THIS engine — never random-reuse.
+            let nonce = match engine.next_nonce() {
+                Ok(n) => n,
+                Err(_) => {
+                    last_err = Some(TransportError::EncryptionError(
+                        "nonce counter exhausted for peer".into(),
+                    ));
+                    continue;
+                }
+            };
+            let (ciphertext, auth_tag) = match engine.encrypt(audio_data, &nonce) {
+                Ok(v) => v,
+                Err(_) => {
+                    last_err = Some(TransportError::EncryptionError("encrypt failed".into()));
+                    continue;
+                }
+            };
+
+            // Pack: nonce (12) + auth_tag (16) + ciphertext
+            let mut payload = Vec::with_capacity(28 + ciphertext.len());
+            payload.extend_from_slice(&nonce);
+            payload.extend_from_slice(&auth_tag);
+            payload.extend_from_slice(&ciphertext);
+
+            let packet = Packet::audio(self.device_id, channel, payload);
+            let data = match packet.serialize() {
+                Ok(d) => d,
+                Err(e) => {
+                    last_err = Some(TransportError::SerializationError(e));
+                    continue;
+                }
+            };
+
+            match self.socket.send_to(&data, &addr.into()) {
+                Ok(_) => sent_any = true,
+                Err(e) => last_err = Some(TransportError::IoError(e)),
+            }
+        }
+
+        if sent_any {
+            Ok(())
+        } else if !had_ready_peer {
+            // Encryption is ENABLED but no peer has a completed key exchange yet.
+            // Do NOT fall back to plaintext — drop the frame and signal the caller.
+            warn!("send_audio: encryption enabled but no ready peer — refusing plaintext fallback");
+            Err(TransportError::EncryptionError(
+                "no completed key exchange yet — not sending plaintext".into(),
+            ))
+        } else {
+            // Had ready peers but every send/encrypt failed — surface the last error.
+            Err(last_err.unwrap_or_else(|| {
+                TransportError::EncryptionError("encrypted send failed for all peers".into())
+            }))
+        }
     }
     
     /// Get received audio receiver
-    pub fn take_audio_receiver(&self) -> Option<mpsc::UnboundedReceiver<Vec<u8>>> {
+    pub fn take_audio_receiver(&self) -> Option<mpsc::UnboundedReceiver<AudioFrame>> {
         self.audio_rx.write().unwrap().take()
     }
     

@@ -75,3 +75,9 @@ ios-native.zip
 
 # Holding pen for files staged for deletion (keep out of source tree, don't push)
 /delete/
+
+# Nested archive leftovers (never commit)
+**/sassytalkie-android-native-build.zip
+**/playstore-complete.zip
+**/core.zip
+

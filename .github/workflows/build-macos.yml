@@ -4,7 +4,7 @@
 name: Build macOS
 
 # Builds the SassyTalkie desktop app for macOS (Tauri 2 — React frontend +
-# Rust in sassy-talk-clean/tauri-desktop, which consumes sassytalkie-core).
+# Rust in tauri-desktop, which consumes sassytalkie-core).
 #
 # Two modes:
 #   * push / PR / plain dispatch → unsigned universal .app/.dmg. Verifies the
@@ -30,12 +30,12 @@ on:
   push:
     branches: [main]
     paths:
-      - 'sassy-talk-clean/tauri-desktop/**'
-      - 'sassy-talk-clean/core/**'
+      - 'tauri-desktop/**'
+      - 'core/**'
   pull_request:
     paths:
-      - 'sassy-talk-clean/tauri-desktop/**'
-      - 'sassy-talk-clean/core/**'
+      - 'tauri-desktop/**'
+      - 'core/**'
 
 jobs:
   build-macos:
@@ -48,7 +48,7 @@ jobs:
       CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     defaults:
       run:
-        working-directory: sassy-talk-clean/tauri-desktop
+        working-directory: tauri-desktop
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -72,8 +72,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            sassy-talk-clean/tauri-desktop/src-tauri/target
-          key: ${{ runner.os }}-macos-cargo-${{ hashFiles('sassy-talk-clean/tauri-desktop/src-tauri/Cargo.lock') }}
+            tauri-desktop/src-tauri/target
+          key: ${{ runner.os }}-macos-cargo-${{ hashFiles('tauri-desktop/src-tauri/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-macos-cargo-
 
       - name: Install frontend deps
@@ -129,7 +129,7 @@ jobs:
         with:
           name: sassy-talk-macos
           path: |
-            sassy-talk-clean/tauri-desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
-            sassy-talk-clean/tauri-desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
+            tauri-desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            tauri-desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
           retention-days: 30
           if-no-files-found: error

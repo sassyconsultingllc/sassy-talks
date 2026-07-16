@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
-// CodeMark: SCLLC1-sassytalkie-6EDMQWZ7TGYP
+// CodeMark: SCLLC1-sassytalkie-53CVA2GFR6FK
 package com.sassyconsulting.sassytalkie.ui
 
 import androidx.compose.animation.core.*
@@ -32,11 +32,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.sassyconsulting.sassytalkie.SassyTalkNative
+import com.sassyconsulting.sassytalkie.SessionShareLink
 import com.sassyconsulting.sassytalkie.TranscriptionBridge
 import com.sassyconsulting.sassytalkie.WalkieService
 import com.sassyconsulting.sassytalkie.ui.theme.*
-import androidx.compose.foundation.layout.safeDrawingPadding
+import com.sassyconsulting.sassytalkie.ui.util.QrBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.material3.TextButton
@@ -65,6 +67,7 @@ fun MainScreen(
 
     val connectState by autoConnect.state.collectAsState()
     val connectStatusText by autoConnect.statusText.collectAsState()
+    val transportAdvisory by autoConnect.transportAdvisory.collectAsState()
 
     // Incoming audio indicator
     val incomingAudio by TranscriptionBridge.incomingAudio.collectAsState()
@@ -73,35 +76,125 @@ fun MainScreen(
     // Relay readiness
     val relayReady by autoConnect.relayReady.collectAsState()
 
-    // Reaching-peer indicator (Task 4.2)
-    val reachingPeer by (walkieService?.pttCoordinator?.reachingPeer
-        ?: kotlinx.coroutines.flow.MutableStateFlow(false)).collectAsState()
+    // Per-screen fallback flows. `remember`d once so the same Flow instance
+    // is reused across recompositions — otherwise every recompose builds a
+    // brand-new MutableStateFlow and triggers a re-subscribe + coroutine
+    // churn on collectAsState. (Previously: when pttCoordinator was null,
+    // each recompose allocated a new flow → new subscription → cancel old →
+    // launch new → repeat at every state change. Wasteful.)
+    val falseFallback = remember { kotlinx.coroutines.flow.MutableStateFlow(false) }
+    val idleDeliveryFallback = remember {
+        kotlinx.coroutines.flow.MutableStateFlow(com.sassyconsulting.sassytalkie.DeliveryState.Idle)
+    }
+
+    // Reaching-peer indicator — use reach-failed (watchdog) not inverted reachingPeer
+    val peerReachFailed by (walkieService?.pttCoordinator?.peerReachFailed ?: falseFallback).collectAsState()
 
     // Delivery state indicator (Task 4.3)
-    val deliveryState by (walkieService?.pttCoordinator?.deliveredState
-        ?: kotlinx.coroutines.flow.MutableStateFlow(com.sassyconsulting.sassytalkie.DeliveryState.Idle)).collectAsState()
+    val deliveryState by (walkieService?.pttCoordinator?.deliveredState ?: idleDeliveryFallback).collectAsState()
 
     // Audio path degraded indicator (Task 7.1)
-    val audioPathDegraded by (walkieService?.pttCoordinator?.audioPathDegraded
-        ?: kotlinx.coroutines.flow.MutableStateFlow(false)).collectAsState()
+    val audioPathDegraded by (walkieService?.pttCoordinator?.audioPathDegraded ?: falseFallback).collectAsState()
 
     // Stale-peer banner (Task 6.2)
-    val anyPeerStale by (walkieService?.pttCoordinator?.anyPeerStale
-        ?: kotlinx.coroutines.flow.MutableStateFlow(false)).collectAsState()
+    val anyPeerStale by (walkieService?.pttCoordinator?.anyPeerStale ?: falseFallback).collectAsState()
 
     // Talk-over indicator (Task 6.2)
-    val peerSpeaking by (walkieService?.pttCoordinator?.peerSpeaking
-        ?: kotlinx.coroutines.flow.MutableStateFlow(false)).collectAsState()
+    val peerSpeaking by (walkieService?.pttCoordinator?.peerSpeaking ?: falseFallback).collectAsState()
 
-    // Auto-connect and set cache to queue mode (cache-first)
+    // Half-duplex: while WE transmit, hard-mute incoming RX playback so the
+    // remote stream isn't played out the speaker into our hot mic (acoustic
+    // feedback) — radio convention is you don't hear others while keyed. This is
+    // an absolute cut (native rx_muted), not a duck, and it preserves the user's
+    // configured RX gain. We intentionally do NOT block transmitting while a peer
+    // speaks (this app has an emergency path — barge-in must always be possible).
+    LaunchedEffect(isTransmitting) {
+        SassyTalkNative.setRxMuted(isTransmitting)
+    }
+
+    // v2.7.1: snackbar host for peer join/leave toasts.
+    // `scope` is already declared earlier in this composable for the existing
+    // disconnect handler — reuse it; don't redeclare.
+    val snackbarHost = remember { androidx.compose.material3.SnackbarHostState() }
+
+    // v2.7.1: subscribe to peer join/leave events → snackbar.
+    // Only collects while this composable is in the tree; key = pttCoordinator
+    // so we re-subscribe if the service rebinds (preserves identity otherwise).
+    val coord = walkieService?.pttCoordinator
+    val cacheSnap by TranscriptionBridge.cacheSnapshot.collectAsState()
+
+    LaunchedEffect(coord) {
+        // Peers are keyed differently across transports (relay:<epoch> vs
+        // relay:<clientId> vs BLE MAC), so an unresolved id must NEVER leak into
+        // the UI as a raw "relay:1a9618" string. Also coalesce churn: a fast
+        // rejoin cancels the pending "left", and identical messages are
+        // rate-limited so a flapping peer doesn't spam the snackbar.
+        val coalesceMs = 4_000L
+        val pendingLeave = HashMap<String, kotlinx.coroutines.Job>()
+        val lastShownAt = HashMap<String, Long>()
+        suspend fun resolve(peerId: String): String {
+            val users = withContext(Dispatchers.IO) { SassyTalkNative.getUsers() }
+            return users.associate { it.id to it.name }[peerId]
+                ?.takeIf { it.isNotBlank() && it != "null" } ?: "A device"
+        }
+        suspend fun show(msg: String) {
+            val now = System.currentTimeMillis()
+            if (now - (lastShownAt[msg] ?: 0L) > coalesceMs) {
+                lastShownAt[msg] = now
+                snackbarHost.showSnackbar(msg, duration = androidx.compose.material3.SnackbarDuration.Short)
+            }
+        }
+        coord?.peerEvents?.collect { ev ->
+            try {
+                when (ev) {
+                    is com.sassyconsulting.sassytalkie.PeerEvent.Joined -> {
+                        pendingLeave.remove(ev.peerId)?.cancel()
+                        show("${resolve(ev.peerId)} joined")
+                    }
+                    is com.sassyconsulting.sassytalkie.PeerEvent.Left -> {
+                        pendingLeave.remove(ev.peerId)?.cancel()
+                        pendingLeave[ev.peerId] = launch {
+                            kotlinx.coroutines.delay(coalesceMs)
+                            pendingLeave.remove(ev.peerId)
+                            show("${resolve(ev.peerId)} left")
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                android.util.Log.w("MainScreen", "peer event UI failed: ${t.message}")
+            }
+        }
+    }
+
+    // Transport advisory refresh only — cache status polled centrally in TranscriptionBridge.
     LaunchedEffect(Unit) {
+        var tick = 0
+        while (true) {
+            if (tick % 5 == 0) autoConnect.refreshTransportAdvisory()
+            kotlinx.coroutines.delay(2_000L)
+            tick++
+        }
+    }
+
+    // Auto-connect and set cache to queue mode (cache-first). Re-run when the
+    // WalkieService binds — share-link cold starts often reach Main before the
+    // service is ready, leaving the relay client unwired.
+    LaunchedEffect(walkieService) {
+        val service = walkieService ?: return@LaunchedEffect
+        // Re-attempt BT init on every Main mount (idempotent, cheap guards).
+        // Covers Bluetooth toggled on / permissions granted / entitlement
+        // unlocked AFTER the one-shot AppNavigation init ran — before this,
+        // a skipped init left pttCoordinator null for the whole session.
+        // Must run BEFORE attachWalkieService so the relay client gets wired
+        // to the freshly-created coordinator.
+        withContext(Dispatchers.IO) { service.initBleTransport() }
+        autoConnect.attachWalkieService(service)
         if (connectState != ConnectState.CONNECTED) {
             autoConnect.reset()
-            autoConnect.autoConnect(walkieService)
+            autoConnect.autoConnect(service)
         }
         withContext(Dispatchers.IO) {
-            SassyTalkNative.restoreSession()
-            // Default to queue mode so incoming audio caches until user is done speaking
+            SassyTalkNative.restoreCohortHistory()
             SassyTalkNative.setCacheMode(SassyTalkNative.CACHE_MODE_QUEUE)
         }
     }
@@ -118,11 +211,19 @@ fun MainScreen(
         label = "pulseScale"
     )
 
-    Column(
+    Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(DarkBg)
-            .safeDrawingPadding()
+            .background(Brush.radialGradient(listOf(BgMedium, BgDark)))
+    ) {
+    Column(
+        modifier = Modifier
+            .fillMaxHeight()
+            // Cap + center content on large screens so a 7"+ tablet isn't a
+            // stretched phone with big empty side gaps. No-op on phones (<560dp).
+            .widthIn(max = 560.dp)
+            .fillMaxWidth()
+            .align(Alignment.TopCenter)
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
@@ -135,23 +236,31 @@ fun MainScreen(
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = {
-                scope.launch {
-                    withContext(Dispatchers.IO) { SassyTalkNative.disconnect() }
-                    onDisconnect()
-                }
+                // Plain navigation — deliberately NOT SassyTalkNative.disconnect().
+                // That native call wipes transport crypto (TransportManager.
+                // disconnect sets crypto=None), so backing out once and
+                // Continue-ing back in landed on Main un-encrypted: every PTT
+                // press was rejected ("Authenticate via QR first") while the
+                // roster still showed peers. Full teardown = End Session menu.
+                onDisconnect()
             }) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Disconnect", tint = TextGray)
+                Icon(Icons.Default.ArrowBack, contentDescription = "Leave radio screen", tint = TextGray)
             }
 
             // Group name (editable per-channel) — defaults to "Sassy-Talk" if no name set
             val channelGroupName = remember(currentChannel) {
                 SassyTalkNative.getGroupName(currentChannel)
             }
+            // Brand title — blue→purple gradient, matching the Tauri reference
+            // (app.css --gradient-primary). GradientPrimary is defined in
+            // ui/theme/Color.kt.
             Text(
                 text = channelGroupName.ifEmpty { "Sassy-Talk" },
                 fontSize = 24.sp,
                 fontWeight = FontWeight.Bold,
-                color = Orange,
+                style = androidx.compose.ui.text.TextStyle(
+                    brush = Brush.linearGradient(GradientPrimary)
+                ),
                 maxLines = 1
             )
 
@@ -205,14 +314,14 @@ fun MainScreen(
                         DropdownMenuItem(
                             text = { Text("End Session", color = Color(0xFFFF6B6B)) },
                             onClick = { showMenu = false; showEndSessionDialog = true },
-                            leadingIcon = { Icon(Icons.Default.ExitToApp, contentDescription = null, tint = Color(0xFFFF6B6B), modifier = Modifier.size(20.dp)) }
+                            leadingIcon = { Icon(Icons.Default.StopCircle, contentDescription = null, tint = Color(0xFFFF6B6B), modifier = Modifier.size(20.dp)) }
                         )
                     }
                 }
             }
         }
 
-        // Connection status
+        // Connection status — single line for encrypted audio plane
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center,
@@ -220,15 +329,24 @@ fun MainScreen(
         ) {
             when (connectState) {
                 ConnectState.CONNECTED -> {
+                    val planeColor = when (transportAdvisory?.activePlane) {
+                        AudioPlane.BOTH_WIFI_RELAY -> StatusConnected
+                        AudioPlane.WIFI -> Color(0xFF4CD964)
+                        AudioPlane.RELAY -> Orange
+                        AudioPlane.BLUETOOTH -> Cyan
+                        else -> StatusConnected
+                    }
                     Box(
                         modifier = Modifier
                             .size(10.dp)
                             .clip(CircleShape)
-                            .background(StatusConnected)
+                            .background(planeColor)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
+                    val planeLabel = transportAdvisory?.activeLabel
+                        ?: SassyTalkNative.getTransportName()
                     Text(
-                        text = "Connected via ${SassyTalkNative.getTransportName()}",
+                        text = planeLabel,
                         fontSize = 13.sp,
                         color = TextGray
                     )
@@ -248,7 +366,10 @@ fun MainScreen(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     TextButton(onClick = {
-                        scope.launch { autoConnect.autoConnect(walkieService) }
+                        // Match the header Reconnect icon: clear the prior
+                        // FAILED state before re-attempting so the two retry
+                        // paths behave identically.
+                        scope.launch { autoConnect.reset(); autoConnect.autoConnect(walkieService) }
                     }) {
                         Text("Retry", fontSize = 12.sp, color = Cyan)
                     }
@@ -266,6 +387,45 @@ fun MainScreen(
                         color = TextGray
                     )
                 }
+            }
+        }
+
+        // Transport advisory — only when action may help (not routine OK states)
+        val advisory = transportAdvisory
+        if (connectState == ConnectState.CONNECTED &&
+            advisory != null &&
+            advisory.severity != AdvisorySeverity.OK &&
+            advisory.message != null
+        ) {
+            Spacer(modifier = Modifier.height(4.dp))
+            val advisoryColor = when (advisory.severity) {
+                AdvisorySeverity.DEGRADED -> Color(0xFFFF6B6B)
+                AdvisorySeverity.UPGRADE -> Color(0xFFFFB300)
+                else -> TextMuted
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                    Icon(
+                        when (advisory.severity) {
+                            AdvisorySeverity.DEGRADED -> Icons.Default.Warning
+                            AdvisorySeverity.UPGRADE -> Icons.Default.Wifi
+                            else -> Icons.Default.Info
+                        },
+                    contentDescription = null,
+                    tint = advisoryColor,
+                    modifier = Modifier.size(12.dp),
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = advisory.message,
+                    fontSize = 11.sp,
+                    color = advisoryColor,
+                    textAlign = TextAlign.Center,
+                    maxLines = 2,
+                )
             }
         }
 
@@ -307,7 +467,7 @@ fun MainScreen(
                     Icon(Icons.Default.Warning, contentDescription = null, tint = Color(0xFFFFB300), modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "Reconnecting\u2026 peer out of contact",
+                        text = "Peer offline \u2014 reconnecting\u2026",
                         fontSize = 13.sp,
                         color = Color(0xFFFFB300),
                         fontWeight = FontWeight.Medium
@@ -316,8 +476,10 @@ fun MainScreen(
             }
         }
 
-        // Incoming audio indicator
-        if (incomingAudio && !isTransmitting) {
+        // Incoming audio — hide when cache strip already shows the same speaker.
+        if (incomingAudio && !isTransmitting && activeSpeaker.isNotBlank() &&
+            cacheSnap.currentSpeakerName != activeSpeaker
+        ) {
             Spacer(modifier = Modifier.height(4.dp))
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -369,7 +531,7 @@ fun MainScreen(
                         SassyTalkNative.setSubchannel(idx)
                     },
                     colors = ButtonDefaults.textButtonColors(
-                        contentColor = if (selected) Orange else TextMuted
+                        contentColor = if (selected) Teal else TextMuted
                     )
                 ) {
                     Text(
@@ -389,8 +551,8 @@ fun MainScreen(
                 checked = pttHoldMode,
                 onCheckedChange = { pttHoldMode = it },
                 colors = SwitchDefaults.colors(
-                    checkedThumbColor = Orange,
-                    checkedTrackColor = Orange.copy(alpha = 0.3f),
+                    checkedThumbColor = Teal,
+                    checkedTrackColor = Teal.copy(alpha = 0.3f),
                     uncheckedThumbColor = TextMuted,
                     uncheckedTrackColor = SurfaceBg
                 ),
@@ -422,190 +584,187 @@ fun MainScreen(
 
         val pttEnabled = connectState == ConnectState.CONNECTED
 
+        // Rejected-press feedback \u2014 a press that can't start TX must say WHY
+        // on the hint line instead of silently doing nothing (auto-clears).
+        var pressRejectedMsg by remember { mutableStateOf<String?>(null) }
+        LaunchedEffect(pressRejectedMsg) {
+            if (pressRejectedMsg != null) {
+                kotlinx.coroutines.delay(3_000L)
+                pressRejectedMsg = null
+            }
+        }
+
+        // Start TX via the coordinator when the BT stack is up, else fall back
+        // to the native IP pipeline directly \u2014 the same fallback the
+        // notification-shade toggle and hardware PTT already use. Without it,
+        // any device where initBleTransport skipped (Bluetooth off, BT
+        // permission denied, entitlement not yet cached) had a dead PTT button
+        // while the WiFi/relay roster still showed peers.
+        val startTx = {
+            val ptt = walkieService?.pttCoordinator
+            val started = when {
+                ptt != null -> ptt.onPttPressed()
+                SassyTalkNative.isConnected() -> {
+                    SassyTalkNative.pttStart()
+                    true
+                }
+                else -> false
+            }
+            if (started) {
+                isTransmitting = true
+                walkieService?.updateNotification("Transmitting on CH $currentChannel")
+            } else {
+                pressRejectedMsg = "No route to peers \u2014 check connection"
+            }
+        }
+        val stopTx = {
+            isTransmitting = false
+            walkieService?.pttCoordinator?.onPttReleased() ?: SassyTalkNative.pttStop()
+            walkieService?.updateNotification("Radio active \u2014 ${SassyTalkNative.getTransportName()}")
+        }
+
         PTTButton(
             isTransmitting = isTransmitting,
             pulseScale = if (isTransmitting) pulseScale else 1f,
             enabled = pttEnabled,
             dimmed = anyPeerStale,
-            holdMode = pttHoldMode,
             onPressStart = {
-                if (!pttEnabled) return@PTTButton
                 if (!SassyTalkNative.isEncrypted()) {
                     showEncryptionWarning = true
-                } else if (pttHoldMode) {
-                    // Toggle mode: tap to start/stop
-                    if (isTransmitting) {
-                        isTransmitting = false
-                        SassyTalkNative.pttStop()
-                        walkieService?.pttCoordinator?.notifyPttReleased()
-                        walkieService?.updateNotification("Radio active \u2014 ${SassyTalkNative.getTransportName()}")
-                    } else {
-                        showEncryptionWarning = false
-                        isTransmitting = true
-                        SassyTalkNative.pttStart()
-                        walkieService?.pttCoordinator?.notifyPttPressed()
-                        walkieService?.updateNotification("Transmitting on CH $currentChannel")
-                    }
+                } else if (pttHoldMode && isTransmitting) {
+                    stopTx()
                 } else {
-                    // Push-to-talk: press to start
                     showEncryptionWarning = false
-                    isTransmitting = true
-                    SassyTalkNative.pttStart()
-                    walkieService?.pttCoordinator?.notifyPttPressed()
-                    walkieService?.updateNotification("Transmitting on CH $currentChannel")
+                    startTx()
                 }
             },
             onPressEnd = {
-                // Only stop on release in push-to-talk mode (not hold mode)
                 if (!pttHoldMode && isTransmitting) {
-                    isTransmitting = false
-                    SassyTalkNative.pttStop()
-                    walkieService?.pttCoordinator?.notifyPttReleased()
-                    walkieService?.updateNotification("Radio active \u2014 ${SassyTalkNative.getTransportName()}")
+                    stopTx()
                 }
+            },
+            onPressRejected = {
+                pressRejectedMsg = "Not connected \u2014 tap \u21bb to reconnect"
             }
         )
 
-        // Reaching-peer indicator (Task 4.2) — shown only while transmitting
-        if (isTransmitting) {
-            Spacer(modifier = Modifier.height(12.dp))
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center,
+        // One line of PTT feedback — replaces separate reaching/slow/talk-over cards + status bar.
+        val pttHint = when {
+            isTransmitting && audioPathDegraded -> "Slow audio path" to Color(0xFFFF9800)
+            isTransmitting && peerSpeaking -> "Talk-over detected" to Color(0xFFFF9800)
+            isTransmitting && peerReachFailed -> "Not reaching peer" to Color(0xFFFF5252)
+            isTransmitting -> "Transmitting on CH $currentChannel" to Orange
+            pressRejectedMsg != null -> pressRejectedMsg!! to Color(0xFFFF5252)
+            deliveryState == com.sassyconsulting.sassytalkie.DeliveryState.Sending ->
+                "Sending…" to Color(0xFFFF9800)
+            deliveryState == com.sassyconsulting.sassytalkie.DeliveryState.Delivered ->
+                "Delivered" to Color(0xFF4CAF50)
+            else -> (if (pttHoldMode) "Ready — tap PTT to talk" else "Ready — hold PTT to talk") to TextGray
+        }
+        Spacer(modifier = Modifier.height(12.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Icon(
+                imageVector = when {
+                    isTransmitting -> Icons.Default.Mic
+                    pressRejectedMsg != null -> Icons.Default.Warning
+                    deliveryState == com.sassyconsulting.sassytalkie.DeliveryState.Delivered ->
+                        Icons.Default.CheckCircle
+                    deliveryState == com.sassyconsulting.sassytalkie.DeliveryState.Sending ->
+                        Icons.Default.Upload
+                    else -> Icons.Default.Hearing
+                },
+                contentDescription = null,
+                tint = pttHint.second,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = pttHint.first,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                color = pttHint.second,
+            )
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Encryption warning only when session is not encrypted
+        if (!SassyTalkNative.isEncrypted()) {
+            Text(
+                text = "⚠ Not encrypted — set up a session to protect audio",
+                fontSize = 11.sp,
+                color = Color(0xFFFF6B6B),
+                textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth()
+            )
+        }
+
+        // v2.7.1: cache mini-strip — only visible when cache is non-idle.
+        // Compact mirror of TranscriptionFeedScreen's cache bar so the user
+        // can see "audio is queued / playing" without leaving the main screen.
+        if (cacheSnap.currentSpeakerName != null || cacheSnap.queuedUtterances > 0 ||
+            cacheSnap.mode == "Queue" || cacheSnap.mode == "Mix"
+        ) {
+            val pipColor = when (cacheSnap.mode) {
+                "Queue"  -> Orange
+                "Mix"    -> Cyan
+                "Replay" -> OrangeLight
+                else     -> TextMuted
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
                 Box(
                     modifier = Modifier
-                        .size(10.dp)
+                        .size(8.dp)
                         .clip(CircleShape)
-                        .background(if (reachingPeer) Color(0xFF4CAF50) else Color(0xFFFF5252))
+                        .background(pipColor),
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = if (reachingPeer) "Reaching peer" else "Not reaching",
-                    fontSize = 13.sp,
-                    color = if (reachingPeer) Color(0xFF4CAF50) else Color(0xFFFF5252)
+                    text = when {
+                        // Guard against a blank/"null" speaker name leaking to the
+                        // UI as literal "Playing null" (unresolved relay peer name).
+                        !cacheSnap.currentSpeakerName.isNullOrBlank() &&
+                            cacheSnap.currentSpeakerName != "null" ->
+                            "Playing ${cacheSnap.currentSpeakerName}" +
+                                (if (cacheSnap.queuedUtterances > 0) " · ${cacheSnap.queuedUtterances} queued" else "")
+                        cacheSnap.queuedUtterances > 0 -> "${cacheSnap.queuedUtterances} queued"
+                        else -> cacheSnap.mode
+                    },
+                    fontSize = 11.sp,
+                    color = TextMuted,
                 )
             }
         }
-
-        // Audio path degraded warning (Task 7.1) — shown when PTT held and probe RTT exceeded
-        if (isTransmitting && audioPathDegraded) {
-            Spacer(modifier = Modifier.height(8.dp))
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF3A2200)),
-                shape = RoundedCornerShape(8.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.Center
-                ) {
-                    Icon(Icons.Default.Warning, contentDescription = null, tint = Color(0xFFFF9800), modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "\u26A0\uFE0F Audio path slow",
-                        fontSize = 13.sp,
-                        color = Color(0xFFFF9800),
-                        fontWeight = FontWeight.Medium
-                    )
-                }
-            }
-        }
-
-        // Talk-over indicator (Task 6.2) — shown when we're transmitting and peer is also speaking
-        if (isTransmitting && peerSpeaking) {
-            Spacer(modifier = Modifier.height(8.dp))
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF3A1A00)),
-                shape = RoundedCornerShape(8.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.Center
-                ) {
-                    Icon(Icons.Default.Mic, contentDescription = null, tint = Color(0xFFFF9800), modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "They are also talking",
-                        fontSize = 13.sp,
-                        color = Color(0xFFFF9800),
-                        fontWeight = FontWeight.Medium
-                    )
-                }
-            }
-        }
-
-        // Delivery state indicator (Task 4.3) — shown after PTT release
-        if (!isTransmitting && deliveryState != com.sassyconsulting.sassytalkie.DeliveryState.Idle) {
-            Spacer(modifier = Modifier.height(12.dp))
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                when (deliveryState) {
-                    com.sassyconsulting.sassytalkie.DeliveryState.Sending -> {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(14.dp),
-                            strokeWidth = 2.dp,
-                            color = Color(0xFFFF9800)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "Sending...",
-                            fontSize = 13.sp,
-                            color = Color(0xFFFF9800)
-                        )
-                    }
-                    com.sassyconsulting.sassytalkie.DeliveryState.Delivered -> {
-                        Text(
-                            text = "\u2713 Delivered",
-                            fontSize = 13.sp,
-                            color = Color(0xFF4CAF50),
-                            fontWeight = FontWeight.Medium
-                        )
-                    }
-                    else -> {}
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.weight(1f))
-
-        // Status Bar
-        StatusBar(isTransmitting = isTransmitting, channel = currentChannel)
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        // Transport + encryption badge
-        val encStatus = if (SassyTalkNative.isEncrypted()) "AES-256-GCM" else "\uD83D\uDD13 UNENCRYPTED"
-        val encColor = if (SassyTalkNative.isEncrypted()) TextMuted else Color(0xFFFF6B6B)
-        Text(
-            text = "$encStatus \u2022 Opus \u2022 ${SassyTalkNative.getTransportName()}",
-            fontSize = 11.sp,
-            color = encColor,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.fillMaxWidth()
-        )
 
         Spacer(modifier = Modifier.height(8.dp))
     }
 
+    androidx.compose.material3.SnackbarHost(
+        hostState = snackbarHost,
+        modifier = Modifier.align(Alignment.BottomCenter)
+    )
+    }
+
     // Show QR dialog for current session
     if (showQrDialog) {
-        val sessionStatus = remember { SassyTalkNative.getSessionStatus() }
+        val context = androidx.compose.ui.platform.LocalContext.current
         val sessionId = remember { SassyTalkNative.getSessionId() ?: "" }
-        val channelInfo = remember { SassyTalkNative.getChannelInfo() }
 
-        // Find the current channel's session JSON from SharedPreferences
-        val context = LocalContext.current
-        val sessionJson = remember {
-            context.getSharedPreferences("sassy_session", android.content.Context.MODE_PRIVATE)
-                .getString("session_ch_$currentChannel", null) ?: ""
+        // Read the per-channel session JSON via the encrypted accessor —
+        // bypassing it (e.g. by reading MODE_PRIVATE prefs directly) returns
+        // empty because writes go to EncryptedSharedPreferences and the
+        // cleartext file is purged on launch.
+        val sessionJson = remember(currentChannel) {
+            SassyTalkNative.getChannelSessionJson(currentChannel)
         }
 
         AlertDialog(
@@ -619,24 +778,21 @@ fun MainScreen(
             text = {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     if (sessionJson.isNotEmpty()) {
-                        // Generate QR bitmap
-                        val qrBitmap = remember(sessionJson) {
-                            try {
-                                val writer = com.google.zxing.qrcode.QRCodeWriter()
-                                val matrix = writer.encode(sessionJson, com.google.zxing.BarcodeFormat.QR_CODE, 400, 400)
-                                val bmp = android.graphics.Bitmap.createBitmap(400, 400, android.graphics.Bitmap.Config.RGB_565)
-                                for (x in 0 until 400) for (y in 0 until 400)
-                                    bmp.setPixel(x, y, if (matrix[x, y]) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
-                                bmp
-                            } catch (_: Exception) { null }
+                        val density = LocalDensity.current
+                        val qrSizePx = with(density) { 180.dp.roundToPx() }
+                        var qrBitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
+                        LaunchedEffect(sessionJson, qrSizePx) {
+                            qrBitmap = withContext(Dispatchers.Default) {
+                                QrBitmap.generate(sessionJson, qrSizePx)
+                            }
                         }
-                        if (qrBitmap != null) {
+                        qrBitmap?.let { bmp ->
                             Card(
                                 colors = CardDefaults.cardColors(containerColor = Color.White),
                                 shape = RoundedCornerShape(12.dp)
                             ) {
                                 Image(
-                                    bitmap = qrBitmap.asImageBitmap(),
+                                    bitmap = bmp.asImageBitmap(),
                                     contentDescription = "Session QR",
                                     modifier = Modifier.size(180.dp).padding(8.dp)
                                 )
@@ -646,6 +802,103 @@ fun MainScreen(
                         Text("Scan to join CH $currentChannel", color = TextGray, fontSize = 13.sp)
                         if (sessionId.isNotEmpty()) {
                             Text("Session: ${sessionId.take(8)}", color = TextMuted, fontSize = 11.sp)
+                        }
+
+                        // Invite-link actions — same encrypted one-shot link the
+                        // Auth screen offers. Without these, minting an invite
+                        // from INSIDE a session meant backing out to the Auth
+                        // screen, which is where "how do I share this?" died.
+                        Spacer(modifier = Modifier.height(10.dp))
+                        var linking by remember { mutableStateOf(false) }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedButton(
+                                enabled = !linking,
+                                onClick = {
+                                    linking = true
+                                    scope.launch {
+                                        val result = withContext(Dispatchers.IO) {
+                                            SessionShareLink.createShare(sessionJson)
+                                        }
+                                        linking = false
+                                        when (result) {
+                                            is SessionShareLink.Result.Ok -> {
+                                                val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                                                    as android.content.ClipboardManager
+                                                cm.setPrimaryClip(
+                                                    android.content.ClipData.newPlainText(
+                                                        "SassyTalk Invite", result.httpsUrl,
+                                                    ),
+                                                )
+                                                android.widget.Toast.makeText(
+                                                    context, "Invite link copied",
+                                                    android.widget.Toast.LENGTH_SHORT,
+                                                ).show()
+                                            }
+                                            is SessionShareLink.Result.Err -> {
+                                                android.widget.Toast.makeText(
+                                                    context, "Copy failed: ${result.message}",
+                                                    android.widget.Toast.LENGTH_LONG,
+                                                ).show()
+                                            }
+                                        }
+                                    }
+                                },
+                                shape = RoundedCornerShape(25.dp),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = Cyan),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                                modifier = Modifier.weight(1f).height(36.dp)
+                            ) {
+                                Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(if (linking) "Linking…" else "Copy Link", fontSize = 12.sp)
+                            }
+                            OutlinedButton(
+                                enabled = !linking,
+                                onClick = {
+                                    linking = true
+                                    scope.launch {
+                                        val result = withContext(Dispatchers.IO) {
+                                            SessionShareLink.createShare(sessionJson)
+                                        }
+                                        linking = false
+                                        when (result) {
+                                            is SessionShareLink.Result.Ok -> {
+                                                val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                                    type = "text/plain"
+                                                    putExtra(
+                                                        android.content.Intent.EXTRA_TEXT,
+                                                        "Join my SassyTalk session:\n${result.httpsUrl}\n\n" +
+                                                            "One-time encrypted invite, expires shortly. If it opens a " +
+                                                            "web page, tap \"Open in SassyTalk\" there — or paste the " +
+                                                            "link in SassyTalk → Authenticate → Enter Code.",
+                                                    )
+                                                    putExtra(android.content.Intent.EXTRA_SUBJECT, "SassyTalk invite")
+                                                }
+                                                context.startActivity(
+                                                    android.content.Intent.createChooser(intent, "Share invite link"),
+                                                )
+                                            }
+                                            is SessionShareLink.Result.Err -> {
+                                                android.widget.Toast.makeText(
+                                                    context, "Share failed: ${result.message}",
+                                                    android.widget.Toast.LENGTH_LONG,
+                                                ).show()
+                                            }
+                                        }
+                                    }
+                                },
+                                shape = RoundedCornerShape(25.dp),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = Cyan),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                                modifier = Modifier.weight(1f).height(36.dp)
+                            ) {
+                                Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Share Link", fontSize = 12.sp)
+                            }
                         }
                     } else {
                         Text("No active session for this channel", color = TextMuted)
@@ -729,7 +982,7 @@ private fun ChannelSelector(
                     text = "%02d".format(channel),
                     fontSize = 48.sp,
                     fontWeight = FontWeight.Bold,
-                    color = Cyan
+                    color = TealLight
                 )
             }
 
@@ -765,13 +1018,20 @@ private fun PTTButton(
     pulseScale: Float,
     enabled: Boolean = true,
     dimmed: Boolean = false,
-    holdMode: Boolean = false,
     onPressStart: () -> Unit,
-    onPressEnd: () -> Unit
+    onPressEnd: () -> Unit,
+    onPressRejected: () -> Unit = {}
 ) {
-    val buttonColor = if (isTransmitting) Orange else SurfaceBg
-    val ringColor = if (isTransmitting) Orange else if (dimmed) TextMuted else Cyan
-    val innerColor = if (isTransmitting) OrangeLight else CardBg
+    // Gradient fill to match the Tauri desktop PTT: teal→purple (GradientCool)
+    // idle, coral→purple (GradientWarm) while transmitting. Was a flat single-
+    // color fill, which is why the Android PTT read as "unchanged" vs desktop.
+    val buttonBrush = if (isTransmitting) {
+        Brush.linearGradient(GradientWarm)
+    } else {
+        Brush.linearGradient(GradientCool)
+    }
+    val ringColor = if (isTransmitting) Coral else if (dimmed) TextMuted else Teal
+    val innerColor = if (isTransmitting) CoralLight else BgCard
 
     Box(
         contentAlignment = Alignment.Center,
@@ -802,9 +1062,16 @@ private fun PTTButton(
                 .size(240.dp)
                 .clip(CircleShape)
                 .border(8.dp, ringColor, CircleShape)
-                .background(buttonColor)
+                .background(buttonBrush)
                 .pointerInteropFilter { event ->
-                    if (!enabled) return@pointerInteropFilter false
+                    if (!enabled) {
+                        // Surface WHY the button is inert instead of eating
+                        // the touch silently — dead-feeling PTT reads as a bug.
+                        if (event.action == android.view.MotionEvent.ACTION_DOWN) {
+                            onPressRejected()
+                        }
+                        return@pointerInteropFilter false
+                    }
                     when (event.action) {
                         android.view.MotionEvent.ACTION_DOWN -> {
                             onPressStart()
@@ -828,54 +1095,22 @@ private fun PTTButton(
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Icon(
-                        if (isTransmitting) Icons.Default.Mic else Icons.Default.MicNone,
-                        contentDescription = null,
+                        Icons.Default.Mic,
+                        contentDescription = if (isTransmitting) "Transmitting" else "Push to talk",
                         tint = if (isTransmitting) TextWhite else TextGray,
-                        modifier = Modifier.size(40.dp)
+                        modifier = Modifier.size(48.dp)
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = if (isTransmitting) "TX" else "PTT",
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = if (isTransmitting) TextWhite else TextGray
-                    )
+                    if (isTransmitting) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "TX",
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = TextWhite
+                        )
+                    }
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun StatusBar(isTransmitting: Boolean, channel: Int) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = if (isTransmitting) Orange.copy(alpha = 0.2f) else CardBg
-        ),
-        shape = RoundedCornerShape(12.dp)
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            horizontalArrangement = Arrangement.Center,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                if (isTransmitting) Icons.Default.RadioButtonChecked else Icons.Default.RadioButtonUnchecked,
-                contentDescription = null,
-                tint = if (isTransmitting) Orange else TextGray,
-                modifier = Modifier.size(20.dp)
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                text = if (isTransmitting) "TRANSMITTING ON CH $channel" else "READY - HOLD TO TALK",
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium,
-                color = if (isTransmitting) Orange else TextGray,
-                letterSpacing = 1.sp
-            )
         }
     }
 }

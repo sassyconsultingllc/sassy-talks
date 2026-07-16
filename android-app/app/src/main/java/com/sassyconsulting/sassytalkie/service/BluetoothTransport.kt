@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
-// CodeMark: SCLLC1-sassytalkie-WDXTMKTTJZJV
+// CodeMark: SCLLC1-sassytalkie-JJ5MRTFW76ZR
 package com.sassyconsulting.sassytalkie.service
 
 import android.annotation.SuppressLint
@@ -53,6 +53,16 @@ class BluetoothTransport(private val context: Context) {
         private const val FRAME_HEADER_SIZE = 4
         private const val MAX_FRAME_SIZE = 4096
 
+        // Channel-sync control message framing. A plain [0xFF,0xFF,channel]
+        // 3-byte payload collides with any legitimate 3-byte audio/control
+        // frame whose first two bytes happen to be 0xFF. Use a reserved 3-byte
+        // magic (0xFF 0xFF 0x53 = 'S') plus a dedicated type byte 0x01, so the
+        // sync message is a fixed 5-byte payload that audio frames cannot match.
+        // Layout: [0xFF][0xFF][0x53][0x01][channel].
+        private val CHANNEL_SYNC_MAGIC = byteArrayOf(0xFF.toByte(), 0xFF.toByte(), 0x53.toByte())
+        private const val CHANNEL_SYNC_TYPE: Byte = 0x01
+        private const val CHANNEL_SYNC_LEN = 5
+
         // Dead peer detection timeout (ms)
         private const val DEAD_PEER_TIMEOUT_MS = 10_000L
     }
@@ -64,6 +74,45 @@ class BluetoothTransport(private val context: Context) {
     @Volatile
     var state: State = State.DISCONNECTED
         private set
+
+    // Single lock guarding all `state` transitions. Transitions are compound
+    // (they depend on whether `connectedPeers` is empty) so plain @Volatile
+    // visibility is not enough — concurrent connect/disconnect paths could
+    // otherwise clobber each other (e.g. report CONNECTED with no peers, or a
+    // racing failed-connect overwriting a successful one). All writes to
+    // `state` must go through the helpers below.
+    private val stateLock = Any()
+
+    /**
+     * Recompute `state` from the authoritative source of truth (`connectedPeers`).
+     * CONNECTED iff at least one peer is present, otherwise DISCONNECTED. Never
+     * downgrades or fabricates CONNECTING. Safe to call from any thread.
+     */
+    private fun refreshState() {
+        synchronized(stateLock) {
+            state = if (connectedPeers.isEmpty()) State.DISCONNECTED else State.CONNECTED
+        }
+    }
+
+    /**
+     * Mark CONNECTING only while genuinely idle (no peers yet). If peers already
+     * exist we keep CONNECTED rather than regressing to CONNECTING — a new
+     * connect attempt must not visually disconnect existing peers.
+     */
+    private fun markConnecting() {
+        synchronized(stateLock) {
+            if (connectedPeers.isEmpty()) {
+                state = State.CONNECTING
+            }
+        }
+    }
+
+    /** Force DISCONNECTED (used by shutdown, which tears down all peers). */
+    private fun forceDisconnected() {
+        synchronized(stateLock) {
+            state = State.DISCONNECTED
+        }
+    }
 
     private val btAdapter: BluetoothAdapter? by lazy {
         val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -81,9 +130,25 @@ class BluetoothTransport(private val context: Context) {
     )
 
     private val connectedPeers = ConcurrentHashMap<String, ConnectedPeer>()
+    // Transport lifecycle flag: gates the per-peer RX threads and the
+    // dead-peer monitor. True from startAcceptThread() until shutdown().
+    // Deliberately NOT tied to accept-loop health — a failed server socket
+    // must not kill RX for outbound-connected peers.
     private val running = AtomicBoolean(false)
+    // Accept-loop guard: true only while the bt-accept thread is alive, so a
+    // later startAcceptThread() can restart it after a failure. Previously
+    // `running` doubled as this guard, and an accept-loop exit with `running`
+    // still true made startAcceptThread a permanent no-op.
+    private val acceptLoopActive = AtomicBoolean(false)
     private val txPumpRunning = AtomicBoolean(false)
     private val peerCount = AtomicInteger(0)
+
+    // TX epoch/seq bookkeeping for the PTT_STOP_V2 → EOT_ACK "Delivered" tick.
+    // The wire audio payload is encrypted (AES-GCM ciphertext) so we can't
+    // recover seq by decoding the frame on the way out. Track it locally
+    // instead — the seq only has to be monotonic and echoed by the receiver.
+    @Volatile private var txEpoch: Long = 0L
+    private val txSeqCounter = AtomicInteger(0)
 
     // Server socket for incoming connections
     private var serverSocket: BluetoothServerSocket? = null
@@ -115,6 +180,17 @@ class BluetoothTransport(private val context: Context) {
      */
     var txFrameCallback: ((epoch: Long, seq: Int) -> Unit)? = null
 
+    /**
+     * Set the session epoch used when reporting outbound audio frames via
+     * [txFrameCallback]. Called by PttCoordinator with its selfEpoch so the
+     * receiver's EOT_ACK (echoing our epoch+seq) can be matched on our side.
+     * Resets the seq counter — subsequent TX frames start at seq 0.
+     */
+    fun setTxEpoch(epoch: Long) {
+        txEpoch = epoch
+        txSeqCounter.set(0)
+    }
+
     /** Check if we have an active RFCOMM connection to a specific device */
     fun isConnectedTo(address: String): Boolean = connectedPeers.containsKey(address)
 
@@ -137,7 +213,7 @@ class BluetoothTransport(private val context: Context) {
             return true
         }
 
-        state = State.CONNECTING
+        markConnecting()
         Log.i(TAG, "Connecting to ${device.name} ($addr)...")
 
         // === Fallback 1: Standard RFCOMM ===
@@ -174,7 +250,7 @@ class BluetoothTransport(private val context: Context) {
             Log.e(TAG, "All RFCOMM methods failed for ${device.name}: ${e.message}")
         }
 
-        state = if (connectedPeers.isEmpty()) State.DISCONNECTED else State.CONNECTED
+        refreshState()
         return false
     }
 
@@ -182,38 +258,66 @@ class BluetoothTransport(private val context: Context) {
      * Start accepting incoming RFCOMM connections.
      */
     fun startAcceptThread() {
-        if (running.getAndSet(true)) return
+        running.set(true)
+        if (acceptLoopActive.getAndSet(true)) return
 
         Thread {
             Thread.currentThread().name = "bt-accept"
             Log.i(TAG, "Accept thread started")
 
             try {
-                serverSocket = btAdapter?.listenUsingRfcommWithServiceRecord(SERVICE_NAME, SPP_UUID)
-                    ?: run {
-                        // Insecure fallback
-                        btAdapter?.listenUsingInsecureRfcommWithServiceRecord(SERVICE_NAME, SPP_UUID)
+                while (running.get()) {
+                    // (Re)create the server socket whenever we don't have one —
+                    // covers first entry, a dead/closed socket after an error,
+                    // and an adapter that was off at startup but is on now.
+                    if (serverSocket == null) {
+                        serverSocket = try {
+                            btAdapter?.listenUsingRfcommWithServiceRecord(SERVICE_NAME, SPP_UUID)
+                                ?: btAdapter?.listenUsingInsecureRfcommWithServiceRecord(SERVICE_NAME, SPP_UUID)
+                        } catch (e: IOException) {
+                            Log.e(TAG, "Failed to create server socket: ${e.message}")
+                            null
+                        }
+                        if (serverSocket == null) {
+                            // No adapter / listen failed. Keep the transport
+                            // alive (outbound RFCOMM peers still need RX) and
+                            // retry listening on a slow cadence.
+                            Thread.sleep(5_000)
+                            continue
+                        }
+                        Log.i(TAG, "RFCOMM server socket listening")
                     }
-            } catch (e: IOException) {
-                Log.e(TAG, "Failed to create server socket: ${e.message}")
-                running.set(false)
-                return@Thread
-            }
 
-            while (running.get()) {
-                try {
-                    val socket = serverSocket?.accept(30_000) ?: continue
-                    val device = socket.remoteDevice
-                    Log.i(TAG, "Accepted connection from ${device.name} (${device.address})")
-                    onPeerConnected(device, socket)
-                } catch (e: IOException) {
-                    if (running.get()) {
-                        // Timeout is normal, other errors are not
-                        if (!e.message.orEmpty().contains("timeout", ignoreCase = true)) {
-                            Log.w(TAG, "Accept error: ${e.message}")
+                    val acceptStartNs = System.nanoTime()
+                    try {
+                        val socket = serverSocket?.accept(30_000) ?: continue
+                        val device = socket.remoteDevice
+                        Log.i(TAG, "Accepted connection from ${device.name} (${device.address})")
+                        onPeerConnected(device, socket)
+                    } catch (e: IOException) {
+                        if (!running.get()) break
+                        // A genuine 30s-elapsed accept throws a "timeout" and we
+                        // just re-arm. But a bad/closed socket makes accept()
+                        // throw almost immediately, and retrying with no delay
+                        // spins this thread at 100% CPU. If it returned far
+                        // faster than the timeout, the socket is likely dead —
+                        // drop it so the top of the loop re-listens, and back
+                        // off before retrying.
+                        val elapsedMs = (System.nanoTime() - acceptStartNs) / 1_000_000
+                        if (elapsedMs < 5_000) {
+                            if (!e.message.orEmpty().contains("timeout", ignoreCase = true)) {
+                                Log.w(TAG, "Accept error (${elapsedMs}ms): ${e.message} — recreating server socket")
+                            }
+                            try { serverSocket?.close() } catch (_: IOException) {}
+                            serverSocket = null
+                            Thread.sleep(1000)
                         }
                     }
                 }
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } finally {
+                acceptLoopActive.set(false)
             }
 
             Log.i(TAG, "Accept thread stopped")
@@ -232,6 +336,12 @@ class BluetoothTransport(private val context: Context) {
             val peerCountAtStart = connectedPeers.size
             Log.i(TAG, "BT TX pump started ($peerCountAtStart peers)")
 
+            // Reuse a single 4-byte header buffer across the audio loop. At ~50
+            // frames/sec a per-frame ByteBuffer allocation is a steady GC source
+            // for a thread that runs for the full duration of every PTT press.
+            val headerArr = ByteArray(FRAME_HEADER_SIZE)
+            val headerBb = ByteBuffer.wrap(headerArr).order(ByteOrder.LITTLE_ENDIAN)
+
             while (txPumpRunning.get() && SassyTalkNative.isPttActive()) {
                 if (connectedPeers.isEmpty()) {
                     Log.w(TAG, "BT TX pump: no peers, stopping")
@@ -246,11 +356,19 @@ class BluetoothTransport(private val context: Context) {
                     continue
                 }
 
+                // Guard frame size against the RX-side limit. The receiver
+                // rejects any frame with length <= 0 or > MAX_FRAME_SIZE, so
+                // sending one would be unreadable by peers (and risks receiver
+                // buffer issues). Skip it rather than transmitting garbage.
+                if (frameData.size <= 0 || frameData.size > MAX_FRAME_SIZE) {
+                    Log.w(TAG, "BT TX pump: dropping oversized/empty frame (${frameData.size} bytes, max $MAX_FRAME_SIZE)")
+                    continue
+                }
+
                 // Write length-prefixed frame to all connected peers
-                val header = ByteBuffer.allocate(FRAME_HEADER_SIZE)
-                    .order(ByteOrder.LITTLE_ENDIAN)
-                    .putInt(frameData.size)
-                    .array()
+                headerBb.clear()
+                headerBb.putInt(frameData.size)
+                val header = headerArr
 
                 val deadPeers = mutableListOf<String>()
 
@@ -268,17 +386,22 @@ class BluetoothTransport(private val context: Context) {
                     }
                 }
 
-                // Notify TX frame callback for seq tracking (PTT_STOP_V2 / EOT_ACK)
-                val decoded = AudioFrameV2.decode(header + frameData)
-                if (decoded != null) {
-                    txFrameCallback?.invoke(decoded.epoch, decoded.seq)
-                }
+                // Report (epoch, seq) for PTT_STOP_V2 / EOT_ACK tracking. The
+                // audio payload itself is encrypted so we can't recover this
+                // by decoding the frame — maintain it as plaintext plumbing
+                // metadata instead. The seq is purely local and only has to
+                // round-trip through the receiver's echo intact.
+                val seq = txSeqCounter.getAndIncrement()
+                txFrameCallback?.invoke(txEpoch, seq)
 
                 // Cleanup dead peers
                 deadPeers.forEach { removePeer(it) }
             }
 
             txPumpRunning.set(false)
+            // If the pump exited because all peers dropped, make sure `state`
+            // reflects DISCONNECTED rather than a stale CONNECTED.
+            refreshState()
             Log.i(TAG, "BT TX pump stopped")
         }.start()
     }
@@ -322,7 +445,7 @@ class BluetoothTransport(private val context: Context) {
         val addrs = connectedPeers.keys.toList()
         addrs.forEach { removePeer(it) }
 
-        state = State.DISCONNECTED
+        forceDisconnected()
         SassyTalkNative.btDisconnected()
     }
 
@@ -342,9 +465,21 @@ class BluetoothTransport(private val context: Context) {
             output = socket.outputStream
         )
 
-        connectedPeers[addr] = peer
+        // Dedup the symmetric-connect race. BLE discovery fires on BOTH peers, so
+        // each may dial RFCOMM at the same instant: our outgoing connectTo() and
+        // their connection landing on our accept thread can both reach this method
+        // for the same address. putIfAbsent picks one winner atomically; the loser
+        // closes its socket and bails. The previous `connectedPeers[addr] = peer`
+        // overwrote the entry, leaking the first socket + its RX thread and
+        // double-playing every received frame.
+        val existing = connectedPeers.putIfAbsent(addr, peer)
+        if (existing != null) {
+            Log.i(TAG, "Duplicate RFCOMM link to ${device.name ?: addr} — closing late socket")
+            try { socket.close() } catch (_: IOException) {}
+            return
+        }
         peerCount.set(connectedPeers.size)
-        state = State.CONNECTED
+        refreshState()
 
         // Notify Rust that BT transport is active
         SassyTalkNative.btConnected()
@@ -363,12 +498,16 @@ class BluetoothTransport(private val context: Context) {
 
     /**
      * Send channel sync message to a newly connected peer.
-     * Format: [0xFF][0xFF][channel:1] — distinguished from audio frames by the 0xFFFF prefix.
+     * Format: [0xFF][0xFF][0x53][0x01][channel:1] — a reserved 5-byte control
+     * frame (magic + type byte) that real audio frames cannot collide with.
      */
     private fun sendChannelSync(peer: ConnectedPeer) {
         try {
             val channel = SassyTalkNative.getChannel()
-            val syncMsg = byteArrayOf(0xFF.toByte(), 0xFF.toByte(), channel.toByte())
+            val syncMsg = byteArrayOf(
+                CHANNEL_SYNC_MAGIC[0], CHANNEL_SYNC_MAGIC[1], CHANNEL_SYNC_MAGIC[2],
+                CHANNEL_SYNC_TYPE, channel.toByte()
+            )
             val header = ByteBuffer.allocate(FRAME_HEADER_SIZE)
                 .order(ByteOrder.LITTLE_ENDIAN)
                 .putInt(syncMsg.size)
@@ -416,33 +555,56 @@ class BluetoothTransport(private val context: Context) {
 
                     peer.lastActivity = System.currentTimeMillis()
 
-                    // Check if it's a channel sync message (0xFF 0xFF prefix)
-                    if (frameLen == 3 && payload[0] == 0xFF.toByte() && payload[1] == 0xFF.toByte()) {
-                        val remoteChannel = payload[2].toInt() and 0xFF
+                    // Check if it's a channel sync message: reserved 5-byte
+                    // control frame [0xFF][0xFF][0x53][0x01][channel]. The full
+                    // magic + type byte makes this unambiguous so real audio
+                    // frames (even 5-byte ones) cannot be misread as sync.
+                    if (frameLen == CHANNEL_SYNC_LEN &&
+                        payload[0] == CHANNEL_SYNC_MAGIC[0] &&
+                        payload[1] == CHANNEL_SYNC_MAGIC[1] &&
+                        payload[2] == CHANNEL_SYNC_MAGIC[2] &&
+                        payload[3] == CHANNEL_SYNC_TYPE) {
+                        val remoteChannel = payload[4].toInt() and 0xFF
                         Log.i(TAG, "RX: channel sync received: ch=$remoteChannel from ${peer.device.name}")
                         // Optionally sync local channel (or just log for now)
                         continue
                     }
 
-                    // If it's a V2 frame, check for probe marker before passing to Rust
-                    if (AudioFrameV2.isV2(payload)) {
-                        val frame = AudioFrameV2.decode(payload)
-                        if (frame != null) {
-                            // Fire full-frame callback (probe detection / RECV_ACK)
+                    // Probe frames are sent via sendRaw() as unencrypted V2-framed
+                    // bytes: the V2 length field IS the RFCOMM length header, so the
+                    // full V2 frame is `headerBuf + payload`. Regular audio frames
+                    // are AES-GCM ciphertext and will NOT have a real V2 epoch — so
+                    // we only treat a frame as V2 if the decoded epoch matches the
+                    // reserved probe-marker sentinel (-1L). Otherwise ciphertext
+                    // whose random leading bytes happen to parse as a valid V2
+                    // frame would pollute lastRxSeq/lastRxEpoch and trigger bogus
+                    // RECV_ACKs with garbage values.
+                    val fullFrame = ByteArray(FRAME_HEADER_SIZE + frameLen)
+                    System.arraycopy(headerBuf, 0, fullFrame, 0, FRAME_HEADER_SIZE)
+                    System.arraycopy(payload, 0, fullFrame, FRAME_HEADER_SIZE, frameLen)
+                    if (AudioFrameV2.isV2(fullFrame)) {
+                        val frame = AudioFrameV2.decode(fullFrame)
+                        if (frame != null && frame.epoch == -1L &&
+                            (frame.seq == -1 || frame.seq == -2)) {
+                            // Probe request or echo — fire V2 callbacks and skip
+                            // regular-audio playback path entirely.
                             audioFrameV2Callback?.invoke(peer.device.address, frame)
-                            // Also fire legacy seq-only callback for RECV_ACK
                             audioFrameCallback?.invoke(peer.device.address, frame.epoch, frame.seq)
-                            // Only pass non-probe frames to Rust for playback
-                            val isProbe = frame.epoch == -1L && (frame.seq == -1 || frame.seq == -2)
-                            if (!isProbe) {
-                                SassyTalkNative.btDecodeFrame(payload)
-                            }
                             continue
                         }
                     }
 
-                    // Audio frame — pass to Rust for decoding and playback
-                    SassyTalkNative.btDecodeFrame(payload)
+                    // Audio frame — pass to Rust for decoding and playback.
+                    // BT wire frames carry their own (sender_id, timestamp) metadata
+                    // but no V2 (epoch, seq); the encrypted payload can't be probed
+                    // for those without false positives (see comment above). Fire the
+                    // callback with sentinel 0/0 so the coordinator can still update
+                    // lastRxPeerId, kick the RECV_ACK loop, and re-arm the
+                    // peer-speaking UI timeout — handleRecvAck only uses receipt
+                    // (not the values) for the reachingPeer signal.
+                    if (SassyTalkNative.btDecodeFrame(payload)) {
+                        audioFrameCallback?.invoke(peer.device.address, 0L, 0)
+                    }
                 }
             } catch (e: IOException) {
                 if (running.get()) {
@@ -480,8 +642,8 @@ class BluetoothTransport(private val context: Context) {
 
         Log.i(TAG, "Peer removed: ${peer.device.name} ($address), remaining: ${connectedPeers.size}")
 
+        refreshState()
         if (connectedPeers.isEmpty()) {
-            state = State.DISCONNECTED
             SassyTalkNative.btDisconnected()
         }
     }

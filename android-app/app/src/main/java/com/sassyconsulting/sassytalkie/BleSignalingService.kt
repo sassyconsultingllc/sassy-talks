@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
-// CodeMark: SCLLC1-sassytalkie-4TYJ275K7HYF
+// CodeMark: SCLLC1-sassytalkie-UXG5OV66QC2R
 package com.sassyconsulting.sassytalkie
 
 import android.bluetooth.*
@@ -71,6 +71,11 @@ class BleSignalingService(
     private var scanner: BluetoothLeScanner? = null
     private val connectedPeers = ConcurrentHashMap<String, BluetoothDevice>()
     private val peerGattClients = ConcurrentHashMap<String, BluetoothGatt>()
+    /** Addresses with an in-flight connectGatt that has not yet reached a terminal
+     *  state. Guards against a connect storm: onScanResult fires repeatedly at
+     *  SCAN_MODE_LOW_LATENCY, so without this several connectGatt calls would race
+     *  before peerGattClients is populated by the first STATE_CONNECTED callback. */
+    private val connectingPeers = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     // —— GATT Server (receives commands from peers) ——
 
@@ -195,8 +200,13 @@ class BleSignalingService(
             .setTimeout(0) // Advertise indefinitely
             .build()
 
+        // The 31-byte legacy BLE advert packet cannot hold a 128-bit service UUID
+        // (16B + 2B header) AND the device name; advertising with both set fails
+        // with ADVERTISE_FAILED_DATA_TOO_LARGE (errorCode=1), so the service UUID
+        // is never broadcast and no peer ever matches our scan filter. Drop the
+        // device name from the primary advert — the peer can read it after GATT
+        // connect via standard GAP queries.
         val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(true)
             .addServiceUuid(ParcelUuid(SERVICE_UUID))
             .build()
 
@@ -230,6 +240,30 @@ class BleSignalingService(
         if (scanner == null) {
             Log.w(TAG, "BLE scanner not available")
             return
+        }
+
+        // On Android < 12 (API < 31), BLE scan silently returns ZERO results unless
+        // location services are switched on (separate from the runtime permission).
+        // Surface a clear log so an empty-scan situation is diagnosable in the field.
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S) {
+            val locationOn = try {
+                val lm = context.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                    lm.isLocationEnabled
+                } else {
+                    @Suppress("DEPRECATION")
+                    android.provider.Settings.Secure.getInt(
+                        context.contentResolver,
+                        android.provider.Settings.Secure.LOCATION_MODE,
+                        android.provider.Settings.Secure.LOCATION_MODE_OFF
+                    ) != android.provider.Settings.Secure.LOCATION_MODE_OFF
+                }
+            } catch (e: Exception) {
+                true // can't determine — don't block scanning
+            }
+            if (!locationOn) {
+                Log.w(TAG, "Location services are OFF — BLE peer discovery will find NOTHING on Android < 12. Prompt the user to enable Location.")
+            }
         }
 
         val filter = ScanFilter.Builder()
@@ -346,6 +380,9 @@ class BleSignalingService(
 
     fun connectToPeer(device: BluetoothDevice) {
         if (peerGattClients.containsKey(device.address)) return
+        // Claim the in-flight slot atomically; if another scan result already
+        // started a connect to this address, bail out instead of racing a 2nd connectGatt.
+        if (!connectingPeers.add(device.address)) return
 
         Log.i(TAG, "Connecting GATT client to ${device.name ?: device.address}")
         device.connectGatt(context, false, object : BluetoothGattCallback() {
@@ -354,12 +391,14 @@ class BleSignalingService(
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     peerGattClients[device.address] = gatt
                     connectedPeers[device.address] = device
+                    connectingPeers.remove(device.address)
                     gatt.requestMtu(517)
 
                     Log.i(TAG, "GATT client connected to ${device.name ?: device.address}")
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     peerGattClients.remove(device.address)
                     connectedPeers.remove(device.address)
+                    connectingPeers.remove(device.address)
                     gatt.close()
 
                     listener?.onPeerLost(device.address)
@@ -432,6 +471,7 @@ class BleSignalingService(
 
         peerGattClients.clear()
         connectedPeers.clear()
+        connectingPeers.clear()
         stopServer()
     }
 }

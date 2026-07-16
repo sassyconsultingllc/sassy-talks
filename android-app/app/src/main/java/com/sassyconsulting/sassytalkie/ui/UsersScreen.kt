@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
-// CodeMark: SCLLC1-sassytalkie-LKBX5BETEAK6
+// CodeMark: SCLLC1-sassytalkie-2KGXNHA3RE3F
 package com.sassyconsulting.sassytalkie.ui
 
 import androidx.compose.foundation.background
@@ -23,8 +23,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import com.sassyconsulting.sassytalkie.PeerHealth
 import com.sassyconsulting.sassytalkie.PresenceState
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.WalkieService
@@ -37,34 +40,76 @@ fun UsersScreen(
     walkieService: WalkieService? = null
 ) {
     val context = LocalContext.current
-    var users by remember { mutableStateOf(SassyTalkNative.getUsers()) }
+    var users by remember { mutableStateOf(emptyList<SassyTalkNative.UserInfo>()) }
     var isRefreshing by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
-    // Local "You" profile from SharedPreferences
+    LaunchedEffect(Unit) {
+        users = withContext(Dispatchers.IO) { SassyTalkNative.getUsers() }
+    }
+
     val myName = remember { getSavedProfileName(context) }
     val myEmoji = remember { getSavedEmoji(context) }
     val myColorIdx = remember { getSavedColorIdx(context) }
 
-    // Auto-refresh every 3 seconds so new users appear without manual tap
-    LaunchedEffect(Unit) {
-        while (true) {
-            delay(3000)
-            users = SassyTalkNative.getUsers()
+    val coord = walkieService?.pttCoordinator
+    val liveness = coord?.liveness
+    val activePeerIds by (coord?.peerIds ?: remember {
+        kotlinx.coroutines.flow.MutableStateFlow(emptySet())
+    }).collectAsState()
+
+    // One clock + roster refresh loop; peer events trigger immediate reload.
+    var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(coord) {
+        val peerEventsJob = launch {
+            coord?.peerEvents?.collect {
+                users = withContext(Dispatchers.IO) { SassyTalkNative.getUsers() }
+            }
+        }
+        var tick = 0
+        try {
+            while (true) {
+                delay(1_000L)
+                nowMs = System.currentTimeMillis()
+                tick++
+                if (tick % 8 == 0) {
+                    users = withContext(Dispatchers.IO) { SassyTalkNative.getUsers() }
+                }
+            }
+        } finally {
+            peerEventsJob.cancel()
         }
     }
 
-    val favorites = users.filter { it.isFavorite }
-    val others = users.filter { !it.isFavorite }
+    // One physical peer can register under multiple ids (relay:<clientId>, its
+    // audio sender_id, a BLE MAC). Collapse rows that resolve to the same
+    // display name — but ONLY when the group contains a transport-alias id
+    // (relay:*/MAC); two distinct devices that merely share a display name
+    // (both have real sender_ids) must stay separate rows. Keep the entry
+    // liveness actually tracks so presence/health stay accurate.
+    fun isTransportAlias(id: String): Boolean =
+        id.startsWith("relay:") || Regex("(?i)^([0-9a-f]{2}:){5}[0-9a-f]{2}$").matches(id)
+    val deduped = users
+        .groupBy { it.displayName() }
+        .flatMap { (_, dupes) ->
+            if (dupes.size > 1 && dupes.any { isTransportAlias(it.id) }) {
+                listOf(
+                    dupes.firstOrNull { liveness?.isTracked(it.id) == true || it.id in activePeerIds }
+                        ?: dupes.first()
+                )
+            } else {
+                dupes
+            }
+        }
+    val favorites = deduped.filter { it.isFavorite }
+    val others = deduped.filter { !it.isFavorite }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(DarkBg)
-            .safeDrawingPadding()
             .padding(16.dp)
     ) {
-        // Header
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -81,28 +126,29 @@ fun UsersScreen(
                 color = Orange
             )
 
-            // Edit profile + refresh row
             Row(verticalAlignment = Alignment.CenterVertically) {
                 IconButton(onClick = onEditProfile) {
                     Icon(Icons.Default.Edit, contentDescription = "Edit Profile", tint = Cyan)
                 }
-                Box(
-                    modifier = Modifier.size(48.dp),
-                    contentAlignment = Alignment.Center
+                IconButton(
+                    onClick = {
+                        scope.launch {
+                            isRefreshing = true
+                            users = withContext(Dispatchers.IO) { SassyTalkNative.getUsers() }
+                            isRefreshing = false
+                        }
+                    },
+                    enabled = !isRefreshing,
                 ) {
-                    RainbowRefreshIndicator(
-                        isRefreshing = isRefreshing,
-                        onRefresh = {
-                            scope.launch {
-                                isRefreshing = true
-                                delay(600)
-                                users = SassyTalkNative.getUsers()
-                                isRefreshing = false
-                            }
-                        },
-                        size = 28.dp,
-                        strokeWidth = 3.dp
-                    )
+                    if (isRefreshing) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(22.dp),
+                            strokeWidth = 2.dp,
+                            color = Cyan,
+                        )
+                    } else {
+                        Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = Cyan)
+                    }
                 }
             }
         }
@@ -110,7 +156,6 @@ fun UsersScreen(
         Spacer(modifier = Modifier.height(16.dp))
 
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            // ── You (local user) ──
             item {
                 SectionHeader(
                     title = "You",
@@ -145,14 +190,13 @@ fun UsersScreen(
                         Text("No one else yet", color = TextGray, fontSize = 15.sp)
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            "Others will appear here when they transmit on your channel",
+                            "Others appear when they join your channel",
                             color = TextMuted,
                             fontSize = 13.sp
                         )
                     }
                 }
             } else {
-                // Favorites section
                 if (favorites.isNotEmpty()) {
                     item {
                         Spacer(modifier = Modifier.height(8.dp))
@@ -163,26 +207,34 @@ fun UsersScreen(
                             count = favorites.size
                         )
                     }
-                    items(favorites) { user ->
-                        val liveness = walkieService?.pttCoordinator?.liveness
+                    items(favorites, key = { it.id }) { user ->
                         UserCard(
                             user = user,
-                            presenceState = liveness?.presence(user.id) ?: PresenceState.IDLE,
-                            rttMs = liveness?.rttMs(user.id) ?: -1,
-                            lastHeardMs = liveness?.lastHeardMs(user.id) ?: 0L,
+                            status = peerStatus(
+                                presence = liveness?.presence(user.id) ?: PresenceState.IDLE,
+                                health = liveness?.health(user.id, nowMs),
+                                lastHeardMs = liveness?.lastHeardMs(user.id) ?: 0L,
+                                rttMs = liveness?.rttMs(user.id) ?: -1,
+                                inActiveSet = user.id in activePeerIds,
+                                isTracked = liveness?.isTracked(user.id) == true,
+                                nowMs = nowMs,
+                            ),
                             onToggleMute = {
                                 SassyTalkNative.setUserMuted(user.id, !user.isMuted)
-                                users = SassyTalkNative.getUsers()
+                                scope.launch {
+                                    users = withContext(Dispatchers.IO) { SassyTalkNative.getUsers() }
+                                }
                             },
                             onToggleFavorite = {
                                 SassyTalkNative.setUserFavorite(user.id, !user.isFavorite)
-                                users = SassyTalkNative.getUsers()
+                                scope.launch {
+                                    users = withContext(Dispatchers.IO) { SassyTalkNative.getUsers() }
+                                }
                             }
                         )
                     }
                 }
 
-                // Others section
                 if (others.isNotEmpty()) {
                     item {
                         Spacer(modifier = Modifier.height(8.dp))
@@ -193,20 +245,29 @@ fun UsersScreen(
                             count = others.size
                         )
                     }
-                    items(others) { user ->
-                        val liveness = walkieService?.pttCoordinator?.liveness
+                    items(others, key = { it.id }) { user ->
                         UserCard(
                             user = user,
-                            presenceState = liveness?.presence(user.id) ?: PresenceState.IDLE,
-                            rttMs = liveness?.rttMs(user.id) ?: -1,
-                            lastHeardMs = liveness?.lastHeardMs(user.id) ?: 0L,
+                            status = peerStatus(
+                                presence = liveness?.presence(user.id) ?: PresenceState.IDLE,
+                                health = liveness?.health(user.id, nowMs),
+                                lastHeardMs = liveness?.lastHeardMs(user.id) ?: 0L,
+                                rttMs = liveness?.rttMs(user.id) ?: -1,
+                                inActiveSet = user.id in activePeerIds,
+                                isTracked = liveness?.isTracked(user.id) == true,
+                                nowMs = nowMs,
+                            ),
                             onToggleMute = {
                                 SassyTalkNative.setUserMuted(user.id, !user.isMuted)
-                                users = SassyTalkNative.getUsers()
+                                scope.launch {
+                                    users = withContext(Dispatchers.IO) { SassyTalkNative.getUsers() }
+                                }
                             },
                             onToggleFavorite = {
                                 SassyTalkNative.setUserFavorite(user.id, !user.isFavorite)
-                                users = SassyTalkNative.getUsers()
+                                scope.launch {
+                                    users = withContext(Dispatchers.IO) { SassyTalkNative.getUsers() }
+                                }
                             }
                         )
                     }
@@ -214,6 +275,60 @@ fun UsersScreen(
             }
         }
     }
+}
+
+/** Single-line peer status derived from liveness heartbeats + registry membership. */
+internal data class PeerStatus(val label: String, val color: Color)
+
+/**
+ * Never label a registry peer "offline" just because heartbeats haven't
+ * arrived yet. "Out of contact" only when tracked AND liveness says STALE.
+ */
+internal fun peerStatus(
+    presence: PresenceState,
+    health: PeerHealth?,
+    lastHeardMs: Long,
+    rttMs: Int,
+    inActiveSet: Boolean,
+    isTracked: Boolean,
+    nowMs: Long,
+): PeerStatus {
+    when (presence) {
+        PresenceState.SPEAKING -> return PeerStatus("Speaking", Color(0xFF2979FF))
+        PresenceState.LISTENING -> return PeerStatus("Listening", Green)
+        PresenceState.MUTED -> return PeerStatus("Muted", Orange)
+        PresenceState.AWAY -> return PeerStatus("Away", TextMuted)
+        PresenceState.BACKGROUNDED -> return PeerStatus("Background", TextMuted)
+        PresenceState.DND -> return PeerStatus("Do not disturb", Purple)
+        PresenceState.IDLE -> { /* fall through */ }
+    }
+
+    if (health == PeerHealth.STALE && isTracked) {
+        return PeerStatus("Out of contact", StatusDisconnected)
+    }
+    if (health == PeerHealth.DEGRADED) {
+        val rtt = if (rttMs in 1..999) " · ${rttMs} ms" else ""
+        return PeerStatus("Weak signal$rtt", Orange)
+    }
+
+    if (lastHeardMs > 0L) {
+        val ageMs = nowMs - lastHeardMs
+        if (ageMs < 8_000L) {
+            val rtt = if (rttMs in 1..999) " · ${rttMs} ms" else ""
+            return PeerStatus(
+                if (ageMs < 5_000L) "In channel$rtt" else "Active ${ageMs / 1000}s ago$rtt",
+                Green,
+            )
+        }
+    }
+
+    if (inActiveSet || health == PeerHealth.HEALTHY) {
+        val rtt = if (rttMs in 1..999) " · ${rttMs} ms" else ""
+        return PeerStatus("In channel$rtt", Green)
+    }
+
+    // Heard on the wire (registry) but heartbeats not in yet — still on channel.
+    return PeerStatus("On channel", TextGray)
 }
 
 @Composable
@@ -234,7 +349,6 @@ private fun YouCard(
                 .padding(12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Emoji avatar
             Box(
                 modifier = Modifier
                     .size(44.dp)
@@ -296,35 +410,27 @@ private fun SectionHeader(
     }
 }
 
-/** Format a last-heard timestamp as a human-readable "active N ago" string. */
-private fun formatLastActive(lastHeardMs: Long, nowMs: Long): String {
-    if (lastHeardMs <= 0L) return "offline"
-    val ageMs = nowMs - lastHeardMs
-    return when {
-        ageMs < 5_000L    -> "active now"
-        ageMs < 60_000L   -> "active ${ageMs / 1000}s ago"
-        ageMs < 3_600_000L -> "active ${ageMs / 60_000}m ago"
-        else               -> "offline"
-    }
-}
+/**
+ * A human label for a roster entry. Relay/BLE peers can be registered under a
+ * raw transport id (relay:<hex>, a MAC, or a 16-hex sender id) or a blank/"null"
+ * name; never surface those — show a friendly placeholder instead.
+ */
+private fun SassyTalkNative.UserInfo.displayName(): String =
+    name.takeUnless {
+        it.isBlank() ||
+            it == "null" ||
+            it.startsWith("relay:") ||
+            Regex("(?i)^([0-9a-f]{2}:){5}[0-9a-f]{2}$").matches(it) ||
+            Regex("(?i)^[0-9a-f]{16}$").matches(it)
+    } ?: "Nearby device"
 
 @Composable
 private fun UserCard(
     user: SassyTalkNative.UserInfo,
-    presenceState: PresenceState = PresenceState.IDLE,
-    rttMs: Int = -1,
-    lastHeardMs: Long = 0L,
+    status: PeerStatus,
     onToggleMute: () -> Unit,
     onToggleFavorite: () -> Unit
 ) {
-    // Tick every second so the "active Ns ago" label stays fresh
-    var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            delay(1_000L)
-            nowMs = System.currentTimeMillis()
-        }
-    }
     val isMuted = user.isMuted
 
     Card(
@@ -340,7 +446,6 @@ private fun UserCard(
                 .padding(12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Initials avatar
             Box(
                 modifier = Modifier
                     .size(44.dp)
@@ -349,7 +454,7 @@ private fun UserCard(
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = user.name.take(2).uppercase(),
+                    text = user.displayName().take(2).uppercase(),
                     color = if (isMuted) DarkBg else Cyan,
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Bold
@@ -360,7 +465,7 @@ private fun UserCard(
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = user.name,
+                    text = user.displayName(),
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Medium,
                     color = if (isMuted) TextMuted else TextWhite,
@@ -369,14 +474,20 @@ private fun UserCard(
                 if (isMuted) {
                     Text(text = "Muted", fontSize = 12.sp, color = StatusDisconnected)
                 } else {
-                    Spacer(modifier = Modifier.height(2.dp))
-                    PresenceChip(state = presenceState, rttMs = rttMs)
-                    val lastActiveText = formatLastActive(lastHeardMs, nowMs)
-                    Text(
-                        text = lastActiveText,
-                        fontSize = 11.sp,
-                        color = if (lastActiveText == "active now") Color(0xFF4CAF50) else TextMuted
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(status.color)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = status.label,
+                            fontSize = 12.sp,
+                            color = status.color,
+                        )
+                    }
                 }
             }
 
@@ -398,50 +509,5 @@ private fun UserCard(
                 )
             }
         }
-    }
-}
-
-/**
- * Small presence indicator chip showing the peer's current PresenceState and RTT.
- *
- * Visual spec:
- *   LISTENING   -> green dot  + "Listening"
- *   SPEAKING    -> blue dot   + "Speaking"
- *   MUTED       -> orange dot + "Muted"
- *   AWAY        -> gray dot   + "Away"
- *   BACKGROUNDED -> gray dot  + "Background"
- *   DND         -> purple dot + "DND"
- *   IDLE        -> gray dot   + "Idle"
- *
- * If rttMs is in 1..999 an RTT label is appended (e.g. "42 ms").
- */
-@Composable
-fun PresenceChip(state: PresenceState, rttMs: Int) {
-    val (dotColor, label) = when (state) {
-        PresenceState.LISTENING    -> Green  to "Listening"
-        PresenceState.SPEAKING     -> Color(0xFF2979FF) to "Speaking"
-        PresenceState.MUTED        -> Orange to "Muted"
-        PresenceState.AWAY         -> TextMuted to "Away"
-        PresenceState.BACKGROUNDED -> TextMuted to "Background"
-        PresenceState.DND          -> Purple to "DND"
-        PresenceState.IDLE         -> TextMuted to "Idle"
-    }
-
-    val rttLabel = if (rttMs in 1..999) "  ${rttMs} ms" else ""
-
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(
-            modifier = Modifier
-                .size(7.dp)
-                .clip(CircleShape)
-                .background(dotColor)
-        )
-        Spacer(modifier = Modifier.width(4.dp))
-        Text(
-            text = "$label$rttLabel",
-            fontSize = 11.sp,
-            color = dotColor,
-            fontWeight = FontWeight.Normal
-        )
     }
 }

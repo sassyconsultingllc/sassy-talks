@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
-// CodeMark: SCLLC1-sassytalkie-YX3BUV3XZQLI
+// CodeMark: SCLLC1-sassytalkie-H7TRPVQ4SQMD
 package com.sassyconsulting.sassytalkie
 
 import java.nio.ByteBuffer
@@ -40,6 +40,10 @@ data class DecodedFrame(val opcode: Byte, val payload: ByteArray) {
 data class HeartbeatPayload(
     val epoch: Long, val seq: Int, val tsMs: Long,
     val state: PresenceState, val rttMs: Int,
+    /** Capability bitmap (e.g. CAP_HYBRID_PQC=0x01). 0 for peers that predate
+     *  the caps byte — the heartbeat appends it, and parsing tolerates its
+     *  absence, so this is a backward-compatible wire extension. */
+    val caps: Int = 0,
 )
 
 object ControlFrame {
@@ -55,6 +59,30 @@ object ControlFrame {
     const val OP_PARTNER_OFFLINE: Byte = 0x14
     const val OP_PTT_START_V2: Byte  = 0x15
     const val OP_PTT_STOP_V2: Byte   = 0x16
+    /**
+     * Wake beacon. Sent by a peer about to transmit when LivenessTracker
+     * marks any other peer STALE — tells receivers to immediately emit a
+     * fresh heartbeat (bypassing their own outbound interval) and re-warm
+     * any transport that's gone idle, so the imminent audio isn't lost on
+     * the first ~1.5s of the talk burst.
+     *
+     * Receivers that are already HEALTHY treat OP_WAKE as a no-op (still
+     * cheap — they just emit one extra HB). Receivers whose WS has fully
+     * disconnected won't see this frame at all; that case needs FCM (a
+     * Phase-2 follow-up). See [encodeWake] / [parseWake].
+     */
+    const val OP_WAKE: Byte          = 0x17
+
+    /** Hybrid PQC handshake (path a). INIT carries the initiator message
+     *  (X25519 pub || ML-KEM encaps key), RESP carries the responder message
+     *  (X25519 pub || ML-KEM ciphertext). Payload: [channel:u8][message bytes].
+     *  These are large (~1.2 KB) — send over a transport that carries big frames
+     *  (cellular relay / RFCOMM), not a small-MTU BLE GATT write. */
+    const val OP_HYBRID_INIT: Byte   = 0x1B
+    const val OP_HYBRID_RESP: Byte   = 0x1C
+
+    /** Capability bit advertised in the heartbeat caps byte: hybrid-PQC support. */
+    const val CAP_HYBRID_PQC: Int    = 0x01
 
     fun encodeLegacy(op: Byte): ByteArray = byteArrayOf(op)
 
@@ -79,20 +107,25 @@ object ControlFrame {
     }
 
     fun encodeHeartbeat(epoch: Long, seq: Int, tsMs: Long,
-                        state: PresenceState, rttMs: Int): ByteArray {
-        val p = ByteBuffer.allocate(23).order(ByteOrder.LITTLE_ENDIAN)
+                        state: PresenceState, rttMs: Int, caps: Int = 0): ByteArray {
+        // 24 bytes: the original 23 (epoch|seq|tsMs|state|rtt) + a trailing caps
+        // byte. Appending keeps it readable by 23-byte-only peers (they ignore
+        // the extra) while letting upgraded peers advertise capabilities.
+        val p = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
         p.putLong(epoch); p.putInt(seq); p.putLong(tsMs)
         p.put(state.byte); p.putShort(rttMs.toShort())
+        p.put((caps and 0xFF).toByte())
         return encodeTlv(OP_HEARTBEAT, p.array())
     }
 
     fun parseHeartbeat(payload: ByteArray): HeartbeatPayload {
         val b = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
-        return HeartbeatPayload(
-            epoch = b.long, seq = b.int, tsMs = b.long,
-            state = PresenceState.fromByte(b.get()),
-            rttMs = b.short.toInt() and 0xFFFF,
-        )
+        val epoch = b.long; val seq = b.int; val tsMs = b.long
+        val state = PresenceState.fromByte(b.get())
+        val rttMs = b.short.toInt() and 0xFFFF
+        // Caps byte is optional — older peers send a 23-byte payload without it.
+        val caps = if (payload.size >= 24) payload[23].toInt() and 0xFF else 0
+        return HeartbeatPayload(epoch, seq, tsMs, state, rttMs, caps)
     }
 
     fun encodeRecvAck(epoch: Long, lastSeq: Int, tsMs: Long): ByteArray {
@@ -131,5 +164,34 @@ object ControlFrame {
         val p = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
         p.putLong(epoch); p.putInt(endSeq)
         return encodeTlv(OP_PTT_STOP_V2, p.array())
+    }
+
+    /** Hybrid handshake frame: [channel:u8][message bytes]. Used for both
+     *  OP_HYBRID_INIT (initiator msg) and OP_HYBRID_RESP (responder msg). */
+    fun encodeHybridFrame(op: Byte, channel: Int, msg: ByteArray): ByteArray {
+        val p = ByteArray(1 + msg.size)
+        p[0] = (channel and 0xFF).toByte()
+        System.arraycopy(msg, 0, p, 1, msg.size)
+        return encodeTlv(op, p)
+    }
+
+    /** Parse a hybrid handshake payload → (channel, messageBytes), or null. */
+    fun parseHybridFrame(payload: ByteArray): Pair<Int, ByteArray>? {
+        if (payload.isEmpty()) return null
+        val channel = payload[0].toInt() and 0xFF
+        return channel to payload.copyOfRange(1, payload.size)
+    }
+
+    /** Wake beacon payload: [epoch:u64][senderTsMs:u64]. 16 bytes. */
+    fun encodeWake(epoch: Long, senderTsMs: Long): ByteArray {
+        val p = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
+        p.putLong(epoch); p.putLong(senderTsMs)
+        return encodeTlv(OP_WAKE, p.array())
+    }
+
+    /** Returns (senderEpoch, senderTsMs). */
+    fun parseWake(payload: ByteArray): Pair<Long, Long> {
+        val b = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+        return b.long to b.long
     }
 }

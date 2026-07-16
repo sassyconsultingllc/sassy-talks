@@ -1,6 +1,6 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
-// CodeMark: SCLLC1-sassytalkie-CNKUJETMLN5Y
+// CodeMark: SCLLC1-sassytalkie-BQHKF4LBPYCT
 package com.sassyconsulting.sassytalkie
 
 import java.util.concurrent.ConcurrentHashMap
@@ -13,6 +13,7 @@ class LivenessTracker {
         var lastRxMs: Long = 0,
         var lastPresence: PresenceState = PresenceState.IDLE,
         var rttMs: Int = -1,
+        var caps: Int = 0, // last-advertised capability bitmap (CAP_HYBRID_PQC etc.)
         val pendingEchoes: ConcurrentHashMap<Int, Long> = ConcurrentHashMap(), // seq -> sentTsMs
     )
 
@@ -28,16 +29,23 @@ class LivenessTracker {
     }
 
     /** Process an inbound heartbeat from this peer. */
-    fun onHeartbeat(peerId: String, epoch: Long, seq: Int, tsMs: Long, nowMs: Long) {
+    fun onHeartbeat(peerId: String, epoch: Long, seq: Int, tsMs: Long, nowMs: Long, caps: Int = 0) {
         val p = peers.getOrPut(peerId) { PeerState(epoch = epoch) }
         synchronized(p) {
             p.epoch = epoch
             p.lastRxMs = nowMs
+            p.caps = caps
             val sentAt = p.pendingEchoes.remove(seq)
             if (sentAt != null) {
                 p.rttMs = (nowMs - sentAt).toInt().coerceAtLeast(0)
             }
         }
+    }
+
+    /** Last capability bitmap advertised by a peer (0 if unknown/legacy). */
+    fun peerCaps(peerId: String): Int {
+        val p = peers[peerId] ?: return 0
+        return synchronized(p) { p.caps }
     }
 
     /** Update the last-known presence state for a peer (extracted from heartbeat). */
@@ -47,6 +55,9 @@ class LivenessTracker {
             p.lastPresence = state
         }
     }
+
+    /** True if we have ever received a heartbeat from this peer. */
+    fun isTracked(peerId: String): Boolean = peers.containsKey(peerId)
 
     /** Get health assessment for a peer. */
     fun health(peerId: String, nowMs: Long): PeerHealth {

@@ -6,7 +6,7 @@
 .SYNOPSIS
   One-shot: deploy relay license service, wire website checkout, create F&F promo.
 
-  Run from: sassy-talk-clean/cloudflare-worker/
+  Run from: cloudflare-worker/
 
   Requires: wrangler auth, CLOUDFLARE_ACCOUNT_ID (optional if wrangler.toml has account_id)
 

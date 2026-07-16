@@ -14,7 +14,7 @@ This document records the current integration state and next actions for merging
 What we have
 
 - `v1.1.0-lobby/` — a self-contained lobby GUI (React + TypeScript) with components, styles, assets, and docs (`LOBBY_DESIGN.md`).
-- Main code: `sassy-talk-clean/` contains desktop/web (Tauri), Android, and iOS projects.
+- Main code: `` contains desktop/web (Tauri), Android, and iOS projects.
 - A full file inventory was produced and saved at `v:\Projects\sassytalkie\file-inventory.txt`.
 
 Current status

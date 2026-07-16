@@ -6,7 +6,7 @@
 # SassyTalk — Developer Manifesto
 
 > Last updated: 2026-03-29. This document is the ground truth for onboarding any developer or AI assistant.
-> **MANIFESTO.md lives in `sassy-talk-clean/`. The production deploy repo is `sassyconsultingllc-cloudflare/`.**
+> **MANIFESTO.md lives in ``. The production deploy repo is `sassyconsultingllc-cloudflare/`.**
 
 ---
 
@@ -22,18 +22,18 @@ Encrypted push-to-talk walkie-talkie. AES-256-GCM end-to-end encryption, per-cha
 
 ```
 sassyconsultingllc.com         — main website (worker: sassyconsultingllc-cloudflare/)
-relay.sassy-consults.com       — PTT relay only (worker: sassy-talk-clean/cloudflare-worker/)
+relay.sassy-consults.com       — PTT relay only (worker: cloudflare-worker/)
 ```
 
 - `sassyconsultingllc-cloudflare/src/worker.js` — handles website, R2 downloads, contact form,
   checkout. PTT routes are 301 → relay.sassy-consults.com. NEVER add relay logic here.
-- `sassy-talk-clean/cloudflare-worker/` — ONLY the PTT relay. No website, no assets, no APIs.
+- `cloudflare-worker/` — ONLY the PTT relay. No website, no assets, no APIs.
   Deployed as `sassytalk-relay` worker. **This is the one the app connects to.**
 
-**Deploy relay:** `cd sassy-talk-clean/cloudflare-worker && npx wrangler deploy`
+**Deploy relay:** `cd cloudflare-worker && npx wrangler deploy`
 **Deploy website:** `cd sassyconsultingllc-cloudflare && npx wrangler deploy`
 
-**The old `sassy-talk-clean/cloudflare-worker/src/worker.js` is a stale stub — ignore it. The real
+**The old `cloudflare-worker/src/worker.js` is a stale stub — ignore it. The real
 relay entry point is `ptt-relay-worker.js`.**
 
 ---
@@ -270,10 +270,10 @@ audio is unencrypted. See `nativeImportSessionFromQR` in `jni_bridge.rs`.
 |------|-----------|---------|
 | `sassyconsultingllc-cloudflare/src/worker.js` | sassyconsultingllc (sassyconsultingllc.com) | Website + R2 downloads + APIs. PTT routes → 301 to relay domain |
 | `sassyconsultingllc-cloudflare/wrangler.jsonc` | — | D1 db, R2 bucket, DO bindings for main worker |
-| `sassy-talk-clean/cloudflare-worker/src/ptt-relay-worker.js` | sassytalk-relay (relay.sassy-consults.com) | Pure relay entry point. Routes: /health, /ws, /api/ptt/ws |
-| `sassy-talk-clean/cloudflare-worker/src/ptt-relay.js` | — | PttRoom Durable Object. 16 peers/room, hibernation-aware |
-| `sassy-talk-clean/cloudflare-worker/wrangler.toml` | — | Relay worker config. PTT_RELAY binding, relay.sassy-consults.com route |
-| `sassy-talk-clean/cloudflare-worker/src/worker.js` | DISABLED / stub | Old combined worker. DO NOT DEPLOY. |
+| `cloudflare-worker/src/ptt-relay-worker.js` | sassytalk-relay (relay.sassy-consults.com) | Pure relay entry point. Routes: /health, /ws, /api/ptt/ws |
+| `cloudflare-worker/src/ptt-relay.js` | — | PttRoom Durable Object. 16 peers/room, hibernation-aware |
+| `cloudflare-worker/wrangler.toml` | — | Relay worker config. PTT_RELAY binding, relay.sassy-consults.com route |
+| `cloudflare-worker/src/worker.js` | DISABLED / stub | Old combined worker. DO NOT DEPLOY. |
 
 ---
 
@@ -373,8 +373,8 @@ npx wrangler r2 object put sassy-downloads/sassytalk/android/SassyTalk-latest.ap
 ### Deploy Relay
 
 ```bash
-# ONLY from sassy-talk-clean/cloudflare-worker/
-cd sassy-talk-clean/cloudflare-worker
+# ONLY from cloudflare-worker/
+cd cloudflare-worker
 npx wrangler deploy
 # → deploys to relay.sassy-consults.com
 ```

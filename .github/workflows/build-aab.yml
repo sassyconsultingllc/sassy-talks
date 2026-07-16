@@ -22,7 +22,7 @@ on:
     branches:
       - main
     paths:
-      - 'sassy-talk-clean/android-app/**'
+      - 'android-app/**'
 
 jobs:
   build-aab:
@@ -47,12 +47,12 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('sassy-talk-clean/android-app/**/*.gradle.kts') }}
+          key: ${{ runner.os }}-gradle-${{ hashFiles('android-app/**/*.gradle.kts') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
 
       - name: Make gradlew executable
-        run: chmod +x sassy-talk-clean/android-app/gradlew
+        run: chmod +x android-app/gradlew
 
       - name: Decode release keystore
         env:
@@ -62,9 +62,9 @@ jobs:
             echo "::error::RELEASE_KEYSTORE_BASE64 secret is not set — refusing to build a debug-signed AAB."
             exit 1
           fi
-          mkdir -p sassy-talk-clean/android-app/app/keystore
-          echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > sassy-talk-clean/android-app/app/keystore/release.keystore
-          test -s sassy-talk-clean/android-app/app/keystore/release.keystore || { echo "::error::Decoded keystore is empty"; exit 1; }
+          mkdir -p android-app/app/keystore
+          echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > android-app/app/keystore/release.keystore
+          test -s android-app/app/keystore/release.keystore || { echo "::error::Decoded keystore is empty"; exit 1; }
 
       - name: Verify release credentials are present
         env:
@@ -79,7 +79,7 @@ jobs:
           [ "$missing" -eq 0 ] || exit 1
 
       - name: Build Release AAB
-        working-directory: sassy-talk-clean/android-app
+        working-directory: android-app
         env:
           RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
           RELEASE_KEY_ALIAS:      ${{ secrets.RELEASE_KEY_ALIAS }}
@@ -90,7 +90,7 @@ jobs:
 
       - name: Verify AAB is signed with release keystore (not debug)
         run: |
-          AAB="sassy-talk-clean/android-app/app/build/outputs/bundle/playRelease/app-play-release.aab"
+          AAB="android-app/app/build/outputs/bundle/playRelease/app-play-release.aab"
           test -s "$AAB" || { echo "::error::AAB not produced"; exit 1; }
           # Pull the signing cert subject and fail if it's the Android debug cert.
           tmpdir=$(mktemp -d)
@@ -108,7 +108,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sassy-talkie-release-aab
-          path: sassy-talk-clean/android-app/app/build/outputs/bundle/playRelease/*.aab
+          path: android-app/app/build/outputs/bundle/playRelease/*.aab
           retention-days: 30
 
       - name: Publish to Google Play
@@ -122,7 +122,7 @@ jobs:
         with:
           serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
           packageName: com.sassyconsulting.sassytalkie
-          releaseFiles: sassy-talk-clean/android-app/app/build/outputs/bundle/playRelease/app-play-release.aab
+          releaseFiles: android-app/app/build/outputs/bundle/playRelease/app-play-release.aab
           track: ${{ inputs.play_track }}
           status: completed
           changesNotSentForReview: false
