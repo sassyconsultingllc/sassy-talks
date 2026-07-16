@@ -1,0 +1,25 @@
+---
+description: Single source tree — never recreate nested or stub app copies
+alwaysApply: true
+---
+
+# One source tree
+
+This repo was flattened. There is **no** `sassy-talk-clean/` directory and **no** parallel stub copies of the apps.
+
+## Canonical paths (repo root = `sassy-talks/`)
+
+- Android app: `android-app/`
+- Android Rust/JNI: `android-native/`
+- iOS: `ios-native/`
+- Desktop: `tauri-desktop/`
+- Shared Rust core: `core/`
+- Relay worker: `cloudflare-worker/`
+
+## Never do this
+
+- Do not create `sassy-talk-clean/` or copy projects under a nested “clean” folder
+- Do not create a second `android-app/`, `tauri-desktop/`, or `cloudflare-worker/` elsewhere in the repo
+- Do not “sync” fixes between two trees — there is only one tree
+
+Dual trees caused agents to patch incomplete stubs while the real app diverged, producing fix/regression loops.
