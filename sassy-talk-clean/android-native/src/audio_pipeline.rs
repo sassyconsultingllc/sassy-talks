@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-E74JPYJ2CRHF
 /// Audio Pipeline - TX/RX threads that wire the full audio path
 ///
 /// TX path (on PTT press):

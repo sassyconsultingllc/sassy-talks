@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-OS5SCHBPPZON
 //! pqc — Hybrid post-quantum key agreement (X25519 + ML-KEM-768).
 //!
 //! **INTEGRATION STATUS (staged, not yet on the wire):** this module compiles

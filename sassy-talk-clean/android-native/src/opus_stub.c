@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-3HC6AOF3FXSR
 /* opus_stub.c — host-build stubs for the libopus C ABI.
  *
  * Compiled by build.rs ONLY on non-Android/non-Linux hosts (typically

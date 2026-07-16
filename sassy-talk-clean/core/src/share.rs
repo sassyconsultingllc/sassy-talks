@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-RQIENYDNOL5R
 //! share — open encrypted session-invite blobs from the relay's `/share/<id>`
 //! endpoint, the server-side half of an invite link
 //! `https://relay.sassyconsultingllc.com/v/<id>#<base64url-key>`.

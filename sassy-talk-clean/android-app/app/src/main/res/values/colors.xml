@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
+   Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+   Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+   CodeMark: SCLLC1-sassytalkie-NLWTMCZTNEMM
+-->
+<!--
   Non-Compose chrome palette (splash window, status/nav bar fallbacks). Kept in
   sync with the Tauri desktop reference (app.css :root) and the Compose tokens in
   ui/theme/Color.kt. Slate backgrounds + teal accent; coral is reserved for the

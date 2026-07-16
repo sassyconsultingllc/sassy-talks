@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+# Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+# CodeMark: SCLLC1-sassytalkie-DPNFDADMD57U
 # Upload release APK to Cloudflare R2 (replaces previous build)
 # Requires: CLOUDFLARE_API_TOKEN env var or wrangler login
 #

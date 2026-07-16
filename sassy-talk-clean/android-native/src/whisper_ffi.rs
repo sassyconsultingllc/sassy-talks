@@ -1,4 +1,7 @@
 #![allow(non_camel_case_types)]
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-UBRHRDMGV2I5
 
 /// Minimal FFI bindings to the whisper_wrapper.c shim.
 ///

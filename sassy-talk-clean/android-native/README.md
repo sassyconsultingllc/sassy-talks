@@ -1,3 +1,8 @@
+<!--
+   Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+   Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+   CodeMark: SCLLC1-sassytalkie-RYDQQ2FQWX4M
+-->
 # 🎯 SassyTalkie Android - Complete Implementation
 ## Production-Ready v1.0.0
 

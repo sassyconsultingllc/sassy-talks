@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-PBJ2CFYUT6OQ
 package com.sassyconsulting.sassytalkie.ui
 
 import android.content.Context
@@ -105,6 +108,13 @@ fun AppNavigation(
                     text = "Sassy-Talk needs microphone and camera\npermissions to function.",
                     fontSize = 14.sp,
                     color = TextGray,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "Bluetooth and notifications are optional —\nyou can enable them later in system settings.",
+                    fontSize = 12.sp,
+                    color = TextMuted,
                     textAlign = TextAlign.Center
                 )
                 Spacer(modifier = Modifier.height(32.dp))
@@ -298,14 +308,18 @@ fun AppNavigation(
         if (!ok) currentScreen = Screen.Gate
     }
 
-    // Wait for both native init and the service binding before starting BLE/RFCOMM
-    LaunchedEffect(nativeReady, walkieService) {
+    // Wait for both native init and the service binding before starting BLE/RFCOMM.
+    // Keyed on `entitled` too: initBleTransport refuses while locked, and v3.1.5
+    // latched bleReady=true on that refusal — PttCoordinator then never existed
+    // for the whole session and the on-screen PTT went permanently dead. Only
+    // latch on actual success; a false return (locked / BT off / no permission)
+    // retries when the keys change, and MainScreen re-attempts on mount.
+    LaunchedEffect(nativeReady, walkieService, entitled) {
         val service = walkieService
-        if (nativeReady && service != null && !bleReady) {
-            withContext(Dispatchers.IO) {
+        if (nativeReady && entitled && service != null && !bleReady) {
+            bleReady = withContext(Dispatchers.IO) {
                 service.initBleTransport()
             }
-            bleReady = true
         }
     }
 

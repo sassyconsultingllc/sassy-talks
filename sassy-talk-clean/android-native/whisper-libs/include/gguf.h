@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-LI3ZEW3JYWM2
 // This file contains functionality related to "GGUF" files, the binary file format used by ggml.
 // GGUF files have the following structure:
 //

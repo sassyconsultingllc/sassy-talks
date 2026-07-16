@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-X6NCRFHEVWVJ
 package com.sassyconsulting.sassytalkie
 
 import android.Manifest
@@ -25,7 +28,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.exclude
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -77,35 +82,50 @@ class MainActivity : ComponentActivity() {
     // onCreate, armed in onStart, disarmed in onStop.
     private val hardwarePtt: HardwarePttController by lazy { HardwarePttController(this) }
 
-    private val requiredPermissions: Array<String>
+    // Hard gate: the radio cannot function without mic (PTT) and camera (QR pairing).
+    private val corePermissions: Array<String> = arrayOf(
+        Manifest.permission.RECORD_AUDIO,
+        Manifest.permission.CAMERA,
+    )
+
+    // Requested alongside the core set but NOT required to proceed: Bluetooth
+    // transport (12+ trio; pre-12 BLE scan legally needs location) and the
+    // foreground-service status notification (13+). Denying these degrades —
+    // no BT fallback / hidden status card — it must never block startup.
+    // (Gating startup on POST_NOTIFICATIONS wedged the app in an endless
+    // re-request loop when the user tapped "Don't allow": Android answers a
+    // permanently-denied request instantly, and the results callback fired a
+    // fresh request each time → ANR at the permission screen.)
+    private val optionalPermissions: Array<String>
         get() {
-            val perms = mutableListOf(
-                Manifest.permission.RECORD_AUDIO,
-                Manifest.permission.CAMERA,
-            )
-            // Android 12+ requires runtime Bluetooth permissions
+            val perms = mutableListOf<String>()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 perms.add(Manifest.permission.BLUETOOTH_CONNECT)
                 perms.add(Manifest.permission.BLUETOOTH_SCAN)
                 perms.add(Manifest.permission.BLUETOOTH_ADVERTISE)
             } else {
-                // Android 7–11 (API 24–30): BLE scanning legally requires
-                // location permission or BluetoothLeScanner.startScan returns
-                // no results. (On 31+ neverForLocation removes this need.)
                 perms.add(Manifest.permission.ACCESS_FINE_LOCATION)
             }
-            // Android 13+ requires POST_NOTIFICATIONS for foreground service notification
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 perms.add(Manifest.permission.POST_NOTIFICATIONS)
             }
             return perms.toTypedArray()
         }
 
+    /** True once at least one request round-trip has completed this process —
+     *  disambiguates "never asked" from "permanently denied" (both return
+     *  false from shouldShowRequestPermissionRationale). */
+    private var permissionsAskedOnce = false
+
     private val requestPermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
         Log.i(TAG, "Permission results: $results")
-        checkAllPermissions()
+        permissionsAskedOnce = true
+        // Recompute state ONLY — never auto-re-request from this callback.
+        // A permanently-denied permission resolves instantly, so a re-request
+        // here loops forever and ANRs. The gate screen button is the retry path.
+        permissionsGranted.value = coreGranted()
     }
 
     // ── Service binding ──
@@ -160,7 +180,12 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier
                         .fillMaxSize()
                         .background(BgDark)
-                        .windowInsetsPadding(WindowInsets.safeDrawing),
+                        // System bars + cutout only. IME is deliberately
+                        // EXCLUDED here: safeDrawing includes it, and screens
+                        // with text input (Auth, Profile) apply imePadding()
+                        // themselves — padding both places shifted content by
+                        // 2x the keyboard height (the "funky" resize).
+                        .windowInsetsPadding(WindowInsets.safeDrawing.exclude(WindowInsets.ime)),
                 ) {
                     if (pipActive) {
                         PipRadioOverlay(isTransmitting = hwTransmitting)
@@ -235,6 +260,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // Re-evaluate after a round-trip through the system Settings page —
+        // the permission gate must clear the moment mic + camera are granted.
+        if (!permissionsGranted.value && coreGranted()) {
+            permissionsGranted.value = true
+        }
         updatePipAutoEnter()
     }
 
@@ -337,26 +367,53 @@ class MainActivity : ComponentActivity() {
 
     // ── Permission helpers ──
 
-    private fun checkAllPermissions() {
-        val allGranted = requiredPermissions.all { perm ->
-            ContextCompat.checkSelfPermission(this, perm) == PackageManager.PERMISSION_GRANTED
-        }
+    private fun isGranted(perm: String): Boolean =
+        ContextCompat.checkSelfPermission(this, perm) == PackageManager.PERMISSION_GRANTED
 
-        if (allGranted) {
-            Log.i(TAG, "All permissions granted")
+    private fun coreGranted(): Boolean = corePermissions.all { isGranted(it) }
+
+    private fun checkAllPermissions() {
+        if (coreGranted()) {
+            Log.i(TAG, "Core permissions granted")
             permissionsGranted.value = true
+            // First run: still surface the optional dialogs (BT, notifications)
+            // once so those features work out of the box. Safe — the callback
+            // never re-requests, and the app is already past the gate.
+            if (!permissionsAskedOnce && optionalPermissions.any { !isGranted(it) }) {
+                requestAllPermissions()
+            }
         } else {
-            Log.i(TAG, "Some permissions missing — requesting")
+            Log.i(TAG, "Core permissions missing — requesting")
             requestAllPermissions()
         }
     }
 
     private fun requestAllPermissions() {
-        val missing = requiredPermissions.filter { perm ->
-            ContextCompat.checkSelfPermission(this, perm) != PackageManager.PERMISSION_GRANTED
+        val missing = (corePermissions + optionalPermissions).filter { !isGranted(it) }
+        if (missing.isEmpty()) {
+            permissionsGranted.value = coreGranted()
+            return
         }
-        if (missing.isNotEmpty()) {
-            requestPermissionsLauncher.launch(missing.toTypedArray())
+        val missingCore = corePermissions.filter { !isGranted(it) }
+        // Permanently denied core permission: the system resolves the request
+        // instantly with no dialog, so the only working path is the app's
+        // Settings page. onResume re-evaluates when the user comes back.
+        if (permissionsAskedOnce && missingCore.isNotEmpty() &&
+            missingCore.none { shouldShowRequestPermissionRationale(it) }
+        ) {
+            Log.i(TAG, "Core permissions permanently denied — routing to app settings")
+            try {
+                startActivity(
+                    Intent(
+                        android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.fromParts("package", packageName, null),
+                    )
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not open app settings: ${e.message}")
+            }
+            return
         }
+        requestPermissionsLauncher.launch(missing.toTypedArray())
     }
 }

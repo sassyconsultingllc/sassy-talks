@@ -1,8 +1,55 @@
+<!--
+   Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+   Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+   CodeMark: SCLLC1-sassytalkie-TRE5664GFP4D
+-->
 # Changelog
 
 All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
+
+## [3.1.6] (58) — 2026-07-15
+
+### Fixed
+- **Permission-screen crash on notification deny.** POST_NOTIFICATIONS (and
+  Bluetooth) are now optional: startup gates only on mic + camera, the results
+  callback no longer auto-re-requests (a permanently-denied permission answered
+  instantly, looping the request until ANR), and a permanently-denied core
+  permission routes to the app's Settings page instead of a dead button.
+- **Dead PTT button while roster shows peers.** The on-screen PTT now falls
+  back to the native IP pipeline when `PttCoordinator` is absent (Bluetooth
+  off/unpermitted or entitlement not yet cached at init) — the same fallback
+  the notification-shade toggle and hardware PTT already had. BT transport
+  init also retries on entitlement unlock and Main-screen mount instead of
+  being skipped once per session, and a rejected press now explains itself on
+  the hint line instead of eating the touch.
+- **Keyboard resize.** IME insets were applied twice (root `safeDrawing` +
+  per-screen `imePadding`), shifting content by 2x the keyboard height; the
+  root now excludes IME and `windowSoftInputMode="adjustResize"` pins the
+  behavior across OEM defaults.
+- **QR session screen.** Continue renders directly above the generated QR
+  (was: below the share buttons inside a scrolling column — off-screen on
+  phones), the inner scroll is gone, and the duplicate Active Session card is
+  suppressed while the generated QR is on screen.
+- **Paywall promo/license entry hidden by keyboard.** Both gate screens now
+  scroll and imePadding so the code field rides above the IME (typed text was
+  invisible under the keyboard); typed text is white on a filled container
+  with a teal cursor for contrast.
+- **Session crypto wiped by back-navigation.** The radio screen's back arrow
+  called native `disconnect()`, which nulls the transport's AEAD session —
+  re-entering via Continue then rejected every PTT press ("Authenticate via
+  QR first") while presence still showed peers. Back is now pure navigation
+  (End Session remains the hard teardown), and Continue re-arms crypto from
+  the persisted channel session if a wipe already happened.
+- **Debug builds re-locked onto the paywall.** `refresh()` lacked the debug
+  entitlement bypass `isUnlockedCached` has, so the silent post-startup
+  reconciliation flipped dev installs onto the gate a beat after launch.
+
+### Added
+- **Invite links inside the session.** The radio screen's Session QR dialog
+  now has the same Copy Link / Share Link actions as the Auth screen — no
+  more backing out of the session to mint an invite.
 
 ## [3.1.5] (57) — 2026-07-14
 

@@ -1,11 +1,16 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-DTOOWM25QCE7
 package com.sassyconsulting.sassytalkie.license
 
 import android.content.Context
 import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -25,8 +30,10 @@ import com.sassyconsulting.sassytalkie.BuildConfig
 import com.sassyconsulting.sassytalkie.ui.theme.DarkBg
 import com.sassyconsulting.sassytalkie.ui.theme.PrimaryBlue
 import com.sassyconsulting.sassytalkie.ui.theme.StatusDisconnected
+import com.sassyconsulting.sassytalkie.ui.theme.SurfaceBg
 import com.sassyconsulting.sassytalkie.ui.theme.Teal
 import com.sassyconsulting.sassytalkie.ui.theme.TextGray
+import com.sassyconsulting.sassytalkie.ui.theme.TextWhite
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -89,6 +96,12 @@ object Entitlements {
      * rejection from the server clears the entitlement.
      */
     fun refresh(context: Context, onResult: (Boolean) -> Unit = {}) {
+        // Debug builds are always entitled — must mirror isUnlockedCached's
+        // bypass. Without this, AppNavigation's silent reconciliation called
+        // refresh() a beat after startup, got `false` (no stored license on a
+        // dev install), and flipped an already-unlocked debug session onto
+        // the paywall gate.
+        if (BuildConfig.DEBUG) return onResult(true)
         val p = LicenseStore.prefs(context) ?: return onResult(false)
         val key = p.getString(LicenseStore.KEY_LICENSE, null) ?: return onResult(false)
         val kind = p.getString(LicenseStore.KEY_KIND, null)
@@ -141,9 +154,15 @@ object Entitlements {
             modifier = Modifier.fillMaxSize().background(DarkBg),
             contentAlignment = Alignment.Center,
         ) {
+            // Scroll + imePadding: the key/promo field lives low in this
+            // column and the soft keyboard covered it — typed text was
+            // invisible under the IME. Mirrors the play-flavor gate fix.
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.padding(32.dp),
+                modifier = Modifier
+                    .padding(32.dp)
+                    .verticalScroll(rememberScrollState())
+                    .imePadding(),
             ) {
                 Text(text = "🎙", fontSize = 64.sp)
                 Spacer(modifier = Modifier.height(24.dp))
@@ -168,10 +187,13 @@ object Entitlements {
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = Teal,
+                        focusedTextColor = TextWhite,
                         unfocusedTextColor = Teal,
                         focusedBorderColor = PrimaryBlue,
                         unfocusedBorderColor = TextGray,
+                        cursorColor = Teal,
+                        focusedContainerColor = SurfaceBg,
+                        unfocusedContainerColor = SurfaceBg,
                     ),
                     modifier = Modifier.fillMaxWidth(),
                 )

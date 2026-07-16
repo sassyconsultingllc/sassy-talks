@@ -1,4 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+   Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+   Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+   CodeMark: SCLLC1-sassytalkie-QS2RHFSN2466
+-->
 <resources>
     <!-- Slate chrome; edge-to-edge is configured in values-v28/v35 and
          MainActivity.enableEdgeToEdge(). -->

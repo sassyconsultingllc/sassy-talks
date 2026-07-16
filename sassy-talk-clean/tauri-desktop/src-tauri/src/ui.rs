@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-62FCRLMO4BIS
 /// UI module for SassyTalkie
 /// 
 /// Since we're building a pure Rust Android app, UI can be:

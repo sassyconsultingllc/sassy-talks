@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-WGSLS3ER3L6S
 /// Session Management - Per-channel QR-based key exchange with time-limited sessions
 ///
 /// Each channel (1-8) can have its own independent AES-256-GCM encryption key

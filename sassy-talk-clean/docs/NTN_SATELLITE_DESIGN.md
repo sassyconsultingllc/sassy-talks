@@ -1,3 +1,8 @@
+<!--
+   Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+   Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+   CodeMark: SCLLC1-sassytalkie-P4Z5QTGY2BWU
+-->
 # SassyTalkie — Non-Terrestrial Network (Satellite) Support Design
 
 **Status:** design (2027–2028 planning horizon)

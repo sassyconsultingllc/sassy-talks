@@ -1,4 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+   Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+   Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+   CodeMark: SCLLC1-sassytalkie-HW6G3524WZM6
+-->
 <resources>
     <!-- API 35+: edge-to-edge is enforced by default; disable contrast scrims
          so our slate background reads through the transparent system bars. -->

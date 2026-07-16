@@ -1,3 +1,8 @@
+<!--
+   Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+   Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+   CodeMark: SCLLC1-sassytalkie-CBQ3D4HDRJQW
+-->
 # Bitrate-guard Design Notes
 
 > Status: **draft, not wired into the wire protocol.** Receiver-side guard fn is implementable today against estimated bitrate; sender-side advertisement requires a protocol version bump that affects every client.

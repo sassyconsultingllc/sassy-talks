@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-XBTRJPKJDX3A
 /// Crypto Module - AES-256-GCM Encryption for Audio Transport
 ///
 /// Handles key exchange (X25519 ECDH) and packet encryption/decryption.

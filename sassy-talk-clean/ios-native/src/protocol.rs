@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-DUC54ITAXK5K
 /// Protocol Module - Packet Format
 /// 
 /// Defines wire protocol for UDP multicast communication

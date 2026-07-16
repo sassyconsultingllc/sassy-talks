@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-PBLN6O7JKWAZ
 package com.sassyconsulting.sassytalkie.ui
 
 import android.content.ClipData
@@ -9,9 +12,7 @@ import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -99,9 +100,35 @@ fun QRAuthScreen(
         Spacer(modifier = Modifier.height(8.dp))
 
         // ── Existing session card ──
-        if (hasExistingSession.value) {
+        // Suppressed while the Show QR tab is displaying a freshly-generated
+        // QR: that tab renders its own Continue directly above the code, and
+        // stacking the card on top duplicated the button and pushed the QR
+        // below the fold (the old "scroll to find Continue" complaint).
+        if (hasExistingSession.value && !(selectedTab == 0 && qrBitmap != null)) {
             ActiveSessionCard(
-                onContinue = onAuthenticated,
+                onContinue = { activeChannel ->
+                    scope.launch {
+                        // Re-arm live crypto from the persisted channel session
+                        // when a prior native disconnect wiped it. Without this
+                        // re-import, Continue landed on Main un-encrypted and
+                        // every PTT press bounced off "Authenticate via QR
+                        // first" while presence still showed peers.
+                        if (activeChannel > 0 && !SassyTalkNative.isEncrypted()) {
+                            val rearmed = withContext(Dispatchers.IO) {
+                                val stored = try {
+                                    SassyTalkNative.getChannelSessionJson(activeChannel)
+                                } catch (_: Throwable) { "" }
+                                stored.isNotEmpty() && try {
+                                    SassyTalkNative.importSessionFromQR(stored)
+                                } catch (_: Throwable) { false }
+                            }
+                            // Same post-import contract as scan/paste joins:
+                            // the WS must attach to the session's room.
+                            if (rearmed) onSessionMutated()
+                        }
+                        onAuthenticated()
+                    }
+                },
                 onNewSession = {
                     SassyTalkNative.clearSession()
                     hasExistingSession.value = false
@@ -267,7 +294,7 @@ fun QRAuthScreen(
 
 @Composable
 private fun ActiveSessionCard(
-    onContinue: () -> Unit,
+    onContinue: (activeChannel: Int) -> Unit,
     onNewSession: () -> Unit
 ) {
     val sessionJson = SassyTalkNative.getSessionStatus()
@@ -276,12 +303,14 @@ private fun ActiveSessionCard(
     val channels = session?.optJSONArray("channels")
     var peerDevice = ""
     var remainingSecs = 0L
+    var activeChannel = -1
     if (channels != null) {
         for (i in 0 until channels.length()) {
             val ch = channels.getJSONObject(i)
             if (ch.optBoolean("active", false)) {
                 peerDevice = ch.optString("peer_device", "")
                 remainingSecs = ch.optLong("remaining_seconds", 0)
+                activeChannel = ch.optInt("channel", -1)
                 break
             }
         }
@@ -322,7 +351,7 @@ private fun ActiveSessionCard(
             ) {
                 // Continue with existing session
                 Button(
-                    onClick = onContinue,
+                    onClick = { onContinue(activeChannel) },
                     colors = ButtonDefaults.buttonColors(containerColor = Green, contentColor = DarkBg),
                     shape = RoundedCornerShape(25.dp),
                     modifier = Modifier.weight(1f).height(44.dp)
@@ -358,11 +387,12 @@ private fun ShowQRTab(
     onGenerate: () -> Unit,
     onContinue: () -> Unit
 ) {
+    // No verticalScroll here: everything, Continue included, must be reachable
+    // without scrolling. Continue renders ABOVE the QR so the primary action
+    // is never below the fold even on short screens.
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier
-            .fillMaxWidth()
-            .verticalScroll(rememberScrollState())
+        modifier = Modifier.fillMaxWidth()
     ) {
         // Channel picker
         Card(
@@ -478,8 +508,26 @@ private fun ShowQRTab(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // QR display
         if (qrBitmap != null) {
+            // Continue FIRST — the primary action sits above the QR so it's
+            // always visible the instant the code is generated (previously it
+            // was last in a scrolling column and hid below the fold).
+            Button(
+                onClick = onContinue,
+                colors = ButtonDefaults.buttonColors(containerColor = Green),
+                shape = RoundedCornerShape(25.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+            ) {
+                Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Continue", fontSize = 14.sp)
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // QR display
             Card(
                 colors = CardDefaults.cardColors(containerColor = androidx.compose.ui.graphics.Color.White),
                 shape = RoundedCornerShape(12.dp)
@@ -635,30 +683,6 @@ private fun ShowQRTab(
                 }
             }
 
-            Spacer(modifier = Modifier.height(6.dp))
-
-            // Continue button
-            Button(
-                onClick = onContinue,
-                colors = ButtonDefaults.buttonColors(containerColor = Green),
-                shape = RoundedCornerShape(25.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(48.dp)
-            ) {
-                Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Continue", fontSize = 14.sp)
-            }
-
-            Spacer(modifier = Modifier.height(4.dp))
-
-            Text(
-                text = "Your session key is active — the other device just needs to scan or enter the code.",
-                color = TextMuted,
-                fontSize = 10.sp,
-                textAlign = TextAlign.Center
-            )
         }
     }
 }

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-7GKMDXM4QB3F
 // SassyTalkie - Standalone egui UI for development/testing
 // This module is only compiled with `--features standalone-ui`.
 // The production app uses Kotlin/Compose + JNI (jni_bridge.rs).

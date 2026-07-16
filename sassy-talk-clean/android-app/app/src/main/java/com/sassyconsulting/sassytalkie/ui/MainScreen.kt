@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-53CVA2GFR6FK
 package com.sassyconsulting.sassytalkie.ui
 
 import androidx.compose.animation.core.*
@@ -29,6 +32,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.sassyconsulting.sassytalkie.SassyTalkNative
+import com.sassyconsulting.sassytalkie.SessionShareLink
 import com.sassyconsulting.sassytalkie.TranscriptionBridge
 import com.sassyconsulting.sassytalkie.WalkieService
 import com.sassyconsulting.sassytalkie.ui.theme.*
@@ -177,6 +181,13 @@ fun MainScreen(
     // service is ready, leaving the relay client unwired.
     LaunchedEffect(walkieService) {
         val service = walkieService ?: return@LaunchedEffect
+        // Re-attempt BT init on every Main mount (idempotent, cheap guards).
+        // Covers Bluetooth toggled on / permissions granted / entitlement
+        // unlocked AFTER the one-shot AppNavigation init ran — before this,
+        // a skipped init left pttCoordinator null for the whole session.
+        // Must run BEFORE attachWalkieService so the relay client gets wired
+        // to the freshly-created coordinator.
+        withContext(Dispatchers.IO) { service.initBleTransport() }
         autoConnect.attachWalkieService(service)
         if (connectState != ConnectState.CONNECTED) {
             autoConnect.reset()
@@ -225,12 +236,15 @@ fun MainScreen(
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = {
-                scope.launch {
-                    withContext(Dispatchers.IO) { SassyTalkNative.disconnect() }
-                    onDisconnect()
-                }
+                // Plain navigation — deliberately NOT SassyTalkNative.disconnect().
+                // That native call wipes transport crypto (TransportManager.
+                // disconnect sets crypto=None), so backing out once and
+                // Continue-ing back in landed on Main un-encrypted: every PTT
+                // press was rejected ("Authenticate via QR first") while the
+                // roster still showed peers. Full teardown = End Session menu.
+                onDisconnect()
             }) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Disconnect", tint = TextGray)
+                Icon(Icons.Default.ArrowBack, contentDescription = "Leave radio screen", tint = TextGray)
             }
 
             // Group name (editable per-channel) — defaults to "Sassy-Talk" if no name set
@@ -570,42 +584,67 @@ fun MainScreen(
 
         val pttEnabled = connectState == ConnectState.CONNECTED
 
+        // Rejected-press feedback \u2014 a press that can't start TX must say WHY
+        // on the hint line instead of silently doing nothing (auto-clears).
+        var pressRejectedMsg by remember { mutableStateOf<String?>(null) }
+        LaunchedEffect(pressRejectedMsg) {
+            if (pressRejectedMsg != null) {
+                kotlinx.coroutines.delay(3_000L)
+                pressRejectedMsg = null
+            }
+        }
+
+        // Start TX via the coordinator when the BT stack is up, else fall back
+        // to the native IP pipeline directly \u2014 the same fallback the
+        // notification-shade toggle and hardware PTT already use. Without it,
+        // any device where initBleTransport skipped (Bluetooth off, BT
+        // permission denied, entitlement not yet cached) had a dead PTT button
+        // while the WiFi/relay roster still showed peers.
+        val startTx = {
+            val ptt = walkieService?.pttCoordinator
+            val started = when {
+                ptt != null -> ptt.onPttPressed()
+                SassyTalkNative.isConnected() -> {
+                    SassyTalkNative.pttStart()
+                    true
+                }
+                else -> false
+            }
+            if (started) {
+                isTransmitting = true
+                walkieService?.updateNotification("Transmitting on CH $currentChannel")
+            } else {
+                pressRejectedMsg = "No route to peers \u2014 check connection"
+            }
+        }
+        val stopTx = {
+            isTransmitting = false
+            walkieService?.pttCoordinator?.onPttReleased() ?: SassyTalkNative.pttStop()
+            walkieService?.updateNotification("Radio active \u2014 ${SassyTalkNative.getTransportName()}")
+        }
+
         PTTButton(
             isTransmitting = isTransmitting,
             pulseScale = if (isTransmitting) pulseScale else 1f,
             enabled = pttEnabled,
             dimmed = anyPeerStale,
             onPressStart = {
-                if (!pttEnabled) return@PTTButton
-                val ptt = walkieService?.pttCoordinator
                 if (!SassyTalkNative.isEncrypted()) {
                     showEncryptionWarning = true
-                } else if (pttHoldMode) {
-                    if (isTransmitting) {
-                        isTransmitting = false
-                        ptt?.onPttReleased()
-                        walkieService?.updateNotification("Radio active \u2014 ${SassyTalkNative.getTransportName()}")
-                    } else {
-                        showEncryptionWarning = false
-                        if (ptt?.onPttPressed() == true) {
-                            isTransmitting = true
-                            walkieService?.updateNotification("Transmitting on CH $currentChannel")
-                        }
-                    }
+                } else if (pttHoldMode && isTransmitting) {
+                    stopTx()
                 } else {
                     showEncryptionWarning = false
-                    if (ptt?.onPttPressed() == true) {
-                        isTransmitting = true
-                        walkieService?.updateNotification("Transmitting on CH $currentChannel")
-                    }
+                    startTx()
                 }
             },
             onPressEnd = {
                 if (!pttHoldMode && isTransmitting) {
-                    isTransmitting = false
-                    walkieService?.pttCoordinator?.onPttReleased()
-                    walkieService?.updateNotification("Radio active \u2014 ${SassyTalkNative.getTransportName()}")
+                    stopTx()
                 }
+            },
+            onPressRejected = {
+                pressRejectedMsg = "Not connected \u2014 tap \u21bb to reconnect"
             }
         )
 
@@ -615,6 +654,7 @@ fun MainScreen(
             isTransmitting && peerSpeaking -> "Talk-over detected" to Color(0xFFFF9800)
             isTransmitting && peerReachFailed -> "Not reaching peer" to Color(0xFFFF5252)
             isTransmitting -> "Transmitting on CH $currentChannel" to Orange
+            pressRejectedMsg != null -> pressRejectedMsg!! to Color(0xFFFF5252)
             deliveryState == com.sassyconsulting.sassytalkie.DeliveryState.Sending ->
                 "Sending…" to Color(0xFFFF9800)
             deliveryState == com.sassyconsulting.sassytalkie.DeliveryState.Delivered ->
@@ -630,6 +670,7 @@ fun MainScreen(
             Icon(
                 imageVector = when {
                     isTransmitting -> Icons.Default.Mic
+                    pressRejectedMsg != null -> Icons.Default.Warning
                     deliveryState == com.sassyconsulting.sassytalkie.DeliveryState.Delivered ->
                         Icons.Default.CheckCircle
                     deliveryState == com.sassyconsulting.sassytalkie.DeliveryState.Sending ->
@@ -715,6 +756,7 @@ fun MainScreen(
 
     // Show QR dialog for current session
     if (showQrDialog) {
+        val context = androidx.compose.ui.platform.LocalContext.current
         val sessionId = remember { SassyTalkNative.getSessionId() ?: "" }
 
         // Read the per-channel session JSON via the encrypted accessor —
@@ -760,6 +802,103 @@ fun MainScreen(
                         Text("Scan to join CH $currentChannel", color = TextGray, fontSize = 13.sp)
                         if (sessionId.isNotEmpty()) {
                             Text("Session: ${sessionId.take(8)}", color = TextMuted, fontSize = 11.sp)
+                        }
+
+                        // Invite-link actions — same encrypted one-shot link the
+                        // Auth screen offers. Without these, minting an invite
+                        // from INSIDE a session meant backing out to the Auth
+                        // screen, which is where "how do I share this?" died.
+                        Spacer(modifier = Modifier.height(10.dp))
+                        var linking by remember { mutableStateOf(false) }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedButton(
+                                enabled = !linking,
+                                onClick = {
+                                    linking = true
+                                    scope.launch {
+                                        val result = withContext(Dispatchers.IO) {
+                                            SessionShareLink.createShare(sessionJson)
+                                        }
+                                        linking = false
+                                        when (result) {
+                                            is SessionShareLink.Result.Ok -> {
+                                                val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                                                    as android.content.ClipboardManager
+                                                cm.setPrimaryClip(
+                                                    android.content.ClipData.newPlainText(
+                                                        "SassyTalk Invite", result.httpsUrl,
+                                                    ),
+                                                )
+                                                android.widget.Toast.makeText(
+                                                    context, "Invite link copied",
+                                                    android.widget.Toast.LENGTH_SHORT,
+                                                ).show()
+                                            }
+                                            is SessionShareLink.Result.Err -> {
+                                                android.widget.Toast.makeText(
+                                                    context, "Copy failed: ${result.message}",
+                                                    android.widget.Toast.LENGTH_LONG,
+                                                ).show()
+                                            }
+                                        }
+                                    }
+                                },
+                                shape = RoundedCornerShape(25.dp),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = Cyan),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                                modifier = Modifier.weight(1f).height(36.dp)
+                            ) {
+                                Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(if (linking) "Linking…" else "Copy Link", fontSize = 12.sp)
+                            }
+                            OutlinedButton(
+                                enabled = !linking,
+                                onClick = {
+                                    linking = true
+                                    scope.launch {
+                                        val result = withContext(Dispatchers.IO) {
+                                            SessionShareLink.createShare(sessionJson)
+                                        }
+                                        linking = false
+                                        when (result) {
+                                            is SessionShareLink.Result.Ok -> {
+                                                val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                                    type = "text/plain"
+                                                    putExtra(
+                                                        android.content.Intent.EXTRA_TEXT,
+                                                        "Join my SassyTalk session:\n${result.httpsUrl}\n\n" +
+                                                            "One-time encrypted invite, expires shortly. If it opens a " +
+                                                            "web page, tap \"Open in SassyTalk\" there — or paste the " +
+                                                            "link in SassyTalk → Authenticate → Enter Code.",
+                                                    )
+                                                    putExtra(android.content.Intent.EXTRA_SUBJECT, "SassyTalk invite")
+                                                }
+                                                context.startActivity(
+                                                    android.content.Intent.createChooser(intent, "Share invite link"),
+                                                )
+                                            }
+                                            is SessionShareLink.Result.Err -> {
+                                                android.widget.Toast.makeText(
+                                                    context, "Share failed: ${result.message}",
+                                                    android.widget.Toast.LENGTH_LONG,
+                                                ).show()
+                                            }
+                                        }
+                                    }
+                                },
+                                shape = RoundedCornerShape(25.dp),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = Cyan),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                                modifier = Modifier.weight(1f).height(36.dp)
+                            ) {
+                                Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Share Link", fontSize = 12.sp)
+                            }
                         }
                     } else {
                         Text("No active session for this channel", color = TextMuted)
@@ -880,7 +1019,8 @@ private fun PTTButton(
     enabled: Boolean = true,
     dimmed: Boolean = false,
     onPressStart: () -> Unit,
-    onPressEnd: () -> Unit
+    onPressEnd: () -> Unit,
+    onPressRejected: () -> Unit = {}
 ) {
     // Gradient fill to match the Tauri desktop PTT: teal→purple (GradientCool)
     // idle, coral→purple (GradientWarm) while transmitting. Was a flat single-
@@ -924,7 +1064,14 @@ private fun PTTButton(
                 .border(8.dp, ringColor, CircleShape)
                 .background(buttonBrush)
                 .pointerInteropFilter { event ->
-                    if (!enabled) return@pointerInteropFilter false
+                    if (!enabled) {
+                        // Surface WHY the button is inert instead of eating
+                        // the touch silently — dead-feeling PTT reads as a bug.
+                        if (event.action == android.view.MotionEvent.ACTION_DOWN) {
+                            onPressRejected()
+                        }
+                        return@pointerInteropFilter false
+                    }
                     when (event.action) {
                         android.view.MotionEvent.ACTION_DOWN -> {
                             onPressStart()

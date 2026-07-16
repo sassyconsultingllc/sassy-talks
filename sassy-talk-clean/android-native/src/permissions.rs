@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-KUNU5X76PNP4
 /// Permissions Module - Runtime Permission Requests for Android
 ///
 /// Handles Android 6.0+ runtime permission requests via JNI

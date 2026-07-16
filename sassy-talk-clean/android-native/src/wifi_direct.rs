@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-LHS4NNFF3YYT
 /// WiFi Direct (Wi-Fi P2P) Module
 ///
 /// Manages WiFi Direct group state reported by the Kotlin side.

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-YDXTQIFHTVCL
 package com.sassyconsulting.sassytalkie
 
 import android.app.Notification
@@ -339,47 +342,87 @@ class WalkieService : Service() {
     // ── BLE + RFCOMM init ──
 
     /**
+     * Runtime Bluetooth permission check. BT permissions are OPTIONAL as of
+     * v3.1.6 (denying them must not block the app), so this can no longer be
+     * assumed granted: starting GATT/RFCOMM without BLUETOOTH_CONNECT/SCAN/
+     * ADVERTISE throws SecurityException on Android 12+.
+     */
+    private fun hasBtPermissions(): Boolean {
+        fun granted(p: String) =
+            androidx.core.content.ContextCompat.checkSelfPermission(this, p) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            granted(android.Manifest.permission.BLUETOOTH_CONNECT) &&
+                granted(android.Manifest.permission.BLUETOOTH_SCAN) &&
+                granted(android.Manifest.permission.BLUETOOTH_ADVERTISE)
+        } else {
+            // Pre-12: CONNECT/ADMIN are install-time; BLE scanning legally
+            // requires location permission or startScan returns nothing.
+            granted(android.Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+    }
+
+    /**
      * Initialize BLE signaling + RFCOMM transport.
-     * Call after SassyTalkNative.init() succeeds and BT permissions are granted.
+     * Call after SassyTalkNative.init() succeeds.
+     *
+     * @return true when the BT stack (and PttCoordinator) is up — either from
+     *   this call or a previous one. false when skipped (locked, BT off, or
+     *   permissions missing); safe to call again once conditions change, and
+     *   callers MUST treat false as "IP-only mode", not an error.
      */
     @android.annotation.SuppressLint("MissingPermission")
-    fun initBleTransport() {
+    fun initBleTransport(): Boolean {
         if (!Entitlements.isUnlockedCached(this)) {
             Log.i(TAG, "initBleTransport: not entitled — refusing to start BLE/RFCOMM")
-            return
+            return false
         }
         if (bleInitialized) {
-            Log.i(TAG, "BLE transport already initialized; skipping")
-            return
+            return true
+        }
+        if (!hasBtPermissions()) {
+            Log.w(TAG, "initBleTransport: Bluetooth permissions not granted — IP-only mode")
+            return false
         }
 
         val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
         if (adapter == null || !adapter.isEnabled) {
             Log.w(TAG, "Bluetooth not available or not enabled")
-            return
+            return false
         }
 
         val ble = BleSignalingService(this, adapter)
         val bt = BluetoothTransport(this)
         val coord = PttCoordinator(ble, bt)
 
-        // Start BLE
-        ble.startServer()
-        ble.startAdvertising()
-        ble.startScanning()
+        return try {
+            // Start BLE
+            ble.startServer()
+            ble.startAdvertising()
+            ble.startScanning()
 
-        // Start RFCOMM listener
-        bt.startAcceptThread()
+            // Start RFCOMM listener
+            bt.startAcceptThread()
 
-        bleSignaling = ble
-        btTransport = bt
-        pttCoordinator = coord
+            bleSignaling = ble
+            btTransport = bt
+            pttCoordinator = coord
 
-        // Wire BT transport reference so SassyTalkNative.pttStart() can start TX pump
-        SassyTalkNative.bluetoothTransport = bt
+            // Wire BT transport reference so SassyTalkNative.pttStart() can start TX pump
+            SassyTalkNative.bluetoothTransport = bt
 
-        Log.i(TAG, "BLE + RFCOMM transport initialized")
-        bleInitialized = true
+            Log.i(TAG, "BLE + RFCOMM transport initialized")
+            bleInitialized = true
+            true
+        } catch (e: SecurityException) {
+            // Permission revoked mid-flight or OEM quirk — tear down the
+            // half-started stack and stay in IP-only mode.
+            Log.e(TAG, "initBleTransport: SecurityException — ${e.message}")
+            try { coord.shutdown() } catch (_: Exception) {}
+            try { bt.shutdown() } catch (_: Exception) {}
+            try { ble.shutdown() } catch (_: Exception) {}
+            false
+        }
     }
 
     private fun shutdownBleTransport() {

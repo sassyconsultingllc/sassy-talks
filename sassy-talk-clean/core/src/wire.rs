@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-XY5S3HJSKJBC
 //! wire — the audio DATA-plane frame shared by every SassyTalkie endpoint.
 //!
 //! This is the multicast/relay audio frame (distinct from the control-plane

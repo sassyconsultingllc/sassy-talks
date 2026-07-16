@@ -1,3 +1,8 @@
+<!--
+   Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+   Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+   CodeMark: SCLLC1-sassytalkie-YWJNC4H5LKVQ
+-->
 # SassyTalkie: Comprehensive Design Document
 ## A Secure Bluetooth Push-to-Talk Communication System
 ### Computer Science Analysis & Implementation Guide

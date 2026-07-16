@@ -1,3 +1,8 @@
+<!--
+   Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+   Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+   CodeMark: SCLLC1-sassytalkie-L63CUHFFDQZW
+-->
 # SassyTalkie — App Data & UI Pathway
 
 > Independent TX and RX structures for both UI and Data planes, mirrored across two channels (Phone 1 ↔ Phone 2).

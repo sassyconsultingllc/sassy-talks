@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-IY5GUIRKI2FK
 //! Wire-protocol opcodes shared by every SassyTalkie endpoint.
 //!
 //! Every constant in this file is on the wire. Changing a value is a

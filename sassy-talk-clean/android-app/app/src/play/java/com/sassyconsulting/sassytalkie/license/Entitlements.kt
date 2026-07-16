@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-FKJI2JW3AVPW
 package com.sassyconsulting.sassytalkie.license
 
 import android.app.Activity
@@ -5,8 +8,10 @@ import android.content.Context
 import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -43,8 +48,10 @@ import com.sassyconsulting.sassytalkie.BuildConfig
 import com.sassyconsulting.sassytalkie.ui.theme.DarkBg
 import com.sassyconsulting.sassytalkie.ui.theme.PrimaryBlue
 import com.sassyconsulting.sassytalkie.ui.theme.StatusDisconnected
+import com.sassyconsulting.sassytalkie.ui.theme.SurfaceBg
 import com.sassyconsulting.sassytalkie.ui.theme.Teal
 import com.sassyconsulting.sassytalkie.ui.theme.TextGray
+import com.sassyconsulting.sassytalkie.ui.theme.TextWhite
 
 /**
  * Play-flavor entitlement gate: Google Play Billing purchase, with promo-code
@@ -78,6 +85,10 @@ object Entitlements {
      */
     fun refresh(context: Context, onResult: (Boolean) -> Unit = {}) {
         val appContext = context.applicationContext
+        // Debug builds are always entitled — must mirror isUnlockedCached's
+        // bypass, or the post-startup reconciliation re-locks a dev install
+        // onto the paywall (no Play purchase on emulators).
+        if (BuildConfig.DEBUG) return onResult(true)
         if (LicenseStore.prefs(appContext)?.getString(LicenseStore.KEY_KIND, null) == "promo") {
             if (!LicensePromo.hasValidReceipt(appContext)) {
                 onResult(false)
@@ -329,9 +340,17 @@ object Entitlements {
             modifier = Modifier.fillMaxSize().background(DarkBg),
             contentAlignment = Alignment.Center,
         ) {
+            // Scroll + imePadding: the promo field sits at the BOTTOM of this
+            // column, and without these the soft keyboard covered it — the
+            // user typed a code they could not see. Scroll keeps every control
+            // reachable in the reduced viewport; imePadding lifts the focused
+            // field above the IME.
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.padding(32.dp),
+                modifier = Modifier
+                    .padding(32.dp)
+                    .verticalScroll(rememberScrollState())
+                    .imePadding(),
             ) {
                 Text(text = "🎙", fontSize = 64.sp)
                 Spacer(modifier = Modifier.height(24.dp))
@@ -436,10 +455,13 @@ object Entitlements {
                             capitalization = KeyboardCapitalization.Characters,
                         ),
                         colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = Teal,
+                            focusedTextColor = TextWhite,
                             unfocusedTextColor = Teal,
                             focusedBorderColor = PrimaryBlue,
                             unfocusedBorderColor = TextGray,
+                            cursorColor = Teal,
+                            focusedContainerColor = SurfaceBg,
+                            unfocusedContainerColor = SurfaceBg,
                         ),
                         modifier = Modifier.fillMaxWidth(),
                     )

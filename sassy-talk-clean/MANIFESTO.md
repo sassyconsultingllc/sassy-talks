@@ -1,3 +1,8 @@
+<!--
+   Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+   Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+   CodeMark: SCLLC1-sassytalkie-EFQTS2UQEPZ5
+-->
 # SassyTalk — Developer Manifesto
 
 > Last updated: 2026-03-29. This document is the ground truth for onboarding any developer or AI assistant.

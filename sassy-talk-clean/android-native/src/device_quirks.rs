@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-CBS5ONHLPWCN
 //! Per-OEM audio tuning profiles. Ported from the Kotlin `audio/DeviceQuirks.kt`
 //! so the Rust audio pipeline benefits from the same field-collected
 //! workarounds. Profile selection happens once at startup based on

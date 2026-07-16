@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-5DYAZXCJOUHT
 import { describe, it, expect, beforeEach } from "vitest";
 import { handleLicenseRoute } from "../src/license.js";
 import { hmacSha256Hex } from "../src/relay-auth.js";

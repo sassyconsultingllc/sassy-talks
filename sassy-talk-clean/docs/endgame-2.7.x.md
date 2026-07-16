@@ -1,3 +1,8 @@
+<!--
+   Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+   Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+   CodeMark: SCLLC1-sassytalkie-PKYHYTE35FRB
+-->
 # SassyTalkie v2.7.x — Endgame Roadmap
 
 > Three releases. Finite, named features. After v2.7.2 the app is "done" — further bugs go in the v2.8 backlog instead of fix-of-the-day cycles.

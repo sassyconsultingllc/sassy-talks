@@ -1,4 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+   Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+   Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+   CodeMark: SCLLC1-sassytalkie-3EXXZ7SL4M6D
+-->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- Audio -->
@@ -68,11 +73,15 @@
              single-column Compose and reflows; configChanges keeps the
              activity (native audio engine, service binding, live session)
              alive across rotation/resize instead of recreating it. -->
+        <!-- adjustResize (not the OEM-dependent default, which can PAN the
+             whole window): Compose consumes IME insets via imePadding, and a
+             framework pan on top of that double-shifts the content. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
             android:supportsPictureInPicture="true"
+            android:windowSoftInputMode="adjustResize"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
             android:theme="@style/Theme.SassyTalk.Splash">
             <intent-filter>

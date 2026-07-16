@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-OCHBVFKEDGW5
 /// State Machine - Central coordinator for all subsystems
 ///
 /// Manages audio engine, transport, crypto, users, audio cache, and the

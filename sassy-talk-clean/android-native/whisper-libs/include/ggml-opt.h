@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-STYMZ752ZRGL
 // This file contains functionality for training models using GGML.
 // It is not strictly needed vs. just vanilla GGML but it provides a more high-level interface for common needs such as datasets.
 // At the bottom of this file especially there are relatively high-level functions that are suitable use or adaptation in user code.
