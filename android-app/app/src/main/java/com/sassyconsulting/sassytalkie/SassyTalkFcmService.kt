@@ -113,41 +113,31 @@ class SassyTalkFcmService : FirebaseMessagingService() {
             ?.putLong(WAKE_KEY_LAST_TS, System.currentTimeMillis())
             ?.apply()
 
-        // Two-pronged: cold-start MainActivity (which wires PttCoordinator +
-        // cellular client via the existing AppNavigation flow), and ALSO send
-        // an ACTION_WAKE to the already-running service for the warm case.
-        // High-priority FCM messages get a temporary background-launch
-        // allowlist on Android 12+, which makes both starts legal.
-        //
-        // The Activity path is the only one that actually bootstraps the
-        // walkie stack from a fully-killed process — startForegroundService
-        // with foregroundServiceType=microphone is rejected on Android 14+
-        // when launched from background without a UI foreground promotion.
-        val activityIntent = Intent(applicationContext, MainActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-        }
-        try {
-            applicationContext.startActivity(activityIntent)
-        } catch (t: Throwable) {
-            Log.w(TAG, "Failed to start MainActivity on wake: ${t.message}")
-        }
-
-        // Best-effort warm-path nudge — fine if the service isn't running yet,
-        // the Activity launch above will start it. startService (not
-        // startForegroundService) avoids the A14+ microphone-fg-type trap;
-        // the service stays foregrounded via the existing notification if it
-        // was already promoted, or stays plain-bound if newly bound.
+        // Prefer nudging the already-running WalkieService (sticky radio FGS)
+        // without yanking the UI. Cold-start MainActivity only when the service
+        // was not alive — required to bootstrap PttCoordinator from a killed
+        // process (A14+ blocks startForegroundService+microphone from FCM alone).
+        val serviceWasRunning = WalkieService.isRunning
         val serviceIntent = Intent(applicationContext, WalkieService::class.java).apply {
             action = WalkieService.ACTION_WAKE
             putExtra(WalkieService.EXTRA_ROOM, room)
         }
         try {
             applicationContext.startService(serviceIntent)
+            Log.i(TAG, "WAKE → WalkieService ACTION_WAKE room=$room runningWas=$serviceWasRunning")
         } catch (t: Throwable) {
-            // If the service isn't running and the OS rejects a plain
-            // startService from background, the Activity launch above is the
-            // real bootstrap path — silent skip is correct.
             Log.d(TAG, "warm-path startService skipped: ${t.message}")
+        }
+
+        if (!serviceWasRunning) {
+            val activityIntent = Intent(applicationContext, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            }
+            try {
+                applicationContext.startActivity(activityIntent)
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to start MainActivity on wake: ${t.message}")
+            }
         }
     }
 

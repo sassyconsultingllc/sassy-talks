@@ -90,6 +90,10 @@ fun TranscriptionFeedScreen(
     val timeFormatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
 
     val cacheStatus = TranscriptionBridge.cacheSnapshot.collectAsState().value.toUi()
+    DisposableEffect(Unit) {
+        TranscriptionBridge.acquireCacheUi()
+        onDispose { TranscriptionBridge.releaseCacheUi() }
+    }
 
     val snackbarHost = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
@@ -355,6 +359,8 @@ private fun TranscriptionBubble(
         Spacer(modifier = Modifier.width(8.dp))
 
         Column(modifier = Modifier.weight(1f)) {
+            val isLocalCaption = entry.senderId.startsWith("local:")
+
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = entry.senderName,
@@ -362,6 +368,15 @@ private fun TranscriptionBubble(
                     fontWeight = FontWeight.SemiBold,
                     color = color
                 )
+                if (isLocalCaption) {
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "translated",
+                        fontSize = 10.sp,
+                        color = Orange,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     text = timeFormatter.format(Date(entry.timestamp)),
@@ -375,29 +390,31 @@ private fun TranscriptionBubble(
             Text(
                 text = entry.text,
                 fontSize = 14.sp,
-                color = TextWhite
+                color = if (isLocalCaption) Orange else TextWhite
             )
         }
 
-        // Replay button — always rendered so the row layout is consistent;
-        // disabled (grey) and shows an explanatory snackbar on tap when this
-        // entry's audio isn't in the cache (utteranceId < 0). Hiding the
-        // button entirely was the previous behavior, and it made the feature
-        // feel broken — users tapped where they expected a button and got
-        // nothing.
+        // Replay for remote utterances; local live-captions have no PCM cache.
+        val isLocalCaption = entry.senderId.startsWith("local:")
         val cached = entry.utteranceId >= 0
         IconButton(
             onClick = {
-                if (cached) {
-                    val started = SassyTalkNative.replayById(entry.utteranceId)
-                    scope.launch {
+                when {
+                    isLocalCaption -> scope.launch {
                         snackbarHost.showSnackbar(
-                            if (started) "Replaying ${entry.senderName}"
-                            else         "Audio expired from cache"
+                            "On-device caption — no audio to replay"
                         )
                     }
-                } else {
-                    scope.launch {
+                    cached -> {
+                        val started = SassyTalkNative.replayById(entry.utteranceId)
+                        scope.launch {
+                            snackbarHost.showSnackbar(
+                                if (started) "Replaying ${entry.senderName}"
+                                else "Audio expired from cache"
+                            )
+                        }
+                    }
+                    else -> scope.launch {
                         snackbarHost.showSnackbar(
                             "No cached audio — older entries aren't replayable"
                         )
@@ -407,9 +424,17 @@ private fun TranscriptionBubble(
             modifier = Modifier.size(32.dp),
         ) {
             Icon(
-                Icons.Default.PlayArrow,
-                contentDescription = if (cached) "Replay" else "Replay unavailable",
-                tint = if (cached) Cyan else TextMuted.copy(alpha = 0.4f),
+                imageVector = if (isLocalCaption) Icons.Default.Translate else Icons.Default.PlayArrow,
+                contentDescription = when {
+                    isLocalCaption -> "Live caption"
+                    cached -> "Replay"
+                    else -> "Replay unavailable"
+                },
+                tint = when {
+                    isLocalCaption -> Orange
+                    cached -> Cyan
+                    else -> TextMuted.copy(alpha = 0.4f)
+                },
                 modifier = Modifier.size(20.dp),
             )
         }

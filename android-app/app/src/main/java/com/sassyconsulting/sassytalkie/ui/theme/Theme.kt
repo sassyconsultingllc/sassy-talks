@@ -12,8 +12,8 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 
-// Material3 scheme mapped onto the Tauri tokens: blue primary, teal secondary,
-// purple tertiary, slate surfaces. See ui/theme/Color.kt.
+// Material3 scheme: blue primary, teal secondary, coral tertiary (TX accent),
+// slate surfaces. Purple is not a Material role — keep it for rare accents.
 private val DarkColorScheme = darkColorScheme(
     primary = PrimaryBlue,
     onPrimary = TextPrimary,
@@ -25,8 +25,8 @@ private val DarkColorScheme = darkColorScheme(
     secondaryContainer = TealDark,
     onSecondaryContainer = TextPrimary,
 
-    tertiary = BrandPurple,
-    onTertiary = TextPrimary,
+    tertiary = Coral,
+    onTertiary = BgDark,
 
     background = BgDark,
     onBackground = TextPrimary,

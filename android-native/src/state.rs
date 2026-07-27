@@ -294,14 +294,18 @@ impl StateMachine {
         // (Transport lock is dropped before stop_audio_threads: the audio
         // threads take that lock, so joining them while holding it would
         // deadlock.)
-        let ip_still_live = {
+        let audio_still_live = {
             let mut transport = self.transport.lock().unwrap();
             transport.on_cellular_disconnected(reason);
-            transport.has_live_ip_transport()
+            // Keep TX/RX threads when WiFi OR Bluetooth still carries audio —
+            // stopping here after a relay flap with RFCOMM up caused silent PTT
+            // until the next connect event (BT re-promotion alone is not enough
+            // if the pipeline was torn down).
+            transport.has_live_audio_path()
         };
 
-        if ip_still_live {
-            info!("StateMachine: cellular down but WiFi path still live — audio pipeline kept running");
+        if audio_still_live {
+            info!("StateMachine: cellular down but local path still live — audio pipeline kept running");
             return;
         }
 

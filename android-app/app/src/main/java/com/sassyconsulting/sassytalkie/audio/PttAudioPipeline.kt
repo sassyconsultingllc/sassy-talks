@@ -100,10 +100,17 @@ class PttAudioPipeline(
             ?: throw IllegalStateException("AudioRecord init failed for calibration")
         record.startRecording()
         val job = scope.launch {
+            // Reuse one capture buffer; only copy when the collector needs a
+            // stable snapshot (partial reads or overlapping consumption).
             val buf = ShortArray(frameSizeSamples)
             while (isActive) {
                 val n = record.read(buf, 0, frameSizeSamples)
-                if (n > 0) trySend(buf.copyOf(n))
+                if (n <= 0) continue
+                // callbackFlow trySend is synchronous to the collector; MicCalibrator
+                // processes immediately, so a shared full-frame buffer is safe.
+                // Partial reads still need a sized copy.
+                val frame = if (n == frameSizeSamples) buf else buf.copyOf(n)
+                trySend(frame)
             }
         }
         awaitClose {

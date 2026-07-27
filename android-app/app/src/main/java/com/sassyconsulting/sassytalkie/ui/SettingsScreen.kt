@@ -39,7 +39,9 @@ private const val KEY_SPEAKERPHONE = "speakerphone_on"
 private const val KEY_JITTER_PREBUFFER = "jitter_prebuffer_frames"
 private const val DEFAULT_RX_GAIN = 1.0f
 private const val DEFAULT_SPEAKERPHONE = true   // walkie-talkie default = loud speaker
-private const val DEFAULT_JITTER_PREBUFFER = 5  // matches core's DEFAULT_LIVE_JITTER_PREBUFFER_FRAMES
+// Matches core DEFAULT_LIVE_JITTER_PREBUFFER_FRAMES (3 = 60 ms). Higher presets
+// (5/8) remain available in the UI for flaky cellular links.
+private const val DEFAULT_JITTER_PREBUFFER = 3
 // When true, 2..=6 overlapping speakers are PCM-mixed in real time on the
 // receiver instead of being serialized into the legacy Queue. Lets a small
 // group sound like a real conversation (with step-on) instead of a walkie-
@@ -86,10 +88,6 @@ fun SettingsScreen(
     }
     var noiseSuppression by remember { mutableStateOf(prefs.getBoolean(KEY_NOISE_SUPPRESSION, false)) }
     var sealedSender by remember { mutableStateOf(prefs.getBoolean(KEY_SEALED_SENDER, false)) }
-    // Shared on-device translator (ML Kit + offline SpeechRecognizer). Released
-    // when the screen leaves composition so model handles don't leak.
-    val translationManager = remember { com.sassyconsulting.sassytalkie.translate.TranslationManager() }
-    DisposableEffect(Unit) { onDispose { translationManager.release() } }
     LaunchedEffect(Unit) {
         // Apply the persisted preference to native on screen entry — the
         // native side resets to default (off) whenever the audio cache is
@@ -401,13 +399,10 @@ fun SettingsScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // On-device translation — ML Kit + offline SpeechRecognizer. Captions
-            // and translates your speech locally; nothing leaves the device. The
-            // panel carries its own enable switch + target-language picker.
-            com.sassyconsulting.sassytalkie.ui.TranslationPanel(
-                translationManager = translationManager,
-                requireWifiForModels = wifiEnabled,
-            )
+            // On-device translation — ML Kit + offline SpeechRecognizer. Configures
+            // the app-scoped LiveTranslationBridge; captions keep running on the
+            // main radio screen after leaving Settings.
+            TranslationPanel()
 
             Spacer(modifier = Modifier.height(12.dp))
 
@@ -417,7 +412,7 @@ fun SettingsScreen(
             // over time. Coordinated: every peer must enable it (shared key).
             SettingsCard(title = "Privacy") {
                 Text(
-                    text = "Sealed Sender hides your room and device identity from the relay using rotating, key-derived handles — the relay only ever sees opaque tokens, never a stable room or device name. Everyone in the channel must turn this on (you all share the same key); toggling briefly reconnects.",
+                    text = "Recommended on Cloudflare Relay. Sealed Sender replaces stable room/device names with rotating, key-derived handles so the relay only sees opaque tokens. Everyone in the channel must use the same setting (shared session key); mismatched peers land in different rooms. Toggling briefly reconnects. Local WiFi/Bluetooth paths are unaffected.",
                     fontSize = 11.sp,
                     color = TextMuted
                 )
@@ -425,7 +420,7 @@ fun SettingsScreen(
                 SettingsToggle(
                     icon = Icons.Default.Lock,
                     title = "Sealed Sender",
-                    description = "Blind room/peer/device metadata on the relay (metadata resistance)",
+                    description = "Blind relay room/peer/device metadata (anonymize relay)",
                     checked = sealedSender,
                     onCheckedChange = { enabled ->
                         sealedSender = enabled
@@ -445,7 +440,7 @@ fun SettingsScreen(
             // for same-WiFi peers; turning WiFi off forces relay-only.
             SettingsCard(title = "Network") {
                 Text(
-                    text = "Choose which transports the app uses. The app auto-fails over WiFi → relay → Bluetooth when signal drops, and advises when a better path is available. Turning Cloudflare Relay off keeps audio LAN-local for peers on the same WiFi.",
+                    text = "Local-first: WiFi multicast and Bluetooth are preferred for nearby peers; Cloudflare Relay is a long-distance backup. The app fails over WiFi → relay → Bluetooth when a path drops, and advises when a better path is available. Turning Relay off keeps audio LAN-local.",
                     fontSize = 11.sp,
                     color = TextMuted
                 )
@@ -464,7 +459,7 @@ fun SettingsScreen(
                 SettingsToggle(
                     icon = Icons.Default.Cloud,
                     title = "Cloudflare Relay",
-                    description = "Remote peers via the cellular/internet relay",
+                    description = "Long-distance backup for remote peers (not preferred when WiFi/BT works)",
                     checked = relayEnabled,
                     onCheckedChange = { enabled ->
                         relayEnabled = enabled

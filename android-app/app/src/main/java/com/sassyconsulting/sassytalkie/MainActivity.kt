@@ -162,6 +162,9 @@ class MainActivity : ComponentActivity() {
         // Diagnostics overlay toggle — persisted, honoured in release builds.
         DiagnosticsPrefs.init(this)
 
+        // Live translation session (Settings configure; Main/PiP observe).
+        com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge.init(this)
+
         // Block screenshots on the live radio screen; Auth/QR screens re-enable
         // capture via setScreenshotsAllowed() so users can photograph QR codes.
         if (BuildConfig.NO_SCREENSHOTS) {

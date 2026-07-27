@@ -221,7 +221,7 @@ fun AppNavigation(
                 // process death without requiring a Settings visit.
                 SassyTalkNative.setRxGain(micPrefs.getFloat("rx_gain", 1.0f))
                 SassyTalkNative.setSpeakerphone(micPrefs.getBoolean("speakerphone_on", true))
-                SassyTalkNative.setJitterPrebufferFrames(micPrefs.getInt("jitter_prebuffer_frames", 5))
+                SassyTalkNative.setJitterPrebufferFrames(micPrefs.getInt("jitter_prebuffer_frames", 3))
             } else {
                 initFailed = true
             }

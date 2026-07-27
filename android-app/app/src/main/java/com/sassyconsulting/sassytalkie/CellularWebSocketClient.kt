@@ -7,6 +7,7 @@ import android.util.Log
 import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okio.ByteString
+import okio.ByteString.Companion.toByteString
 import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -31,13 +32,10 @@ class CellularWebSocketClient {
 
     companion object {
         private const val TAG = "CellularWS"
-        // Outbound pump idle-poll interval. Each frame adds up to this many
-        // milliseconds of send latency beyond capture-to-encode time, and the
-        // receiver has no large jitter buffer so wire-side pacing irregularity
-        // is audible as "robotic / chopped" audio. 2 ms keeps the pump
-        // responsive without burning CPU. The pump also drains the queue
-        // fully each wake so bursts go on the wire immediately.
-        private const val POLL_INTERVAL_MS = 2L
+        // Idle poll between JNI outbound drains. Was 2 ms (~500 JNI/s while
+        // idle); 20 ms still keeps TX latency fine for 20 ms Opus frames and
+        // the pump drains the full queue each wake for bursts.
+        private const val POLL_INTERVAL_MS = 20L
         private const val PING_INTERVAL_SEC = 15L
         private const val MAX_RECONNECT_ATTEMPTS = 8
         // After the fast exponential retries, keep trying at this fixed floor
@@ -112,6 +110,14 @@ class CellularWebSocketClient {
     var onRelayReady: (() -> Unit)? = null
 
     /**
+     * Fired once when a previously-open relay socket transitions to down
+     * (graceful close, failure, or user disconnect). AutoConnect uses this
+     * for local-first failover (stay on WiFi, or drop to Bluetooth) instead
+     * of waiting for a WiFi NetworkCallback.
+     */
+    var onRelayLost: ((reason: String) -> Unit)? = null
+
+    /**
      * Stable per-install peer identifier appended to the WS URL as `peer=...`.
      * The relay uses it to map WS sessions to /presence registrations so audio
      * for a peer with no active WS triggers an FCM wake push. Set this from
@@ -152,6 +158,12 @@ class CellularWebSocketClient {
             Log.e(TAG, "No WS URL — set room first")
             return false
         }
+        // Room id (= QR session_id). Log a short fingerprint so split-room
+        // pairing bugs are obvious in logcat without dumping the full UUID.
+        val roomFp = runCatching {
+            android.net.Uri.parse(baseWsUrl).getQueryParameter("room")?.take(8)
+        }.getOrNull() ?: "?"
+        Log.i(TAG, "Connecting cellular room=$roomFp")
 
         // Fetch the capability token asynchronously. Doing this synchronously
         // here would block the calling thread (typically Dispatchers.Main via
@@ -374,7 +386,7 @@ class CellularWebSocketClient {
                         val packet = SassyTalkNative.cellularPollOutbound() ?: break
                         if (packet.isEmpty()) break
                         paceSend()
-                        webSocket?.send(ByteString.of(*packet))
+                        webSocket?.send(packet.toByteString())
                         sentAny = true
                     }
                     if (!sentAny) {
@@ -404,12 +416,17 @@ class CellularWebSocketClient {
         if (isConnected.getAndSet(false)) {
             stopOutboundPump()
             SassyTalkNative.cellularOnDisconnected(reason)
+            try {
+                onRelayLost?.invoke(reason)
+            } catch (t: Throwable) {
+                Log.w(TAG, "onRelayLost callback threw: ${t.message}")
+            }
         }
     }
 
     /** Send a raw binary frame via the WebSocket relay. */
     fun sendBinary(bytes: ByteArray) {
-        webSocket?.send(ByteString.of(*bytes))
+        webSocket?.send(bytes.toByteString())
     }
 
     /** Send a heartbeat ping to the relay (JSON control message) */
@@ -466,7 +483,7 @@ class CellularWebSocketClient {
             0,
             SassyTalkNative.localCapabilities(),
         )
-        webSocket?.send(ByteString.of(*frame))
+        webSocket?.send(frame.toByteString())
     }
 
     /**

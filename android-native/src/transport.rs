@@ -43,6 +43,10 @@ pub struct TransportManager {
     cellular: CellularTransport,
     crypto: Option<CryptoSession>,
     active: ActiveTransport,
+    /// True while at least one RFCOMM peer is connected (Kotlin-managed).
+    /// Used to re-promote Bluetooth when IP paths die without a fresh
+    /// `on_bluetooth_connected` callback.
+    bluetooth_connected: bool,
     device_name: String,
 }
 
@@ -60,8 +64,25 @@ impl TransportManager {
             cellular,
             crypto: None,
             active: ActiveTransport::None,
+            bluetooth_connected: false,
             device_name: device_name.to_string(),
         })
+    }
+
+    /// Pick the best remaining plane after an IP path drops.
+    /// Local-first: WiFi multicast > Bluetooth > None (relay handled by caller
+    /// before this runs, or via a separate cellular-up event).
+    fn promote_after_ip_loss(&mut self) -> ActiveTransport {
+        if self.wifi.get_state() == WifiState::Active {
+            info!("TransportManager: IP loss — WiFi multicast still active, promoting to Wifi");
+            ActiveTransport::Wifi
+        } else if self.bluetooth_connected {
+            info!("TransportManager: IP loss — promoting Bluetooth (RFCOMM still up)");
+            ActiveTransport::Bluetooth
+        } else {
+            info!("TransportManager: IP loss — no local path left");
+            ActiveTransport::None
+        }
     }
 
     /// Initialize WiFi multicast transport (call after permissions granted)
@@ -128,8 +149,17 @@ impl TransportManager {
         info!("TransportManager: WiFi Direct group dissolved");
         self.wifi.shutdown();
 
-        if self.active == ActiveTransport::WifiDirect {
-            self.active = ActiveTransport::None;
+        if matches!(
+            self.active,
+            ActiveTransport::WifiDirect | ActiveTransport::Wifi
+        ) {
+            // Prefer relay if still up; else Bluetooth; else None.
+            self.active = if self.cellular.get_state() == CellularState::Connected {
+                info!("TransportManager: WiFi Direct down — relay still up, promoting Cellular");
+                ActiveTransport::Cellular
+            } else {
+                self.promote_after_ip_loss()
+            };
         }
     }
 
@@ -262,17 +292,28 @@ impl TransportManager {
         if self.wifi.get_state() != WifiState::Active {
             return Ok(0);
         }
-        let mut wifi_buf = vec![0u8; buffer.len() + 128];
-        match self.wifi.receive_audio(&mut wifi_buf) {
-            Ok(n) if n > 0 => self.decrypt_into(&wifi_buf[..n], buffer),
-            Ok(_) => Ok(0),
-            Err(e) => {
-                if !e.contains("would block") && !e.contains("timed out") {
-                    warn!("WiFi receive failed: {}", e);
-                }
-                Ok(0)
-            }
+        // Reuse a thread-local scratch to avoid allocating every idle poll.
+        thread_local! {
+            static WIFI_SCRATCH: std::cell::RefCell<Vec<u8>> =
+                std::cell::RefCell::new(Vec::with_capacity(2048));
         }
+        WIFI_SCRATCH.with(|cell| {
+            let mut wifi_buf = cell.borrow_mut();
+            let need = buffer.len() + 128;
+            if wifi_buf.len() < need {
+                wifi_buf.resize(need, 0);
+            }
+            match self.wifi.receive_audio(&mut wifi_buf[..need]) {
+                Ok(n) if n > 0 => self.decrypt_into(&wifi_buf[..n], buffer),
+                Ok(_) => Ok(0),
+                Err(e) => {
+                    if !e.contains("would block") && !e.contains("timed out") {
+                        warn!("WiFi receive failed: {}", e);
+                    }
+                    Ok(0)
+                }
+            }
+        })
     }
 
     /// Non-blocking cellular relay poll. Returns decrypted bytes written to
@@ -281,15 +322,25 @@ impl TransportManager {
         if self.cellular.get_state() != CellularState::Connected {
             return Ok(0);
         }
-        let mut cell_buf = vec![0u8; buffer.len() + 128];
-        match self.cellular.receive_audio(&mut cell_buf) {
-            Ok(n) if n > 0 => self.decrypt_into(&cell_buf[..n], buffer),
-            Ok(_) => Ok(0),
-            Err(e) => {
-                warn!("Cellular receive failed: {}", e);
-                Ok(0)
-            }
+        thread_local! {
+            static CELL_SCRATCH: std::cell::RefCell<Vec<u8>> =
+                std::cell::RefCell::new(Vec::with_capacity(2048));
         }
+        CELL_SCRATCH.with(|cell| {
+            let mut cell_buf = cell.borrow_mut();
+            let need = buffer.len() + 128;
+            if cell_buf.len() < need {
+                cell_buf.resize(need, 0);
+            }
+            match self.cellular.receive_audio(&mut cell_buf[..need]) {
+                Ok(n) if n > 0 => self.decrypt_into(&cell_buf[..n], buffer),
+                Ok(_) => Ok(0),
+                Err(e) => {
+                    warn!("Cellular receive failed: {}", e);
+                    Ok(0)
+                }
+            }
+        })
     }
 
     /// Receive data from active transport with decryption
@@ -373,15 +424,10 @@ impl TransportManager {
         self.cellular.on_disconnected(reason);
 
         if self.active == ActiveTransport::Cellular {
-            // Fall back to a still-live path instead of going dark: leaving
-            // `active = None` here hard-blocked PTT ("No active transport")
-            // through every relay flap even with WiFi multicast fully up.
-            self.active = if self.wifi.get_state() == WifiState::Active {
-                info!("TransportManager: relay down — WiFi multicast still active, promoting to Wifi");
-                ActiveTransport::Wifi
-            } else {
-                ActiveTransport::None
-            };
+            // Fall back to a still-live local path instead of going dark:
+            // leaving `active = None` hard-blocked PTT even with WiFi or
+            // RFCOMM fully up. Prefer WiFi, then re-promote Bluetooth.
+            self.active = self.promote_after_ip_loss();
         }
     }
 
@@ -390,6 +436,11 @@ impl TransportManager {
     pub fn has_live_ip_transport(&self) -> bool {
         self.wifi.get_state() == WifiState::Active
             || self.cellular.get_state() == CellularState::Connected
+    }
+
+    /// True while any plane can carry audio (IP or Bluetooth RFCOMM).
+    pub fn has_live_audio_path(&self) -> bool {
+        self.has_live_ip_transport() || self.bluetooth_connected
     }
 
     /// Called by Kotlin when WebSocket receives a binary message
@@ -424,6 +475,7 @@ impl TransportManager {
     /// of this flag, so promoting it is unnecessary while an IP path is healthy —
     /// and harmful, because it would knock IP peers off the air.
     pub fn on_bluetooth_connected(&mut self) {
+        self.bluetooth_connected = true;
         if self.active == ActiveTransport::None {
             self.active = ActiveTransport::Bluetooth;
             info!("TransportManager: Bluetooth RFCOMM connected — now the active path (no IP transport up)");
@@ -435,8 +487,15 @@ impl TransportManager {
     /// Called by Kotlin when BT RFCOMM disconnects
     pub fn on_bluetooth_disconnected(&mut self) {
         info!("TransportManager: Bluetooth disconnected");
+        self.bluetooth_connected = false;
         if self.active == ActiveTransport::Bluetooth {
-            self.active = ActiveTransport::None;
+            self.active = if self.wifi.get_state() == WifiState::Active {
+                ActiveTransport::Wifi
+            } else if self.cellular.get_state() == CellularState::Connected {
+                ActiveTransport::Cellular
+            } else {
+                ActiveTransport::None
+            };
         }
     }
 
@@ -463,6 +522,7 @@ impl TransportManager {
         self.wifi_direct.reset();
         self.cellular.shutdown();
         self.crypto = None;
+        self.bluetooth_connected = false;
         self.active = ActiveTransport::None;
 
         Ok(())
@@ -477,5 +537,49 @@ impl TransportManager {
 impl Drop for TransportManager {
     fn drop(&mut self) {
         let _ = self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bluetooth_promoted_when_cellular_dies_and_rfcomm_up() {
+        let mut tm = TransportManager::new("test").unwrap();
+        // Simulate cellular as active primary with BT connected in parallel.
+        tm.bluetooth_connected = true;
+        tm.active = ActiveTransport::Cellular;
+        // cellular state starts Disconnected; mark active Cellular then disconnect
+        // via the public path which clears cellular and re-promotes.
+        tm.on_cellular_disconnected("test flap");
+        assert_eq!(tm.active_transport(), ActiveTransport::Bluetooth);
+    }
+
+    #[test]
+    fn wifi_preferred_over_bluetooth_on_connect() {
+        let mut tm = TransportManager::new("test").unwrap();
+        tm.bluetooth_connected = true;
+        tm.active = ActiveTransport::Wifi;
+        tm.on_bluetooth_connected();
+        assert_eq!(tm.active_transport(), ActiveTransport::Wifi);
+        assert!(tm.bluetooth_connected);
+    }
+
+    #[test]
+    fn bluetooth_takes_slot_when_no_ip() {
+        let mut tm = TransportManager::new("test").unwrap();
+        assert_eq!(tm.active_transport(), ActiveTransport::None);
+        tm.on_bluetooth_connected();
+        assert_eq!(tm.active_transport(), ActiveTransport::Bluetooth);
+    }
+
+    #[test]
+    fn has_live_audio_path_includes_bluetooth() {
+        let mut tm = TransportManager::new("test").unwrap();
+        assert!(!tm.has_live_audio_path());
+        tm.on_bluetooth_connected();
+        assert!(tm.has_live_audio_path());
+        assert!(!tm.has_live_ip_transport());
     }
 }

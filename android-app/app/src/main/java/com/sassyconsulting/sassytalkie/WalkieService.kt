@@ -3,6 +3,9 @@
 // CodeMark: SCLLC1-sassytalkie-YDXTQIFHTVCL
 package com.sassyconsulting.sassytalkie
 
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -23,6 +26,10 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
+import com.sassyconsulting.sassytalkie.BuildConfig
 import com.sassyconsulting.sassytalkie.debug.AudioTelemetry
 import com.sassyconsulting.sassytalkie.license.Entitlements
 import com.sassyconsulting.sassytalkie.service.BluetoothTransport
@@ -31,8 +38,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.collectLatest
 
 /**
  * Foreground service that keeps SassyTalkie alive while in use.
@@ -61,6 +70,11 @@ class WalkieService : Service() {
         /** Sent by [SassyTalkFcmService] when an inbound wake push arrives. */
         const val ACTION_WAKE = "com.sassyconsulting.sassytalkie.action.WAKE"
         const val EXTRA_ROOM = "room"
+
+        /** True while a WalkieService instance exists (sticky radio FGS). */
+        @Volatile
+        var isRunning: Boolean = false
+            private set
     }
 
     inner class LocalBinder : Binder() {
@@ -71,6 +85,15 @@ class WalkieService : Service() {
 
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    @Volatile private var lastWakeRenewMs = 0L
+    private var audioFocusRequest: AudioFocusRequest? = null
+    private var hasAudioFocus = false
+    private var rxWakeHoldJob: Job? = null
+    private var inboundAudioWatchJob: Job? = null
+    private var processLifecycleObserver: DefaultLifecycleObserver? = null
+    /** Jitter frames preferred while the UI process is in the foreground. */
+    @Volatile private var foregroundJitterFrames: Int = 3
+    @Volatile private var backgroundJitterApplied = false
 
     // SupervisorJob so a failure in one child (cohort snapshotter, telemetry
     // bridge, kickCellularReconnect) doesn't cascade-cancel the others.
@@ -100,6 +123,7 @@ class WalkieService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        isRunning = true
         Log.i(TAG, "Service created")
         createNotificationChannel()
         registerPttToggleReceiver()
@@ -107,7 +131,20 @@ class WalkieService : Service() {
         // getActiveCohortId() guard makes it a no-op when no channel has an
         // active session — so it's safe to run regardless of transport.
         startCohortSnapshotter()
-        startTelemetryBridge()
+        // Telemetry JNI poll only while diagnostics overlay is on (or debug builds).
+        startTelemetryBridgeIfNeeded()
+        // Notification can mirror captions, but the service must NOT acquire the
+        // recognizer mic — that held AudioRecord for the whole radio session and
+        // drained battery in the background. Mic ownership is UI + process-foreground.
+        try {
+            com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge.init(this)
+        } catch (t: Throwable) {
+            Log.w(TAG, "LiveTranslationBridge init failed: ${t.message}")
+        }
+        startTranslationNotificationBridge()
+        requestRadioAudioFocus()
+        startInboundAudioWatch()
+        registerProcessLifecycleForJitter()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -230,8 +267,9 @@ class WalkieService : Service() {
             while (System.currentTimeMillis() < deadline) {
                 val client = pttCoordinator?.cellularClient
                 if (client != null) {
+                    val room = SassyTalkNative.getSessionId()?.take(8) ?: "?"
                     try {
-                        Log.i(TAG, "forceCellularReconnect: disconnect → reconnect for room change")
+                        Log.i(TAG, "forceCellularReconnect: disconnect → reconnect room=$room")
                         client.disconnect()
                     } catch (t: Throwable) {
                         Log.w(TAG, "force disconnect threw: ${t.message}")
@@ -242,6 +280,7 @@ class WalkieService : Service() {
                     kotlinx.coroutines.delay(150)
                     try {
                         client.connect()
+                        Log.i(TAG, "forceCellularReconnect: connect issued room=$room")
                     } catch (t: Throwable) {
                         Log.w(TAG, "force connect threw: ${t.message}")
                     }
@@ -260,8 +299,13 @@ class WalkieService : Service() {
 
     override fun onDestroy() {
         Log.i(TAG, "Service destroyed")
+        isRunning = false
+        stopTranslationNotificationBridge()
         stopCohortSnapshotter()
         stopTelemetryBridge()
+        stopInboundAudioWatch()
+        unregisterProcessLifecycleForJitter()
+        abandonRadioAudioFocus()
         serviceScope.cancel()
         shutdownBleTransport()
         releaseMulticastLock()
@@ -314,19 +358,32 @@ class WalkieService : Service() {
     private fun handleNotificationPttToggle() {
         try {
             val coord = pttCoordinator
-            if (notificationPttActive) {
+            // Derive toggle direction from real TX state so we don't double-start
+            // when MainScreen already keyed the mic (notificationPttActive alone
+            // used to desync from coordinator / hardware paths).
+            val actuallyTx = try {
+                SassyTalkNative.isPttActive() || notificationPttActive
+            } catch (_: Exception) {
+                notificationPttActive
+            }
+            if (actuallyTx) {
                 if (coord != null) coord.onPttReleased() else SassyTalkNative.pttStop()
                 notificationPttActive = false
                 updateNotification("Radio standby")
             } else {
+                if (!SassyTalkNative.isEncrypted()) {
+                    updateNotification("Authenticate via QR first")
+                    return
+                }
                 val started = if (coord != null) {
                     coord.onPttPressed()
                 } else {
                     SassyTalkNative.pttStart()
-                    true
+                    SassyTalkNative.isPttActive()
                 }
                 if (!started) {
-                    updateNotification("Radio standby — no peers")
+                    notificationPttActive = false
+                    updateNotification("Radio standby — no peers / not encrypted")
                     return
                 }
                 notificationPttActive = true
@@ -394,6 +451,7 @@ class WalkieService : Service() {
         val ble = BleSignalingService(this, adapter)
         val bt = BluetoothTransport(this)
         val coord = PttCoordinator(ble, bt)
+        coord.onRadioActivity = { renewActivityWakeLock() }
 
         return try {
             // Start BLE
@@ -485,6 +543,15 @@ class WalkieService : Service() {
     // for service lifetime. If/when PttAudioPipeline takes over capture, this
     // keeps working unchanged.
 
+    private fun startTelemetryBridgeIfNeeded() {
+        serviceScope.launch {
+            com.sassyconsulting.sassytalkie.debug.DiagnosticsPrefs.overlayEnabled.collect { on ->
+                val want = on || BuildConfig.DEBUG
+                if (want) startTelemetryBridge() else stopTelemetryBridge()
+            }
+        }
+    }
+
     private fun startTelemetryBridge() {
         if (telemetryBridgeJob?.isActive == true) return
         telemetryBridgeJob = serviceScope.launch {
@@ -534,11 +601,8 @@ class WalkieService : Service() {
             acquire()
         }
         Log.i(TAG, "MulticastLock acquired")
-
-        // Also acquire a partial wake lock so audio threads survive screen-off
-        acquireWakeLock()
-
-        // Update notification
+        // MulticastLock alone is enough for LAN RX while idle. CPU WakeLock is
+        // activity-scoped (PTT / recent RX) — see [renewActivityWakeLock].
         updateNotification("Radio active")
     }
 
@@ -562,21 +626,46 @@ class WalkieService : Service() {
 
     // ── Wake lock ──
 
-    private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-
+    /**
+     * Short PARTIAL_WAKE_LOCK renewal for active radio work (PTT or recent RX).
+     * Not tied to MulticastLock lifetime — avoids holding CPU awake for hours
+     * on an idle WiFi session. Throttle is 5s so background RX can keep the
+     * CPU warm without waking every Opus frame.
+     */
+    fun renewActivityWakeLock() {
+        val now = System.currentTimeMillis()
+        if (wakeLock?.isHeld == true && now - lastWakeRenewMs < 5_000L) return
+        lastWakeRenewMs = now
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "SassyTalkie::RadioWake"
-        ).apply {
-            // 4-hour max to prevent accidental battery drain if user forgets
-            acquire(4 * 60 * 60 * 1000L)
+        if (wakeLock == null) {
+            wakeLock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "SassyTalkie::RadioWake",
+            ).apply { setReferenceCounted(false) }
         }
-        Log.i(TAG, "WakeLock acquired (4h timeout)")
+        try {
+            // 3 minutes; callers renew while talking / receiving.
+            wakeLock?.acquire(3 * 60 * 1000L)
+            Log.d(TAG, "Activity WakeLock renewed (3m)")
+        } catch (t: Throwable) {
+            Log.w(TAG, "WakeLock acquire failed: ${t.message}")
+        }
+    }
+
+    /** Hold WakeLock across an inbound RX burst; resets silence timer. */
+    fun noteInboundRx() {
+        renewActivityWakeLock()
+        if (!hasAudioFocus) requestRadioAudioFocus()
+        rxWakeHoldJob?.cancel()
+        rxWakeHoldJob = serviceScope.launch {
+            delay(3_000L)
+            // WakeLock expires on its own timeout; silence ends the burst hold.
+        }
     }
 
     private fun releaseWakeLock() {
+        rxWakeHoldJob?.cancel()
+        rxWakeHoldJob = null
         wakeLock?.let {
             if (it.isHeld) {
                 it.release()
@@ -584,6 +673,136 @@ class WalkieService : Service() {
             }
         }
         wakeLock = null
+    }
+
+    private fun requestRadioAudioFocus() {
+        val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val attrs = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(attrs)
+                    .setAcceptsDelayedFocusGain(true)
+                    .setOnAudioFocusChangeListener { change ->
+                        when (change) {
+                            AudioManager.AUDIOFOCUS_GAIN,
+                            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
+                            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK -> {
+                                hasAudioFocus = true
+                                // Re-assert speakerphone / comm mode after focus return.
+                                try {
+                                    val prefs = getSharedPreferences("sassy_settings", MODE_PRIVATE)
+                                    SassyTalkNative.setSpeakerphone(
+                                        prefs.getBoolean("speakerphone_on", true),
+                                    )
+                                } catch (_: Throwable) {}
+                            }
+                            AudioManager.AUDIOFOCUS_LOSS,
+                            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+                            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                                hasAudioFocus = false
+                            }
+                        }
+                    }
+                    .build()
+                audioFocusRequest = req
+                val result = am.requestAudioFocus(req)
+                hasAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            } else {
+                @Suppress("DEPRECATION")
+                val result = am.requestAudioFocus(
+                    null,
+                    AudioManager.STREAM_VOICE_CALL,
+                    AudioManager.AUDIOFOCUS_GAIN,
+                )
+                hasAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            }
+            Log.i(TAG, "AudioFocus requested granted=$hasAudioFocus")
+        } catch (t: Throwable) {
+            Log.w(TAG, "AudioFocus request failed: ${t.message}")
+        }
+    }
+
+    private fun abandonRadioAudioFocus() {
+        val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                audioFocusRequest?.let { am.abandonAudioFocusRequest(it) }
+            } else {
+                @Suppress("DEPRECATION")
+                am.abandonAudioFocus(null)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "AudioFocus abandon failed: ${t.message}")
+        }
+        audioFocusRequest = null
+        hasAudioFocus = false
+    }
+
+    private fun startInboundAudioWatch() {
+        if (inboundAudioWatchJob?.isActive == true) return
+        inboundAudioWatchJob = serviceScope.launch {
+            TranscriptionBridge.incomingAudio.collectLatest { incoming ->
+                if (incoming) noteInboundRx()
+            }
+        }
+    }
+
+    private fun stopInboundAudioWatch() {
+        inboundAudioWatchJob?.cancel()
+        inboundAudioWatchJob = null
+    }
+
+    private fun registerProcessLifecycleForJitter() {
+        if (processLifecycleObserver != null) return
+        val prefs = getSharedPreferences("sassy_settings", MODE_PRIVATE)
+        foregroundJitterFrames = prefs.getInt("jitter_prebuffer_frames", 3).coerceIn(1, 12)
+        val observer = object : DefaultLifecycleObserver {
+            override fun onStop(owner: LifecycleOwner) {
+                // App backgrounded — thicken jitter buffer so delayed packet
+                // delivery under Doze doesn't underrun the loudspeaker.
+                if (backgroundJitterApplied) return
+                val bumped = maxOf(foregroundJitterFrames, 8)
+                try {
+                    SassyTalkNative.setJitterPrebufferFrames(bumped)
+                    backgroundJitterApplied = true
+                    Log.i(TAG, "Background jitter prebuffer → $bumped frames")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Background jitter bump failed: ${t.message}")
+                }
+            }
+
+            override fun onStart(owner: LifecycleOwner) {
+                if (!backgroundJitterApplied) return
+                try {
+                    SassyTalkNative.setJitterPrebufferFrames(foregroundJitterFrames)
+                    backgroundJitterApplied = false
+                    Log.i(TAG, "Foreground jitter prebuffer restored → $foregroundJitterFrames")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Foreground jitter restore failed: ${t.message}")
+                }
+            }
+        }
+        processLifecycleObserver = observer
+        ProcessLifecycleOwner.get().lifecycle.addObserver(observer)
+    }
+
+    private fun unregisterProcessLifecycleForJitter() {
+        processLifecycleObserver?.let {
+            try {
+                ProcessLifecycleOwner.get().lifecycle.removeObserver(it)
+            } catch (_: Throwable) {}
+        }
+        processLifecycleObserver = null
+        if (backgroundJitterApplied) {
+            try {
+                SassyTalkNative.setJitterPrebufferFrames(foregroundJitterFrames)
+            } catch (_: Throwable) {}
+            backgroundJitterApplied = false
+        }
     }
 
     // ── Notification ──
@@ -607,6 +826,32 @@ class WalkieService : Service() {
         }
     }
 
+    private var translationNotifJob: kotlinx.coroutines.Job? = null
+    @Volatile private var lastNotificationStatus: String = "Radio standby"
+
+    private fun startTranslationNotificationBridge() {
+        if (translationNotifJob != null) return
+        translationNotifJob = serviceScope.launch {
+            var lastPushed = ""
+            // Collapse rapid partial hypotheses before touching the shade.
+            com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge.translation
+                .debounce(450L)
+                .collect { translated ->
+                    val bridge = com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge
+                    if (!bridge.enabled.value) return@collect
+                    val line = translated.trim()
+                    if (line.isEmpty() || line == lastPushed) return@collect
+                    lastPushed = line
+                    updateNotification(lastNotificationStatus)
+                }
+        }
+    }
+
+    private fun stopTranslationNotificationBridge() {
+        translationNotifJob?.cancel()
+        translationNotifJob = null
+    }
+
     private fun buildNotification(status: String, showPttAction: Boolean = false): Notification {
         val launchIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -616,9 +861,21 @@ class WalkieService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val translationLine = try {
+            val bridge = com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge
+            if (bridge.enabled.value) {
+                bridge.translation.value.ifBlank { bridge.caption.value }.take(80)
+            } else ""
+        } catch (_: Throwable) { "" }
+        val contentText = if (translationLine.isNotBlank()) {
+            "$status · $translationLine"
+        } else {
+            status
+        }
+
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Sassy-Talk")
-            .setContentText(status)
+            .setContentText(contentText)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
@@ -628,8 +885,8 @@ class WalkieService : Service() {
             .setWhen(System.currentTimeMillis())
             .setNumber(1)
             .setBadgeIconType(NotificationCompat.BADGE_ICON_SMALL)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
 
         // Quick-send PTT action — toggles transmit directly from the shade so
         // the user never has to reopen the app. State is local to the
@@ -668,6 +925,7 @@ class WalkieService : Service() {
     }
 
     fun updateNotification(status: String) {
+        lastNotificationStatus = status
         val lockScreenPtt = try {
             getSharedPreferences("sassy_settings", Context.MODE_PRIVATE)
                 .getBoolean("lock_screen_ptt", false)

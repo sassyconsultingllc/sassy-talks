@@ -47,10 +47,10 @@ import java.util.Locale
  *     you're about to say, or while listening), OR
  *   • Let the caller gate start/stop around PTT press/release.
  *
- * start()/stop() are therefore EXPLICIT and idempotent. The owner (UI / a
- * coordinator) is responsible for not running this concurrently with a live
- * PTT transmit. SpeechRecognizer is also mic-only: it cannot transcribe the
- * decoded PCM of REMOTE speakers — see TranslationPanel's remote-audio note.
+ * start()/stop() are therefore EXPLICIT and idempotent. Prefer driving this
+ * through [LiveTranslationBridge], which pauses around PTT and only runs while
+ * a UI consumer (Main / Settings) is visible. SpeechRecognizer is mic-only: it
+ * cannot transcribe the decoded PCM of REMOTE speakers.
  * ────────────────────────────────────────────────────────────────────────
  *
  * All recognition callbacks arrive on the main thread; translation is
@@ -117,6 +117,19 @@ class LiveCaptionTranslator(
     // Coalesce overlapping translation jobs so a fast stream of partials
     // doesn't pile up — only the latest in-flight translate matters.
     private var translateJob: Job? = null
+
+    /**
+     * Fired after a FINAL recognition result has been translated (caption +
+     * translation). Used by [LiveTranslationBridge] for Timeline + TTS.
+     */
+    var onFinalUtterance: ((caption: String, translation: String) -> Unit)? = null
+
+    /**
+     * Fired when the recognizer gives up after too many empty/silent sessions.
+     * The bridge should schedule a later restart so quiet radio standby doesn't
+     * leave captioning permanently dead.
+     */
+    var onGaveUpListening: (() -> Unit)? = null
 
     /** True if this device exposes a usable on-device speech recognizer. */
     fun isRecognitionAvailable(): Boolean =
@@ -225,7 +238,7 @@ class LiveCaptionTranslator(
         try { Locale.forLanguageTag(code).toLanguageTag() } catch (_: Throwable) { code }
 
     /** Fire-and-forget translation of [text], cancelling any prior in-flight job. */
-    private fun translateAsync(text: String) {
+    private fun translateAsync(text: String, isFinal: Boolean = false) {
         translateJob?.cancel()
         translateJob = scope.launch {
             val out = translationManager.translate(
@@ -235,11 +248,19 @@ class LiveCaptionTranslator(
                 requireWifi = requireWifiForModels,
             )
             _translation.value = out
+            if (isFinal) {
+                try {
+                    onFinalUtterance?.invoke(text, out)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "onFinalUtterance failed: ${t.message}")
+                }
+            }
         }
     }
 
     private val listener = object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) {
+            _errorMessage.value = null
             _status.value = Status.LISTENING
         }
 
@@ -254,7 +275,7 @@ class LiveCaptionTranslator(
             val text = firstResult(results)
             if (!text.isNullOrBlank()) {
                 _caption.value = text
-                translateAsync(text)
+                translateAsync(text, isFinal = true)
                 // Real speech recognized — restart promptly, reset backoff.
                 scheduleRestart(backoff = false)
             } else {
@@ -271,16 +292,27 @@ class LiveCaptionTranslator(
                 // Transient no-speech: restart with backoff (silent-room guard).
                 SpeechRecognizer.ERROR_NO_MATCH,
                 SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> scheduleRestart(backoff = true)
-                // Mic busy — almost always PTT contention. Back off; the owner
-                // should stop captioning during transmit. Surface and idle.
+                // Mic busy / flaky client — almost always PTT contention or a
+                // brief AudioRecord race. Keep trying with backoff instead of
+                // sticking in ERROR until the user toggles translation off/on.
                 SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
-                SpeechRecognizer.ERROR_AUDIO -> {
+                SpeechRecognizer.ERROR_AUDIO,
+                SpeechRecognizer.ERROR_CLIENT -> {
                     _errorMessage.value = msg
-                    _status.value = Status.ERROR
+                    scheduleRestart(backoff = true)
+                }
+                // Offline pack / permission — surface and stop; Settings deep-link
+                // covers language packs. Health watchdog ignores UNAVAILABLE.
+                SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED,
+                SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE,
+                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
+                    running = false
+                    _errorMessage.value = msg
+                    _status.value = Status.UNAVAILABLE
                 }
                 else -> {
                     _errorMessage.value = msg
-                    _status.value = Status.ERROR
+                    scheduleRestart(backoff = true)
                 }
             }
         }
@@ -315,6 +347,11 @@ class LiveCaptionTranslator(
                 running = false
                 pendingRestart = null
                 if (_status.value == Status.LISTENING) _status.value = Status.IDLE
+                try {
+                    onGaveUpListening?.invoke()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "onGaveUpListening failed: ${t.message}")
+                }
                 return
             }
             // 400ms, 800, 1600, 3200, capped at 5s.

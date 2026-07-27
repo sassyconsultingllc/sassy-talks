@@ -85,6 +85,7 @@ object TranscriptionBridge {
     val cacheSnapshot: StateFlow<CacheSnapshot> = _cacheSnapshot.asStateFlow()
 
     private var cachePollJob: kotlinx.coroutines.Job? = null
+    private val cacheUiSubscribers = java.util.concurrent.atomic.AtomicInteger(0)
 
     private val bridgeScope = kotlinx.coroutines.CoroutineScope(
         kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob()
@@ -127,11 +128,23 @@ object TranscriptionBridge {
         appContext = context.applicationContext
         createNotificationChannel(context.applicationContext)
         initialized = true
-        startCachePolling()
+        // Cache JNI poll starts only when a UI screen acquires a subscriber.
         Log.i(TAG, "Initialized (timeline mode)")
     }
 
-    /** Poll native cache status once for all UI consumers (Main + Activity screens). */
+    /** Call from Compose DisposableEffect while a screen reads [cacheSnapshot]. */
+    fun acquireCacheUi() {
+        if (cacheUiSubscribers.getAndIncrement() == 0) startCachePolling()
+    }
+
+    fun releaseCacheUi() {
+        if (cacheUiSubscribers.decrementAndGet() <= 0) {
+            cacheUiSubscribers.set(0)
+            stopCachePolling()
+        }
+    }
+
+    /** Poll native cache status only while UI consumers are subscribed. */
     private fun startCachePolling() {
         if (cachePollJob?.isActive == true) return
         cachePollJob = bridgeScope.launch {
@@ -152,6 +165,11 @@ object TranscriptionBridge {
                 delay(500L)
             }
         }
+    }
+
+    private fun stopCachePolling() {
+        cachePollJob?.cancel()
+        cachePollJob = null
     }
 
     private fun createNotificationChannel(context: Context) {
@@ -526,6 +544,28 @@ object TranscriptionBridge {
                 "${minutes}m ${seconds}s"
             }
         }
+    }
+
+    /**
+     * Record a local live-translation utterance into the Timeline feed.
+     * Called from [com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge]
+     * when offline STT produces a final caption (+ optional translation).
+     */
+    fun recordLocalCaption(
+        caption: String,
+        translation: String = "",
+        senderName: String = "You",
+    ) {
+        val text = com.sassyconsulting.sassytalkie.translate.LiveTranslationText
+            .timelineEntry(caption, translation) ?: return
+        val entry = TranscriptionEntry(
+            senderId = "local:self",
+            senderName = senderName.ifBlank { "You" },
+            text = text,
+            timestamp = System.currentTimeMillis(),
+            utteranceId = -1L,
+        )
+        addEntry(entry)
     }
 
     private fun addEntry(entry: TranscriptionEntry) {

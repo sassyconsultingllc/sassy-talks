@@ -65,9 +65,26 @@ fun MainScreen(
     var showQrDialog by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
+    // Keep on-device captioning alive while the radio screen is visible.
+    DisposableEffect(Unit) {
+        com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge.acquireUi()
+        onDispose {
+            com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge.releaseUi()
+        }
+    }
+
     val connectState by autoConnect.state.collectAsState()
     val connectStatusText by autoConnect.statusText.collectAsState()
     val transportAdvisory by autoConnect.transportAdvisory.collectAsState()
+    val context = LocalContext.current
+    val settingsPrefs = remember {
+        context.getSharedPreferences("sassy_settings", android.content.Context.MODE_PRIVATE)
+    }
+    // Sealed Sender — relay metadata blinding. Local state mirrors prefs so the
+    // radio screen can show / one-tap enable without a Settings round-trip.
+    var sealedSenderOn by remember {
+        mutableStateOf(settingsPrefs.getBoolean("sealed_sender", false))
+    }
 
     // Incoming audio indicator
     val incomingAudio by TranscriptionBridge.incomingAudio.collectAsState()
@@ -99,6 +116,9 @@ fun MainScreen(
     // Stale-peer banner (Task 6.2)
     val anyPeerStale by (walkieService?.pttCoordinator?.anyPeerStale ?: falseFallback).collectAsState()
 
+    // RFCOMM still dialing after BLE sighting
+    val linkingBluetooth by (walkieService?.pttCoordinator?.linkingBluetooth ?: falseFallback).collectAsState()
+
     // Talk-over indicator (Task 6.2)
     val peerSpeaking by (walkieService?.pttCoordinator?.peerSpeaking ?: falseFallback).collectAsState()
 
@@ -122,6 +142,10 @@ fun MainScreen(
     // so we re-subscribe if the service rebinds (preserves identity otherwise).
     val coord = walkieService?.pttCoordinator
     val cacheSnap by TranscriptionBridge.cacheSnapshot.collectAsState()
+    DisposableEffect(Unit) {
+        TranscriptionBridge.acquireCacheUi()
+        onDispose { TranscriptionBridge.releaseCacheUi() }
+    }
 
     LaunchedEffect(coord) {
         // Peers are keyed differently across transports (relay:<epoch> vs
@@ -149,14 +173,16 @@ fun MainScreen(
                 when (ev) {
                     is com.sassyconsulting.sassytalkie.PeerEvent.Joined -> {
                         pendingLeave.remove(ev.peerId)?.cancel()
-                        show("${resolve(ev.peerId)} joined")
+                        // Sticky channel: no snackbar on first sighting —
+                        // Users list / peer chip already reflect roster.
                     }
                     is com.sassyconsulting.sassytalkie.PeerEvent.Left -> {
                         pendingLeave.remove(ev.peerId)?.cancel()
                         pendingLeave[ev.peerId] = launch {
                             kotlinx.coroutines.delay(coalesceMs)
                             pendingLeave.remove(ev.peerId)
-                            show("${resolve(ev.peerId)} left")
+                            // Explicit session removal only (not HB silence).
+                            show("${resolve(ev.peerId)} left the session")
                         }
                     }
                 }
@@ -199,17 +225,9 @@ fun MainScreen(
         }
     }
 
-    // Pulse animation for transmitting
-    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
-    val pulseScale by infiniteTransition.animateFloat(
-        initialValue = 1f,
-        targetValue = 1.15f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(600, easing = EaseInOut),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "pulseScale"
-    )
+    // Pulse only while transmitting — isolated so idle MainScreen is not
+    // recomposed every animation frame.
+    val pulseScale = rememberTxPulseScale(isTransmitting)
 
     Box(
         modifier = Modifier
@@ -251,9 +269,7 @@ fun MainScreen(
             val channelGroupName = remember(currentChannel) {
                 SassyTalkNative.getGroupName(currentChannel)
             }
-            // Brand title — blue→purple gradient, matching the Tauri reference
-            // (app.css --gradient-primary). GradientPrimary is defined in
-            // ui/theme/Color.kt.
+            // Brand title — blue→teal tactical gradient (see ui/theme/Color.kt).
             Text(
                 text = channelGroupName.ifEmpty { "Sassy-Talk" },
                 fontSize = 24.sp,
@@ -350,6 +366,15 @@ fun MainScreen(
                         fontSize = 13.sp,
                         color = TextGray
                     )
+                    if (sealedSenderOn && autoConnect.isUsingRelay()) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "· Sealed",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = TealLight
+                        )
+                    }
                 }
                 ConnectState.FAILED -> {
                     Box(
@@ -451,6 +476,56 @@ fun MainScreen(
             }
         }
 
+        // Relay anonymization nudge — only when the relay plane is active and
+        // Sealed Sender is off. One tap enables + reconnects; peers must match.
+        if (connectState == ConnectState.CONNECTED &&
+            autoConnect.isUsingRelay() &&
+            !sealedSenderOn
+        ) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Relay sees room id",
+                    fontSize = 11.sp,
+                    color = TextMuted,
+                )
+                TextButton(
+                    onClick = {
+                        sealedSenderOn = true
+                        settingsPrefs.edit().putBoolean("sealed_sender", true).apply()
+                        SassyTalkNative.setSealedSenderEnabled(true)
+                        scope.launch {
+                            snackbarHost.showSnackbar(
+                                "Sealed Sender on — peers must enable it too",
+                                duration = androidx.compose.material3.SnackbarDuration.Short,
+                            )
+                            autoConnect.reset()
+                            autoConnect.autoConnect(walkieService)
+                        }
+                    },
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                ) {
+                    Text("Seal relay", fontSize = 11.sp, color = TealLight)
+                }
+            }
+        }
+
+        // Bluetooth data-plane linking (BLE seen, RFCOMM not yet up)
+        if (linkingBluetooth) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "Linking Bluetooth\u2026",
+                fontSize = 11.sp,
+                color = TealLight,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+
         // Stale-peer banner (Task 6.2)
         if (anyPeerStale) {
             Spacer(modifier = Modifier.height(4.dp))
@@ -467,7 +542,7 @@ fun MainScreen(
                     Icon(Icons.Default.Warning, contentDescription = null, tint = Color(0xFFFFB300), modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "Peer offline \u2014 reconnecting\u2026",
+                        text = "Peer idle \u2014 waking their radio\u2026",
                         fontSize = 13.sp,
                         color = Color(0xFFFFB300),
                         fontWeight = FontWeight.Medium
@@ -562,6 +637,14 @@ fun MainScreen(
 
         Spacer(modifier = Modifier.weight(1f))
 
+        // Live translation captions (local speech → on-device translate).
+        // Configured in Settings; stays active while on the radio screen.
+        LiveTranslationOverlay(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 10.dp),
+        )
+
         // PTT Button
         // Encryption warning snackbar
         if (showEncryptionWarning) {
@@ -614,7 +697,8 @@ fun MainScreen(
                 isTransmitting = true
                 walkieService?.updateNotification("Transmitting on CH $currentChannel")
             } else {
-                pressRejectedMsg = "No route to peers \u2014 check connection"
+                pressRejectedMsg = walkieService?.pttCoordinator?.pttRejectReason?.value
+                    ?: "No route to peers \u2014 check connection"
             }
         }
         val stopTx = {
@@ -625,7 +709,7 @@ fun MainScreen(
 
         PTTButton(
             isTransmitting = isTransmitting,
-            pulseScale = if (isTransmitting) pulseScale else 1f,
+            pulseScale = pulseScale,
             enabled = pttEnabled,
             dimmed = anyPeerStale,
             onPressStart = {
@@ -801,8 +885,17 @@ fun MainScreen(
                         Spacer(modifier = Modifier.height(8.dp))
                         Text("Scan to join CH $currentChannel", color = TextGray, fontSize = 13.sp)
                         if (sessionId.isNotEmpty()) {
-                            Text("Session: ${sessionId.take(8)}", color = TextMuted, fontSize = 11.sp)
+                            Text(
+                                "Room ${sessionId.take(8)} · peer must match this id",
+                                color = Cyan,
+                                fontSize = 12.sp,
+                            )
                         }
+                        Text(
+                            "Copy/Share mint one-time links for this room (not a new session)",
+                            color = TextMuted,
+                            fontSize = 11.sp,
+                        )
 
                         // Invite-link actions — same encrypted one-shot link the
                         // Auth screen offers. Without these, minting an invite
@@ -833,8 +926,9 @@ fun MainScreen(
                                                     ),
                                                 )
                                                 android.widget.Toast.makeText(
-                                                    context, "Invite link copied",
-                                                    android.widget.Toast.LENGTH_SHORT,
+                                                    context,
+                                                    "Invite copied — one-time link for this room",
+                                                    android.widget.Toast.LENGTH_LONG,
                                                 ).show()
                                             }
                                             is SessionShareLink.Result.Err -> {
@@ -1002,6 +1096,23 @@ private fun ChannelSelector(
             }
         }
     }
+}
+
+/** Pulse scale that only animates while [transmitting]; idle stays at 1f with no infinite clock. */
+@Composable
+private fun rememberTxPulseScale(transmitting: Boolean): Float {
+    val scale = remember { Animatable(1f) }
+    LaunchedEffect(transmitting) {
+        if (transmitting) {
+            while (true) {
+                scale.animateTo(1.15f, tween(600, easing = EaseInOut))
+                scale.animateTo(1f, tween(600, easing = EaseInOut))
+            }
+        } else if (scale.value != 1f) {
+            scale.snapTo(1f)
+        }
+    }
+    return scale.value
 }
 
 /**

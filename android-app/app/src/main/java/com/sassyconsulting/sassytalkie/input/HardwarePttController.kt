@@ -435,12 +435,16 @@ class HardwarePttController(context: Context) {
     private fun startPtt(reason: String) {
         if (_transmitting.value) return // guard double-start
         try {
+            if (!SassyTalkNative.isEncrypted()) {
+                Log.w(TAG, "PTT blocked ($reason): session not encrypted")
+                return
+            }
             val coord = pttCoordinatorProvider?.invoke()
             val started = if (coord != null) {
                 coord.onPttPressed()
             } else {
                 SassyTalkNative.pttStart()
-                true
+                SassyTalkNative.isPttActive()
             }
             if (!started) return
             _transmitting.value = true

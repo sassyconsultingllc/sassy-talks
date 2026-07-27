@@ -14,9 +14,11 @@ import java.util.concurrent.atomic.AtomicInteger
 import com.sassyconsulting.sassytalkie.service.BluetoothTransport
 
 /**
- * v2.7.1 peer-roster event.
- * Emitted from the 1 Hz stale-check loop whenever the active peer set changes.
- * Active = HEALTHY or DEGRADED; transitions to STALE fire [Left].
+ * Session-roster events (sticky channel model — not a chat lobby).
+ * [Joined] fires the first time we learn a peer is in the session.
+ * [Left] fires only on explicit removal (session clear / leave), never when
+ * heartbeats go quiet — idle peers stay on the roster and are woken via
+ * OP_WAKE / FCM → foreground service.
  */
 sealed class PeerEvent {
     data class Joined(val peerId: String) : PeerEvent()
@@ -65,6 +67,17 @@ class PttCoordinator(
     /** Optional cellular relay client — set after construction when relay connects. */
     var cellularClient: CellularWebSocketClient? = null
 
+    /** Fired on PTT / inbound audio so the service can renew a short WakeLock. */
+    var onRadioActivity: (() -> Unit)? = null
+
+    /** Last PTT rejection reason for UI snackbars (null when OK). */
+    private val _pttRejectReason = MutableStateFlow<String?>(null)
+    val pttRejectReason = _pttRejectReason.asStateFlow()
+
+    /** True while BLE peers are nearby but RFCOMM audio link is still dialing. */
+    private val _linkingBluetooth = MutableStateFlow(false)
+    val linkingBluetooth = _linkingBluetooth.asStateFlow()
+
     /** Presence sensor — set after construction once a Context is available. */
     lateinit var presenceSensor: PresenceSensor
 
@@ -105,6 +118,8 @@ class PttCoordinator(
         // doesn't continuously flag reachingPeer=false. With the slower
         // ACK cadence we need at most one missed packet of slack.
         private const val REACHING_PEER_TIMEOUT_MS = 2_500L
+        /** Bound RFCOMM dial retries for BLE peers without a data socket. */
+        private const val RFCOMM_LINK_RETRY_MS = 3_000L
 
         // Task 7.1 — Sub-audible audio path probe marker
         const val PROBE_EPOCH    = -1L  // 0xFFFFFFFFFFFFFFFF as signed Long
@@ -115,6 +130,9 @@ class PttCoordinator(
     private val transmitting = AtomicBoolean(false)
     private val readyAckCount = AtomicInteger(0)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    /** Delayed READY_ACK → native pttStart job. Must be cancelled on release. */
+    private var preAudioJob: Job? = null
+    private var rfcommLinkJob: Job? = null
 
     // —— Delivery State (Task 4.3) — EOT_ACK "delivered" tick ——
 
@@ -161,14 +179,10 @@ class PttCoordinator(
 
     // —— v2.7.1: Peer roster + join/leave events ——
 
-    /** Set of currently-known peer IDs (HEALTHY or DEGRADED — excludes STALE
-     *  so the chip reflects "who can hear me right now"). Polled at the
-     *  same 1 Hz cadence as the stale-check loop. */
+    /** Sticky session roster (includes idle/STALE peers). Polled at 1 Hz. */
     val peerIds = MutableStateFlow<Set<String>>(emptySet())
 
-    /** Hot signal for v2.7.1 toasts — emitted when a peer first appears
-     *  (`Joined`) or vanishes from the live set (`Left`). One per change;
-     *  no replay so a recomposing collector doesn't see stale events. */
+    /** Toasts for first sighting / explicit leave — not HB silence. */
     private val _peerEvents = kotlinx.coroutines.flow.MutableSharedFlow<PeerEvent>(
         replay = 0, extraBufferCapacity = 16
     )
@@ -196,11 +210,11 @@ class PttCoordinator(
     }
 
     fun onRelayPeerGone(peerKey: String) {
-        try {
-            liveness.removePeer(peerKey)
-        } catch (t: Throwable) {
-            Log.w(TAG, "onRelayPeerGone($peerKey) failed: ${t.message}")
-        }
+        // Sticky channel: relay WS leave ≠ left the session. Keep roster /
+        // liveness so they go idle→wakeable instead of join/leave spam.
+        // (peerKey here is often "relay:<serverClientId>", which is not the
+        // epoch-based heartbeat id anyway — removing it never matched HB.)
+        Log.i(TAG, "Relay socket idle for $peerKey — keeping on channel")
     }
 
     // —— Talk-over indicator (Task 6.2) ——
@@ -266,6 +280,32 @@ class PttCoordinator(
             lastTxSeq = seq
         }
         startHeartbeat()
+        startRfcommLinkRetry()
+    }
+
+    /**
+     * Keep dialing RFCOMM for BLE-discovered session peers until the data
+     * plane is up. BLE alone cannot carry encrypted PTT audio.
+     */
+    private fun startRfcommLinkRetry() {
+        if (rfcommLinkJob?.isActive == true) return
+        rfcommLinkJob = scope.launch {
+            while (isActive) {
+                val blePeers = bleSignaling.blePeers
+                val rfcomm = btTransport.connectedPeerCount
+                val needLink = blePeers.any { !btTransport.isConnectedTo(it.address) }
+                _linkingBluetooth.value = needLink && rfcomm == 0 && blePeers.isNotEmpty()
+                if (needLink) {
+                    for (device in blePeers) {
+                        if (!btTransport.isConnectedTo(device.address)) {
+                            Log.i(TAG, "RFCOMM retry → ${device.name ?: device.address}")
+                            btTransport.connectDevice(device)
+                        }
+                    }
+                }
+                delay(RFCOMM_LINK_RETRY_MS)
+            }
+        }
     }
 
     /**
@@ -289,6 +329,7 @@ class PttCoordinator(
      * @return false if press was rejected (no transport / no peers).
      */
     fun onPttPressed(): Boolean {
+        try { onRadioActivity?.invoke() } catch (_: Throwable) {}
         if (transmitting.getAndSet(true)) return true
 
         val blePeers = bleSignaling.blePeerCount
@@ -297,11 +338,46 @@ class PttCoordinator(
 
         Log.i(TAG, "PTT PRESSED — BLE peers: $blePeers, RFCOMM peers: $rfcommPeers, ipUp=$ipUp")
 
-        if (blePeers == 0 && rfcommPeers == 0 && !ipUp) {
-            Log.w(TAG, "PTT BLOCKED: No peers and no IP transport")
+        // Kick RFCOMM if BLE sees peers but sockets are not up yet.
+        if (rfcommPeers == 0 && blePeers > 0) {
+            for (device in bleSignaling.blePeers) {
+                if (!btTransport.isConnectedTo(device.address)) {
+                    btTransport.connectDevice(device)
+                }
+            }
+        }
+
+        if (!BtAudioPath.canTransmit(ipUp, rfcommPeers)) {
+            val reason = if (blePeers > 0) {
+                BtAudioPath.REJECT_BT_LINKING
+            } else {
+                BtAudioPath.REJECT_NO_AUDIO_PATH
+            }
+            Log.w(TAG, "PTT BLOCKED: $reason (ble=$blePeers rfcomm=$rfcommPeers ip=$ipUp)")
+            _pttRejectReason.value = reason
             transmitting.set(false)
             return false
         }
+        _pttRejectReason.value = null
+
+        // Refuse cleartext TX before opening the mic (native also drops frames,
+        // but without this gate hardware/notification PTT looked "live" with silence).
+        val encrypted = try { SassyTalkNative.isEncrypted() } catch (_: Throwable) { false }
+        if (!encrypted) {
+            Log.w(TAG, "PTT BLOCKED: session not encrypted")
+            _pttRejectReason.value = "Authenticate via QR first"
+            transmitting.set(false)
+            return false
+        }
+
+        // Pause live captioning immediately (before the READY_ACK delay) so STT
+        // releases the mic before native TX starts.
+        try {
+            com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge.onPttStarted()
+        } catch (_: Throwable) {}
+
+        // Half-duplex: mute RX as soon as we key up (covers READY_ACK wait too).
+        try { SassyTalkNative.setRxMuted(true) } catch (_: Throwable) {}
 
         if (rfcommPeers > 0) {
             sendAudioProbe()
@@ -327,19 +403,33 @@ class PttCoordinator(
         readyAckCount.set(0)
         bleSignaling.broadcastPttStart()
 
-        // Step 2: Brief wait for ACKs, then start audio regardless
-        scope.launch {
+        // Step 2: Brief wait for ACKs, then start audio regardless.
+        // CRITICAL: cancel this job on release — a quick tap used to let the
+        // delayed pttStart fire after pttStop (ghost TX / mic stuck open).
+        preAudioJob?.cancel()
+        preAudioJob = scope.launch {
             val preAudioDelay = when {
                 blePeers == 0 && rfcommPeers == 0 && ipUp -> 0L
                 wakeEmitted -> READY_ACK_TIMEOUT_MS + WAKE_PRE_AUDIO_DELAY_MS
                 else -> READY_ACK_TIMEOUT_MS
             }
             if (preAudioDelay > 0) delay(preAudioDelay)
+            if (!transmitting.get() || !isActive) {
+                Log.i(TAG, "PTT released before audio start — aborting pttStart")
+                return@launch
+            }
             val acks = readyAckCount.get()
             Log.i(TAG, "Got $acks/$blePeers READY_ACKs, proceeding (delay=${preAudioDelay}ms)")
 
             // Step 3: Start native audio (mic -> ADPCM -> transport)
             SassyTalkNative.pttStart()
+            if (!transmitting.get() || !isActive) {
+                // Released while native start was in flight — force stop.
+                Log.i(TAG, "PTT released during pttStart — forcing stop")
+                SassyTalkNative.pttStop()
+                btTransport.stopTxPump()
+                return@launch
+            }
             Log.i(TAG, "Native PTT started")
 
             // Step 4: Start RFCOMM TX pump
@@ -379,6 +469,10 @@ class PttCoordinator(
 
         Log.i(TAG, "PTT RELEASED")
 
+        // Cancel pending READY_ACK → pttStart so a quick tap can't ghost-TX.
+        preAudioJob?.cancel()
+        preAudioJob = null
+
         // Stop watchdog and reset reaching-peer indicator
         stopWatchdog()
         _reachingPeer.value = false
@@ -386,6 +480,9 @@ class PttCoordinator(
 
         // Stop native audio
         SassyTalkNative.pttStop()
+
+        // Restore RX playback (half-duplex)
+        try { SassyTalkNative.setRxMuted(false) } catch (_: Throwable) {}
 
         // Stop RFCOMM TX
         btTransport.stopTxPump()
@@ -410,6 +507,11 @@ class PttCoordinator(
                 Log.d(TAG, "EOT_ACK timeout — deliveredState reset to Idle")
             }
         }
+
+        // Belt-and-suspenders: resume captioning even if native pttStop early-returned.
+        try {
+            com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge.onPttReleased()
+        } catch (_: Throwable) {}
     }
 
     // —— Audio Path Probe (Task 7.1) ——
@@ -518,6 +620,7 @@ class PttCoordinator(
 
     /** Called when a V2 audio frame arrives — resets the 400ms speaking timeout. */
     fun onPeerAudioFrame() {
+        try { onRadioActivity?.invoke() } catch (_: Throwable) {}
         if (peerSpeaking.value) {
             // Extend timeout — cancel and rearm
             peerSpeakingTimeoutJob?.cancel()
@@ -545,8 +648,10 @@ class PttCoordinator(
     }
 
     override fun onPeerLost(deviceAddress: String) {
-        Log.i(TAG, "Peer lost: $deviceAddress")
-        liveness.removePeer(deviceAddress)
+        // RFCOMM/BLE drop is a transport blip, not a channel leave. Keep the
+        // liveness entry so the peer stays on the sticky roster and can be
+        // woken over relay/FCM.
+        Log.i(TAG, "BT peer link lost: $deviceAddress — keeping session roster entry")
         peerCaps.remove(deviceAddress)
         // Tear down this peer's RECV_ACK loop so it doesn't pump frames to a dead peer.
         stopRecvAckJob(deviceAddress)
@@ -594,28 +699,31 @@ class PttCoordinator(
                 val stale = allPeers.isNotEmpty() && allPeers.any { liveness.health(it, nowMs) == PeerHealth.STALE }
                 if (anyPeerStale.value != stale) anyPeerStale.value = stale
 
-                // v2.7.1: publish active-peer set + join/leave events.
-                // "Active" = HEALTHY or DEGRADED; STALE peers are excluded
-                // so the chip shows who you can actually reach right now.
-                val active = allPeers.filter { liveness.health(it, nowMs) != PeerHealth.STALE }.toSet()
+                // Sticky session roster: keep STALE peers listed. Quiet HB is
+                // "idle / wakeable", not "left the channel". Emitting Left +
+                // removeUser on STALE caused lobby-style join/leave spam and
+                // dropped peers from the Users list until they spoke again.
+                val roster = allPeers
                 val previous = peerIds.value
-                if (active != previous) {
+                if (roster != previous) {
                     try {
-                        val joined = active - previous
-                        val left = previous - active
-                        peerIds.value = active
+                        val joined = roster - previous
+                        val left = previous - roster
+                        peerIds.value = roster
                         joined.forEach { _peerEvents.tryEmit(PeerEvent.Joined(it)) }
-                        left.forEach {
-                            _peerEvents.tryEmit(PeerEvent.Left(it))
-                            try {
-                                SassyTalkNative.removeUser(it)
-                            } catch (t: Throwable) {
-                                Log.w(TAG, "removeUser($it) failed: ${t.message}")
-                            }
-                        }
+                        // Left only if explicitly removed from LivenessTracker
+                        // (session clear / rare purge) — never on idle.
+                        left.forEach { _peerEvents.tryEmit(PeerEvent.Left(it)) }
                     } catch (t: Throwable) {
                         Log.e(TAG, "peer roster update failed: ${t.message}", t)
                     }
+                }
+
+                // Proactively nudge idle peers so their FGS/relay re-attaches
+                // without waiting for the next PTT (OP_WAKE on wire; FCM is
+                // server-side when audio/presence needs a cold start).
+                if (stale) {
+                    maybeWakeStalePeers()
                 }
             }
         }
@@ -688,9 +796,14 @@ class PttCoordinator(
                     val idLen = frame.payload[0].toInt() and 0xFF
                     if (frame.payload.size >= 1 + idLen) {
                         val offlinePeerId = String(frame.payload, 1, idLen, Charsets.UTF_8)
-                        liveness.removePeer(offlinePeerId)
-                        // Will be surfaced to UI in a later task
-                        android.util.Log.w("PttCoord", "Partner offline: $offlinePeerId")
+                        // Sticky session: WS drop ≠ left the channel. Keep the
+                        // roster entry so health goes STALE and PTT/wake can
+                        // still reach their foreground service via FCM.
+                        android.util.Log.i(
+                            "PttCoord",
+                            "Partner socket idle: $offlinePeerId — keeping on channel for wake",
+                        )
+                        maybeWakeStalePeers()
                     }
                 }
             }
@@ -1136,6 +1249,11 @@ class PttCoordinator(
         stopHeartbeat()
         stopAllRecvAckJobs()
         stopWatchdog()
+        preAudioJob?.cancel()
+        preAudioJob = null
+        rfcommLinkJob?.cancel()
+        rfcommLinkJob = null
+        _linkingBluetooth.value = false
         _reachingPeer.value = false
         audioPathDegraded.value = false
         probeSentMs = 0
@@ -1144,6 +1262,7 @@ class PttCoordinator(
         eotTimeoutJob?.cancel()
         deliveredResetJob?.cancel()
         deliveredState.value = DeliveryState.Idle
+        try { SassyTalkNative.setRxMuted(false) } catch (_: Throwable) {}
         scope.cancel()
         transmitting.set(false)
     }

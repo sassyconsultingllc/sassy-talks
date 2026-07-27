@@ -54,7 +54,7 @@ class PeerStatusTest {
     }
 
     @Test
-    fun staleTrackedPeer_showsOutOfContact() {
+    fun staleTrackedPeer_showsIdleWaking_notDisconnected() {
         val s = peerStatus(
             presence = PresenceState.IDLE,
             health = PeerHealth.STALE,
@@ -64,7 +64,7 @@ class PeerStatusTest {
             isTracked = true,
             nowMs = System.currentTimeMillis(),
         )
-        assertEquals("Out of contact", s.label)
+        assertEquals("Idle · waking", s.label)
     }
 
     @Test

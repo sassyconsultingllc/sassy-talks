@@ -9,6 +9,22 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.1.13] (65) — 2026-07-27
+
+### Fixed
+- **Bluetooth silent TX.** Failover/connected/PTT now require an RFCOMM data
+  link (BLE alone is control-plane). RFCOMM retry + “Linking Bluetooth…” UI;
+  PTT refuses with a clear reason when no audio path is ready.
+- **Minimized loudspeaker jitter.** FGS holds AudioFocus, renews WakeLock on
+  inbound RX, and bumps jitter prebuffer while backgrounded.
+- **Share “Open in SassyTalk”.** Viewer uses App Link → custom scheme →
+  intent:// with paste fallback (worker deploy required for live page).
+
+### Changed
+- iOS `MARKETING_VERSION` aligned to **3.1.13** / build **65**.
+- GitHub Actions **Build iOS** now runs on published releases so macOS
+  runners can produce the matching iOS build automatically.
+
 ## [3.1.6] (58) — 2026-07-15
 
 ### Fixed

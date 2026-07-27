@@ -243,15 +243,60 @@ const LANDING_HTML = `<!DOCTYPE html>
       }
 
       if (hasKey) {
-        // sassytalk://v/<id>#<key> — opens the installed app on Android AND iOS
-        // via the registered custom scheme, no App Links / Universal Links
-        // verification needed, and (unlike an intent:// URL) it preserves the
-        // #fragment key. If the app isn't installed the tap no-ops and the
-        // install buttons below are the fallback.
+        // Multi-strategy open: App Links (https) → custom scheme → intent://
+        // with Play fallback. Custom scheme alone is often a no-op in Chrome.
         var appUrl = appLinkUrl(fullUrl);
         open.setAttribute('href', appUrl);
         open.textContent = 'Open in SassyTalk';
         pasteHint.style.display = 'block';
+
+        function intentUrl(httpsHref, schemeHref) {
+          try {
+            var u = new URL(httpsHref);
+            // intent:// host/path#Intent;scheme=sassytalk;package=…;end
+            // Fragment keys are unreliable in intent:// — prefer custom scheme
+            // after App Link attempt. Still provide package targeting + Play.
+            var path = u.pathname.replace(/^\//, '');
+            return 'intent://' + path + '#Intent;scheme=sassytalk;package=com.sassyconsulting.sassytalkie;S.browser_fallback_url=' +
+              encodeURIComponent('${PLAY_URL}') + ';end';
+          } catch (e) {
+            return schemeHref;
+          }
+        }
+
+        open.addEventListener('click', function (ev) {
+          ev.preventDefault();
+          var httpsUrl = fullUrl;
+          var scheme = appUrl;
+          var intent = intentUrl(httpsUrl, scheme);
+          var stillHere = true;
+          var flash = function () {
+            if (!stillHere) return;
+            pasteHint.style.display = 'block';
+            pasteHint.style.outline = '2px solid #f97316';
+            pasteHint.textContent =
+              'Could not open the app automatically. Tap Copy invite link, then in SassyTalk go to Authenticate → Enter Code and paste.';
+          };
+          // 1) Verified App Link (may strip #key on some OEMs — scheme follows).
+          try { window.location.href = httpsUrl; } catch (e1) {}
+          setTimeout(function () {
+            if (!stillHere) return;
+            // 2) Custom scheme preserves #key.
+            try { window.location.href = scheme; } catch (e2) {}
+            setTimeout(function () {
+              if (!stillHere) return;
+              // 3) Package-targeted intent with Play Store fallback.
+              try { window.location.href = intent; } catch (e3) {}
+              setTimeout(flash, 1200);
+            }, 450);
+          }, 350);
+          document.addEventListener('visibilitychange', function onVis() {
+            if (document.hidden) {
+              stillHere = false;
+              document.removeEventListener('visibilitychange', onVis);
+            }
+          });
+        });
 
         copyBtn.addEventListener('click', function () {
           var done = function () {

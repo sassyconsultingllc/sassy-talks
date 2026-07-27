@@ -281,8 +281,8 @@ fun UsersScreen(
 internal data class PeerStatus(val label: String, val color: Color)
 
 /**
- * Never label a registry peer "offline" just because heartbeats haven't
- * arrived yet. "Out of contact" only when tracked AND liveness says STALE.
+ * Sticky channel status. Never label a session peer "disconnected" just
+ * because heartbeats paused — they stay on-channel and are woken via FGS/FCM.
  */
 internal fun peerStatus(
     presence: PresenceState,
@@ -304,7 +304,7 @@ internal fun peerStatus(
     }
 
     if (health == PeerHealth.STALE && isTracked) {
-        return PeerStatus("Out of contact", StatusDisconnected)
+        return PeerStatus("Idle · waking", Orange)
     }
     if (health == PeerHealth.DEGRADED) {
         val rtt = if (rttMs in 1..999) " · ${rttMs} ms" else ""

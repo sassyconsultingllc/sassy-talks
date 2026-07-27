@@ -197,21 +197,37 @@ object SassyTalkNative {
         if (!initialized) return
         val transport = getTransport()
         val btConnected = transport == TRANSPORT_BLUETOOTH
-        val btPeers = bluetoothTransport?.connectedPeerCount ?: 0
-        Log.i(TAG, "PTT START pressed — BT connected: $btConnected, BT peers: $btPeers, transport: ${getTransportName()}")
+        val rfcommPeers = bluetoothTransport?.connectedPeerCount ?: 0
+        val hasIp = try { isConnected() } catch (_: Throwable) { false }
+        Log.i(TAG, "PTT START pressed — BT connected: $btConnected, RFCOMM peers: $rfcommPeers, ip=$hasIp, transport: ${getTransportName()}")
 
-        // Connection guard: don't start if no transport is active
-        if (transport == TRANSPORT_NONE && !btConnected && btPeers == 0) {
-            Log.w(TAG, "PTT blocked: no connected peers")
+        // IP plane or RFCOMM data plane required — BLE alone is not enough.
+        if (!BtAudioPath.canTransmit(hasIp, rfcommPeers)) {
+            Log.w(TAG, "PTT blocked: no audio path (ip=$hasIp rfcomm=$rfcommPeers)")
             return
         }
 
+        // Security: never open the mic for an unencrypted session. Frames would
+        // be dropped at the transport layer anyway — fail closed instead.
+        if (!isEncrypted()) {
+            Log.w(TAG, "PTT blocked: session not encrypted")
+            return
+        }
+
+        // Yield the captioning mic before native TX opens AudioRecord.
+        try {
+            com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge.onPttStarted()
+        } catch (_: Throwable) {}
+
+        // Half-duplex: cut RX playback while keyed (all PTT entry points).
+        setRxMuted(true)
+
         nativePttStart()
 
-        // Start BT TX pump if BT transport is active
-        if (btConnected || btPeers > 0) {
+        // Start BT TX pump when RFCOMM peers can receive encrypted frames.
+        if (rfcommPeers > 0) {
             bluetoothTransport?.startTxPump()
-            Log.i(TAG, "BT TX pump started ($btPeers peers)")
+            Log.i(TAG, "BT TX pump started ($rfcommPeers peers)")
         }
         Log.d(TAG, "PTT Started")
     }
@@ -223,6 +239,14 @@ object SassyTalkNative {
         // Stop BT TX pump
         bluetoothTransport?.stopTxPump()
         Log.d(TAG, "PTT Stopped")
+
+        // Restore RX after TX releases the mic.
+        setRxMuted(false)
+
+        // Resume on-device captioning after TX releases the mic.
+        try {
+            com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge.onPttReleased()
+        } catch (_: Throwable) {}
     }
 
     /** Set PTT buffer mode. true = buffer audio and burst-send on release. false = live stream. */
@@ -783,11 +807,38 @@ object SassyTalkNative {
     // blinded room/peer handles (no stable room id, no device name). Opt-in and
     // coordinated: every member must enable it and share the session key.
 
-    /** Enable/disable sealed-sender connection blinding for the relay. */
+    /**
+     * Enable/disable sealed-sender connection blinding for the relay.
+     * When turning ON, rehydrate the sealed context from the active channel
+     * session so blinding actually engages (toggle alone is a no-op without
+     * a key + stable peer id in native).
+     */
     fun setSealedSenderEnabled(enabled: Boolean) {
         if (!initialized) return
+        if (enabled) {
+            ensureSealedContextFromActiveSession()
+        }
         try { nativeSetSealedSenderEnabled(enabled) } catch (e: Exception) {
             Log.e(TAG, "setSealedSenderEnabled failed: ${e.message}")
+        }
+    }
+
+    /** Best-effort: load session key from the active channel into native sealed ctx. */
+    fun ensureSealedContextFromActiveSession() {
+        if (!initialized) return
+        try {
+            val ch = try { getChannel() } catch (_: Exception) { 1 }
+            val json = getChannelSessionJson(ch).ifEmpty {
+                // Fall back across channels — restore may have parked the key
+                // on a different slot than the UI channel.
+                (1..8).asSequence()
+                    .map { getChannelSessionJson(it) }
+                    .firstOrNull { it.isNotEmpty() }
+                    .orEmpty()
+            }
+            if (json.isNotEmpty()) applySealedContext(json)
+        } catch (e: Exception) {
+            Log.w(TAG, "ensureSealedContextFromActiveSession: ${e.message}")
         }
     }
 

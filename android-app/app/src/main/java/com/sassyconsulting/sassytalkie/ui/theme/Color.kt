@@ -6,10 +6,10 @@ package com.sassyconsulting.sassytalkie.ui.theme
 import androidx.compose.ui.graphics.Color
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SassyTalk shared design tokens — ported 1:1 from the Tauri desktop reference
-// (tauri-desktop/src/styles/app.css :root). Single source of truth for the
-// cross-platform look: slate-dark surfaces with blue → purple → teal → coral
-// accents. Keep in sync with app.css and ios-native/Theme.swift.
+// SassyTalk shared design tokens — slate-dark tactical radio surfaces with
+// blue → teal brand fills and coral TX accents. Purple stays a tertiary
+// accent only (not primary fills). Keep roughly in sync with app.css /
+// ios-native/Theme.swift when those land the same shift.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Brand / accent ramps
@@ -17,9 +17,9 @@ val PrimaryBlue       = Color(0xFF2563EB)
 val PrimaryBlueLight  = Color(0xFF3B82F6)
 val PrimaryBlueDark   = Color(0xFF1D4ED8)
 
-val BrandPurple       = Color(0xFF7C3AED)
-val BrandPurpleLight  = Color(0xFF8B5CF6)
-val BrandPurpleDark   = Color(0xFF6D28D9)
+val BrandPurple       = Color(0xFF6D28D9)   // tertiary only — muted vs prior fill purple
+val BrandPurpleLight  = Color(0xFF7C3AED)
+val BrandPurpleDark   = Color(0xFF5B21B6)
 
 val Teal              = Color(0xFF14B8A6)
 val TealLight         = Color(0xFF2DD4BF)
@@ -29,15 +29,15 @@ val Coral             = Color(0xFFF97316)
 val CoralLight        = Color(0xFFFB923C)
 val CoralDark         = Color(0xFFEA580C)
 
-// Surfaces / backgrounds
-val BgDark            = Color(0xFF0F172A)
-val BgMedium          = Color(0xFF1E293B)
-val BgLight           = Color(0xFF334155)
-val BgCard            = Color(0xCC1E293B)   // rgba(30,41,59,0.8)
-val BgStatusBar       = Color(0xFF0B1120)   // one notch darker than BgDark
+// Surfaces / backgrounds — deep navy with a cool teal undertone
+val BgDark            = Color(0xFF0B1220)
+val BgMedium          = Color(0xFF152033)
+val BgLight           = Color(0xFF243247)
+val BgCard            = Color(0xCC152033)   // rgba(21,32,51,0.8)
+val BgStatusBar       = Color(0xFF070D18)   // one notch darker than BgDark
 
 // Text
-val TextPrimary       = Color(0xFFF8FAFC)
+val TextPrimary       = Color(0xFFF1F5F9)
 val TextSecondary     = Color(0xFF94A3B8)
 val TextMutedToken    = Color(0xFF64748B)
 
@@ -51,11 +51,11 @@ val StatusInfo        = PrimaryBlue
 val BorderColor       = Color(0x3394A3B8)   // rgba(148,163,184,0.2)
 
 // Gradient stops — use with Brush.linearGradient / Brush.horizontalGradient.
-// Mirror --gradient-primary / accent / warm / cool from app.css.
-val GradientPrimary = listOf(PrimaryBlue, BrandPurple)   // brand title, primary fills
-val GradientAccent  = listOf(Teal, PrimaryBlue)          // "Find Devices" CTA
-val GradientWarm    = listOf(Coral, BrandPurple)
-val GradientCool    = listOf(Teal, BrandPurple)
+// Primary brand reads blue→teal (radio / encrypted link), not purple fill.
+val GradientPrimary = listOf(PrimaryBlue, Teal)          // brand title, primary fills
+val GradientAccent  = listOf(Teal, PrimaryBlueLight)     // "Find Devices" CTA
+val GradientWarm    = listOf(Coral, TealDark)            // TX / warm accents
+val GradientCool    = listOf(TealLight, PrimaryBlue)     // cool status accents
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Backward-compatible aliases. The previous retro-terminal palette names are

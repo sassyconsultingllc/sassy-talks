@@ -13,6 +13,7 @@ import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -24,6 +25,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.TranscriptionBridge
+import com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge
 import com.sassyconsulting.sassytalkie.ui.theme.*
 import kotlinx.coroutines.delay
 
@@ -35,6 +37,15 @@ import kotlinx.coroutines.delay
 fun PipRadioOverlay(isTransmitting: Boolean) {
     val incoming by TranscriptionBridge.incomingAudio.collectAsState()
     val speaker by TranscriptionBridge.activeSpeakerName.collectAsState()
+    val translationOn by LiveTranslationBridge.enabled.collectAsState()
+    val translationText by LiveTranslationBridge.translation.collectAsState()
+    val captionText by LiveTranslationBridge.caption.collectAsState()
+    val translationPaused by LiveTranslationBridge.pausedForPtt.collectAsState()
+
+    DisposableEffect(Unit) {
+        LiveTranslationBridge.acquireUi()
+        onDispose { LiveTranslationBridge.releaseUi() }
+    }
 
     var channel by remember { mutableIntStateOf(SassyTalkNative.getChannel()) }
     var transport by remember { mutableStateOf(SassyTalkNative.getTransportName()) }
@@ -121,6 +132,25 @@ fun PipRadioOverlay(isTransmitting: Boolean) {
                 color = if (active) Orange else TextMuted,
                 textAlign = TextAlign.Center,
             )
+            if (translationOn) {
+                Spacer(modifier = Modifier.height(6.dp))
+                val translationStatus by LiveTranslationBridge.status.collectAsState()
+                Text(
+                    text = when {
+                        translationPaused || isTransmitting -> "Translation paused"
+                        translationText.isNotBlank() -> translationText
+                        captionText.isNotBlank() -> captionText
+                        translationStatus ==
+                            com.sassyconsulting.sassytalkie.translate.LiveCaptionTranslator.Status.LISTENING ->
+                            "Listening…"
+                        else -> "Quiet — resuming…"
+                    },
+                    fontSize = 11.sp,
+                    color = Orange,
+                    textAlign = TextAlign.Center,
+                    maxLines = 2,
+                )
+            }
         }
     }
 }

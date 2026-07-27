@@ -212,7 +212,15 @@ fun QRAuthScreen(
                 onQRScanned = { json ->
                     showScanner = false
                     val success = SassyTalkNative.importSessionFromQR(json)
-                    scanResult = if (success) "Session established!" else "Invalid QR code"
+                    val roomHint = runCatching {
+                        org.json.JSONObject(json).optString("session_id", "").take(8)
+                    }.getOrDefault("")
+                    scanResult = when {
+                        success && roomHint.isNotEmpty() ->
+                            "Joined room $roomHint — match the host Room id"
+                        success -> "Session established!"
+                        else -> "Invalid QR code"
+                    }
                     if (success) {
                         hasExistingSession.value = true
                         // Joiner-side: force-reconnect to the host's room
@@ -485,9 +493,22 @@ private fun ShowQRTab(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Generate button
+        // Generate / rotate session. "Regenerate" is easy to confuse with
+        // "mint another Copy Link for the same room" — rotating here mints a
+        // NEW session_id and leaves any previously shared /v/… invites
+        // pointing at a dead room (they still decrypt, but the host has left).
+        val regenerating = qrBitmap != null
         Button(
-            onClick = onGenerate,
+            onClick = {
+                if (regenerating) {
+                    Toast.makeText(
+                        context,
+                        "New room created — old invite links no longer reach this device",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                onGenerate()
+            },
             colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
             shape = RoundedCornerShape(25.dp),
             modifier = Modifier
@@ -501,14 +522,33 @@ private fun ShowQRTab(
             Icon(Icons.Default.QrCode2, contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(modifier = Modifier.width(6.dp))
             Text(
-                if (qrBitmap != null) "Regenerate QR" else "Generate Session QR",
-                fontSize = 14.sp
+                if (regenerating) "New session (invalidates invites)" else "Generate Session QR",
+                fontSize = 13.sp
             )
         }
 
         Spacer(modifier = Modifier.height(8.dp))
 
         if (qrBitmap != null) {
+            // Room fingerprint: same session_id on both devices = same relay
+            // room. Different /v/{shareId}#key URLs are normal (one-shot
+            // dead-drops) and do NOT mean different rooms — only this id does.
+            val roomId = remember(sessionJson) {
+                runCatching {
+                    org.json.JSONObject(sessionJson).optString("session_id", "")
+                }.getOrDefault("").take(8)
+            }
+            if (roomId.isNotEmpty()) {
+                Text(
+                    text = "Room $roomId · both devices must show the same id",
+                    color = Cyan,
+                    fontSize = 12.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+            }
+
             // Continue FIRST — the primary action sits above the QR so it's
             // always visible the instant the code is generated (previously it
             // was last in a scrolling column and hid below the fold).
@@ -544,7 +584,7 @@ private fun ShowQRTab(
             Spacer(modifier = Modifier.height(6.dp))
 
             Text(
-                text = "Scan this QR, or share the code for long-distance relay",
+                text = "Scan this QR, or share a one-time link (Copy/Share mint new URLs for this same room)",
                 color = TextGray,
                 fontSize = 11.sp,
                 textAlign = TextAlign.Center
@@ -592,7 +632,11 @@ private fun ShowQRTab(
                                             result.httpsUrl,
                                         ),
                                     )
-                                    Toast.makeText(context, "Invite link copied", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(
+                                        context,
+                                        "Invite copied — one-time link for this room (not a new session)",
+                                        Toast.LENGTH_LONG,
+                                    ).show()
                                 }
                                 is SessionShareLink.Result.Err -> {
                                     Toast.makeText(context, "Copy failed: ${result.message}", Toast.LENGTH_LONG).show()
@@ -876,7 +920,13 @@ private fun EnterCodeTab(
                         SassyTalkNative.importSessionFromQR(trimmed)
                     }
                     joining = false
-                    result = if (success) "Session established!" else "Invalid session code"
+                    val roomHint = SassyTalkNative.getSessionId()?.take(8).orEmpty()
+                    result = when {
+                        success && roomHint.isNotEmpty() ->
+                            "Joined room $roomHint — must match the host"
+                        success -> "Session established!"
+                        else -> "Invalid session code"
+                    }
                     if (success) {
                         onAuthenticated()
                     }

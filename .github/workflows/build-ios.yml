@@ -28,11 +28,16 @@ on:
         default: 'false'
         type: choice
         options: ['false', 'true']
+  # GitHub Releases kick the macOS runner so a published Android tag also
+  # builds (and optionally TestFlight-uploads) the matching iOS version.
+  release:
+    types: [published]
   push:
     branches: [main]
     paths:
       - 'ios-native/**'
       - 'core/**'
+      - '.github/workflows/build-ios.yml'
   pull_request:
     paths:
       - 'ios-native/**'
