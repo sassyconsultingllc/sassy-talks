@@ -11,6 +11,7 @@ import com.google.mlkit.nl.translate.TranslateRemoteModel
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -143,6 +144,13 @@ class TranslationManager {
      * @return true if the models are ready after this call; false on failure.
      */
     suspend fun downloadModelsIfNeeded(src: String, dst: String, requireWifi: Boolean = true): Boolean {
+        // Fast path: both models already on device — don't flash DOWNLOADING.
+        val onDevice = downloadedModels().toSet()
+        if (src in onDevice && dst in onDevice) {
+            _modelState.value = ModelState.READY
+            return true
+        }
+
         val translator = translatorFor(src, dst)
         val conditions = DownloadConditions.Builder().apply {
             if (requireWifi) requireWifi()
@@ -153,6 +161,9 @@ class TranslationManager {
             awaitTask<Void>("downloadModelIfNeeded") { translator.downloadModelIfNeeded(conditions) }
             _modelState.value = ModelState.READY
             true
+        } catch (e: CancellationException) {
+            // Language switch cancelled this job — don't flash FAILED.
+            throw e
         } catch (t: Throwable) {
             Log.w(TAG, "Model download failed for $src→$dst: ${t.message}")
             _modelState.value = ModelState.FAILED
@@ -182,10 +193,10 @@ class TranslationManager {
         cache[cacheKey(src, dst, trimmed)]?.let { return it }
 
         val translator = translatorFor(src, dst)
+        // Avoid flashing "Downloading…" on every final once models are READY.
+        val announceDownload = _modelState.value != ModelState.READY
         return try {
-            // downloadModelIfNeeded is idempotent + cheap once the model is
-            // present, so it's safe to call ahead of every translate. It only
-            // hits the network the first time for a given language.
+            if (announceDownload) _modelState.value = ModelState.DOWNLOADING
             val conditions = DownloadConditions.Builder().apply {
                 if (requireWifi) requireWifi()
             }.build()
@@ -195,8 +206,11 @@ class TranslationManager {
             val result = awaitTask<String>("translate") { translator.translate(trimmed) }
             cache[cacheKey(src, dst, trimmed)] = result
             result
+        } catch (e: CancellationException) {
+            throw e
         } catch (t: Throwable) {
             Log.w(TAG, "translate($src→$dst) failed: ${t.message}")
+            if (announceDownload) _modelState.value = ModelState.FAILED
             // Graceful fallback: surface the original so the UI isn't blank.
             text
         }

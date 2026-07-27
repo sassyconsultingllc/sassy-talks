@@ -88,6 +88,28 @@ object LiveTranslationText {
         }
     }
 
+    /**
+     * Text to re-speak from a timeline row. Prefers the translated line
+     * (`translated\n(heard)`), otherwise the whole caption.
+     */
+    fun speakableFromTimeline(text: String): String {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return ""
+        val firstLine = trimmed.lineSequence().firstOrNull()?.trim().orEmpty()
+        return firstLine.ifEmpty { trimmed }
+    }
+
+    /** Human label for a BCP-47 code from the common list, else the code. */
+    fun languageLabel(code: String): String =
+        TranslationManager.COMMON_LANGUAGES.firstOrNull { it.code == code }?.label ?: code
+
+    /** Status copy while ML Kit models are downloading for a pair. */
+    fun downloadStatusLine(sourceCode: String, targetCode: String): String {
+        val src = languageLabel(sourceCode)
+        val dst = languageLabel(targetCode)
+        return "Downloading $src → $dst model (~30 MB)…"
+    }
+
     /** Collapse whitespace for duplicate-final detection. */
     fun normalizeKey(text: String): String =
         text.trim().lowercase().replace(Regex("\\s+"), " ")

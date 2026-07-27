@@ -23,6 +23,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.TranscriptionBridge
+import com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge
 import com.sassyconsulting.sassytalkie.ui.theme.*
 import kotlinx.coroutines.launch
 import org.json.JSONObject
@@ -92,7 +93,11 @@ fun TranscriptionFeedScreen(
     val cacheStatus = TranscriptionBridge.cacheSnapshot.collectAsState().value.toUi()
     DisposableEffect(Unit) {
         TranscriptionBridge.acquireCacheUi()
-        onDispose { TranscriptionBridge.releaseCacheUi() }
+        onDispose {
+            TranscriptionBridge.releaseCacheUi()
+            // Don't leave TTS talking after the user leaves Activity.
+            LiveTranslationBridge.stopSpeaking()
+        }
     }
 
     val snackbarHost = remember { SnackbarHostState() }
@@ -144,8 +149,10 @@ fun TranscriptionFeedScreen(
                 scope.launch { snackbarHost.showSnackbar("Skipped") }
             },
             onClearCache = {
-                SassyTalkNative.clearAudioCache()
-                scope.launch { snackbarHost.showSnackbar("Cache cleared") }
+                // Soft clear: drop queue/buffers, keep history so replay
+                // still works (full clearAudioCache wiped history immediately).
+                SassyTalkNative.clearActiveAudioCache()
+                scope.launch { snackbarHost.showSnackbar("Playback queue cleared — history kept") }
             },
         )
 
@@ -168,9 +175,9 @@ fun TranscriptionFeedScreen(
                 Text("No activity yet", color = TextGray, fontSize = 16.sp)
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    "Timeline entries will appear here when others speak",
+                    "Peer speech and live translations land here. Tap play to recall audio, or the translate icon to re-speak a caption.",
                     color = TextMuted,
-                    fontSize = 13.sp
+                    fontSize = 13.sp,
                 )
             }
         } else {
@@ -394,23 +401,30 @@ private fun TranscriptionBubble(
             )
         }
 
-        // Replay for remote utterances; local live-captions have no PCM cache.
+        // Replay remote PCM from cache; local captions re-speak via TTS.
         val isLocalCaption = entry.senderId.startsWith("local:")
         val cached = entry.utteranceId >= 0
         IconButton(
             onClick = {
                 when {
-                    isLocalCaption -> scope.launch {
-                        snackbarHost.showSnackbar(
-                            "On-device caption — no audio to replay"
-                        )
+                    isLocalCaption -> {
+                        val started = LiveTranslationBridge.speakTimelineText(entry.text)
+                        scope.launch {
+                            snackbarHost.showSnackbar(
+                                if (started) "Re-speaking caption"
+                                else "Caption playback unavailable"
+                            )
+                        }
                     }
                     cached -> {
                         val started = SassyTalkNative.replayById(entry.utteranceId)
+                        if (!started) {
+                            TranscriptionBridge.invalidateUtteranceId(entry.utteranceId)
+                        }
                         scope.launch {
                             snackbarHost.showSnackbar(
                                 if (started) "Replaying ${entry.senderName}"
-                                else "Audio expired from cache"
+                                else "Audio no longer in cache"
                             )
                         }
                     }
@@ -424,9 +438,9 @@ private fun TranscriptionBubble(
             modifier = Modifier.size(32.dp),
         ) {
             Icon(
-                imageVector = if (isLocalCaption) Icons.Default.Translate else Icons.Default.PlayArrow,
+                imageVector = if (isLocalCaption) Icons.Default.RecordVoiceOver else Icons.Default.PlayArrow,
                 contentDescription = when {
-                    isLocalCaption -> "Live caption"
+                    isLocalCaption -> "Re-speak caption"
                     cached -> "Replay"
                     else -> "Replay unavailable"
                 },

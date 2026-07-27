@@ -153,4 +153,25 @@ class LiveTranslationTextTest {
         assertFalse(LiveTranslationText.shouldSpeakTts(true, true, false))
         assertFalse(LiveTranslationText.shouldSpeakTts(true, false, true))
     }
+
+    @Test
+    fun `speakableFromTimeline prefers translated line`() {
+        assertEquals(
+            "Hola",
+            LiveTranslationText.speakableFromTimeline("Hola\n(Hello)"),
+        )
+        assertEquals(
+            "just caption",
+            LiveTranslationText.speakableFromTimeline("just caption"),
+        )
+        assertEquals("", LiveTranslationText.speakableFromTimeline("   "))
+    }
+
+    @Test
+    fun `downloadStatusLine names the language pair`() {
+        val line = LiveTranslationText.downloadStatusLine("en", "es")
+        assertTrue(line.contains("→"))
+        assertTrue(line.contains("~30 MB"))
+        assertTrue(line.contains("English") || line.contains("en"))
+    }
 }

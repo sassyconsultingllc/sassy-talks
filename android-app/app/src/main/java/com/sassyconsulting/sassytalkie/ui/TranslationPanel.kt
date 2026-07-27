@@ -21,6 +21,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sassyconsulting.sassytalkie.translate.LiveCaptionTranslator
 import com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge
+import com.sassyconsulting.sassytalkie.translate.LiveTranslationText
 import com.sassyconsulting.sassytalkie.translate.TranslationManager
 import com.sassyconsulting.sassytalkie.ui.theme.*
 
@@ -61,6 +62,9 @@ fun TranslationPanel(
     var sourceMenuExpanded by remember { mutableStateOf(false) }
     var targetMenuExpanded by remember { mutableStateOf(false) }
 
+    LaunchedEffect(Unit) {
+        LiveTranslationBridge.refreshDownloadedModels()
+    }
     LaunchedEffect(enabled) {
         if (enabled) LiveTranslationBridge.refreshDownloadedModels()
     }
@@ -123,6 +127,7 @@ fun TranslationPanel(
                 selectedLabel = sourceLabel,
                 expanded = sourceMenuExpanded,
                 onExpandedChange = { sourceMenuExpanded = it },
+                downloadedModels = downloadedModels,
                 onSelect = { code ->
                     LiveTranslationBridge.setSourceLang(code)
                     // Keep source ≠ target so captions actually translate.
@@ -161,6 +166,7 @@ fun TranslationPanel(
                 expanded = targetMenuExpanded,
                 onExpandedChange = { targetMenuExpanded = it },
                 excludeCode = sourceLang,
+                downloadedModels = downloadedModels,
                 onSelect = { code ->
                     LiveTranslationBridge.setTargetLang(code)
                     targetMenuExpanded = false
@@ -173,6 +179,14 @@ fun TranslationPanel(
                     text = "Pick a different target language to translate — source and target match.",
                     fontSize = 11.sp,
                     color = StatusWarning,
+                )
+            }
+
+            if (modelState == TranslationManager.ModelState.DOWNLOADING) {
+                Spacer(modifier = Modifier.height(10.dp))
+                ModelDownloadBanner(
+                    sourceLabel = sourceLabel,
+                    targetLabel = targetLabel,
                 )
             }
 
@@ -215,6 +229,8 @@ fun TranslationPanel(
                 modelState = modelState,
                 errorMessage = errorMessage,
                 wifiOnly = wifiOnly,
+                sourceLabel = sourceLabel,
+                targetLabel = targetLabel,
             )
 
             val needsOfflineSpeechPack = enabled && (
@@ -334,6 +350,7 @@ private fun LanguagePicker(
     onExpandedChange: (Boolean) -> Unit,
     onSelect: (String) -> Unit,
     excludeCode: String? = null,
+    downloadedModels: List<String> = emptyList(),
 ) {
     val options = remember(excludeCode) {
         TranslationManager.COMMON_LANGUAGES.filter { it.code != excludeCode }
@@ -369,9 +386,62 @@ private fun LanguagePicker(
             onDismissRequest = { onExpandedChange(false) },
         ) {
             options.forEach { lang ->
+                val onDevice = downloadedModels.contains(lang.code)
                 DropdownMenuItem(
-                    text = { Text(lang.label) },
+                    text = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = lang.label,
+                                modifier = Modifier.weight(1f),
+                            )
+                            if (!onDevice) {
+                                Text(
+                                    text = "download",
+                                    fontSize = 10.sp,
+                                    color = StatusWarning,
+                                )
+                            }
+                        }
+                    },
                     onClick = { onSelect(lang.code) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ModelDownloadBanner(
+    sourceLabel: String,
+    targetLabel: String,
+) {
+    Surface(
+        color = StatusWarning.copy(alpha = 0.12f),
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            CircularProgressIndicator(
+                color = StatusWarning,
+                strokeWidth = 2.dp,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Downloading language model",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = StatusWarning,
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = "$sourceLabel → $targetLabel · ~30 MB on this device",
+                    fontSize = 11.sp,
+                    color = TextGray,
                 )
             }
         }
@@ -386,8 +456,19 @@ private fun StatusLine(
     modelState: TranslationManager.ModelState,
     errorMessage: String?,
     wifiOnly: Boolean = true,
+    sourceLabel: String = "",
+    targetLabel: String = "",
 ) {
+    val downloadLine = if (sourceLabel.isNotEmpty() && targetLabel.isNotEmpty()) {
+        "Downloading $sourceLabel → $targetLabel model (~30 MB)…"
+    } else {
+        "Downloading language model…"
+    }
     val (text, color) = when {
+        // Download notation wins even while the feature toggle is off —
+        // picking a language still kicks off the model fetch.
+        modelState == TranslationManager.ModelState.DOWNLOADING ->
+            downloadLine to StatusWarning
         !enabled -> "Off" to TextMuted
         pausedForPtt -> "Paused for PTT" to StatusWarning
         status == LiveCaptionTranslator.Status.UNAVAILABLE ->
@@ -404,8 +485,6 @@ private fun StatusLine(
                     "Install offline speech pack in system Settings → Languages" to StatusDisconnected
                 else -> (errorMessage ?: "Error") to StatusDisconnected
             }
-        modelState == TranslationManager.ModelState.DOWNLOADING ->
-            "Downloading language model…" to StatusWarning
         modelState == TranslationManager.ModelState.FAILED ->
             if (wifiOnly) {
                 "Model download failed — connect to Wi-Fi or disable Wi-Fi-only" to StatusDisconnected
@@ -415,12 +494,19 @@ private fun StatusLine(
         status == LiveCaptionTranslator.Status.LISTENING ->
             "Listening (offline) — captions also show on the radio screen" to StatusConnected
         status == LiveCaptionTranslator.Status.IDLE && enabled && !pausedForPtt ->
-            "Quiet — will resume listening shortly" to TextGray
+            if (sourceLabel.isNotEmpty() && targetLabel.isNotEmpty()) {
+                "Quiet · $sourceLabel → $targetLabel" to TextGray
+            } else {
+                "Quiet — will resume listening shortly" to TextGray
+            }
+        modelState == TranslationManager.ModelState.READY &&
+            sourceLabel.isNotEmpty() && targetLabel.isNotEmpty() ->
+            "Ready · $sourceLabel → $targetLabel" to StatusConnected
         else -> "Ready" to TextGray
     }
 
     Row(verticalAlignment = Alignment.CenterVertically) {
-        if (enabled && modelState == TranslationManager.ModelState.DOWNLOADING) {
+        if (modelState == TranslationManager.ModelState.DOWNLOADING) {
             CircularProgressIndicator(
                 color = StatusWarning,
                 strokeWidth = 2.dp,
@@ -500,7 +586,7 @@ fun LiveTranslationOverlay(
                 Text(
                     text = when {
                         pausedForPtt -> "PTT"
-                        modelState == TranslationManager.ModelState.DOWNLOADING -> "…"
+                        modelState == TranslationManager.ModelState.DOWNLOADING -> "DL"
                         status == LiveCaptionTranslator.Status.LISTENING -> "●"
                         status == LiveCaptionTranslator.Status.ERROR ||
                             status == LiveCaptionTranslator.Status.UNAVAILABLE -> "!"
@@ -509,6 +595,7 @@ fun LiveTranslationOverlay(
                     fontSize = 11.sp,
                     color = when {
                         pausedForPtt -> StatusWarning
+                        modelState == TranslationManager.ModelState.DOWNLOADING -> StatusWarning
                         status == LiveCaptionTranslator.Status.LISTENING -> StatusConnected
                         status == LiveCaptionTranslator.Status.ERROR ||
                             status == LiveCaptionTranslator.Status.UNAVAILABLE -> StatusDisconnected
@@ -517,38 +604,54 @@ fun LiveTranslationOverlay(
                 )
             }
             Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = when {
-                    pausedForPtt -> "Paused while transmitting"
-                    modelState == TranslationManager.ModelState.DOWNLOADING ->
-                        "Downloading language model…"
-                    status == LiveCaptionTranslator.Status.UNAVAILABLE ||
-                        status == LiveCaptionTranslator.Status.ERROR ->
-                        "Translation unavailable — check Settings"
-                    translation.isNotBlank() -> translation
-                    caption.isNotBlank() -> caption
-                    status == LiveCaptionTranslator.Status.LISTENING -> "Listening…"
-                    else -> "Quiet — will resume shortly"
-                },
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Medium,
-                color = when {
-                    pausedForPtt -> StatusWarning
-                    translation.isNotBlank() -> Coral
-                    status == LiveCaptionTranslator.Status.ERROR ||
-                        status == LiveCaptionTranslator.Status.UNAVAILABLE -> StatusDisconnected
-                    else -> TextPrimary
-                },
-                maxLines = 3,
-            )
-            if (translation.isNotBlank() && caption.isNotBlank() && !pausedForPtt) {
-                Spacer(modifier = Modifier.height(2.dp))
+            if (modelState == TranslationManager.ModelState.DOWNLOADING) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(
+                        color = StatusWarning,
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(12.dp),
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = LiveTranslationText.downloadStatusLine(sourceLang, targetLang),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = StatusWarning,
+                        maxLines = 2,
+                    )
+                }
+            } else {
                 Text(
-                    text = caption,
-                    fontSize = 11.sp,
-                    color = TextMuted,
-                    maxLines = 2,
+                    text = when {
+                        pausedForPtt -> "Paused while transmitting"
+                        status == LiveCaptionTranslator.Status.UNAVAILABLE ||
+                            status == LiveCaptionTranslator.Status.ERROR ->
+                            "Translation unavailable — check Settings"
+                        translation.isNotBlank() -> translation
+                        caption.isNotBlank() -> caption
+                        status == LiveCaptionTranslator.Status.LISTENING -> "Listening…"
+                        else -> "Quiet — will resume shortly"
+                    },
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = when {
+                        pausedForPtt -> StatusWarning
+                        translation.isNotBlank() -> Coral
+                        status == LiveCaptionTranslator.Status.ERROR ||
+                            status == LiveCaptionTranslator.Status.UNAVAILABLE -> StatusDisconnected
+                        else -> TextPrimary
+                    },
+                    maxLines = 3,
                 )
+                if (translation.isNotBlank() && caption.isNotBlank() && !pausedForPtt) {
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = caption,
+                        fontSize = 11.sp,
+                        color = TextMuted,
+                        maxLines = 2,
+                    )
+                }
             }
         }
     }

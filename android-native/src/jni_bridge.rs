@@ -2683,7 +2683,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     }
 }
 
-/// JNI: Clear all cached audio
+/// JNI: Clear all cached audio (including history). Hard reset only.
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeClearAudioCache(
     _env: JNIEnv,
@@ -2697,6 +2697,24 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     if let Some(ref sm) = guard.state_machine {
         let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
         cache.clear();
+    }
+}
+
+/// JNI: Clear in-flight queue/buffers but keep history so Timeline replay
+/// still works after a "reset playback" gesture.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeClearActiveAudioCache(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    info!("JNI: Clear active audio cache (preserve history)");
+
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref sm) = guard.state_machine {
+        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        cache.clear_active();
     }
 }
 

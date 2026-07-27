@@ -300,6 +300,29 @@ object LiveTranslationBridge {
         ensureModels()
     }
 
+    /**
+     * Re-speak a Timeline caption/translation row via on-device TTS.
+     * Used by Activity playback when the entry has no PCM cache (local:self).
+     */
+    fun speakTimelineText(text: String): Boolean {
+        val speakable = LiveTranslationText.speakableFromTimeline(text)
+        if (speakable.isEmpty()) return false
+        // Ensure TTS engine exists even if the user never opened Settings.
+        val ctx = appContext
+        if (speaker == null && ctx != null) {
+            speaker = TranslationSpeaker(ctx).also { it.setLanguage(_targetLang.value) }
+        }
+        val engine = speaker ?: return false
+        engine.setLanguage(_targetLang.value)
+        mainHandler.post { engine.speak(speakable) }
+        return true
+    }
+
+    /** Stop Timeline / translation TTS (e.g. leaving Activity). */
+    fun stopSpeaking() {
+        mainHandler.post { speaker?.stop() }
+    }
+
     fun refreshDownloadedModels() {
         val tm = manager ?: return
         scope.launch {
@@ -502,9 +525,19 @@ object LiveTranslationBridge {
         val dst = _targetLang.value
         val wifiOnly = _wifiOnlyModels.value
         modelJob?.cancel()
+        // Only flip the banner when we don't already know both models are present.
+        val cached = _downloadedModels.value
+        val alreadyOnDevice = src in cached && dst in cached
+        if (!alreadyOnDevice) {
+            _modelState.value = TranslationManager.ModelState.DOWNLOADING
+        }
         modelJob = scope.launch {
-            tm.downloadModelsIfNeeded(src, dst, requireWifi = wifiOnly)
-            _downloadedModels.value = tm.downloadedModels().sorted()
+            try {
+                tm.downloadModelsIfNeeded(src, dst, requireWifi = wifiOnly)
+                _downloadedModels.value = tm.downloadedModels().sorted()
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                // Superseded by another language pick — new job owns state.
+            }
         }
     }
 

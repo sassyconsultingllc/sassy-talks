@@ -936,11 +936,23 @@ object SassyTalkNative {
         return try { nativeGetJitterPrebufferFrames() } catch (_: Exception) { 5 }
     }
 
-    /** Clear all cached audio, reset to Live mode */
+    /** Clear all cached audio + history (hard reset / end session). */
     fun clearAudioCache() {
         if (initialized) {
             try { nativeClearAudioCache() } catch (e: Exception) {
                 Log.e(TAG, "clearAudioCache failed: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Clear in-flight queue/buffers only — keeps history so Activity
+     * replay buttons still work after a soft "reset playback".
+     */
+    fun clearActiveAudioCache() {
+        if (initialized) {
+            try { nativeClearActiveAudioCache() } catch (e: Exception) {
+                Log.e(TAG, "clearActiveAudioCache failed: ${e.message}")
             }
         }
     }
@@ -1279,6 +1291,7 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeSkipCurrentUtterance()
     @JvmStatic private external fun nativeSetCacheMode(mode: Byte)
     @JvmStatic private external fun nativeClearAudioCache()
+    @JvmStatic private external fun nativeClearActiveAudioCache()
     @JvmStatic private external fun nativeReplayUtterance(index: Int): Boolean
     @JvmStatic private external fun nativeSyncCacheUserInfo()
     @JvmStatic private external fun nativeSetMixModeEnabled(enabled: Boolean)

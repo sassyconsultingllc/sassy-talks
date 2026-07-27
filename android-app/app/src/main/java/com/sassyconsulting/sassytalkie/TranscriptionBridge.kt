@@ -389,7 +389,9 @@ object TranscriptionBridge {
                 _entries.value = emptyList()
                 resetSpeechState()
             }
-            try { SassyTalkNative.clearAudioCache() } catch (_: Exception) {}
+            // Persist the empty snapshot so a relaunch doesn't resurrect
+            // rows the user (or End Session) deliberately cleared.
+            schedulePersist()
             Log.d(TAG, "Entries cleared")
         } finally {
             clearing.set(false)
@@ -569,13 +571,17 @@ object TranscriptionBridge {
     }
 
     private fun addEntry(entry: TranscriptionEntry) {
-        val current = _entries.value
-        val updated = if (current.size >= MAX_ENTRIES) {
-            current.drop(1) + entry
-        } else {
-            current + entry
+        // Must hold `lock` — onUtteranceCommitted / updateUserStatus also
+        // mutate `_entries` and a lock-free RMW can drop caption rows.
+        synchronized(lock) {
+            val current = _entries.value
+            val updated = if (current.size >= MAX_ENTRIES) {
+                current.drop(1) + entry
+            } else {
+                current + entry
+            }
+            _entries.value = updated
         }
-        _entries.value = updated
 
         showTimelineNotification(entry)
 
@@ -583,6 +589,28 @@ object TranscriptionBridge {
         // coalescing rapid additions into one disk write. Survives process
         // death so the "who spoke when" log isn't lost on app kill.
         schedulePersist()
+    }
+
+    /**
+     * Drop a stale utteranceId after a failed replay so the play button
+     * greys out instead of repeatedly saying "Audio expired".
+     */
+    fun invalidateUtteranceId(utteranceId: Long) {
+        if (utteranceId < 0) return
+        synchronized(lock) {
+            val current = _entries.value
+            var changed = false
+            val updated = current.map { e ->
+                if (e.utteranceId == utteranceId) {
+                    changed = true
+                    e.copy(utteranceId = -1L)
+                } else e
+            }
+            if (changed) {
+                _entries.value = updated
+                schedulePersist()
+            }
+        }
     }
 
     // ── v2.7.2: persisted timeline ──
@@ -648,7 +676,10 @@ object TranscriptionBridge {
                         timestamp = o.optLong("timestamp"),
                         isFavorite = o.optBoolean("isFavorite", false),
                         isMuted = o.optBoolean("isMuted", false),
-                        utteranceId = o.optLong("utteranceId", -1L),
+                        // PCM cache is in-memory only — IDs from a prior
+                        // process are always stale and would show
+                        // "Audio expired" on every tap.
+                        utteranceId = -1L,
                     )
                 )
             }
