@@ -637,11 +637,11 @@ fun MainScreen(
 
         Spacer(modifier = Modifier.weight(1f))
 
-        // Live translation captions (local speech → on-device translate).
-        // Configured in Settings; stays active while on the radio screen.
+        // Live translation — slim full-bleed bar above PTT (cancels Column's 16.dp inset).
         LiveTranslationOverlay(
             modifier = Modifier
                 .fillMaxWidth()
+                .padding(horizontal = (-16).dp)
                 .padding(bottom = 10.dp),
         )
 

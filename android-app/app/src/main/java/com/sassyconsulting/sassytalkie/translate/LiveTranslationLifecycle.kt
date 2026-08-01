@@ -110,6 +110,10 @@ object LiveTranslationText {
         return "Downloading $src → $dst model (~30 MB)…"
     }
 
+    /** Prefer translated line; fall back to caption. */
+    fun speakableUtterance(caption: String, translation: String): String =
+        translation.trim().ifEmpty { caption.trim() }
+
     /** Collapse whitespace for duplicate-final detection. */
     fun normalizeKey(text: String): String =
         text.trim().lowercase().replace(Regex("\\s+"), " ")
@@ -120,4 +124,44 @@ object LiveTranslationText {
         pausedForPtt: Boolean,
         incomingAudio: Boolean,
     ): Boolean = ttsEnabled && !pausedForPtt && !incomingAudio
+
+    /**
+     * When TTS is on but TX/RX owns the audio path, queue the line for
+     * post-PTT / post-RX read-back instead of dropping it.
+     */
+    fun shouldQueueTts(
+        ttsEnabled: Boolean,
+        pausedForPtt: Boolean,
+        incomingAudio: Boolean,
+    ): Boolean = ttsEnabled && (pausedForPtt || incomingAudio)
+
+    /** True when the offline speech pack error copy should prompt system Settings. */
+    fun needsOfflineSpeechPack(errorMessage: String?): Boolean {
+        val msg = errorMessage ?: return false
+        return msg.contains("Offline language", ignoreCase = true) ||
+            msg.contains("not installed", ignoreCase = true) ||
+            msg.contains("Language not supported offline", ignoreCase = true) ||
+            msg.contains("speech recognition unavailable", ignoreCase = true)
+    }
+
+    /**
+     * First-run checklist copy for ML Kit models + system speech packs.
+     * [modelsReady] = both pair languages on-device; [speechOk] = recognizer not UNAVAILABLE.
+     */
+    fun setupHint(
+        modelsReady: Boolean,
+        modelDownloading: Boolean,
+        modelFailed: Boolean,
+        speechOk: Boolean,
+        wifiOnly: Boolean,
+    ): String = when {
+        modelDownloading -> "Step 1 of 2: downloading translation models (~30 MB)…"
+        modelFailed && wifiOnly ->
+            "Translation models need Wi-Fi (or turn off Wi-Fi-only downloads)."
+        modelFailed -> "Translation model download failed — tap Retry."
+        !modelsReady -> "Step 1 of 2: translation models will download for your language pair."
+        !speechOk ->
+            "Step 2 of 2: install an offline speech pack in system Settings (Voice / Languages)."
+        else -> "Ready — speak while idle to caption; release PTT to hear translation read-back."
+    }
 }

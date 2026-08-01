@@ -100,7 +100,14 @@ impl CryptoSession {
         }
     }
 
-    /// Encrypt plaintext, returns nonce || ciphertext || tag
+    /// Encrypt plaintext, returns nonce || ciphertext || tag.
+    ///
+    /// Cost note (2026-07): dual-path TX (WiFi + cellular) encrypts **once** and
+    /// reuses the same ciphertext on both transports — there is no redundant
+    /// AES-GCM work to remove. Softening AEAD (shorter tag, CTR-without-auth,
+    /// skipping the replay window) would trade integrity for microseconds that
+    /// do not show up against Opus encode cost. Leave crypto alone; spend
+    /// cycles on jitter buffering and relay backpressure instead.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
         let nonce_bytes = self.next_nonce()?;
         let nonce = Nonce::from_slice(&nonce_bytes);

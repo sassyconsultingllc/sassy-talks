@@ -148,10 +148,12 @@ const ACTIVE_SPEAKER_MIN_FRAMES: usize = 2;
 ///
 /// Read via [live_jitter_prebuffer_frames]; never read the constant
 /// directly (it's just the initial value).
-// 3 frames = 60 ms — enough now that the native RX path does pre-decode
-// reorder + a 20 ms playout pacer; the old default of 5 added ~100 ms of
-// avoidable mouth-to-ear latency on top of those layers.
-const DEFAULT_LIVE_JITTER_PREBUFFER_FRAMES: usize = 3;
+// 3 frames = 60 ms was too thin once OkHttp/DO backpressure added 40–120 ms
+// of arrival jitter on cellular. Default 5 (= 100 ms) absorbs a typical
+// spike without audible chops; Settings still offers 3 (low-latency) and
+// 8/12 (smooth). The native RX path also does pre-decode reorder + a 20 ms
+// playout pacer on top of this.
+const DEFAULT_LIVE_JITTER_PREBUFFER_FRAMES: usize = 5;
 static LIVE_JITTER_PREBUFFER_FRAMES_ATOMIC: AtomicU64 =
     AtomicU64::new(DEFAULT_LIVE_JITTER_PREBUFFER_FRAMES as u64);
 
@@ -174,11 +176,11 @@ pub fn set_live_jitter_prebuffer_frames(frames: usize) {
 const LIVE_JITTER_PREBUFFER_FRAMES: usize = DEFAULT_LIVE_JITTER_PREBUFFER_FRAMES;
 
 /// Age (ms) after which the jitter buffer drains one stranded frame per
-/// tick instead of waiting for new arrivals. Just above one frame period
-/// (20 ms) so the tail of an utterance plays out promptly when PTT is
-/// released. Larger values (we used 40 ms) audibly slow the closing of
-/// a transmission and were a contributor to the "slowed-down" symptom.
-const LIVE_JITTER_DRAIN_AGE_MS: u64 = 25;
+/// tick instead of waiting for new arrivals. Slightly above one frame
+/// period so utterance tails play out promptly, but high enough that a
+/// single late cellular frame (often 30–60 ms behind) can still land in
+/// order before we drain past it.
+const LIVE_JITTER_DRAIN_AGE_MS: u64 = 35;
 
 /// Per-speaker accumulator: collects frames until speech gap detected
 struct SpeakerBuffer {
@@ -348,6 +350,15 @@ pub struct AudioCache {
     /// mode (multi-speaker overlap) so no frames go missing in transition.
     live_jitter: HashMap<String, VecDeque<CachedFrame>>,
 
+    /// Adaptive prebuffer boost (0..=4 frames) derived from measured
+    /// inter-arrival jitter on the Live path. Added on top of the user/runtime
+    /// setting from [live_jitter_prebuffer_frames], capped at 16 total.
+    live_adaptive_extra: usize,
+    /// Last Live-path frame arrival (for inter-arrival measurement).
+    live_arrival_last: Option<Instant>,
+    /// EWMA of |gap − 20 ms| in milliseconds.
+    live_jitter_ewma_ms: f32,
+
     /// IDs of utterances added to `history` since the last call to
     /// `take_newly_committed_ids()`. Drained by the RX thread, dispatched
     /// to Kotlin via JNI so `TranscriptionEntry.utteranceId` can be
@@ -406,12 +417,48 @@ impl AudioCache {
             max_history: 50,
             live_accumulator: HashMap::new(),
             live_jitter: HashMap::new(),
+            live_adaptive_extra: 0,
+            live_arrival_last: None,
+            live_jitter_ewma_ms: 0.0,
             newly_committed_ids: Vec::new(),
             enable_mix_mode: false,
             mix_pending: HashMap::new(),
             mix_gain: 1.0,
             recent_frames: (HashSet::new(), VecDeque::new()),
         }
+    }
+
+    /// Effective Live-mode prebuffer = user setting + adaptive boost (capped).
+    #[inline]
+    fn effective_live_prebuffer(&self) -> usize {
+        (live_jitter_prebuffer_frames() + self.live_adaptive_extra).min(16)
+    }
+
+    /// Update adaptive extra frames from inter-arrival gap vs the nominal
+    /// 20 ms Opus period. Decays toward 0 when the link is steady.
+    fn note_live_arrival_jitter(&mut self) {
+        let now = Instant::now();
+        if let Some(last) = self.live_arrival_last {
+            let gap_ms = now.saturating_duration_since(last).as_secs_f32() * 1000.0;
+            // Ignore sub-5 ms gaps (same-tick bursts / unit tests) and multi-
+            // second idle gaps — those aren't network jitter.
+            if (5.0..200.0).contains(&gap_ms) {
+                let err = (gap_ms - 20.0).abs();
+                self.live_jitter_ewma_ms = self.live_jitter_ewma_ms * 0.85 + err * 0.15;
+                self.live_adaptive_extra = if self.live_jitter_ewma_ms > 45.0 {
+                    4
+                } else if self.live_jitter_ewma_ms > 30.0 {
+                    3
+                } else if self.live_jitter_ewma_ms > 18.0 {
+                    2
+                } else if self.live_jitter_ewma_ms > 10.0 {
+                    1
+                } else {
+                    0
+                };
+            }
+        }
+        self.live_arrival_last = Some(now);
     }
 
     /// Record `(sender, timestamp)` and report whether it is NEW (true) or a
@@ -595,11 +642,14 @@ impl AudioCache {
 
             // Jitter buffer: insertion-sort the incoming frame by wire
             // timestamp, then forward the oldest only once we have
-            // LIVE_JITTER_PREBUFFER_FRAMES queued. This absorbs network
-            // jitter (no more chopped audio at AudioTrack underrun) and
-            // fixes small-window reordering (no more garbled playback).
+            // effective_live_prebuffer() queued. Absorbs network jitter
+            // (no more chopped audio at AudioTrack underrun) and fixes
+            // small-window reordering (no more garbled playback). Adaptive
+            // extra frames kick in when inter-arrival EWMA rises.
             // Residual frames at end-of-press are drained one-per-tick by
             // next_playback_frame() after LIVE_JITTER_DRAIN_AGE_MS.
+            self.note_live_arrival_jitter();
+            let prebuffer = self.effective_live_prebuffer();
             let new_frame = CachedFrame {
                 sender_id: sender_id.to_string(),
                 timestamp,
@@ -615,7 +665,7 @@ impl AudioCache {
                 .unwrap_or(q.len());
             q.insert(pos, new_frame);
 
-            if q.len() > live_jitter_prebuffer_frames() {
+            if q.len() > prebuffer {
                 if let Some(out) = q.pop_front() {
                     return Some(out.samples);
                 }

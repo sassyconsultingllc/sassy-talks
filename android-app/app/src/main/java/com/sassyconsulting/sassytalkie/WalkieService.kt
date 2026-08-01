@@ -565,11 +565,27 @@ class WalkieService : Service() {
                     } else {
                         "idle"
                     }
+                    val nowMs = System.currentTimeMillis()
+                    val liv = pttCoordinator?.liveness
+                    val peerSet = liv?.peerIds().orEmpty()
+                    var bestRtt: Int? = null
+                    var freshestHbAgo: Long? = null
+                    for (pid in peerSet) {
+                        val r = liv?.rttMs(pid) ?: -1
+                        if (r in 1..9_999) {
+                            bestRtt = minOf(bestRtt ?: r, r)
+                        }
+                        val heard = liv?.lastHeardMs(pid) ?: 0L
+                        if (heard > 0L) {
+                            val ago = (nowMs - heard).coerceAtLeast(0L)
+                            freshestHbAgo = minOf(freshestHbAgo ?: ago, ago)
+                        }
+                    }
                     AudioTelemetry.updateNetwork(
                         path = path,
                         wsState = wsState,
-                        rttMs = null,
-                        hbAgoMs = null,
+                        rttMs = bestRtt,
+                        hbAgoMs = freshestHbAgo,
                     )
                     com.sassyconsulting.sassytalkie.debug.DiagnosticsCollector
                         .pushLiveTelemetry(this@WalkieService)
@@ -759,7 +775,7 @@ class WalkieService : Service() {
     private fun registerProcessLifecycleForJitter() {
         if (processLifecycleObserver != null) return
         val prefs = getSharedPreferences("sassy_settings", MODE_PRIVATE)
-        foregroundJitterFrames = prefs.getInt("jitter_prebuffer_frames", 3).coerceIn(1, 12)
+        foregroundJitterFrames = prefs.getInt("jitter_prebuffer_frames", 5).coerceIn(1, 12)
         val observer = object : DefaultLifecycleObserver {
             override fun onStop(owner: LifecycleOwner) {
                 // App backgrounded — thicken jitter buffer so delayed packet

@@ -21,9 +21,10 @@ use log::{info, warn, error};
 use sassytalkie_core::sealed;
 
 /// Max queued packets before dropping oldest.
-/// 128 packets × 20ms = 2.56 seconds of audio buffer — enough to absorb
-/// relay jitter spikes without dropping frames during normal speech.
-const MAX_QUEUE_SIZE: usize = 128;
+/// 256 packets × 20ms = 5.12 seconds of audio buffer — absorbs longer
+/// cellular/relay backpressure spikes (OkHttp send retries, DO wake) without
+/// the drop-oldest path that previously looked like ~30% loss under load.
+const MAX_QUEUE_SIZE: usize = 256;
 
 /// Max single packet size (encrypted audio frame + overhead).
 /// MUST match `wifi_transport::MAX_PACKET_SIZE` (1400): a transmitted frame is
@@ -123,9 +124,11 @@ impl PacketQueue {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// Returns true if queue is more than half full (backpressure signal).
+    /// Returns true if queue is more than ~75% full (backpressure signal).
+    /// Was 50% — too eager for dual-path skip under brief bursts.
     pub fn is_congested(&self) -> bool {
-        self.inner.lock().unwrap().len() > MAX_QUEUE_SIZE / 2
+        let len = self.inner.lock().unwrap().len();
+        len > MAX_QUEUE_SIZE * 3 / 4
     }
 
     /// Pop a packet (FIFO). Returns None if empty.

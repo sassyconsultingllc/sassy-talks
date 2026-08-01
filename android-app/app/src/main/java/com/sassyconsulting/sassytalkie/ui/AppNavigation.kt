@@ -194,12 +194,12 @@ fun AppNavigation(
                 }
                 nativeReady = true
 
-                // Initialize the activity bridge for incoming-audio detection + notifications
+                // Initialize the activity bridge for incoming-audio detection + notifications.
+                // Activity is session-scoped only — do NOT rehydrate disk history (favorites
+                // and speech rows must not linger across days / process restarts).
                 TranscriptionBridge.initialize(context)
-                // v2.7.2: rehydrate the persisted timeline so the user's
-                // "who spoke when" log survives process death. Cheap I/O —
-                // a single small JSON file read.
-                TranscriptionBridge.restoreEntries()
+                TranscriptionBridge.discardPersistedTimeline()
+                TranscriptionBridge.clearEntries()
                 TranscriptionBridge.setEnabled(true)
 
                 // Restore persisted mic settings (gain + squelch). Defaults
@@ -221,7 +221,7 @@ fun AppNavigation(
                 // process death without requiring a Settings visit.
                 SassyTalkNative.setRxGain(micPrefs.getFloat("rx_gain", 1.0f))
                 SassyTalkNative.setSpeakerphone(micPrefs.getBoolean("speakerphone_on", true))
-                SassyTalkNative.setJitterPrebufferFrames(micPrefs.getInt("jitter_prebuffer_frames", 3))
+                SassyTalkNative.setJitterPrebufferFrames(micPrefs.getInt("jitter_prebuffer_frames", 5))
             } else {
                 initFailed = true
             }
@@ -404,6 +404,7 @@ fun AppNavigation(
                 // with the just-imported session_id. Without this, importing
                 // a new session leaves the WS bound to the previous room.
                 autoConnect.disconnect()
+                TranscriptionBridge.clearEntries()
                 currentScreen = Screen.Main
             },
             onSessionMutated = {
@@ -413,12 +414,14 @@ fun AppNavigation(
                 // their WS would stay on the old room while joiners try to
                 // attach to the new one shown in the QR.
                 walkieService?.forceCellularReconnect()
+                TranscriptionBridge.clearEntries()
             },
         ) }
         Screen.Main -> MainScreen(
             onDisconnect = {
                 autoConnect.disconnect()
                 walkieService?.releaseMulticastLock()
+                TranscriptionBridge.clearEntries()
                 currentScreen = Screen.Auth
             },
             onShowUsers = { currentScreen = Screen.Users },

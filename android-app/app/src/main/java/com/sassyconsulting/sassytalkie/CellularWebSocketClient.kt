@@ -43,9 +43,21 @@ class CellularWebSocketClient {
         // still self-heals once connectivity returns (a successful connect
         // resets the attempt counter).
         private const val RECONNECT_FLOOR_MS = 60_000L
-        // The relay force-closes (1008) a socket exceeding ~120 msg/s. Pace the
-        // outbound drain under that so a post-stall burst can't trip it.
+        // The relay force-closes (1008) only after extreme sustained abuse;
+        // soft-drops start at ~120 msg/s. Pace under the soft cap so a
+        // post-stall burst doesn't lose frames to soft-drop either.
         private const val MAX_SENDS_PER_SEC = 100
+        // OkHttp WebSocket.send() returns false when its outbound buffer is
+        // full — previously ignored, which silently dropped frames and looked
+        // like ~30% relay loss under cellular backpressure.
+        private const val SEND_RETRY_MAX = 8
+        private const val SEND_RETRY_SLEEP_MS = 8L
+        // Local counter exposed via getSendDropCount() for diagnostics.
+        @JvmStatic
+        @Volatile
+        var cumulativeSendDrops: Long = 0
+            private set
+        fun noteSendDrop() { cumulativeSendDrops++ }
         // The relay DO reaps any socket silent for >8s (1001 "Heartbeat stale").
         // Send a keepalive comfortably under that when nothing else is (see
         // sendKeepAlive) so a relay-only device doesn't flap-reconnect endlessly.
@@ -230,6 +242,7 @@ class CellularWebSocketClient {
                     }
                 }
                 // Otherwise treat as encrypted audio frame
+                com.sassyconsulting.sassytalkie.debug.AudioTelemetry.onPacketReceived(raw.size)
                 SassyTalkNative.cellularOnMessage(raw)
             }
 
@@ -369,6 +382,36 @@ class CellularWebSocketClient {
         }
     }
 
+    /**
+     * Send [packet] via the WebSocket, retrying briefly when OkHttp's outbound
+     * buffer is full (`send` returns false). Without this, frames were
+     * silently discarded under cellular backpressure and surfaced as high
+     * "relay packet loss" in diagnostics.
+     */
+    private fun sendWithRetry(ws: WebSocket, packet: ByteArray): Boolean {
+        val payload = packet.toByteString()
+        var attempt = 0
+        while (attempt < SEND_RETRY_MAX && isConnected.get()) {
+            val accepted = try {
+                ws.send(payload)
+            } catch (e: Exception) {
+                Log.w(TAG, "WS send threw: ${e.message}")
+                false
+            }
+            if (accepted) return true
+            attempt++
+            try {
+                Thread.sleep(SEND_RETRY_SLEEP_MS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
+        noteSendDrop()
+        Log.w(TAG, "WS send dropped after $SEND_RETRY_MAX retries (${packet.size}B)")
+        return false
+    }
+
     private fun startOutboundPump() {
         if (isRunning.getAndSet(true)) return
 
@@ -386,7 +429,8 @@ class CellularWebSocketClient {
                         val packet = SassyTalkNative.cellularPollOutbound() ?: break
                         if (packet.isEmpty()) break
                         paceSend()
-                        webSocket?.send(packet.toByteString())
+                        val ws = webSocket ?: break
+                        sendWithRetry(ws, packet)
                         sentAny = true
                     }
                     if (!sentAny) {
@@ -426,7 +470,12 @@ class CellularWebSocketClient {
 
     /** Send a raw binary frame via the WebSocket relay. */
     fun sendBinary(bytes: ByteArray) {
-        webSocket?.send(bytes.toByteString())
+        val ws = webSocket ?: return
+        // Control frames (HB / PTT markers) are small and infrequent — still
+        // honour backpressure so we don't silently drop a wake/PTT_START.
+        if (!sendWithRetry(ws, bytes) && BuildConfig.DEBUG) {
+            Log.w(TAG, "sendBinary dropped ${bytes.size}B control frame")
+        }
     }
 
     /** Send a heartbeat ping to the relay (JSON control message) */
@@ -483,7 +532,7 @@ class CellularWebSocketClient {
             0,
             SassyTalkNative.localCapabilities(),
         )
-        webSocket?.send(frame.toByteString())
+        webSocket?.let { sendWithRetry(it, frame) }
     }
 
     /**

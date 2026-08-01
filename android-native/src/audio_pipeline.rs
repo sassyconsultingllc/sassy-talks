@@ -531,8 +531,12 @@ pub struct RxSharedState {
 const MAX_PLAYOUT_QUEUE_FRAMES: usize = 48;
 
 pub const RX_FRAME_PERIOD_MS: u64 = 20;
-pub const RX_MAX_PLC_FRAMES: u64 = 4;
-pub const RX_REORDER_WAIT_MS: u64 = 40;
+pub const RX_MAX_PLC_FRAMES: u64 = 5;
+/// Wait for a late/reordered frame before FEC/PLC. Cellular relay often
+/// delivers adjacent Opus frames 20–60 ms out of order; 40 ms was thin and
+/// forced PLC (audible chop). 60 ms still fits inside the Live jitter
+/// prebuffer budget.
+pub const RX_REORDER_WAIT_MS: u64 = 60;
 
 impl RxSharedState {
     pub fn new() -> Self {

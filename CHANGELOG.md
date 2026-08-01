@@ -9,6 +9,25 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.1.14] — 2026-07-29
+
+### Fixed
+- **Relay soft backpressure.** Durable Object no longer hard-closes sockets on
+  the first rate overshoot or a single `peer.send` failure — soft-drops excess
+  frames and only closes after sustained abuse / consecutive send failures.
+  Text JSON pings now refresh DO liveness; alarm arming left the audio hot path.
+- **Silent OkHttp TX drops.** Cellular outbound pump retries when
+  `WebSocket.send` returns false (buffer full); previously ignored → looked
+  like ~30% relay packet loss under cellular backpressure.
+- **Diagnostics panel.** RX pkt/s wired; RTT/HB age from liveness (incl. relay
+  peers); queue/ws drop counters + local drop %; jitter prebuffer shown.
+
+### Changed
+- Live jitter default **5 frames (100 ms)** + adaptive boost from inter-arrival
+  EWMA; longer reorder wait (60 ms) and drain age (35 ms); cellular queues
+  256 frames; dual-path congestion skip at ~75% full.
+- **Encryption:** no weakening — dual-path already encrypts once; AES-GCM kept.
+
 ## [3.1.13] (65) — 2026-07-27
 
 ### Fixed

@@ -165,8 +165,23 @@ private fun RelaySection(s: AudioTelemetry.State) {
         "  sent=${s.cellularSent}  rx=${s.cellularReceived}  " +
             "q in/out=${s.inboundQueue}/${s.outboundQueue}",
     )
-    if (s.droppedPackets > 0) {
-        Mono("  dropped=${s.droppedPackets}", color = StatusWarning)
+    Mono(
+        "  drop q=${s.droppedPackets}  ws_tx_drop=${s.wsSendDrops}  " +
+            "jitter=${s.jitterPrebufferFrames}f",
+        color = if (s.droppedPackets > 0 || s.wsSendDrops > 0) StatusWarning else TextSecondary,
+    )
+    // Rough local loss signal: queue overflows + OkHttp backpressure drops
+    // relative to frames we believe we sent. Not end-to-end loss (peer RX).
+    if (s.cellularSent > 20L) {
+        val localLoss = s.droppedPackets + s.wsSendDrops
+        val pct = (localLoss * 100.0 / s.cellularSent).coerceAtMost(100.0)
+        if (pct >= 1.0) {
+            Mono(
+                "  local drop ~${String.format("%.0f", pct)}% of TX " +
+                    "(queue/ws — not relay fan-out)",
+                color = StatusWarning,
+            )
+        }
     }
     Mono("  peers=${s.peerCount}  users=${s.usersInRegistry}")
     if (s.cellularReceived > 0 && s.usersInRegistry == 0) {

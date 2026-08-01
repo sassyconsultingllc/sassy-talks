@@ -38,6 +38,11 @@ import kotlinx.coroutines.launch
  * Pipeline: local mic → [LiveCaptionTranslator] → [TranslationManager] (ML Kit).
  * Captions the LOCAL user only (platform SpeechRecognizer cannot ingest remote
  * PCM). Init once from [MainActivity]; release is process-lifetime.
+ *
+ * Speak translation: deferred across PTT — snapshots the last captioned line
+ * at key-up and reads it back after release (STT cannot hear during TX).
+ * TTS ducks for incoming peer audio and holds the recognizer so it does not
+ * caption its own read-back.
  */
 object LiveTranslationBridge {
 
@@ -51,10 +56,14 @@ object LiveTranslationBridge {
     private const val KEY_TIMELINE = "live_translation_timeline"
     /** Delay after PTT release before reclaiming the mic for STT. */
     private const val RESUME_AFTER_PTT_MS = 350L
+    /** Extra beat after PTT before deferred TTS so TX audio fully settles. */
+    private const val POST_PTT_TTS_MS = 180L
     /** Delay before restarting STT after a silent-room give-up. */
     private const val SILENT_RESUME_MS = 2_500L
     /** Periodic health check while captioning should be running. */
     private const val HEALTH_CHECK_MS = 5_000L
+    /** Safety: never hold STT forever if TTS onDone never fires. */
+    private const val TTS_HOLD_TIMEOUT_MS = 12_000L
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -67,10 +76,18 @@ object LiveTranslationBridge {
     private var modelJob: Job? = null
     private var pendingResume: Runnable? = null
     private var pendingSilentResume: Runnable? = null
+    private var pendingTtsFlush: Runnable? = null
+    private var ttsHoldTimeout: Runnable? = null
     private var healthWatchdog: Runnable? = null
     private val lifecycle = LiveTranslationLifecycle()
     /** Deduplicate consecutive identical finals (recognizer can re-emit). */
     @Volatile private var lastFinalKey: String = ""
+    /** Last translation queued for post-PTT / post-RX TTS read-back. */
+    @Volatile private var pendingTtsText: String = ""
+    /** Avoid re-speaking the same deferred line. */
+    @Volatile private var lastSpokenKey: String = ""
+    /** True while post-PTT TTS owns the speaker path — STT stays stopped. */
+    @Volatile private var holdingMicForTts = false
     @Volatile private var processObserverRegistered = false
     @Volatile private var processForegroundHeld = false
 
@@ -142,12 +159,16 @@ object LiveTranslationBridge {
         _targetLang.value = p.getString(KEY_TARGET, TranslationLangDefaults.DEFAULT_TARGET)
             ?: TranslationLangDefaults.DEFAULT_TARGET
         _wifiOnlyModels.value = p.getBoolean(KEY_WIFI_ONLY, true)
-        _ttsEnabled.value = p.getBoolean(KEY_TTS, false)
+        // Sensible default: on for first install so post-PTT read-back is discoverable.
+        _ttsEnabled.value = p.getBoolean(KEY_TTS, true)
         _timelineEnabled.value = p.getBoolean(KEY_TIMELINE, true)
 
         val tm = TranslationManager()
         manager = tm
-        speaker = TranslationSpeaker(app).also { it.setLanguage(_targetLang.value) }
+        speaker = TranslationSpeaker(app).also { sp ->
+            sp.setLanguage(_targetLang.value)
+            sp.onUtteranceDone = { mainHandler.post { onTtsUtteranceFinished() } }
+        }
         val cap = LiveCaptionTranslator(app, tm).apply {
             onMicBusy = { SassyTalkNative.isPttActive() || _pausedForPtt.value }
             setLanguages(_sourceLang.value, _targetLang.value)
@@ -209,10 +230,13 @@ object LiveTranslationBridge {
                 processForegroundHeld = false
                 lifecycle.releaseUi()
             }
+            clearPendingTts()
             speaker?.stop()
+            holdingMicForTts = false
             applyMicAction(action) // STOP from setEnabled(false)
             stopHealthWatchdog()
             lastFinalKey = ""
+            lastSpokenKey = ""
             _caption.value = ""
             _translation.value = ""
         }
@@ -286,7 +310,11 @@ object LiveTranslationBridge {
         if (_ttsEnabled.value == on) return
         _ttsEnabled.value = on
         prefs?.edit()?.putBoolean(KEY_TTS, on)?.apply()
-        if (!on) speaker?.stop()
+        if (!on) {
+            clearPendingTts()
+            speaker?.stop()
+            finishTtsHoldAndMaybeResumeMic()
+        }
     }
 
     fun setTimelineEnabled(on: Boolean) {
@@ -307,11 +335,7 @@ object LiveTranslationBridge {
     fun speakTimelineText(text: String): Boolean {
         val speakable = LiveTranslationText.speakableFromTimeline(text)
         if (speakable.isEmpty()) return false
-        // Ensure TTS engine exists even if the user never opened Settings.
-        val ctx = appContext
-        if (speaker == null && ctx != null) {
-            speaker = TranslationSpeaker(ctx).also { it.setLanguage(_targetLang.value) }
-        }
+        ensureSpeaker()
         val engine = speaker ?: return false
         engine.setLanguage(_targetLang.value)
         mainHandler.post { engine.speak(speakable) }
@@ -355,7 +379,9 @@ object LiveTranslationBridge {
         val action = lifecycle.releaseUi()
         if (action == LiveTranslationLifecycle.MicAction.STOP) {
             cancelPendingResume()
+            clearPendingTts()
             speaker?.stop()
+            holdingMicForTts = false
         }
         applyMicAction(action)
     }
@@ -364,12 +390,25 @@ object LiveTranslationBridge {
      * Yield the mic immediately when PTT keys up. Idempotent — safe to call from
      * both [com.sassyconsulting.sassytalkie.PttCoordinator] and
      * [SassyTalkNative] paths.
+     *
+     * Snapshots the current translation for post-PTT TTS read-back (STT cannot
+     * hear during TX — this is the last captioned line before / at key-up).
      */
     fun onPttStarted() {
         cancelPendingResume()
+        cancelPendingTtsFlush()
+        // Snapshot before STOP so post-PTT read-back has something to speak.
+        if (_ttsEnabled.value && _sourceLang.value != _targetLang.value) {
+            val snap = LiveTranslationText.speakableUtterance(_caption.value, _translation.value)
+            if (snap.isNotBlank()) pendingTtsText = snap
+        }
         val action = lifecycle.onPttStarted()
         _pausedForPtt.value = lifecycle.pausedForPtt
         if (action == LiveTranslationLifecycle.MicAction.STOP) {
+            // If we cut off an in-progress read-back, allow the same line after release.
+            if (holdingMicForTts) lastSpokenKey = ""
+            holdingMicForTts = false
+            cancelTtsHoldTimeout()
             speaker?.stop()
             applyMicAction(action)
         }
@@ -379,6 +418,9 @@ object LiveTranslationBridge {
      * Resume captioning shortly after PTT releases the mic. Coalesces duplicate
      * calls from [SassyTalkNative.pttStop] + [com.sassyconsulting.sassytalkie.PttCoordinator]
      * so the delay is not reset repeatedly on the same release.
+     *
+     * When Speak translation is on, deferred TTS plays first and STT stays
+     * stopped until the utterance ends (so the recognizer does not caption TTS).
      */
     fun onPttReleased() {
         if (!lifecycle.enabled) {
@@ -392,8 +434,19 @@ object LiveTranslationBridge {
             val pttActive = try { SassyTalkNative.isPttActive() } catch (_: Throwable) { false }
             val action = lifecycle.onPttResumeReady(pttActive)
             _pausedForPtt.value = lifecycle.pausedForPtt
-            applyMicAction(action)
-            syncRunningState()
+            if (pttActive || lifecycle.pausedForPtt) {
+                applyMicAction(action)
+                return@Runnable
+            }
+            // Prefer deferred read-back before reclaiming the mic for STT.
+            if (_ttsEnabled.value && pendingTtsText.isNotBlank()) {
+                holdingMicForTts = true
+                applyMicAction(LiveTranslationLifecycle.MicAction.STOP)
+                scheduleDeferredTtsFlush(POST_PTT_TTS_MS)
+            } else {
+                applyMicAction(action)
+                syncRunningState()
+            }
         }
         pendingResume = resume
         mainHandler.postDelayed(resume, RESUME_AFTER_PTT_MS)
@@ -462,18 +515,24 @@ object LiveTranslationBridge {
                 Log.w(TAG, "timeline record failed: ${t.message}")
             }
         }
+        // Skip TTS when source==target (identity) — no new audio value, just echo.
+        val identity = _sourceLang.value == _targetLang.value
+        if (identity) return
+
+        val speakText = LiveTranslationText.speakableUtterance(caption, translation)
+        if (speakText.isBlank()) return
+
         val incoming = try {
             TranscriptionBridge.incomingAudio.value
         } catch (_: Throwable) {
             false
         }
-        // Skip TTS when source==target (identity) — no new audio value, just echo.
-        val identity = _sourceLang.value == _targetLang.value
-        if (!identity &&
-            LiveTranslationText.shouldSpeakTts(_ttsEnabled.value, _pausedForPtt.value, incoming)
-        ) {
-            val speakText = translation.ifBlank { caption }
-            mainHandler.post { speaker?.speak(speakText) }
+        val paused = _pausedForPtt.value || holdingMicForTts
+        when {
+            LiveTranslationText.shouldSpeakTts(_ttsEnabled.value, paused, incoming) ->
+                speakNow(speakText)
+            LiveTranslationText.shouldQueueTts(_ttsEnabled.value, paused, incoming) ->
+                pendingTtsText = speakText
         }
     }
 
@@ -482,16 +541,169 @@ object LiveTranslationBridge {
         scope.launch {
             TranscriptionBridge.incomingAudio.collect { incoming ->
                 if (incoming) {
-                    mainHandler.post { speaker?.stop() }
+                    mainHandler.post {
+                        // Keep the deferred line; only stop active playback.
+                        speaker?.stop()
+                        if (holdingMicForTts) {
+                            // Don't resume STT while a peer is talking — wait for RX end.
+                            holdingMicForTts = false
+                            cancelTtsHoldTimeout()
+                        }
+                    }
+                } else {
+                    mainHandler.post {
+                        if (_ttsEnabled.value &&
+                            pendingTtsText.isNotBlank() &&
+                            !_pausedForPtt.value &&
+                            lifecycle.enabled
+                        ) {
+                            scheduleDeferredTtsFlush(POST_PTT_TTS_MS)
+                        }
+                    }
                 }
             }
         }
+    }
+
+    private fun ensureSpeaker() {
+        val ctx = appContext ?: return
+        if (speaker != null) return
+        speaker = TranslationSpeaker(ctx).also { sp ->
+            sp.setLanguage(_targetLang.value)
+            sp.onUtteranceDone = { mainHandler.post { onTtsUtteranceFinished() } }
+        }
+    }
+
+    private fun speakNow(text: String) {
+        val key = LiveTranslationText.normalizeKey(text)
+        if (key.isEmpty() || key == lastSpokenKey) return
+        ensureSpeaker()
+        val engine = speaker ?: return
+        lastSpokenKey = key
+        pendingTtsText = ""
+        mainHandler.post {
+            // Hold STT while we speak so the recognizer does not caption TTS.
+            holdingMicForTts = true
+            applyMicAction(LiveTranslationLifecycle.MicAction.STOP)
+            val started = engine.speak(text)
+            if (started) {
+                armTtsHoldTimeout()
+            } else {
+                pendingTtsText = text
+                lastSpokenKey = ""
+                finishTtsHoldAndMaybeResumeMic()
+            }
+        }
+    }
+
+    /**
+     * Speak deferred post-PTT / post-RX translation. Holds STT until utterance
+     * completes so the recognizer does not caption the read-back.
+     */
+    private fun scheduleDeferredTtsFlush(delayMs: Long) {
+        cancelPendingTtsFlush()
+        val flush = Runnable {
+            pendingTtsFlush = null
+            flushPendingTts()
+        }
+        pendingTtsFlush = flush
+        mainHandler.postDelayed(flush, delayMs)
+    }
+
+    private fun flushPendingTts() {
+        if (!_ttsEnabled.value || !_enabled.value) {
+            finishTtsHoldAndMaybeResumeMic()
+            return
+        }
+        if (_pausedForPtt.value) return
+        val incoming = try {
+            TranscriptionBridge.incomingAudio.value
+        } catch (_: Throwable) {
+            false
+        }
+        if (incoming) return
+
+        val text = pendingTtsText.trim()
+        if (text.isEmpty()) {
+            finishTtsHoldAndMaybeResumeMic()
+            return
+        }
+        val key = LiveTranslationText.normalizeKey(text)
+        if (key == lastSpokenKey) {
+            pendingTtsText = ""
+            finishTtsHoldAndMaybeResumeMic()
+            return
+        }
+
+        ensureSpeaker()
+        val engine = speaker
+        if (engine == null) {
+            finishTtsHoldAndMaybeResumeMic()
+            return
+        }
+
+        holdingMicForTts = true
+        applyMicAction(LiveTranslationLifecycle.MicAction.STOP)
+        lastSpokenKey = key
+        pendingTtsText = ""
+        val started = engine.speak(text)
+        if (started) {
+            armTtsHoldTimeout()
+        } else {
+            // Not ready yet — restore pending and resume mic; next final can retry.
+            pendingTtsText = text
+            lastSpokenKey = ""
+            finishTtsHoldAndMaybeResumeMic()
+        }
+    }
+
+    private fun onTtsUtteranceFinished() {
+        finishTtsHoldAndMaybeResumeMic()
+    }
+
+    private fun finishTtsHoldAndMaybeResumeMic() {
+        cancelTtsHoldTimeout()
+        val wasHolding = holdingMicForTts
+        holdingMicForTts = false
+        if (!wasHolding) return
+        if (!_enabled.value || _pausedForPtt.value) return
+        val pttActive = try { SassyTalkNative.isPttActive() } catch (_: Throwable) { false }
+        if (pttActive) return
+        syncRunningState()
+    }
+
+    private fun armTtsHoldTimeout() {
+        cancelTtsHoldTimeout()
+        val timeout = Runnable {
+            ttsHoldTimeout = null
+            Log.w(TAG, "TTS hold timed out — resuming captioning")
+            finishTtsHoldAndMaybeResumeMic()
+        }
+        ttsHoldTimeout = timeout
+        mainHandler.postDelayed(timeout, TTS_HOLD_TIMEOUT_MS)
+    }
+
+    private fun cancelTtsHoldTimeout() {
+        ttsHoldTimeout?.let { mainHandler.removeCallbacks(it) }
+        ttsHoldTimeout = null
+    }
+
+    private fun cancelPendingTtsFlush() {
+        pendingTtsFlush?.let { mainHandler.removeCallbacks(it) }
+        pendingTtsFlush = null
+    }
+
+    private fun clearPendingTts() {
+        cancelPendingTtsFlush()
+        cancelTtsHoldTimeout()
+        pendingTtsText = ""
     }
 
     private fun applyMicAction(action: LiveTranslationLifecycle.MicAction) {
         when (action) {
             LiveTranslationLifecycle.MicAction.START ->
                 mainHandler.post {
+                    if (holdingMicForTts) return@post
                     if (lifecycle.shouldRun(
                             try { SassyTalkNative.isPttActive() } catch (_: Throwable) { false }
                         )
@@ -506,6 +718,7 @@ object LiveTranslationBridge {
     }
 
     private fun syncRunningState() {
+        if (holdingMicForTts) return
         val pttActive = try { SassyTalkNative.isPttActive() } catch (_: Throwable) { false }
         if (pttActive && lifecycle.enabled) {
             applyMicAction(lifecycle.onPttStarted())
@@ -563,6 +776,7 @@ object LiveTranslationBridge {
     private fun cancelPendingResume() {
         pendingResume?.let { mainHandler.removeCallbacks(it) }
         pendingResume = null
+        cancelPendingTtsFlush()
         // Also drop silent-room restarts — otherwise a timer armed before
         // disable/PTT could fire and briefly reopen the mic.
         pendingSilentResume?.let { mainHandler.removeCallbacks(it) }
@@ -574,10 +788,11 @@ object LiveTranslationBridge {
      * captioning is still supposed to be active (radio standby is usually silent).
      */
     private fun scheduleSilentResume() {
-        if (!lifecycle.enabled || lifecycle.pausedForPtt) return
+        if (!lifecycle.enabled || lifecycle.pausedForPtt || holdingMicForTts) return
         pendingSilentResume?.let { mainHandler.removeCallbacks(it) }
         val resume = Runnable {
             pendingSilentResume = null
+            if (holdingMicForTts) return@Runnable
             val pttActive = try { SassyTalkNative.isPttActive() } catch (_: Throwable) { false }
             if (!lifecycle.shouldRun(pttActive)) return@Runnable
             if (_status.value == LiveCaptionTranslator.Status.LISTENING) return@Runnable
@@ -600,6 +815,7 @@ object LiveTranslationBridge {
                 healthWatchdog = this
                 val pttActive = try { SassyTalkNative.isPttActive() } catch (_: Throwable) { false }
                 if (lifecycle.shouldRun(pttActive) &&
+                    !holdingMicForTts &&
                     _status.value != LiveCaptionTranslator.Status.LISTENING &&
                     _status.value != LiveCaptionTranslator.Status.UNAVAILABLE
                 ) {

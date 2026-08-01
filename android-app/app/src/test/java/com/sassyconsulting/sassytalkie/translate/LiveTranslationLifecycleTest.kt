@@ -155,6 +155,61 @@ class LiveTranslationTextTest {
     }
 
     @Test
+    fun `shouldQueueTts when blocked by PTT or incoming`() {
+        assertTrue(LiveTranslationText.shouldQueueTts(true, true, false))
+        assertTrue(LiveTranslationText.shouldQueueTts(true, false, true))
+        assertTrue(LiveTranslationText.shouldQueueTts(true, true, true))
+        assertFalse(LiveTranslationText.shouldQueueTts(true, false, false))
+        assertFalse(LiveTranslationText.shouldQueueTts(false, true, false))
+    }
+
+    @Test
+    fun `speakableUtterance prefers translation`() {
+        assertEquals("hola", LiveTranslationText.speakableUtterance("hello", "hola"))
+        assertEquals("hello", LiveTranslationText.speakableUtterance("hello", "  "))
+        assertEquals("", LiveTranslationText.speakableUtterance("  ", ""))
+    }
+
+    @Test
+    fun `needsOfflineSpeechPack detects pack errors`() {
+        assertTrue(LiveTranslationText.needsOfflineSpeechPack("Offline language model not installed"))
+        assertTrue(LiveTranslationText.needsOfflineSpeechPack("Language not supported offline"))
+        assertFalse(LiveTranslationText.needsOfflineSpeechPack("Recognizer busy (PTT using mic?)"))
+        assertFalse(LiveTranslationText.needsOfflineSpeechPack(null))
+    }
+
+    @Test
+    fun `setupHint guides first-run steps`() {
+        val downloading = LiveTranslationText.setupHint(
+            modelsReady = false,
+            modelDownloading = true,
+            modelFailed = false,
+            speechOk = false,
+            wifiOnly = true,
+        )
+        assertTrue(downloading.contains("Step 1"))
+
+        val speech = LiveTranslationText.setupHint(
+            modelsReady = true,
+            modelDownloading = false,
+            modelFailed = false,
+            speechOk = false,
+            wifiOnly = true,
+        )
+        assertTrue(speech.contains("Step 2"))
+        assertTrue(speech.contains("speech pack", ignoreCase = true))
+
+        val ready = LiveTranslationText.setupHint(
+            modelsReady = true,
+            modelDownloading = false,
+            modelFailed = false,
+            speechOk = true,
+            wifiOnly = true,
+        )
+        assertTrue(ready.contains("Ready"))
+    }
+
+    @Test
     fun `speakableFromTimeline prefers translated line`() {
         assertEquals(
             "Hola",

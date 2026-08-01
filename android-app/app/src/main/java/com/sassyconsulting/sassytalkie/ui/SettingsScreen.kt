@@ -39,9 +39,9 @@ private const val KEY_SPEAKERPHONE = "speakerphone_on"
 private const val KEY_JITTER_PREBUFFER = "jitter_prebuffer_frames"
 private const val DEFAULT_RX_GAIN = 1.0f
 private const val DEFAULT_SPEAKERPHONE = true   // walkie-talkie default = loud speaker
-// Matches core DEFAULT_LIVE_JITTER_PREBUFFER_FRAMES (3 = 60 ms). Higher presets
-// (5/8) remain available in the UI for flaky cellular links.
-private const val DEFAULT_JITTER_PREBUFFER = 3
+// Matches core DEFAULT_LIVE_JITTER_PREBUFFER_FRAMES (5 = 100 ms). Lower (3)
+// and higher (8/12) presets remain available for latency vs smoothness.
+private const val DEFAULT_JITTER_PREBUFFER = 5
 // When true, 2..=6 overlapping speakers are PCM-mixed in real time on the
 // receiver instead of being serialized into the legacy Queue. Lets a small
 // group sound like a real conversation (with step-on) instead of a walkie-

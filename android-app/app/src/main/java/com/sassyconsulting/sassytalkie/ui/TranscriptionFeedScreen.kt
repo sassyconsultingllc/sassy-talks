@@ -175,7 +175,7 @@ fun TranscriptionFeedScreen(
                 Text("No activity yet", color = TextGray, fontSize = 16.sp)
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    "Peer speech and live translations land here. Tap play to recall audio, or the translate icon to re-speak a caption.",
+                    "This session's speech and translations appear here. Favorites only pin rows for the current session — Activity clears when you leave or end the session.",
                     color = TextMuted,
                     fontSize = 13.sp,
                 )

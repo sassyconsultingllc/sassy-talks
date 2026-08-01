@@ -71,8 +71,16 @@ function looksLikeTrigger(bytes) {
 // ~2.4x headroom for bursts (e.g. recovery after a brief network stall) but
 // cuts off a runaway client well below the rate that could meaningfully spike
 // DO billing.
+// Soft-drop (don't close) until SOFT_RATE_CLOSE_MULT × the cap within the
+// same window — closing on the first overshoot used to flap the socket and
+// show up as ~20–40% "packet loss" during post-stall catch-up.
 const MAX_MESSAGES_PER_SEC = 120;
+const SOFT_RATE_CLOSE_MULT = 3; // hard-close only at 360 msg/s sustained
 const RATE_WINDOW_MS = 1_000;
+// Consecutive peer.send failures before we force-close that peer. A single
+// backpressured send used to kill the receiver mid-talk (fan-out catch →
+// close), which looked like high loss on the sender's diagnostics.
+const SEND_FAIL_CLOSE_THRESHOLD = 3;
 
 // ── Store-and-forward (async voice / catch-up) ────────────────────────────
 // A bounded, DO-local in-memory ring buffer of the most recent broadcast
@@ -184,6 +192,14 @@ export class PttRoom extends DurableObject {
     // the per-frame copy entirely instead of buffering ~800 frames/sec/room
     // that no one will ever replay.
     this.bufferUntilMs = 0;
+    // Per-peer consecutive send-failure counters (WebSocket → count). Cleared
+    // on a successful send. Not persisted — hibernation resets to zero which
+    // is the safe direction (prefer retry over premature close).
+    this.sendFailCounts = new WeakMap();
+    // Soft-dropped frames this DO lifetime (rate-limit + send-skip). Useful
+    // when correlating client "30% loss" reports against relay behaviour.
+    this.droppedFanout = 0;
+    this.droppedRateLimited = 0;
     // Cache the room name for FCM data payload. Restored from DO storage on
     // wake — without persistence, a wake-message arriving on a hibernated DO
     // would find roomId=null and silently skip FCM fan-out for offline peers.
@@ -315,9 +331,9 @@ export class PttRoom extends DurableObject {
       }
     }
 
-    // Per-socket rate limit. Anyone exceeding MAX_MESSAGES_PER_SEC is closed
-    // immediately; a healthy client never approaches this rate even during
-    // recovery bursts.
+    // Per-socket rate limit. Soft-drop excess frames first; only hard-close
+    // on extreme sustained abuse (SOFT_RATE_CLOSE_MULT × cap). Closing on the
+    // first overshoot caused reconnect flaps that looked like packet loss.
     const rlSession = this.sessions.get(ws);
     if (rlSession) {
       const now = Date.now();
@@ -326,10 +342,14 @@ export class PttRoom extends DurableObject {
         rlSession.msgCount = 0;
       }
       rlSession.msgCount++;
-      if (rlSession.msgCount > MAX_MESSAGES_PER_SEC) {
+      if (rlSession.msgCount > MAX_MESSAGES_PER_SEC * SOFT_RATE_CLOSE_MULT) {
         try { ws.close(1008, "Rate limit exceeded"); } catch {}
         this.sessions.delete(ws);
         return;
+      }
+      if (rlSession.msgCount > MAX_MESSAGES_PER_SEC) {
+        this.droppedRateLimited++;
+        return; // soft-drop this frame; keep the socket
       }
     }
 
@@ -361,12 +381,16 @@ export class PttRoom extends DurableObject {
       }
 
       // Defensive: ensure the sweeper alarm is always armed while sockets
-      // are active. In-memory flag — no per-frame storage read. Worst case
-      // after hibernation: alarm doesn't fire for one extra SWEEP_INTERVAL_MS
-      // until the next message; acceptable.
+      // are active. Optimistic in-memory flag + waitUntil so the audio
+      // fan-out never awaits a storage round-trip on the hot path (that
+      // serialization was a contributor to bursty delivery / perceived loss
+      // right after hibernation wake).
       if (!this.alarmArmed) {
-        await this.ctx.storage.setAlarm(Date.now() + SWEEP_INTERVAL_MS);
         this.alarmArmed = true;
+        this.ctx.waitUntil(
+          this.ctx.storage.setAlarm(Date.now() + SWEEP_INTERVAL_MS)
+            .catch(() => { this.alarmArmed = false; }),
+        );
       }
 
       // Binary broadcast to all other peers
@@ -374,13 +398,7 @@ export class PttRoom extends DurableObject {
       const sockets = this.ctx.getWebSockets();
       for (const peer of sockets) {
         if (peer !== ws) {
-          try {
-            peer.send(message);
-          } catch {
-            // Send failed — peer is dead. Force-close so it gets cleaned up.
-            try { peer.close(1011, "Send failed"); } catch { /* already closed */ }
-            this.sessions.delete(peer);
-          }
+          this.safeSend(peer, message);
         }
       }
 
@@ -442,10 +460,43 @@ export class PttRoom extends DurableObject {
     try {
       const parsed = JSON.parse(message);
       if (parsed.type === "ping") {
-        ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
+        // Text ping must refresh liveness too — otherwise a client that only
+        // emits JSON keepalives (or OkHttp protocol pings that never reach
+        // this handler) still gets reaped at HEARTBEAT_STALE_MS.
+        const sess = this.sessions.get(ws);
+        if (sess) {
+          sess.lastSeenMs = Date.now();
+          try { ws.serializeAttachment(sess); } catch { /* ignore */ }
+        }
+        try {
+          ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
+        } catch { /* peer gone */ }
       }
     } catch {
       // Ignore malformed JSON
+    }
+  }
+
+  /**
+   * Fan-out send with soft backpressure. One failed send no longer kills the
+   * peer mid-utterance; we only force-close after SEND_FAIL_CLOSE_THRESHOLD
+   * consecutive failures.
+   */
+  safeSend(peer, message) {
+    try {
+      peer.send(message);
+      this.sendFailCounts.delete(peer);
+      return true;
+    } catch {
+      const fails = (this.sendFailCounts.get(peer) || 0) + 1;
+      this.sendFailCounts.set(peer, fails);
+      this.droppedFanout++;
+      if (fails >= SEND_FAIL_CLOSE_THRESHOLD) {
+        try { peer.close(1011, "Send failed"); } catch { /* already closed */ }
+        this.sessions.delete(peer);
+        this.sendFailCounts.delete(peer);
+      }
+      return false;
     }
   }
 
@@ -471,7 +522,7 @@ export class PttRoom extends DurableObject {
         const frame = buildPartnerOfflineFrame(session.peer || session.id || "unknown");
         for (const peer of this.ctx.getWebSockets()) {
           if (peer !== ws) {
-            try { peer.send(frame); } catch {}
+            this.safeSend(peer, frame);
           }
         }
         try { ws.close(1001, "Heartbeat stale"); } catch {}
@@ -518,7 +569,7 @@ export class PttRoom extends DurableObject {
     // keying on session.id meant the offline notice never matched a partner.
     const offlineFrame = buildPartnerOfflineFrame(session.peer || session.id || "unknown");
     for (const peer of sockets) {
-      try { peer.send(offlineFrame); } catch {}
+      this.safeSend(peer, offlineFrame);
     }
   }
 
@@ -664,13 +715,7 @@ export class PttRoom extends DurableObject {
     const sockets = this.ctx.getWebSockets();
     for (const peer of sockets) {
       if (peer !== sender) {
-        try {
-          peer.send(message);
-        } catch {
-          // Dead socket — force-close
-          try { peer.close(1011, "Broadcast failed"); } catch { /* ignore */ }
-          this.sessions.delete(peer);
-        }
+        this.safeSend(peer, message);
       }
     }
   }

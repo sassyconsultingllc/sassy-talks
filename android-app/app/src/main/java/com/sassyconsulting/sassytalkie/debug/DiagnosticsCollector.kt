@@ -4,6 +4,7 @@
 package com.sassyconsulting.sassytalkie.debug
 
 import android.content.Context
+import com.sassyconsulting.sassytalkie.CellularWebSocketClient
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.WalkieService
 import org.json.JSONObject
@@ -54,6 +55,12 @@ object DiagnosticsCollector {
             val channel = try { SassyTalkNative.getChannel() } catch (_: Throwable) { 0 }
             val roomMatch = sessionRoom.isEmpty() || cell.room.isEmpty() ||
                 sessionRoom == cell.room
+            val jitterFrames = try {
+                SassyTalkNative.getJitterPrebufferFrames()
+            } catch (_: Throwable) { 0 }
+            val wsDrops = try {
+                CellularWebSocketClient.cumulativeSendDrops
+            } catch (_: Throwable) { 0L }
 
             AudioTelemetry.updateRelay(
                 relayRoom = sessionRoom.ifEmpty { cell.room },
@@ -68,6 +75,8 @@ object DiagnosticsCollector {
                 peerCount = peers,
                 usersInRegistry = users,
                 roomMatch = roomMatch,
+                wsSendDrops = wsDrops,
+                jitterPrebufferFrames = jitterFrames,
             )
         } catch (_: Throwable) { /* native not ready */ }
     }
@@ -112,6 +121,18 @@ object DiagnosticsCollector {
         line("sent / received", "${cell.sent} / ${cell.received}")
         line("in / out queue", "${cell.inboundQueue} / ${cell.outboundQueue}")
         line("dropped packets", cell.dropped)
+        line("ws send drops", try { CellularWebSocketClient.cumulativeSendDrops } catch (_: Throwable) { 0 })
+        line("jitter prebuffer", try { SassyTalkNative.getJitterPrebufferFrames() } catch (_: Throwable) { "?" })
+        line("rtt / hb ago", run {
+            val liv = walkieService?.pttCoordinator?.liveness
+            val now = System.currentTimeMillis()
+            val peers = liv?.peerIds().orEmpty()
+            val rtt = peers.mapNotNull { id -> liv?.rttMs(id)?.takeIf { it in 1..9999 } }.minOrNull()
+            val hb = peers.mapNotNull { id ->
+                liv?.lastHeardMs(id)?.takeIf { it > 0 }?.let { now - it }
+            }.minOrNull()
+            "${rtt?.let { "${it}ms" } ?: "--"} / ${hb?.let { "${it}ms" } ?: "--"}"
+        })
 
         line("---", "--- Peers ---")
         val peers = walkieService?.pttCoordinator?.peerIds?.value?.size

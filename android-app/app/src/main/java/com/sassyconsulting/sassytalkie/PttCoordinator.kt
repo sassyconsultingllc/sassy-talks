@@ -675,8 +675,15 @@ class PttCoordinator(
                     rttMs  = 0,
                     caps   = SassyTalkNative.localCapabilities(),
                 )
-                // Track sent heartbeat for RTT measurement per peer
-                for (peerId in bleSignaling.blePeerAddresses) {
+                // Track sent heartbeat for RTT measurement per peer. Include
+                // already-tracked relay peers (relay:<epoch>) — previously only
+                // BLE addresses were registered, so cellular RTT always stayed
+                // unknown and the diagnostics panel showed "--".
+                val hbTargets = LinkedHashSet<String>().apply {
+                    addAll(bleSignaling.blePeerAddresses)
+                    addAll(liveness.peerIds())
+                }
+                for (peerId in hbTargets) {
                     liveness.onHeartbeatSent(peerId, selfEpoch, seq, nowMs)
                 }
                 bleSignaling.broadcastControl(frame)

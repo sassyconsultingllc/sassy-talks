@@ -252,6 +252,8 @@ impl TransportManager {
         // (dual-path: local peers get multicast, remote peers get relay)
         if matches!(self.active, ActiveTransport::Wifi | ActiveTransport::WifiDirect) {
             if self.cellular.get_state() == CellularState::Connected {
+                // Soft-skip only near full; half-full dual-path skips looked
+                // like cellular loss while WiFi peers still heard audio.
                 if self.cellular.is_outbound_congested() {
                     warn!("Dual-path: relay outbound queue congested, skipping relay send");
                 } else if let Err(e) = self.cellular.send_audio(&payload) {
