@@ -75,6 +75,15 @@ class WalkieService : Service() {
         @Volatile
         var isRunning: Boolean = false
             private set
+
+        /**
+         * How long focus + comm-mode stay engaged after the last inbound
+         * audio frame. 5s covers the natural pause between rapid back-and-
+         * forth ("copy?" "yeah"), so the second burst plays without paying
+         * the setup cost. Longer would keep the phone line "busy" past
+         * conversational usefulness; shorter would chop every reply.
+         */
+        private const val RX_STAY_HOT_MS: Long = 5_000L
     }
 
     inner class LocalBinder : Binder() {
@@ -142,7 +151,13 @@ class WalkieService : Service() {
             Log.w(TAG, "LiveTranslationBridge init failed: ${t.message}")
         }
         startTranslationNotificationBridge()
-        requestRadioAudioFocus()
+        // Do NOT request audio focus here. Holding focus with
+        // USAGE_VOICE_COMMUNICATION for the whole service lifetime tells
+        // Android "a voice call is in progress" — the volume rocker snaps
+        // to STREAM_VOICE_CALL and the telephony stack treats the phone
+        // line as busy, which blocks conference-call add-line and normal
+        // dialer routing. Focus is now scoped to actual RX bursts by
+        // [noteInboundRx]/[rxWakeHoldJob].
         startInboundAudioWatch()
         registerProcessLifecycleForJitter()
     }
@@ -668,14 +683,28 @@ class WalkieService : Service() {
         }
     }
 
-    /** Hold WakeLock across an inbound RX burst; resets silence timer. */
+    /**
+     * Called for every inbound audio frame — engages focus + starts a "stay
+     * hot" window so back-to-back bursts don't pay the focus/comm-mode
+     * setup cost on every "yeah"/"copy".
+     *
+     * Stay-hot window: [RX_STAY_HOT_MS]. Longer than a natural pause between
+     * quick replies (~2s), shorter than a break in conversation, so the
+     * phone-line-busy signal doesn't linger longer than the user expects.
+     *
+     * WakeLock: refreshed here too; its own 3-minute timeout backstops us.
+     */
     fun noteInboundRx() {
         renewActivityWakeLock()
         if (!hasAudioFocus) requestRadioAudioFocus()
         rxWakeHoldJob?.cancel()
         rxWakeHoldJob = serviceScope.launch {
-            delay(3_000L)
-            // WakeLock expires on its own timeout; silence ends the burst hold.
+            delay(RX_STAY_HOT_MS)
+            // Silence ended the burst — release focus so the volume rocker
+            // stops adjusting STREAM_VOICE_CALL and the OS considers the
+            // phone line free again (conference-call add-line, incoming
+            // ring routing, etc. all depend on this).
+            abandonRadioAudioFocus()
         }
     }
 

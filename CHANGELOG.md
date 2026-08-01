@@ -9,6 +9,42 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.1.15] (67) — 2026-08-01
+
+### Fixed
+- **"Takes up a phone line" while service runs.** WalkieService no longer holds
+  `AudioFocusRequest(USAGE_VOICE_COMMUNICATION)` for its whole lifetime; that
+  told Android a voice call was in progress, snapped the volume rocker to
+  `STREAM_VOICE_CALL`, and blocked conference-call add-line + normal dialer
+  routing. Focus is now requested on the first inbound audio frame and
+  abandoned after 5 s of silence (stay-hot window keeps back-to-back "copy?"
+  bursts snappy).
+- **Same for `MODE_IN_COMMUNICATION` on Moto/Xiaomi.** The Rust RX thread
+  released `AudioTrack` + comm-mode only when the whole session ended;
+  now releases after 5 s of silence and re-engages on the next burst,
+  matching the Kotlin stay-hot window so the phone stays "free" between
+  transmissions on quirked devices.
+- **VPN/backpressure stall latency.** Cellular WS retry ceiling cut 64 ms →
+  15 ms (`SEND_RETRY_MAX` 8→3, `SEND_RETRY_SLEEP_MS` 8→5). Outbound queue's
+  drop-oldest policy still handles loss shaping; pump now moves on 4× faster
+  when the socket buffer is chronically full.
+
+### Changed
+- **Adaptive jitter visible.** `AudioCache.status_json` now exposes
+  `jitter_base_frames`, `jitter_adaptive_extra`, `jitter_effective_frames`,
+  and `jitter_ewma_ms`. Diagnostics dump + debug overlay show
+  `base+extra=effective, ewma=Xms` so you can see the controller reacting.
+- **Adaptive controller test.** Unit test proves
+  `note_live_arrival_jitter` climbs under sustained 60 ms gaps and decays
+  back to 0 under steady 20 ms arrivals.
+
+### Deferred
+- **Real UDP transport.** Cloudflare Workers still has no WebTransport
+  server termination ([workerd#6454](https://github.com/cloudflare/workerd/discussions/6454)),
+  so #1 from the "remove jitter" plan is unshippable here. Real UDP requires
+  either WebRTC data channels (Android + iOS + Tauri) or moving the relay
+  off Workers to a host that speaks HTTP/3 — both need explicit sign-off.
+
 ## [3.1.14] — 2026-07-29
 
 ### Fixed

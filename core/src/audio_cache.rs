@@ -434,6 +434,17 @@ impl AudioCache {
         (live_jitter_prebuffer_frames() + self.live_adaptive_extra).min(16)
     }
 
+    /// Extra frames the adaptive controller is currently adding on top of the
+    /// runtime setting. Exposed for diagnostics/telemetry.
+    #[inline]
+    pub fn adaptive_extra_frames(&self) -> usize { self.live_adaptive_extra }
+
+    /// Current EWMA of |inter-arrival gap − 20 ms| in milliseconds. Exposed
+    /// for diagnostics/telemetry so the overlay can show the controller's
+    /// input, not just its output.
+    #[inline]
+    pub fn jitter_ewma_ms(&self) -> f32 { self.live_jitter_ewma_ms }
+
     /// Update adaptive extra frames from inter-arrival gap vs the nominal
     /// 20 ms Opus period. Decays toward 0 when the link is steady.
     fn note_live_arrival_jitter(&mut self) {
@@ -1149,6 +1160,10 @@ impl AudioCache {
             "current_speaker_name": status.current_speaker_name,
             "speakers_in_queue": status.speakers_in_queue,
             "history_count": self.history.len(),
+            "jitter_base_frames": live_jitter_prebuffer_frames(),
+            "jitter_adaptive_extra": self.live_adaptive_extra,
+            "jitter_effective_frames": self.effective_live_prebuffer(),
+            "jitter_ewma_ms": (self.live_jitter_ewma_ms * 10.0).round() / 10.0,
         }).to_string()
     }
 
@@ -1656,6 +1671,45 @@ mod tests {
         let json = cache.status_json();
         assert!(json.contains("\"mode\":\"Live\""));
         assert!(json.contains("\"queued_utterances\":0"));
+        assert!(json.contains("\"jitter_base_frames\""));
+        assert!(json.contains("\"jitter_adaptive_extra\":0"));
+        assert!(json.contains("\"jitter_effective_frames\""));
+        assert!(json.contains("\"jitter_ewma_ms\""));
+    }
+
+    #[test]
+    fn test_adaptive_extra_climbs_under_jitter_and_decays_when_steady() {
+        let mut cache = AudioCache::new();
+        // Baseline: no arrivals yet.
+        assert_eq!(cache.adaptive_extra_frames(), 0);
+        assert!(cache.jitter_ewma_ms() < 0.01);
+
+        // Simulate several noisy arrivals with ~60ms gaps (nominal 20ms, err=40ms).
+        // EWMA update is 0.85*prev + 0.15*err; needs a few iterations to climb.
+        for _ in 0..40 {
+            cache.live_arrival_last = Some(Instant::now() - Duration::from_millis(60));
+            cache.note_live_arrival_jitter();
+        }
+        assert!(
+            cache.adaptive_extra_frames() >= 2,
+            "expected controller to boost >=2 frames under sustained 60ms gaps, got {} (ewma={:.1}ms)",
+            cache.adaptive_extra_frames(),
+            cache.jitter_ewma_ms(),
+        );
+
+        // Simulate a long stretch of on-time arrivals (~20ms gaps, err=0).
+        // EWMA decays 15% per sample toward zero.
+        for _ in 0..60 {
+            cache.live_arrival_last = Some(Instant::now() - Duration::from_millis(20));
+            cache.note_live_arrival_jitter();
+        }
+        assert_eq!(
+            cache.adaptive_extra_frames(),
+            0,
+            "expected controller to decay back to 0 under steady arrivals, got {} (ewma={:.1}ms)",
+            cache.adaptive_extra_frames(),
+            cache.jitter_ewma_ms(),
+        );
     }
 
     #[test]

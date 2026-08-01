@@ -62,6 +62,20 @@ object DiagnosticsCollector {
                 CellularWebSocketClient.cumulativeSendDrops
             } catch (_: Throwable) { 0L }
 
+            // Adaptive jitter: piggyback on the cache-status JSON so we don't
+            // need a second JNI round-trip.
+            var adaptiveExtra = 0
+            var effectiveFrames = jitterFrames
+            var ewmaMs = 0f
+            try {
+                val cacheJson = SassyTalkNative.getCacheStatus()
+                if (cacheJson != null) {
+                    adaptiveExtra = cacheJson.optInt("jitter_adaptive_extra", 0)
+                    effectiveFrames = cacheJson.optInt("jitter_effective_frames", jitterFrames)
+                    ewmaMs = cacheJson.optDouble("jitter_ewma_ms", 0.0).toFloat()
+                }
+            } catch (_: Throwable) { /* native not ready or older core */ }
+
             AudioTelemetry.updateRelay(
                 relayRoom = sessionRoom.ifEmpty { cell.room },
                 cellularState = cell.state,
@@ -77,6 +91,9 @@ object DiagnosticsCollector {
                 roomMatch = roomMatch,
                 wsSendDrops = wsDrops,
                 jitterPrebufferFrames = jitterFrames,
+                jitterAdaptiveExtra = adaptiveExtra,
+                jitterEffectiveFrames = effectiveFrames,
+                jitterEwmaMs = ewmaMs,
             )
         } catch (_: Throwable) { /* native not ready */ }
     }
@@ -123,6 +140,14 @@ object DiagnosticsCollector {
         line("dropped packets", cell.dropped)
         line("ws send drops", try { CellularWebSocketClient.cumulativeSendDrops } catch (_: Throwable) { 0 })
         line("jitter prebuffer", try { SassyTalkNative.getJitterPrebufferFrames() } catch (_: Throwable) { "?" })
+        line("jitter adaptive", run {
+            try {
+                val c = SassyTalkNative.getCacheStatus()
+                if (c == null) "?" else "+${c.optInt("jitter_adaptive_extra", 0)}f (ewma ${
+                    String.format("%.1f", c.optDouble("jitter_ewma_ms", 0.0))
+                }ms → eff ${c.optInt("jitter_effective_frames", 0)}f)"
+            } catch (_: Throwable) { "?" }
+        })
         line("rtt / hb ago", run {
             val liv = walkieService?.pttCoordinator?.liveness
             val now = System.currentTimeMillis()

@@ -68,6 +68,9 @@ object AudioTelemetry {
         val droppedPackets: Long = 0,
         val wsSendDrops: Long = 0,
         val jitterPrebufferFrames: Int = 0,
+        val jitterAdaptiveExtra: Int = 0,
+        val jitterEffectiveFrames: Int = 0,
+        val jitterEwmaMs: Float = 0f,
         val activeChannel: Int = 0,
         val peerCount: Int = 0,
         val usersInRegistry: Int = 0,
@@ -159,6 +162,9 @@ object AudioTelemetry {
         roomMatch: Boolean,
         wsSendDrops: Long = 0,
         jitterPrebufferFrames: Int = 0,
+        jitterAdaptiveExtra: Int = 0,
+        jitterEffectiveFrames: Int = 0,
+        jitterEwmaMs: Float = 0f,
     ) = _state.update {
         it.copy(
             relayRoom = relayRoom,
@@ -175,6 +181,9 @@ object AudioTelemetry {
             roomMatch = roomMatch,
             wsSendDrops = wsSendDrops,
             jitterPrebufferFrames = jitterPrebufferFrames,
+            jitterAdaptiveExtra = jitterAdaptiveExtra,
+            jitterEffectiveFrames = jitterEffectiveFrames,
+            jitterEwmaMs = jitterEwmaMs,
         )
     }
 

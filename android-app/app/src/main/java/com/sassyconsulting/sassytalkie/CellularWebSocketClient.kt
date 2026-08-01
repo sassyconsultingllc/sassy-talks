@@ -50,8 +50,16 @@ class CellularWebSocketClient {
         // OkHttp WebSocket.send() returns false when its outbound buffer is
         // full — previously ignored, which silently dropped frames and looked
         // like ~30% relay loss under cellular backpressure.
-        private const val SEND_RETRY_MAX = 8
-        private const val SEND_RETRY_SLEEP_MS = 8L
+        //
+        // 3×5 ms = 15 ms retry ceiling (was 8×8 ms = 64 ms). Longer ceilings
+        // help throughput on a briefly-stalled link but hurt real-time audio:
+        // during the block the pump can't advance to newer frames, and 40 ms
+        // of stall = 2 dropped Opus frames of listener-side latency. The
+        // outbound queue already drop-oldests on overflow (cellular_transport.rs
+        // PacketQueue), so giving up faster loses at most one frame per stall
+        // instead of piling latency behind a doomed one.
+        private const val SEND_RETRY_MAX = 3
+        private const val SEND_RETRY_SLEEP_MS = 5L
         // Local counter exposed via getSendDropCount() for diagnostics.
         @JvmStatic
         @Volatile

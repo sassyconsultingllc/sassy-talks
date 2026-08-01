@@ -170,6 +170,16 @@ private fun RelaySection(s: AudioTelemetry.State) {
             "jitter=${s.jitterPrebufferFrames}f",
         color = if (s.droppedPackets > 0 || s.wsSendDrops > 0) StatusWarning else TextSecondary,
     )
+    // Adaptive prebuffer: base + N extra = effective (ewma of |gap − 20 ms|).
+    // Highlight when the controller is actively boosting (>0) — that's the
+    // signal that the link is jittering enough to warrant extra latency.
+    if (s.jitterEffectiveFrames > 0 || s.jitterAdaptiveExtra > 0) {
+        Mono(
+            "  jb ${s.jitterPrebufferFrames}+${s.jitterAdaptiveExtra}=${s.jitterEffectiveFrames}f  " +
+                "ewma=${String.format("%.1f", s.jitterEwmaMs)}ms",
+            color = if (s.jitterAdaptiveExtra >= 2) StatusWarning else TextSecondary,
+        )
+    }
     // Rough local loss signal: queue overflows + OkHttp backpressure drops
     // relative to frames we believe we sent. Not end-to-end loss (peer RX).
     if (s.cellularSent > 20L) {

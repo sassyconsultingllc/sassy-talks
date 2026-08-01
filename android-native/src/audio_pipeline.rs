@@ -689,6 +689,14 @@ pub fn spawn_rx_thread(
             let mut cell_buffer = vec![0u8; 2048];
             let mut playback_started = false;
             let mut pacer = PlayoutPacer::new();
+            let mut last_write_at: Option<Instant> = None;
+            // Release AudioTrack + MODE_IN_COMMUNICATION (via stop_playing)
+            // when we've been silent this long. Matches the Kotlin
+            // WalkieService `RX_STAY_HOT_MS` window — after this the phone
+            // line is free again (volume rocker stops adjusting
+            // STREAM_VOICE_CALL, dialer conference-add can join, etc.).
+            // Next inbound frame re-arms start_playing → engage_comm_mode.
+            const RX_STAY_HOT: Duration = Duration::from_millis(5_000);
 
             while rx_running.load(Ordering::SeqCst) {
                 let mut received_any = false;
@@ -765,10 +773,24 @@ pub fn spawn_rx_thread(
                     }
                     let eng = audio.lock().unwrap();
                     let _ = eng.write_audio(&samples);
+                    last_write_at = Some(Instant::now());
                 }
 
                 let playout_empty = rx_shared.lock().unwrap().playout_pending() == 0;
                 if !received_any && playout_empty {
+                    // Idle burst-end: release AudioTrack + comm-mode so the
+                    // phone-line-busy signal doesn't persist between bursts.
+                    // Next inbound audio triggers start_playing → re-engage.
+                    if playback_started {
+                        if let Some(last) = last_write_at {
+                            if last.elapsed() >= RX_STAY_HOT {
+                                let eng = audio.lock().unwrap();
+                                let _ = eng.stop_playing();
+                                playback_started = false;
+                                last_write_at = None;
+                            }
+                        }
+                    }
                     thread::sleep(Duration::from_millis(5));
                 }
             }
