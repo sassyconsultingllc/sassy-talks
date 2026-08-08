@@ -9,6 +9,21 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.1.16] (68) — 2026-08-08
+
+### Fixed
+- **x86_64 devices shipped three releases of stale native code.** The committed
+  `jniLibs/x86_64/libsassytalkie.so` was last built 2026-07-26, but the Rust
+  sources changed in 3.1.13, 3.1.14, and 3.1.15 (BT RFCOMM gate, RX priority,
+  adaptive jitter, comm-mode stay-hot release). Only the arm64-v8a lib was
+  rebuilt for those releases, so Chromebooks, x86 tablets, and every emulator
+  ran 3.1.12-era audio/transport code while reporting 3.1.15. Both ABIs are
+  now rebuilt from the same tree in one `cargo ndk` invocation.
+
+### Changed
+- Fresh native build of `libsassytalkie.so` for arm64-v8a + x86_64. No Kotlin
+  or Rust source changes — this release exists to correct the shipped binary.
+
 ## [3.1.15] (67) — 2026-08-01
 
 ### Fixed
