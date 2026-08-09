@@ -26,7 +26,7 @@
 //! counters, and the audio TX path must not pay for a mutex or a fence.
 //! Everything here is written from the hot path and read ~1/s by the UI.
 
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 /// Mic frames handed to the encoder.
 static FRAMES_CAPTURED: AtomicU64 = AtomicU64::new(0);
@@ -54,6 +54,50 @@ static REPLAY_REJECTED: AtomicU64 = AtomicU64::new(0);
 /// asked when someone reports one-way audio.
 static LAST_TX_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_RX_OK_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Debug-only crypto tracing. When on, the first bytes of each audio frame are
+/// logged BEFORE and AFTER encryption so an operator can confirm with their own
+/// eyes that what leaves the device is not the plaintext.
+///
+/// Gated behind an explicit runtime toggle AND compiled behaviour that only the
+/// diagnostic tooling enables: this logs fragments of live microphone audio, so
+/// it must never be on during normal use.
+static CRYPTO_TRACE: AtomicBool = AtomicBool::new(false);
+static TRACE_REMAINING: AtomicI32 = AtomicI32::new(0);
+
+pub fn set_crypto_trace(on: bool, frames: i32) {
+    CRYPTO_TRACE.store(on, Ordering::Relaxed);
+    TRACE_REMAINING.store(if on { frames } else { 0 }, Ordering::Relaxed);
+}
+
+pub fn crypto_trace_enabled() -> bool {
+    CRYPTO_TRACE.load(Ordering::Relaxed) && TRACE_REMAINING.load(Ordering::Relaxed) > 0
+}
+
+fn hex_prefix(b: &[u8], n: usize) -> String {
+    b.iter().take(n).map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+/// Log one frame's plaintext and ciphertext prefixes. Bounded by the frame
+/// budget passed to [set_crypto_trace] so a forgotten toggle cannot stream
+/// audio fragments into logcat indefinitely.
+pub fn trace_crypto(plain: &[u8], cipher: &[u8]) {
+    if !crypto_trace_enabled() {
+        return;
+    }
+    let left = TRACE_REMAINING.fetch_sub(1, Ordering::Relaxed);
+    if left <= 0 {
+        return;
+    }
+    log::info!(
+        "CRYPTO_TRACE frame#{} PLAIN len={} [{}] -> CIPHER len={} [{}] (nonce is the leading 12B)",
+        left,
+        plain.len(),
+        hex_prefix(plain, 16),
+        cipher.len(),
+        hex_prefix(cipher, 16),
+    );
+}
 
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};

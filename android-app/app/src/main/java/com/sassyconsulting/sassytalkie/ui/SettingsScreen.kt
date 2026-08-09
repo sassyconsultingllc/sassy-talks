@@ -78,6 +78,14 @@ fun SettingsScreen(
     var relayEnabled by remember { mutableStateOf(prefs.getBoolean(KEY_ENABLE_RELAY, true)) }
     // v2.7.5 playback state
     var rxGain by remember { mutableFloatStateOf(prefs.getFloat(KEY_RX_GAIN, DEFAULT_RX_GAIN)) }
+
+    // PTT geometry. Defaults come from the same helper the radio screen reads,
+    // so "reset" and "first run" cannot drift apart.
+    var pttSize by remember { mutableFloatStateOf(prefs.getFloat(KEY_PTT_SIZE, PTT_DEFAULT_SIZE)) }
+    var pttWidth by remember { mutableFloatStateOf(prefs.getFloat(KEY_PTT_WIDTH_SCALE, PTT_DEFAULT_WIDTH_SCALE)) }
+    var pttRound by remember { mutableFloatStateOf(prefs.getFloat(KEY_PTT_CIRCULARITY, PTT_DEFAULT_CIRCULARITY)) }
+    var pttOffX by remember { mutableFloatStateOf(prefs.getFloat(KEY_PTT_OFFSET_X, 0f)) }
+    var pttOffY by remember { mutableFloatStateOf(prefs.getFloat(KEY_PTT_OFFSET_Y, 0f)) }
     var speakerphoneOn by remember { mutableStateOf(prefs.getBoolean(KEY_SPEAKERPHONE, DEFAULT_SPEAKERPHONE)) }
     var jitterFrames by remember { mutableIntStateOf(prefs.getInt(KEY_JITTER_PREBUFFER, DEFAULT_JITTER_PREBUFFER)) }
     // Sync mix-mode state from native on first composition so the toggle
@@ -140,6 +148,89 @@ fun SettingsScreen(
                         prefs.edit().putBoolean(KEY_LOCK_SCREEN_PTT, enabled).apply()
                     }
                 )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // PTT button geometry. A fixed centred circle assumes one grip; in
+            // practice the radio gets held left-handed, right-handed, thumbed
+            // from the bottom edge, or palmed in a mount. Every dimension is
+            // adjustable, and shape is a spectrum rather than a preset list.
+            SettingsCard(title = "PTT Button") {
+                Text(
+                    text = "Shape and place the talk button for how you actually hold the radio. Changes apply when you return to the radio screen.",
+                    fontSize = 11.sp,
+                    color = TextMuted
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+
+                PttSlider(
+                    label = "Size",
+                    valueLabel = "${pttSize.toInt()} dp tall",
+                    value = pttSize,
+                    range = 140f..340f,
+                    onChange = { pttSize = it },
+                    onCommit = { prefs.edit().putFloat(KEY_PTT_SIZE, pttSize).apply() },
+                )
+                PttSlider(
+                    label = "Width",
+                    valueLabel = String.format("%.2fx (%d dp wide)", pttWidth, (pttSize * pttWidth).toInt()),
+                    value = pttWidth,
+                    range = 0.8f..2.0f,
+                    onChange = { pttWidth = it },
+                    onCommit = { prefs.edit().putFloat(KEY_PTT_WIDTH_SCALE, pttWidth).apply() },
+                )
+                PttSlider(
+                    label = "Roundness",
+                    valueLabel = when {
+                        pttRound >= 99f -> "100% — circle / stadium"
+                        pttRound <= 1f -> "0% — rectangle"
+                        else -> "${pttRound.toInt()}% — rounded rect"
+                    },
+                    value = pttRound,
+                    range = 0f..100f,
+                    onChange = { pttRound = it },
+                    onCommit = { prefs.edit().putFloat(KEY_PTT_CIRCULARITY, pttRound).apply() },
+                )
+                PttSlider(
+                    label = "Position X",
+                    valueLabel = "${pttOffX.toInt()} dp",
+                    value = pttOffX,
+                    range = -120f..120f,
+                    onChange = { pttOffX = it },
+                    onCommit = { prefs.edit().putFloat(KEY_PTT_OFFSET_X, pttOffX).apply() },
+                )
+                PttSlider(
+                    label = "Position Y",
+                    valueLabel = "${pttOffY.toInt()} dp",
+                    value = pttOffY,
+                    range = -120f..120f,
+                    onChange = { pttOffY = it },
+                    onCommit = { prefs.edit().putFloat(KEY_PTT_OFFSET_Y, pttOffY).apply() },
+                )
+
+                Spacer(modifier = Modifier.height(6.dp))
+                OutlinedButton(
+                    onClick = {
+                        pttSize = PTT_DEFAULT_SIZE
+                        pttWidth = PTT_DEFAULT_WIDTH_SCALE
+                        pttRound = PTT_DEFAULT_CIRCULARITY
+                        pttOffX = 0f
+                        pttOffY = 0f
+                        prefs.edit()
+                            .putFloat(KEY_PTT_SIZE, pttSize)
+                            .putFloat(KEY_PTT_WIDTH_SCALE, pttWidth)
+                            .putFloat(KEY_PTT_CIRCULARITY, pttRound)
+                            .putFloat(KEY_PTT_OFFSET_X, 0f)
+                            .putFloat(KEY_PTT_OFFSET_Y, 0f)
+                            .apply()
+                    },
+                    shape = RoundedCornerShape(20.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = TextGray),
+                    modifier = Modifier.fillMaxWidth().height(40.dp),
+                ) {
+                    Text("Reset to defaults", fontSize = 13.sp)
+                }
             }
 
             Spacer(modifier = Modifier.height(12.dp))
@@ -712,6 +803,41 @@ private fun SettingsToggle(
                 uncheckedThumbColor = TextMuted,
                 uncheckedTrackColor = SurfaceBg
             )
+        )
+    }
+}
+
+/**
+ * One labelled slider for the PTT geometry card.
+ *
+ * Commits on release rather than on every pixel of drag: each change writes to
+ * SharedPreferences, and a drag emits hundreds of values.
+ */
+@Composable
+private fun PttSlider(
+    label: String,
+    valueLabel: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    onChange: (Float) -> Unit,
+    onCommit: () -> Unit,
+) {
+    Column(modifier = Modifier.padding(bottom = 4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(label, fontSize = 14.sp, color = TextGray, fontWeight = FontWeight.Medium)
+            Spacer(modifier = Modifier.weight(1f))
+            Text(valueLabel, fontSize = 11.sp, color = TextMuted)
+        }
+        Slider(
+            value = value,
+            onValueChange = onChange,
+            onValueChangeFinished = onCommit,
+            valueRange = range,
+            colors = SliderDefaults.colors(
+                thumbColor = Teal,
+                activeTrackColor = Teal,
+                inactiveTrackColor = SurfaceBg,
+            ),
         )
     }
 }

@@ -9,6 +9,38 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.1.20] (72) - 2026-08-09
+
+### Changed
+- **PTT button is fully adjustable.** A fixed 240dp centred circle assumed one
+  grip; the radio actually gets held left-handed, right-handed, thumbed from the
+  bottom edge, or palmed in a mount, and a circle has the least horizontal reach
+  per unit of area. Settings now expose size, width scale, roundness, and X/Y
+  position, with a reset. Roundness is a spectrum rather than a preset list:
+  100% = circle (stadium when wide), 0% = rectangle, anything between = rounded
+  rect. Default is now 1.25x wider than tall, so the resting shape is a stadium
+  with materially more horizontal contact area.
+- **Emergency SOS moved to the overflow menu.** On the radio screen it competed
+  for space with the enlarged PTT target and sat where a sliding thumb lands.
+  Menu -> item -> confirm is deliberate enough that the long-press gesture is no
+  longer needed, and it frees the area under the PTT entirely.
+
+### Fixed
+- **Cohort re-entry claimed a QR scan was required when it was not.** Joined
+  cohorts were labelled "Rejoin - Scan" unconditionally, even though the full
+  session JSON (including the room key) is kept in EncryptedSharedPreferences on
+  the original import and re-importing it restores the session outright. Users
+  were being sent back to a host for a fresh QR to recover a session they still
+  held. The row now checks for stored credentials and only says "Scan" when one
+  is genuinely needed.
+
+### Added
+- **Pre/post-encryption tracing.** Bounded, frame-budgeted logging of each audio
+  frame before and after AEAD, so encryption can be verified from outside the
+  process instead of taken on faith. Debug builds arm it automatically for the
+  first 3 frames of a transmission; it logs fragments of live mic audio, so it
+  is budgeted rather than a persistent switch.
+
 ## [3.1.19] (71) - 2026-08-09
 
 ### Added

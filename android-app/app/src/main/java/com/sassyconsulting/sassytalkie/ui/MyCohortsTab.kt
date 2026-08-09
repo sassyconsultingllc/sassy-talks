@@ -29,6 +29,17 @@ data class CohortListItem(
     val hostDevice: String?,
     val participants: List<String>,
     val lastJoinedAt: Long,
+    /**
+     * True when this channel still has usable session credentials on disk, so
+     * re-entry needs no QR scan at all.
+     *
+     * The joiner path always claimed a scan was required. It never was: the
+     * full session JSON (including the room key) is stashed in
+     * EncryptedSharedPreferences on the original import, and re-importing it
+     * restores the session outright. Users were being sent back to a host for
+     * a fresh QR to recover a session they already held.
+     */
+    val canRejoinDirectly: Boolean = false,
 )
 
 private fun parseHistory(json: String): List<CohortListItem> {
@@ -48,10 +59,16 @@ private fun parseHistory(json: String): List<CohortListItem> {
                 hostDevice = o.optString("host_device", "").ifEmpty { null },
                 participants = names,
                 lastJoinedAt = o.optLong("last_joined_at", 0),
+                canRejoinDirectly = hasStoredSession(o.getInt("channel")),
             )
         }
     } catch (_: Exception) { emptyList() }
 }
+
+/** Are session credentials for [channel] still on disk? */
+private fun hasStoredSession(channel: Int): Boolean = try {
+    SassyTalkNative.getChannelSessionJson(channel).isNotEmpty()
+} catch (_: Throwable) { false }
 
 private fun relativeAgo(unixSecs: Long): String {
     if (unixSecs == 0L) return ""
@@ -187,19 +204,24 @@ private fun CohortRow(
                     modifier = Modifier.weight(1f).height(40.dp),
                 ) {
                     Icon(
-                        when (item.role) {
-                            "Hosted" -> Icons.Default.QrCode2
-                            "Joined" -> Icons.Default.QrCodeScanner
-                            else -> Icons.Default.Login
+                        when {
+                            item.role == "Hosted" -> Icons.Default.QrCode2
+                            // Credentials still on disk -> straight back in.
+                            item.canRejoinDirectly -> Icons.Default.Login
+                            else -> Icons.Default.QrCodeScanner
                         },
                         contentDescription = null,
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        when (item.role) {
-                            "Hosted" -> "Rejoin"
-                            "Joined" -> "Rejoin · Scan"
-                            else -> "Rejoin"
+                        when {
+                            item.role == "Hosted" -> "Rejoin"
+                            item.canRejoinDirectly -> "Rejoin"
+                            // Only say "Scan" when a scan is genuinely
+                            // required — the old label said it unconditionally
+                            // for joiners, so re-entry looked impossible even
+                            // when the session key was still on disk.
+                            else -> "Rejoin · Scan"
                         },
                         fontSize = 13.sp,
                     )

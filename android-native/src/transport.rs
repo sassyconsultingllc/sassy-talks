@@ -240,6 +240,10 @@ impl TransportManager {
             return Err("Encryption required: authenticate via QR code first".to_string());
         };
         crate::diag::note_tx();
+        // Debug-only: show the same frame before and after AEAD so the
+        // encryption can be verified from outside the process rather than
+        // taken on faith. No-op unless the diagnostic tooling armed it.
+        crate::diag::trace_crypto(data, &payload);
 
         // Send on primary transport
         let primary_result = match self.active {

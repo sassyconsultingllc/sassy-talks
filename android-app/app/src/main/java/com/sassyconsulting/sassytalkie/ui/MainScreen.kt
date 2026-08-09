@@ -27,6 +27,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.pointerInteropFilter
+import kotlin.math.roundToInt
 import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -67,6 +68,7 @@ fun MainScreen(
     var pttHoldMode by remember { mutableStateOf(false) } // toggle PTT vs hold-to-talk
     var showEncryptionWarning by remember { mutableStateOf(false) }
     var showQrDialog by remember { mutableStateOf(false) }
+    var showSosConfirm by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     // Keep on-device captioning alive while the radio screen is visible.
@@ -217,6 +219,10 @@ fun MainScreen(
     var isEncrypted by remember { mutableStateOf(SassyTalkNative.isEncrypted()) }
     var transportName by remember { mutableStateOf(SassyTalkNative.getTransportName()) }
 
+    // PTT geometry, re-read on every entry to this screen so a Settings change
+    // is visible the moment the user comes back rather than next launch.
+    val pttShape = remember { readPttShape(settingsPrefs) }
+
     // Transport advisory refresh only — cache status polled centrally in TranscriptionBridge.
     // Woke every 2s but only did work on every 5th tick, so four of every five
     // wakeups computed nothing. Same effective 10s refresh, 1/5 the wakeups.
@@ -361,6 +367,16 @@ fun MainScreen(
                             leadingIcon = { Icon(Icons.Default.Info, contentDescription = null, tint = Cyan, modifier = Modifier.size(20.dp)) }
                         )
                         Divider(color = SurfaceBg)
+                        // Emergency SOS lives at menu level: on the radio
+                        // screen it competed for space with the PTT target and
+                        // sat where a sliding thumb lands. Reaching it is now
+                        // menu -> item -> confirm, which is deliberate enough
+                        // that the press itself needs no hold gesture.
+                        DropdownMenuItem(
+                            text = { Text("Emergency SOS", color = EmergencyRed) },
+                            onClick = { showMenu = false; showSosConfirm = true },
+                            leadingIcon = { Icon(Icons.Default.Warning, contentDescription = null, tint = EmergencyRed, modifier = Modifier.size(20.dp)) }
+                        )
                         DropdownMenuItem(
                             text = { Text("End Session", color = Color(0xFFFF6B6B)) },
                             onClick = { showMenu = false; showEndSessionDialog = true },
@@ -755,6 +771,13 @@ fun MainScreen(
         // permission denied, entitlement not yet cached) had a dead PTT button
         // while the WiFi/relay roster still showed peers.
         val startTx = {
+            // Debug builds only: log the first few frames before and after AEAD
+            // so the encryption can be verified from outside the process. Frame-
+            // budgeted in native, and compiled out of the user's reasoning
+            // entirely in release — this puts mic-audio fragments in logcat.
+            if (com.sassyconsulting.sassytalkie.BuildConfig.DEBUG) {
+                SassyTalkNative.setCryptoTrace(true, 3)
+            }
             val ptt = walkieService?.pttCoordinator
             val started = when {
                 ptt != null -> ptt.onPttPressed()
@@ -783,6 +806,7 @@ fun MainScreen(
             pulseScale = pulseScale,
             enabled = pttEnabled,
             dimmed = anyPeerStale,
+            shape = pttShape,
             onPressStart = {
                 if (!SassyTalkNative.isEncrypted()) {
                     showEncryptionWarning = true
@@ -852,14 +876,6 @@ fun MainScreen(
         // false SOS on a shared channel is expensive. Held for ~600ms it
         // raises the beacon; clearing is a separate deliberate tap on the
         // banner above. Hidden while our own beacon is already live.
-        if (!selfEmergencyActive) {
-            SosTrigger(
-                enabled = walkieService?.pttCoordinator != null,
-                onTrigger = { walkieService?.pttCoordinator?.raiseEmergency() },
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-        }
-
         // Encryption warning only when session is not encrypted
         if (!isEncrypted) {
             Text(
@@ -1087,6 +1103,43 @@ fun MainScreen(
         )
     }
 
+    // SOS confirmation. The menu route replaced the long-press: reaching this
+    // point already took menu -> item, so one explicit confirm is the right
+    // amount of friction for a broadcast everyone on the channel sees.
+    if (showSosConfirm) {
+        AlertDialog(
+            onDismissRequest = { showSosConfirm = false },
+            confirmButton = {
+                TextButton(onClick = {
+                    showSosConfirm = false
+                    val ok = walkieService?.pttCoordinator?.raiseEmergency() ?: false
+                    if (!ok) {
+                        scope.launch {
+                            snackbarHost.showSnackbar("SOS failed — no transport available")
+                        }
+                    }
+                }) {
+                    Text("BROADCAST SOS", color = EmergencyRed, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSosConfirm = false }) {
+                    Text("Cancel", color = Cyan)
+                }
+            },
+            title = { Text("Broadcast emergency?", color = EmergencyRed) },
+            text = {
+                Text(
+                    "Every device on this channel will show a full-screen alert with your " +
+                        "name until you stand down. Use \"I'M OK\" on the banner to clear it.",
+                    color = TextGray,
+                    fontSize = 14.sp,
+                )
+            },
+            containerColor = CardBg,
+        )
+    }
+
     // End Session confirmation dialog
     if (showEndSessionDialog) {
         AlertDialog(
@@ -1116,6 +1169,48 @@ fun MainScreen(
         )
     }
 }
+
+// ── PTT geometry ────────────────────────────────────────────────────────────
+
+/**
+ * User-configurable PTT target geometry.
+ *
+ * A fixed 240dp circle centred in the column assumes one grip. In practice the
+ * radio is held left-handed, right-handed, thumbed from the bottom edge, or
+ * pressed with the whole hand while the device sits in a mount — and a circle
+ * is the shape with the least horizontal reach per unit of area. Width is
+ * therefore scaled independently of height, and everything is adjustable.
+ *
+ * [circularity] is a spectrum, not a toggle: 100 = fully round (circle when
+ * square, stadium when wide), 0 = hard rectangle, anything between = rounded
+ * rect. Stored as 0..100 so the Settings slider maps 1:1 to a percentage.
+ */
+data class PttShape(
+    val sizeDp: Float = PTT_DEFAULT_SIZE,
+    val widthScale: Float = PTT_DEFAULT_WIDTH_SCALE,
+    val circularity: Float = PTT_DEFAULT_CIRCULARITY,
+    val offsetXDp: Float = 0f,
+    val offsetYDp: Float = 0f,
+)
+
+const val PTT_DEFAULT_SIZE = 240f
+const val PTT_DEFAULT_WIDTH_SCALE = 1.25f   // wider than tall by default: more reach
+const val PTT_DEFAULT_CIRCULARITY = 100f
+
+const val KEY_PTT_SIZE = "ptt_size_dp"
+const val KEY_PTT_WIDTH_SCALE = "ptt_width_scale"
+const val KEY_PTT_CIRCULARITY = "ptt_circularity"
+const val KEY_PTT_OFFSET_X = "ptt_offset_x"
+const val KEY_PTT_OFFSET_Y = "ptt_offset_y"
+
+/** Read the persisted PTT geometry. Shared by the radio screen and Settings. */
+fun readPttShape(prefs: android.content.SharedPreferences): PttShape = PttShape(
+    sizeDp = prefs.getFloat(KEY_PTT_SIZE, PTT_DEFAULT_SIZE),
+    widthScale = prefs.getFloat(KEY_PTT_WIDTH_SCALE, PTT_DEFAULT_WIDTH_SCALE),
+    circularity = prefs.getFloat(KEY_PTT_CIRCULARITY, PTT_DEFAULT_CIRCULARITY),
+    offsetXDp = prefs.getFloat(KEY_PTT_OFFSET_X, 0f),
+    offsetYDp = prefs.getFloat(KEY_PTT_OFFSET_Y, 0f),
+)
 
 // ── Life-safety UI ──────────────────────────────────────────────────────────
 
@@ -1219,58 +1314,6 @@ private fun SelfEmergencyBanner(onClear: () -> Unit) {
     }
 }
 
-/**
- * Long-press-to-fire SOS control.
- *
- * Long-press (not tap) is the whole point: this sits on the same screen as a
- * large PTT target, and an accidental distress broadcast costs everyone on the
- * channel. Progress is shown while held so the gesture is discoverable.
- */
-@OptIn(ExperimentalComposeUiApi::class)
-@Composable
-private fun SosTrigger(enabled: Boolean, onTrigger: () -> Unit) {
-    var pressed by remember { mutableStateOf(false) }
-    val holdMs = 600L
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(22.dp))
-            .border(2.dp, if (enabled) EmergencyRed else TextMuted, RoundedCornerShape(22.dp))
-            .background(if (pressed) EmergencyRedDim else Color.Transparent)
-            .height(44.dp)
-            .pointerInput(enabled) {
-                if (!enabled) return@pointerInput
-                detectTapGestures(
-                    onPress = {
-                        pressed = true
-                        // Fire only if the press survives the hold window;
-                        // tryAwaitRelease returns when the finger lifts.
-                        val completed = withTimeoutOrNull(holdMs) { tryAwaitRelease() } == null
-                        pressed = false
-                        if (completed) onTrigger()
-                    },
-                )
-            },
-        horizontalArrangement = Arrangement.Center,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(
-            Icons.Default.Warning,
-            contentDescription = null,
-            tint = if (enabled) EmergencyRed else TextMuted,
-            modifier = Modifier.size(18.dp),
-        )
-        Spacer(modifier = Modifier.width(8.dp))
-        Text(
-            text = if (pressed) "KEEP HOLDING…" else "HOLD FOR SOS",
-            color = if (enabled) EmergencyRed else TextMuted,
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Bold,
-        )
-    }
-}
-
 @Composable
 private fun ChannelSelector(
     channel: Int,
@@ -1367,6 +1410,7 @@ private fun PTTButton(
     pulseScale: Float,
     enabled: Boolean = true,
     dimmed: Boolean = false,
+    shape: PttShape = PttShape(),
     onPressStart: () -> Unit,
     onPressEnd: () -> Unit,
     onPressRejected: () -> Unit = {}
@@ -1382,18 +1426,30 @@ private fun PTTButton(
     val ringColor = if (isTransmitting) Coral else if (dimmed) TextMuted else Teal
     val innerColor = if (isTransmitting) CoralLight else BgCard
 
+    // User-shaped target. Height stays the configured size; width is scaled
+    // independently because a thumb reaching across the screen contacts a wide
+    // area, not a tall one — a pure circle forces the hand into one position.
+    val h = shape.sizeDp.dp
+    val w = (shape.sizeDp * shape.widthScale).dp
+    // Circularity as a spectrum: 100% = fully rounded (a circle when square,
+    // a stadium when wide), 0% = hard rectangle. RoundedCornerShape's percent
+    // is relative to the shorter side, so 50% is the fully-round end.
+    val cornerPct = (shape.circularity / 2f).roundToInt().coerceIn(0, 50)
+    val btnShape = RoundedCornerShape(percent = cornerPct)
+
     Box(
         contentAlignment = Alignment.Center,
         modifier = Modifier
-            .size(280.dp)
+            .offset(x = shape.offsetXDp.dp, y = shape.offsetYDp.dp)
+            .size(width = w + 40.dp, height = h + 40.dp)
             .scale(pulseScale)
             .alpha(if (dimmed) 0.45f else 1f)
     ) {
         if (isTransmitting) {
             Box(
                 modifier = Modifier
-                    .size(300.dp)
-                    .clip(CircleShape)
+                    .size(width = w + 60.dp, height = h + 60.dp)
+                    .clip(btnShape)
                     .background(
                         Brush.radialGradient(
                             colors = listOf(
@@ -1408,9 +1464,9 @@ private fun PTTButton(
         Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier
-                .size(240.dp)
-                .clip(CircleShape)
-                .border(8.dp, ringColor, CircleShape)
+                .size(width = w, height = h)
+                .clip(btnShape)
+                .border(8.dp, ringColor, btnShape)
                 .background(buttonBrush)
                 .pointerInteropFilter { event ->
                     if (!enabled) {

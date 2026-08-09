@@ -1230,6 +1230,20 @@ object SassyTalkNative {
         try { nativeDiagReset() } catch (_: Exception) {}
     }
 
+    /**
+     * Arm bounded pre/post-encryption tracing for the next [frames] audio
+     * frames, logging each frame's plaintext and ciphertext prefixes.
+     *
+     * Debug tooling: this puts fragments of live microphone audio in logcat, so
+     * it is frame-budgeted rather than a persistent switch and must never be
+     * left on.
+     */
+    fun setCryptoTrace(on: Boolean, frames: Int = 3) {
+        if (!initialized) return
+        try { nativeSetCryptoTrace(on, frames) } catch (_: Exception) {}
+    }
+
+    @JvmStatic private external fun nativeSetCryptoTrace(on: Boolean, frames: Int)
     @JvmStatic private external fun nativeDiagSnapshot(): String?
     @JvmStatic private external fun nativeDiagReset()
 

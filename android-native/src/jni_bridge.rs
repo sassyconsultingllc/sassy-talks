@@ -3596,3 +3596,17 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     crate::diag::reset();
     info!("Diagnostics counters reset");
 }
+
+/// JNI: arm bounded pre/post-encryption tracing for the next `frames` audio
+/// frames. Debug tooling only — it logs fragments of live microphone audio, so
+/// it is frame-budgeted and off by default rather than a persistent toggle.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetCryptoTrace(
+    _env: JNIEnv,
+    _class: JClass,
+    on: jboolean,
+    frames: jni::sys::jint,
+) {
+    crate::diag::set_crypto_trace(on != 0, frames);
+    info!("Crypto trace {} for {} frames", if on != 0 { "ARMED" } else { "off" }, frames);
+}
