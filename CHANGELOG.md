@@ -9,6 +9,18 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.1.21] (73) - 2026-08-09
+
+### Fixed
+- **PTT position could push the button off-screen and over the hint text.**
+  Found by driving the new sliders to their limits rather than trusting mid-range
+  values. Two distinct causes, both from `offset` not participating in layout:
+  X had no bound at all, so a 2x-wide button at full left offset ran past the
+  screen edge; and Y shifted only the drawing, sliding the button on top of the
+  hint row while its neighbours stayed put. X is now clamped against the real
+  measured width via `BoxWithConstraints`, and Y is applied as padding so the
+  Column reflows and nothing can overlap at any slider combination.
+
 ## [3.1.20] (72) - 2026-08-09
 
 ### Changed

@@ -1437,10 +1437,36 @@ private fun PTTButton(
     val cornerPct = (shape.circularity / 2f).roundToInt().coerceIn(0, 50)
     val btnShape = RoundedCornerShape(percent = cornerPct)
 
+    // Clamp the offset so the target can never leave the screen.
+    //
+    // `offset` does not participate in layout: nothing reflows around it and
+    // nothing bounds it. Driving X to its extreme with a 2x-wide button pushed
+    // the control off the left edge and on top of the hint row — visible only
+    // by actually setting the sliders to their limits. Clamp against the real
+    // available width so any slider combination stays reachable.
+    BoxWithConstraints(
+        modifier = Modifier.fillMaxWidth(),
+        contentAlignment = Alignment.Center,
+    ) {
+        val slackX = ((maxWidth - w) / 2).coerceAtLeast(0.dp)
+        val clampedX = shape.offsetXDp.dp.coerceIn(-slackX, slackX)
+        val yDp = shape.offsetYDp.dp
+
     Box(
         contentAlignment = Alignment.Center,
         modifier = Modifier
-            .offset(x = shape.offsetXDp.dp, y = shape.offsetYDp.dp)
+            // Vertical placement is PADDING, not offset. `offset` shifts only
+            // the drawing, so a downward Y slid the button straight over the
+            // hint row below it — the neighbours never moved. Padding consumes
+            // the Column's slack instead, so everything below is pushed along
+            // and nothing can overlap at any slider value. X stays a true
+            // offset: it has no horizontal neighbours to disturb, and it is
+            // clamped above so it cannot leave the screen.
+            .padding(
+                top = if (yDp > 0.dp) yDp else 0.dp,
+                bottom = if (yDp < 0.dp) -yDp else 0.dp,
+            )
+            .offset(x = clampedX)
             .size(width = w + 40.dp, height = h + 40.dp)
             .scale(pulseScale)
             .alpha(if (dimmed) 0.45f else 1f)
@@ -1517,5 +1543,6 @@ private fun PTTButton(
                 }
             }
         }
+    }
     }
 }
