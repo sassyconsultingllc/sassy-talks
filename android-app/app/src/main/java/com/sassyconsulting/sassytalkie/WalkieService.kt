@@ -614,9 +614,82 @@ class WalkieService : Service() {
                     com.sassyconsulting.sassytalkie.debug.DiagnosticsCollector
                         .pushLiveTelemetry(this@WalkieService)
                     AudioTelemetry.tickPerSecond()
+                    // MUST follow tickPerSecond: that call rolls the Kotlin-side
+                    // counters (which nothing feeds, since capture lives in Rust)
+                    // and would zero these back out if it ran second.
+                    pushNativeTelemetry()
                 } catch (_: Throwable) { /* native not yet initialized */ }
                 delay(1_000)
             }
+        }
+    }
+
+    // Previous cumulative native counters, for per-second deltas. The loop
+    // runs at 1 Hz so a delta IS a rate.
+    private var prevCapturedFrames = 0L
+    private var prevEncodedFrames = 0L
+    private var prevEncodedBytes = 0L
+
+    /**
+     * Feed the diagnostics panel's CAPTURE / CODEC sections and the AEAD
+     * outcome counters from the native snapshot.
+     *
+     * Those sections were fed only by the Kotlin `PttAudioPipeline`, which is
+     * never constructed — capture, codec and crypto all run in Rust, so the
+     * panel could never show anything but boot defaults no matter what the
+     * radio was doing. This is the missing producer.
+     */
+    private var diagLogTick = 0
+
+    private fun pushNativeTelemetry() {
+        val json = SassyTalkNative.diagSnapshot() ?: return
+
+        // Emit the raw snapshot to logcat every ~2s so scripts/relay-diag.sh
+        // can read both ends of a transfer over adb without the app needing an
+        // exported broadcast receiver — that would be a standing surface
+        // leaking the room id to any app on the device, for a debugging
+        // convenience. This path is already gated on diagnostics being
+        // enabled, so it costs nothing in a normal release install.
+        if (++diagLogTick % 2 == 0) Log.i("SassyDiag", json)
+
+        try {
+            val root = org.json.JSONObject(json)
+            val counters = root.optJSONObject("counters") ?: return
+
+            counters.optJSONObject("capture")?.let { cap ->
+                val frames = cap.optLong("frames", 0)
+                val codec = counters.optJSONObject("codec")
+                val encFrames = codec?.optLong("frames_encoded", 0) ?: 0
+                val encBytes = codec?.optLong("encoded_bytes", 0) ?: 0
+
+                // First pass after a reset/restart would report the whole
+                // cumulative total as one second's worth — clamp to 0.
+                val dCap = (frames - prevCapturedFrames).coerceAtLeast(0)
+                val dEnc = (encFrames - prevEncodedFrames).coerceAtLeast(0)
+                val dBytes = (encBytes - prevEncodedBytes).coerceAtLeast(0)
+                prevCapturedFrames = frames
+                prevEncodedFrames = encFrames
+                prevEncodedBytes = encBytes
+
+                AudioTelemetry.updateFromNative(
+                    dbfs = cap.optDouble("last_dbfs", -120.0).toFloat(),
+                    capturedPerSec = dCap,
+                    encodedPerSec = dEnc,
+                    encodedBytesPerSec = dBytes,
+                )
+            }
+
+            counters.optJSONObject("crypto_rx")?.let { rx ->
+                AudioTelemetry.updateCryptoRx(
+                    ok = rx.optLong("ok", 0),
+                    fail = rx.optLong("fail", 0),
+                    noSession = rx.optLong("no_session", 0),
+                    replay = rx.optLong("replay", 0),
+                    okPct = rx.optDouble("ok_pct", -1.0).toFloat(),
+                )
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "native telemetry parse failed: ${t.message}")
         }
     }
 

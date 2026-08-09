@@ -27,6 +27,10 @@ pub mod transport;
 // changes.
 pub use sassytalkie_core::session;
 pub mod users;
+// Live counters for the diagnostics panel + relay transfer tracing. Lives in
+// this crate because capture, codec, crypto and transport all happen here —
+// Kotlin cannot count frames it never touches.
+pub mod diag;
 pub mod opus_ffi;
 pub mod codec;
 pub mod audio_pipeline;

@@ -44,6 +44,16 @@ object AudioTelemetry {
         val lastTxPacketBytes: Int = 0,
         val lastRxPacketBytes: Int = 0,
 
+        // AEAD outcomes for inbound frames (from native). Splitting these out
+        // is what makes "arriving but not decrypting" visible — the failure
+        // mode where every wire counter looks healthy and no audio is heard.
+        val cryptoRxOk: Long = 0,
+        val cryptoRxFail: Long = 0,
+        val cryptoRxNoSession: Long = 0,
+        val cryptoRxReplay: Long = 0,
+        /** -1 until at least one frame has been attempted. */
+        val cryptoRxOkPct: Float = -1f,
+
         // Effects state
         val aecActive: Boolean = false,
         val nsActive: Boolean = false,
@@ -111,6 +121,51 @@ object AudioTelemetry {
     }
 
     fun onDecodeError() { rxErrors.incrementAndGet() }
+
+    /**
+     * Drive the CAPTURE / CODEC sections from the native counters.
+     *
+     * These fields previously had exactly one producer — the Kotlin
+     * `PttAudioPipeline` — which is never constructed anywhere in the app.
+     * Capture, encoding and encryption all happen in Rust, so Kotlin never saw
+     * a frame and the panel showed boot defaults forever. The values now come
+     * from `SassyTalkNative.diagSnapshot()`, which counts them where the work
+     * actually occurs.
+     *
+     * Call AFTER [tickPerSecond] in the same pass: tick rolls the (unfed)
+     * Kotlin counters and would otherwise zero these straight back out.
+     * Deltas are per-second because the caller polls at 1 Hz.
+     */
+    fun updateFromNative(
+        dbfs: Float,
+        capturedPerSec: Long,
+        encodedPerSec: Long,
+        encodedBytesPerSec: Long,
+    ) = _state.update {
+        it.copy(
+            currentFrameDbfs = dbfs,
+            framesCapturedPerSec = capturedPerSec,
+            txPacketsPerSec = encodedPerSec,
+            txKbpsAvg = encodedBytesPerSec * 8f / 1000f,
+        )
+    }
+
+    /**
+     * AEAD outcomes for inbound frames. `okPct` is -1 when nothing has been
+     * attempted yet. A climbing [cryptoRxFail] with [cryptoRxOk] stuck at zero
+     * is the session-key-mismatch signature: traffic is arriving and being
+     * discarded, which no other counter distinguishes from silence.
+     */
+    fun updateCryptoRx(ok: Long, fail: Long, noSession: Long, replay: Long, okPct: Float) =
+        _state.update {
+            it.copy(
+                cryptoRxOk = ok,
+                cryptoRxFail = fail,
+                cryptoRxNoSession = noSession,
+                cryptoRxReplay = replay,
+                cryptoRxOkPct = okPct,
+            )
+        }
 
     fun updateGate(
         mode: String,

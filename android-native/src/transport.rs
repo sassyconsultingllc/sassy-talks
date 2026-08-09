@@ -202,6 +202,14 @@ impl TransportManager {
         self.crypto.is_some()
     }
 
+    /// Relay transport stats as JSON — room, wire packet counts, queue depths
+    /// and drop counters. Pairs with `diag::snapshot_json` (which reports what
+    /// happened to those packets after they arrived) to give the full relay
+    /// picture in one read.
+    pub fn cellular_stats(&self) -> String {
+        self.cellular.get_stats()
+    }
+
     /// Encrypt raw data for a specific channel (for BT path).
     /// Falls back to legacy crypto if no per-channel key.
     pub fn encrypt_raw(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
@@ -231,6 +239,7 @@ impl TransportManager {
         } else {
             return Err("Encryption required: authenticate via QR code first".to_string());
         };
+        crate::diag::note_tx();
 
         // Send on primary transport
         let primary_result = match self.active {
@@ -270,16 +279,24 @@ impl TransportManager {
         if let Some(ref crypto) = self.crypto {
             match crypto.decrypt(raw_data) {
                 Ok(plaintext) => {
+                    crate::diag::note_decrypt_ok();
                     let copy_len = plaintext.len().min(buffer.len());
                     buffer[..copy_len].copy_from_slice(&plaintext[..copy_len]);
                     Ok(copy_len)
                 }
                 Err(e) => {
+                    // Counted, not just logged. Frames arriving on the wire but
+                    // failing here is the signature of two peers on different
+                    // session keys — everything upstream looks healthy while no
+                    // audio is heard, and a log line nobody is tailing does not
+                    // surface that. The panel shows ok vs fail side by side.
+                    crate::diag::note_decrypt_fail(&e);
                     error!("Decryption failed (dropping packet): {}", e);
                     Ok(0)
                 }
             }
         } else {
+            crate::diag::note_decrypt_no_session();
             warn!("RX: No encryption session, dropping {} bytes", raw_data.len());
             Ok(0)
         }

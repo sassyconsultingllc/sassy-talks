@@ -1199,6 +1199,40 @@ object SassyTalkNative {
         } catch (e: Exception) { false }
     }
 
+    // ── Diagnostics snapshot ──
+
+    /**
+     * One JSON read of the whole native data path: active transport, whether a
+     * session key is installed, relay transport stats (room, wire packet
+     * counts, queue depths, drops) and the live counters (capture level and
+     * frame count, codec output, AEAD outcomes, activity ages).
+     *
+     * The triage field is `counters.crypto_rx`: wire packets arriving while
+     * `ok` stays 0 and `fail` climbs means the peers hold different session
+     * keys. Every other counter looks healthy in that state, which is why it
+     * was previously invisible.
+     *
+     * Returns null before native init.
+     */
+    fun diagSnapshot(): String? {
+        if (!initialized) return null
+        return try {
+            nativeDiagSnapshot()
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "diagSnapshot failed: ${e.message}")
+            null
+        }
+    }
+
+    /** Zero the counters so a reading reflects one test run, not process life. */
+    fun diagReset() {
+        if (!initialized) return
+        try { nativeDiagReset() } catch (_: Exception) {}
+    }
+
+    @JvmStatic private external fun nativeDiagSnapshot(): String?
+    @JvmStatic private external fun nativeDiagReset()
+
     // ── Emergency / SOS (life-safety) ──
     //
     // The wire codec and beacon cadence live in sassytalkie-core so every

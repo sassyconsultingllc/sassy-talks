@@ -343,8 +343,25 @@ pub fn spawn_tx_thread(
                     true, // is_self
                 );
 
+                // Diagnostics: capture level for the panel's CAPTURE section.
+                // This is the only place the mic frame exists, so it is the
+                // only place the number can come from — the Kotlin producer
+                // that used to feed that section belongs to PttAudioPipeline,
+                // which is never constructed, so the panel had no live source.
+                {
+                    let frame = &pcm_buffer[..CODEC_FRAME_SIZE];
+                    let peak = frame.iter().map(|s| s.unsigned_abs() as u32).max().unwrap_or(0);
+                    let dbfs = if peak == 0 {
+                        -120.0
+                    } else {
+                        20.0 * (peak as f32 / i16::MAX as f32).log10()
+                    };
+                    crate::diag::note_capture(dbfs);
+                }
+
                 // Encode with Opus
                 let compressed = encoder.encode(&pcm_buffer[..CODEC_FRAME_SIZE]);
+                crate::diag::note_encode(compressed.len());
 
                 // Pack wire frame (includes device name for receiver display)
                 let channel = current_channel.load(Ordering::SeqCst);

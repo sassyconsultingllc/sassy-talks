@@ -3537,3 +3537,62 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         .map(|s| s.into())
         .unwrap_or_else(|_| JObject::null())
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// Diagnostics snapshot — relay transfer tracing
+// ══════════════════════════════════════════════════════════════════════════
+
+/// JNI: one JSON blob describing the whole native-side data path.
+///
+/// Merges the live counters from `diag` (capture, codec, AEAD outcomes,
+/// activity ages) with the cellular transport's own stats (room, wire packet
+/// counts, queue depths, drops). Callers get a single consistent read instead
+/// of stitching several JNI calls together.
+///
+/// The field that matters most when triaging "audio isn't getting through":
+/// `crypto_rx.ok` vs `crypto_rx.fail`. Wire packets arriving while ok stays 0
+/// means the peers hold different session keys — every other counter looks
+/// healthy in that state, which is why it went undiagnosed for so long.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeDiagSnapshot<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> JObject<'local> {
+    let counters = crate::diag::snapshot_json();
+
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let (transport_name, encrypted, relay) = match guard.state_machine.as_ref() {
+        Some(sm) => {
+            let t = format!("{:?}", sm.get_active_transport());
+            let tm = sm.get_transport();
+            let (enc, relay) = match tm.lock() {
+                Ok(g) => (g.is_encrypted(), g.cellular_stats()),
+                Err(_) => (false, "{}".to_string()),
+            };
+            (t, enc, relay)
+        }
+        None => ("none".to_string(), false, "{}".to_string()),
+    };
+    drop(guard);
+
+    let json = format!(
+        r#"{{"transport":"{}","encrypted":{},"relay":{},"counters":{}}}"#,
+        transport_name, encrypted, relay, counters
+    );
+
+    env.new_string(&json)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| JObject::null())
+}
+
+/// JNI: zero the diagnostic counters so a measurement reflects one test run
+/// rather than the whole process lifetime.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeDiagReset(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    crate::diag::reset();
+    info!("Diagnostics counters reset");
+}
