@@ -217,6 +217,148 @@ class PttCoordinator(
         Log.i(TAG, "Relay socket idle for $peerKey — keeping on channel")
     }
 
+    // —— Emergency / SOS (life-safety) ——
+    //
+    // Beacons are built and parsed natively so every platform is byte-identical
+    // and the payload is AEAD-sealed before it touches a transport. This layer
+    // owns only: broadcast on BOTH transports, re-broadcast on the core-defined
+    // cadence, and surface state to the UI.
+    //
+    // Broadcast goes out on BLE *and* relay unconditionally — unlike audio,
+    // which picks an active plane. A distress beacon is ~40 bytes and its
+    // delivery matters more than the duplicate cost, so it takes every path
+    // available and lets receivers de-dupe by (sender, timestamp).
+
+    /** An emergency raised by a peer, as decoded from the wire. */
+    data class PeerEmergency(
+        val senderId: String,
+        val kind: String,
+        val timestampMs: Long,
+        val lat: Double?,
+        val lon: Double?,
+        val note: String?,
+        /** False when the beacon arrived unsealed — the sender had no session
+         *  key, so treat sender identity as unauthenticated. */
+        val sealed: Boolean,
+    )
+
+    /** Active emergencies from peers, keyed by sender id. Cleared on stand-down. */
+    val peerEmergencies = MutableStateFlow<Map<String, PeerEmergency>>(emptyMap())
+
+    /** True while THIS device is broadcasting a distress beacon. */
+    val selfEmergencyActive = MutableStateFlow(false)
+
+    private var emergencyBeaconJob: Job? = null
+
+    /**
+     * Raise a distress beacon and start the re-broadcast loop.
+     *
+     * @param kind [SassyTalkNative.EMERGENCY_KIND_SOS] or ..._MANDOWN
+     * @param coord optional (latE7, lonE7) fixed-point fix; attached only when
+     *   a session key exists to seal it (enforced natively).
+     * @return true if a beacon frame went out.
+     */
+    fun raiseEmergency(
+        kind: Byte = SassyTalkNative.EMERGENCY_KIND_SOS,
+        coord: Pair<Int, Int>? = null,
+        note: String = "",
+    ): Boolean {
+        val frame = SassyTalkNative.emergencyActivate(
+            kind = kind,
+            hasCoord = coord != null,
+            latE7 = coord?.first ?: 0,
+            lonE7 = coord?.second ?: 0,
+            note = note,
+        ) ?: run {
+            Log.e(TAG, "EMERGENCY: native activate returned no frame")
+            return false
+        }
+        broadcastEmergencyFrame(frame)
+        selfEmergencyActive.value = true
+        Log.w(TAG, "EMERGENCY RAISED kind=$kind coord=${coord != null}")
+        startEmergencyBeacon()
+        return true
+    }
+
+    /** Stand down. Broadcasts the clear frame once and stops the beacon loop. */
+    fun clearEmergency() {
+        emergencyBeaconJob?.cancel()
+        emergencyBeaconJob = null
+        val frame = SassyTalkNative.emergencyClear()
+        selfEmergencyActive.value = false
+        if (frame != null) {
+            broadcastEmergencyFrame(frame)
+            Log.w(TAG, "EMERGENCY CLEARED — stand-down sent")
+        }
+    }
+
+    /**
+     * Re-broadcast loop. The cadence lives in core (`DEFAULT_BEACON_INTERVAL_MS`);
+     * this polls faster than the interval and lets native decide when a frame is
+     * actually due, so the two can never drift apart.
+     */
+    private fun startEmergencyBeacon() {
+        if (emergencyBeaconJob?.isActive == true) return
+        emergencyBeaconJob = scope.launch {
+            while (isActive && SassyTalkNative.emergencyIsActive()) {
+                delay(1_000L)
+                val frame = SassyTalkNative.emergencyTick() ?: continue
+                broadcastEmergencyFrame(frame)
+                Log.d(TAG, "EMERGENCY beacon re-broadcast")
+            }
+        }
+    }
+
+    /** Put a beacon frame on every transport we have. */
+    private fun broadcastEmergencyFrame(frame: ByteArray) {
+        try { bleSignaling.broadcastControl(frame) } catch (t: Throwable) {
+            Log.w(TAG, "EMERGENCY: BLE broadcast failed: ${t.message}")
+        }
+        try { cellularClient?.sendBinary(frame) } catch (t: Throwable) {
+            Log.w(TAG, "EMERGENCY: relay send failed: ${t.message}")
+        }
+    }
+
+    /**
+     * Inbound beacon / stand-down. Decoding is native (bounds-checked, tries
+     * the sealed payload then cleartext); this only maps it into UI state.
+     * A malformed or hostile frame decodes to null and is dropped.
+     */
+    private fun handleEmergencyFrame(peerId: String, raw: ByteArray) {
+        val json = SassyTalkNative.emergencyDecode(raw) ?: run {
+            Log.w(TAG, "EMERGENCY: undecodable frame from $peerId — dropped")
+            return
+        }
+        try {
+            val o = org.json.JSONObject(json)
+            val sender = o.optString("sender", "").ifEmpty { peerId }
+            when (o.optString("op")) {
+                "clear" -> {
+                    peerEmergencies.value = peerEmergencies.value - sender
+                    Log.w(TAG, "EMERGENCY CLEARED by $sender")
+                }
+                "emergency", "mandown" -> {
+                    val e = PeerEmergency(
+                        senderId = sender,
+                        kind = o.optString("kind", "sos"),
+                        timestampMs = o.optLong("ts", System.currentTimeMillis()),
+                        lat = if (o.has("lat")) o.optDouble("lat") else null,
+                        lon = if (o.has("lon")) o.optDouble("lon") else null,
+                        note = o.optString("note", "").ifEmpty { null },
+                        sealed = o.optBoolean("sealed", false),
+                    )
+                    peerEmergencies.value = peerEmergencies.value + (sender to e)
+                    Log.w(
+                        TAG,
+                        "EMERGENCY from $sender kind=${e.kind} coord=${e.lat != null} sealed=${e.sealed}",
+                    )
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "EMERGENCY: bad decode JSON from $peerId: ${t.message}")
+        }
+    }
+
     // —— Talk-over indicator (Task 6.2) ——
 
     /** True while a peer is actively transmitting (OP_PTT_START / OP_PTT_START_V2 received). */
@@ -788,6 +930,14 @@ class PttCoordinator(
             ControlFrame.OP_PTT_STOP_V2 -> handlePttStopV2(peerId, frame.payload)
             ControlFrame.OP_EOT_ACK -> handleEotAck(peerId, frame.payload)
             ControlFrame.OP_WAKE -> handleWake(peerId, frame.payload)
+            // Life-safety beacons. Handled BEFORE the crypto opcodes below as a
+            // reminder of the ordering hazard that motivated the opcode audit:
+            // man-down used to sit on OP_HYBRID_INIT's byte and would have been
+            // swallowed by that handler. Payload parsing is native.
+            ControlFrame.OP_EMERGENCY,
+            ControlFrame.OP_MANDOWN,
+            ControlFrame.OP_EMERGENCY_CLEAR -> handleEmergencyFrame(peerId, bytes)
+
             ControlFrame.OP_HYBRID_INIT -> try {
                 handleHybridInit(peerId, frame.payload)
             } catch (t: Throwable) {
@@ -1256,6 +1406,11 @@ class PttCoordinator(
         stopHeartbeat()
         stopAllRecvAckJobs()
         stopWatchdog()
+        // Stop the beacon loop, but do NOT auto-send a stand-down: the app
+        // going away is not the user declaring they are OK. The beacon simply
+        // stops; peers age it out. Clearing is an explicit user action.
+        emergencyBeaconJob?.cancel()
+        emergencyBeaconJob = null
         preAudioJob?.cancel()
         preAudioJob = null
         rfcommLinkJob?.cancel()

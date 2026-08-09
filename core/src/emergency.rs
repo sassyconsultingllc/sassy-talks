@@ -29,34 +29,18 @@
 //! iOS, and must be unit-testable with an injected clock. The consumer crates
 //! supply only the platform glue — accelerometer samples in, TLV frames out.
 //!
-//! ── NEW OPCODES (provisional — promote into `protocol.rs` later) ───────────
-//! These live here to avoid editing `protocol.rs` while it's owned elsewhere.
-//! They are deliberately in the TLV-framed `>= 0x10` range and do NOT collide
-//! with the in-use set (0x01,0x02,0x10,0x14,0x15,0x16,0x17,0x19). When merged,
-//! move these three constants into `protocol.rs` next to `OP_REPLAY_FRAME` and
-//! delete them here.
-//!
-//!   `OP_EMERGENCY`       = 0x1A  → an SOS / man-down / custom distress beacon.
-//!   `OP_MANDOWN`         = 0x1B  → man-down auto-trip beacon (semantic alias
-//!                                  carrying the same [`EmergencySignal`] body
-//!                                  but distinguishing an *automatic* man-down
-//!                                  trip from a *manual* SOS press on the wire).
-//!   `OP_EMERGENCY_CLEAR` = 0x1C  → "I'm OK / cancel" — stand-down for a prior
-//!                                  beacon from this sender. Carries just the
-//!                                  sender id + timestamp.
+//! ── OPCODES ────────────────────────────────────────────────────────────────
+//! Now owned by [`crate::protocol`] and re-exported here for callers that
+//! `use emergency::*`. They were briefly self-allocated in this file at
+//! 0x1A/0x1B/0x1C, checked only against the constants in `protocol.rs` — but
+//! the Kotlin `ControlFrame` held a second registry that already used
+//! 0x1B/0x1C for the hybrid PQC handshake, so a man-down beacon would have
+//! been parsed as a key exchange. Man-down is now 0x1D, clear 0x1E, and
+//! `protocol::all_opcodes_are_unique` guards the whole set.
 
 use crate::protocol;
 
-/// SOS / man-down / custom distress beacon. Manual SOS press.
-/// Payload is an [`EmergencySignal`].
-pub const OP_EMERGENCY: u8 = 0x1A;
-/// Automatic man-down trip beacon. Payload is an [`EmergencySignal`] whose
-/// `kind` is [`EmergencyKind::ManDown`]; the distinct opcode lets a relay /
-/// receiver special-case auto-trips (louder alert, no de-dupe with a manual
-/// SOS) without parsing the body first.
-pub const OP_MANDOWN: u8 = 0x1B;
-/// Stand-down / "I'm OK". Payload is an [`EmergencyClear`].
-pub const OP_EMERGENCY_CLEAR: u8 = 0x1C;
+pub use crate::protocol::{OP_EMERGENCY, OP_EMERGENCY_CLEAR, OP_MANDOWN};
 
 /// Protocol/format version stamped into the [`EmergencySignal`] header so the
 /// payload can grow fields later without a receiver misreading an old frame.
@@ -714,10 +698,11 @@ mod tests {
         for op in [OP_EMERGENCY, OP_MANDOWN, OP_EMERGENCY_CLEAR] {
             assert!(protocol::is_tlv_opcode(op), "op {op:#x} must be >= 0x10");
         }
-        // Must not collide with the in-use set.
-        let in_use = [0x01u8, 0x02, 0x10, 0x14, 0x15, 0x16, 0x17, 0x19];
+        // Collide-check against the FULL registry, not a hand-copied subset —
+        // the hand-copied subset is exactly what let 0x1B/0x1C through.
         for op in [OP_EMERGENCY, OP_MANDOWN, OP_EMERGENCY_CLEAR] {
-            assert!(!in_use.contains(&op), "op {op:#x} collides with in-use opcode");
+            let hits = protocol::ALL_OPCODES.iter().filter(|(_, v)| *v == op).count();
+            assert_eq!(hits, 1, "op {op:#x} must appear exactly once in ALL_OPCODES");
         }
         assert_ne!(OP_EMERGENCY, OP_MANDOWN);
         assert_ne!(OP_EMERGENCY, OP_EMERGENCY_CLEAR);

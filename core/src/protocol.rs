@@ -25,6 +25,12 @@
 pub const OP_PTT_START: u8 = 0x01;
 /// Legacy PTT-stop. Superseded by [OP_PTT_STOP_V2].
 pub const OP_PTT_STOP:  u8 = 0x02;
+/// Receiver acknowledges a PTT-start (BLE signalling handshake).
+pub const OP_READY_ACK: u8 = 0x03;
+/// Liveness ping (legacy; superseded by [OP_HEARTBEAT]).
+pub const OP_PING: u8 = 0x04;
+/// Channel-change announcement (legacy).
+pub const OP_CHANNEL_SYNC: u8 = 0x05;
 
 // ── TLV-framed v2+ opcodes ────────────────────────────────────────────────
 // Wire format for every opcode in this block:
@@ -36,6 +42,17 @@ pub const OP_PTT_STOP:  u8 = 0x02;
 /// Periodic heartbeat (keepalive + presence advertisement). Payload includes
 /// the sender's epoch + sequence + capabilities bitmap.
 pub const OP_HEARTBEAT: u8 = 0x10;
+
+/// Receiver → sender, during an active transmission: "your audio is landing".
+/// Payload: `[epoch:u64][seq:u32][ts_ms:u64]`.
+pub const OP_RECV_ACK: u8 = 0x11;
+
+/// End-of-transmission acknowledgement — receiver confirms it drained through
+/// the final frame. Payload: `[epoch:u64][up_to_seq:u32]`.
+pub const OP_EOT_ACK: u8 = 0x12;
+
+/// Peer capability advertisement (codec, sample rate, feature bits). JSON body.
+pub const OP_CAPABILITIES: u8 = 0x13;
 
 /// Peer dropped from the room — relay → remaining peers. Payload:
 ///   [peer_id_len:u8] [peer_id bytes (UTF-8)]
@@ -63,6 +80,63 @@ pub const OP_WAKE: u8 = 0x17;
 /// The trailing `original_audio_frame` is the encrypted audio (nonce +
 /// ciphertext + tag) exactly as the originating peer sent it.
 pub const OP_REPLAY_FRAME: u8 = 0x19;
+
+// ── Life-safety + key-agreement opcodes ───────────────────────────────────
+//
+// HISTORY — read before allocating another opcode. `emergency.rs` originally
+// self-allocated 0x1A/0x1B/0x1C after checking only the constants in THIS
+// file. But the Kotlin `ControlFrame` carried a second, larger registry that
+// had never been promoted here, and it already used 0x1B/0x1C for the hybrid
+// PQC handshake. Wiring emergency at those values would have routed a
+// man-down beacon into `handleHybridInit` — a life-safety frame parsed as a
+// key exchange. Man-down moved to 0x1D and clear to 0x1E, and every opcode
+// on the wire now lives in this file so a partial registry can't recur.
+// `all_opcodes_are_unique` below is the regression guard.
+
+/// Manual SOS / distress beacon. Payload: an `emergency::EmergencySignal`,
+/// AEAD-sealed when a session key exists (see `emergency_seal`).
+pub const OP_EMERGENCY: u8 = 0x1A;
+
+/// Hybrid PQC handshake, initiator → responder (X25519 + ML-KEM-768).
+pub const OP_HYBRID_INIT: u8 = 0x1B;
+
+/// Hybrid PQC handshake, responder → initiator.
+pub const OP_HYBRID_RESP: u8 = 0x1C;
+
+/// Automatic man-down trip beacon. Same `EmergencySignal` body as
+/// [OP_EMERGENCY]; the distinct opcode lets a receiver escalate an automatic
+/// trip differently from a deliberate press without parsing the body first.
+pub const OP_MANDOWN: u8 = 0x1D;
+
+/// Stand-down / "I'm OK" for a prior beacon from this sender. Payload: an
+/// `emergency::EmergencyClear`.
+pub const OP_EMERGENCY_CLEAR: u8 = 0x1E;
+
+/// Every opcode this protocol defines, for uniqueness checking and for
+/// consumers that need to validate an inbound byte against the whole set.
+/// Keep in sync when adding an opcode — `all_opcodes_are_unique` fails loudly
+/// if a value is reused, which is the failure this array exists to prevent.
+pub const ALL_OPCODES: &[(&str, u8)] = &[
+    ("PTT_START", OP_PTT_START),
+    ("PTT_STOP", OP_PTT_STOP),
+    ("READY_ACK", OP_READY_ACK),
+    ("PING", OP_PING),
+    ("CHANNEL_SYNC", OP_CHANNEL_SYNC),
+    ("HEARTBEAT", OP_HEARTBEAT),
+    ("RECV_ACK", OP_RECV_ACK),
+    ("EOT_ACK", OP_EOT_ACK),
+    ("CAPABILITIES", OP_CAPABILITIES),
+    ("PARTNER_OFFLINE", OP_PARTNER_OFFLINE),
+    ("PTT_START_V2", OP_PTT_START_V2),
+    ("PTT_STOP_V2", OP_PTT_STOP_V2),
+    ("WAKE", OP_WAKE),
+    ("REPLAY_FRAME", OP_REPLAY_FRAME),
+    ("EMERGENCY", OP_EMERGENCY),
+    ("HYBRID_INIT", OP_HYBRID_INIT),
+    ("HYBRID_RESP", OP_HYBRID_RESP),
+    ("MANDOWN", OP_MANDOWN),
+    ("EMERGENCY_CLEAR", OP_EMERGENCY_CLEAR),
+];
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -105,6 +179,37 @@ pub fn parse_tlv(bytes: &[u8]) -> Option<Tlv<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guard that would have caught the emergency/hybrid collision before
+    /// it reached a build. Every opcode must be unique across the WHOLE
+    /// registry — legacy and TLV alike — because a receiver dispatches on the
+    /// raw byte with no other discriminator.
+    #[test]
+    fn all_opcodes_are_unique() {
+        for (i, (name_a, op_a)) in ALL_OPCODES.iter().enumerate() {
+            for (name_b, op_b) in ALL_OPCODES.iter().skip(i + 1) {
+                assert_ne!(
+                    op_a, op_b,
+                    "opcode collision: {name_a} and {name_b} both use {op_a:#04x}"
+                );
+            }
+        }
+    }
+
+    /// Life-safety opcodes must sit in 0x10..=0x1F. Consumers route only that
+    /// window to the control-frame handler (see the relay client's
+    /// `op in 0x10..0x1F` check); an emergency frame outside it would be
+    /// handed to the audio decoder and dropped.
+    #[test]
+    fn emergency_opcodes_are_in_the_control_routing_window() {
+        for op in [OP_EMERGENCY, OP_MANDOWN, OP_EMERGENCY_CLEAR] {
+            assert!(is_tlv_opcode(op), "{op:#04x} must be TLV-framed");
+            assert!(
+                (0x10..=0x1F).contains(&op),
+                "{op:#04x} must be inside the 0x10..0x1F control-routing window"
+            );
+        }
+    }
 
     #[test]
     fn legacy_opcodes_are_below_tlv_range() {

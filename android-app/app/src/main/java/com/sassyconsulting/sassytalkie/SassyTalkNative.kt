@@ -1199,7 +1199,94 @@ object SassyTalkNative {
         } catch (e: Exception) { false }
     }
 
+    // ── Emergency / SOS (life-safety) ──
+    //
+    // The wire codec and beacon cadence live in sassytalkie-core so every
+    // platform emits byte-identical frames; these wrappers only move bytes.
+    // Beacon payloads are AEAD-sealed natively when a session key exists, so
+    // an attached GPS fix is never visible to the relay. Every call is
+    // exception-guarded: a distress path must degrade, never crash the app.
+
+    /** Kind byte for [emergencyActivate]: deliberate SOS press. */
+    const val EMERGENCY_KIND_SOS: Byte = 1
+    /** Kind byte for [emergencyActivate]: automatic man-down trip. */
+    const val EMERGENCY_KIND_MANDOWN: Byte = 2
+
+    /**
+     * Raise an emergency beacon. Returns the first frame to broadcast on every
+     * transport, or null if the native layer is not ready.
+     *
+     * Coordinates are attached only when [hasCoord] is set AND a session key
+     * exists to seal them; the native side drops them otherwise rather than
+     * leaking a location to the relay in cleartext.
+     */
+    fun emergencyActivate(
+        kind: Byte = EMERGENCY_KIND_SOS,
+        nowMs: Long = System.currentTimeMillis(),
+        hasCoord: Boolean = false,
+        latE7: Int = 0,
+        lonE7: Int = 0,
+        note: String = "",
+    ): ByteArray? {
+        if (!initialized) return null
+        return try {
+            nativeEmergencyActivate(kind, nowMs, hasCoord, latE7, lonE7, note)
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "emergencyActivate failed: ${e.message}")
+            null
+        }
+    }
+
+    /** Beacon cadence tick. Returns a re-broadcast frame when due, else null. */
+    fun emergencyTick(nowMs: Long = System.currentTimeMillis()): ByteArray? {
+        if (!initialized) return null
+        return try {
+            nativeEmergencyTick(nowMs)
+        } catch (e: Exception) { null }
+    }
+
+    /** Stand down. Returns the one-shot clear frame, or null if not active. */
+    fun emergencyClear(nowMs: Long = System.currentTimeMillis()): ByteArray? {
+        if (!initialized) return null
+        return try {
+            nativeEmergencyClear(nowMs)
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "emergencyClear failed: ${e.message}")
+            null
+        }
+    }
+
+    /** True while this device is broadcasting an emergency. */
+    fun emergencyIsActive(): Boolean {
+        if (!initialized) return false
+        return try {
+            nativeEmergencyIsActive()
+        } catch (e: Exception) { false }
+    }
+
+    /**
+     * Decode an inbound emergency frame to JSON, or null when the frame is not
+     * an emergency opcode / fails validation. Shape:
+     * `{"op":"emergency"|"mandown"|"clear","sender":…,"ts":…,"kind":…,
+     *   "sealed":<bool>[,"lat":…,"lon":…][,"note":…]}`
+     */
+    fun emergencyDecode(frame: ByteArray): String? {
+        if (!initialized) return null
+        return try {
+            nativeEmergencyDecode(frame)
+        } catch (e: Exception) { null }
+    }
+
     // ── Native method declarations ──
+
+    // Emergency / SOS
+    @JvmStatic private external fun nativeEmergencyActivate(
+        kind: Byte, nowMs: Long, hasCoord: Boolean, latE7: Int, lonE7: Int, note: String,
+    ): ByteArray?
+    @JvmStatic private external fun nativeEmergencyTick(nowMs: Long): ByteArray?
+    @JvmStatic private external fun nativeEmergencyClear(nowMs: Long): ByteArray?
+    @JvmStatic private external fun nativeEmergencyIsActive(): Boolean
+    @JvmStatic private external fun nativeEmergencyDecode(frame: ByteArray): String?
 
     // Lifecycle
     @JvmStatic private external fun nativeInit(): Boolean

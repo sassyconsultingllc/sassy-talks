@@ -515,6 +515,11 @@ struct JniAppState {
     bt_encoder: VoiceEncoder,
     /// Track whether BT mic capture is active for btEncodeFrame
     bt_recording: bool,
+    /// Manual-SOS beacon controller. Owns the active distress signal and its
+    /// re-broadcast cadence; Kotlin drives it via nativeEmergency* and puts
+    /// the returned frames on both transports. Lives here (not in Kotlin) so
+    /// the wire format and cadence stay identical across platforms.
+    emergency: crate::emergency::EmergencyState,
 }
 
 impl JniAppState {
@@ -538,6 +543,10 @@ impl JniAppState {
             bt_tx_buffer: Arc::new(Mutex::new(None)),
             bt_encoder: VoiceEncoder::new(),
             bt_recording: false,
+            // Placeholder sender id — replaced with the live device name on
+            // every activation (see nativeEmergencyActivate) so a profile
+            // rename is reflected in the beacon a responder actually sees.
+            emergency: crate::emergency::EmergencyState::new("SassyTalkie"),
         }
     }
 
@@ -3256,3 +3265,275 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 }
 
 // Whisper transcription JNI exports removed — transcription module stripped to slim down codebase.
+
+// ══════════════════════════════════════════════════════════════════════════
+// Emergency / SOS — life-safety signalling
+// ══════════════════════════════════════════════════════════════════════════
+//
+// Kotlin owns transport and UI; this layer owns the wire format and the beacon
+// cadence so Android, iOS and desktop stay byte-identical (codec and state
+// machine live in `sassytalkie-core::emergency`).
+//
+// PRIVACY: an emergency beacon can carry the sender's GPS fix. Control frames
+// otherwise cross the relay in the clear, so shipping coordinates that way
+// would hand the relay operator a live location feed for whoever is in
+// distress. Every beacon payload is therefore AEAD-sealed with the active
+// session key before framing — the relay sees an opaque blob under a TLV
+// header. With no session key the beacon still goes out (a distress call must
+// never be gated on key state) but WITHOUT coordinates, and that degradation
+// is decided at construction rather than silently dropped later.
+
+/// Reseal an emergency TLV frame's payload with the live session key.
+///
+/// In: `[op][len][cleartext payload]` from the core codec.
+/// Out: `[op][len][nonce||ciphertext||tag]`.
+/// `None` when there is no crypto session — the caller then sends the
+/// cleartext frame, which by construction carries no coordinates.
+fn seal_emergency_frame(guard: &JniAppState, frame: &[u8]) -> Option<Vec<u8>> {
+    let tlv = crate::protocol::parse_tlv(frame)?;
+    let sm = guard.state_machine.as_ref()?;
+    let sealed = {
+        let mut tm = sm.get_transport().lock().ok()?;
+        tm.encrypt_raw(tlv.payload).ok()?
+    };
+    Some(crate::protocol::encode_tlv(tlv.opcode, &sealed))
+}
+
+/// True when a session key exists to seal a beacon payload.
+fn emergency_can_seal(guard: &JniAppState) -> bool {
+    guard.state_machine.as_ref().map_or(false, |sm| {
+        sm.get_transport()
+            .lock()
+            .map(|tm| tm.is_encrypted())
+            .unwrap_or(false)
+    })
+}
+
+/// JNI: raise an emergency beacon. Returns the first frame to broadcast.
+///
+/// `kind`: 1 = manual SOS, 2 = man-down auto-trip.
+/// Coordinates are attached only when `has_coord` is set AND a session key
+/// exists to seal them (see the privacy note above).
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeEmergencyActivate<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    kind: jni::sys::jbyte,
+    now_ms: jni::sys::jlong,
+    has_coord: jboolean,
+    lat_e7: jni::sys::jint,
+    lon_e7: jni::sys::jint,
+    note: JString<'local>,
+) -> jni::sys::jbyteArray {
+    use crate::emergency::{EmergencyKind, EmergencyState, FixedCoord};
+
+    let note: Option<String> = env
+        .get_string(&note)
+        .ok()
+        .map(Into::<String>::into)
+        .filter(|s| !s.trim().is_empty());
+
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    let sealable = emergency_can_seal(&guard);
+    let coord = if has_coord != 0 && sealable {
+        Some(FixedCoord { lat_e7, lon_e7 })
+    } else {
+        if has_coord != 0 && !sealable {
+            warn!("Emergency: no session key — beacon goes out WITHOUT coordinates");
+        }
+        None
+    };
+
+    let kind = match kind {
+        2 => EmergencyKind::ManDown,
+        _ => EmergencyKind::Sos,
+    };
+
+    // Rebuild the controller against the CURRENT device name so a responder
+    // sees who is calling, not a stale profile name from process start.
+    let sender = guard
+        .state_machine
+        .as_ref()
+        .map(|sm| sm.get_device_name())
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    guard.emergency = EmergencyState::new(sender);
+
+    let frame = guard
+        .emergency
+        .activate_with(kind, now_ms as u64, coord, note);
+    let out = seal_emergency_frame(&guard, &frame).unwrap_or(frame);
+
+    info!(
+        "Emergency ACTIVATED kind={:?} sealed={} coord={}",
+        kind,
+        sealable,
+        coord.is_some()
+    );
+
+    match env.byte_array_from_slice(&out) {
+        Ok(arr) => arr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// JNI: advance the beacon clock. Returns a re-broadcast frame once the
+/// cadence interval has elapsed, else null. Cheap to call on a timer.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeEmergencyTick<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    now_ms: jni::sys::jlong,
+) -> jni::sys::jbyteArray {
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    let frame = match guard.emergency.tick(now_ms as u64) {
+        Some(f) => f,
+        None => return std::ptr::null_mut(),
+    };
+    let out = seal_emergency_frame(&guard, &frame).unwrap_or(frame);
+
+    match env.byte_array_from_slice(&out) {
+        Ok(arr) => arr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// JNI: stand down. Returns the clear frame to broadcast once, or null when
+/// no emergency was active.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeEmergencyClear<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    now_ms: jni::sys::jlong,
+) -> jni::sys::jbyteArray {
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+
+    let frame = match guard.emergency.clear(now_ms as u64) {
+        Some(f) => f,
+        None => return std::ptr::null_mut(),
+    };
+    let out = seal_emergency_frame(&guard, &frame).unwrap_or(frame);
+    info!("Emergency CLEARED — stand-down broadcast");
+
+    match env.byte_array_from_slice(&out) {
+        Ok(arr) => arr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// JNI: is this device currently broadcasting an emergency?
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeEmergencyIsActive(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.emergency.is_active() {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// JNI: decode an inbound emergency TLV frame to JSON for the UI.
+///
+/// Accepts sealed and cleartext payloads: the sealed path is tried first (the
+/// AEAD tag makes it unambiguous), falling back to a direct decode so a peer
+/// with no session key can still raise an alarm. Returns null when the frame
+/// is not an emergency opcode or fails validation — never panics on hostile
+/// input; the core decoder bounds-checks every field.
+///
+/// JSON: {"op":"emergency"|"mandown"|"clear","sender":…,"ts":…,"kind":…,
+///        "sealed":<bool>[,"lat":…,"lon":…][,"note":…]}
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeEmergencyDecode<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    data: jni::sys::jbyteArray,
+) -> JObject<'local> {
+    use crate::emergency::{EmergencyClear, EmergencyKind, EmergencySignal};
+    use jni::objects::JByteArray;
+
+    let j_data = unsafe { JByteArray::from_raw(data) };
+    let raw = match env.convert_byte_array(&j_data) {
+        Ok(b) => b,
+        Err(_) => return JObject::null(),
+    };
+
+    let tlv = match crate::protocol::parse_tlv(&raw) {
+        Some(t) => t,
+        None => return JObject::null(),
+    };
+    let op = tlv.opcode;
+    if op != crate::protocol::OP_EMERGENCY
+        && op != crate::protocol::OP_MANDOWN
+        && op != crate::protocol::OP_EMERGENCY_CLEAR
+    {
+        return JObject::null();
+    }
+
+    let unsealed: Option<Vec<u8>> = {
+        let state = get_jni_state();
+        let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.state_machine.as_ref().and_then(|sm| {
+            let tm = sm.get_transport().lock().ok()?;
+            tm.decrypt_raw(tlv.payload).ok()
+        })
+    };
+    let sealed = unsealed.is_some();
+    let payload: &[u8] = unsealed.as_deref().unwrap_or(tlv.payload);
+
+    let json = if op == crate::protocol::OP_EMERGENCY_CLEAR {
+        match EmergencyClear::decode(payload) {
+            Ok(c) => serde_json::json!({
+                "op": "clear",
+                "sender": c.sender_id,
+                "ts": c.timestamp_ms,
+                "sealed": sealed,
+            }),
+            Err(e) => {
+                warn!("Emergency CLEAR decode failed: {}", e);
+                return JObject::null();
+            }
+        }
+    } else {
+        match EmergencySignal::decode(payload) {
+            Ok(sig) => {
+                let mut obj = serde_json::json!({
+                    "op": if op == crate::protocol::OP_MANDOWN { "mandown" } else { "emergency" },
+                    "sender": sig.sender_id,
+                    "ts": sig.timestamp_ms,
+                    "kind": match sig.kind {
+                        EmergencyKind::Sos => "sos",
+                        EmergencyKind::ManDown => "mandown",
+                        EmergencyKind::Custom(_) => "custom",
+                    },
+                    "sealed": sealed,
+                });
+                if let Some(c) = sig.coord {
+                    let (lat, lon) = c.to_degrees();
+                    obj["lat"] = serde_json::json!(lat);
+                    obj["lon"] = serde_json::json!(lon);
+                }
+                if let Some(n) = sig.note {
+                    obj["note"] = serde_json::json!(n);
+                }
+                obj
+            }
+            Err(e) => {
+                warn!("Emergency signal decode failed: {}", e);
+                return JObject::null();
+            }
+        }
+    };
+
+    env.new_string(json.to_string())
+        .map(|s| s.into())
+        .unwrap_or_else(|_| JObject::null())
+}

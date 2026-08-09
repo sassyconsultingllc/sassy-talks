@@ -81,8 +81,50 @@ object ControlFrame {
     const val OP_HYBRID_INIT: Byte   = 0x1B
     const val OP_HYBRID_RESP: Byte   = 0x1C
 
+    /**
+     * Life-safety beacons. Payload bodies are built and parsed natively
+     * (sassytalkie-core `emergency`), AEAD-sealed with the session key when
+     * one exists — Kotlin only routes the opcode and moves the bytes.
+     *
+     * These MUST match `core/src/protocol.rs`, which is the single source of
+     * truth for the whole opcode space. Man-down is 0x1D and clear is 0x1E
+     * (not the 0x1B/0x1C the core module originally self-allocated) because
+     * those two were already taken by the hybrid PQC handshake above — an
+     * allocation made against a partial registry. `EmergencyOpcodeTest` and
+     * the Rust `all_opcodes_are_unique` test guard both halves.
+     */
+    const val OP_EMERGENCY: Byte       = 0x1A
+    const val OP_MANDOWN: Byte         = 0x1D
+    const val OP_EMERGENCY_CLEAR: Byte = 0x1E
+
     /** Capability bit advertised in the heartbeat caps byte: hybrid-PQC support. */
     const val CAP_HYBRID_PQC: Int    = 0x01
+
+    /**
+     * Every opcode this app puts on or takes off the wire, as (name, value).
+     * Exists so a test can assert uniqueness — the collision that motivated
+     * it was invisible precisely because no single list existed.
+     */
+    val ALL_OPCODES: List<Pair<String, Byte>> = listOf(
+        "PTT_START" to OP_PTT_START,
+        "PTT_STOP" to OP_PTT_STOP,
+        "READY_ACK" to OP_READY_ACK,
+        "PING" to OP_PING,
+        "CHANNEL_SYNC" to OP_CHANNEL_SYNC,
+        "HEARTBEAT" to OP_HEARTBEAT,
+        "RECV_ACK" to OP_RECV_ACK,
+        "EOT_ACK" to OP_EOT_ACK,
+        "CAPABILITIES" to OP_CAPABILITIES,
+        "PARTNER_OFFLINE" to OP_PARTNER_OFFLINE,
+        "PTT_START_V2" to OP_PTT_START_V2,
+        "PTT_STOP_V2" to OP_PTT_STOP_V2,
+        "WAKE" to OP_WAKE,
+        "HYBRID_INIT" to OP_HYBRID_INIT,
+        "HYBRID_RESP" to OP_HYBRID_RESP,
+        "EMERGENCY" to OP_EMERGENCY,
+        "MANDOWN" to OP_MANDOWN,
+        "EMERGENCY_CLEAR" to OP_EMERGENCY_CLEAR,
+    )
 
     fun encodeLegacy(op: Byte): ByteArray = byteArrayOf(op)
 

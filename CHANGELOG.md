@@ -9,6 +9,51 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.1.17] (69) — 2026-08-08
+
+### Fixed
+- **CRITICAL: radio screen crashed on entry.** `LiveTranslationOverlay` was
+  given `Modifier.padding(horizontal = (-16).dp)` to bleed past the parent
+  Column's inset, but Compose's padding modifier rejects negative values and
+  throws `IllegalArgumentException: Padding must be non-negative` when the
+  modifier is *constructed* — so every composition of MainScreen died. Present
+  since 6b8d717, shipped in **3.1.15 (67)** and **3.1.16 (68)**. Replaced with
+  the supported idiom: a custom `layout` that measures wider and places itself
+  back by the inset, reporting the original width so siblings are unaffected.
+  Anyone on 3.1.15/3.1.16 should update.
+
+### Added
+- **Emergency / SOS beacons — the life-safety path is live.** `emergency.rs`
+  had shipped as dead code since it was written: full codec, beacon cadence
+  and man-down state machine with 22 passing tests, but no JNI binding and no
+  UI, so pressing anything produced no wire frame. Now wired end to end.
+  - Long-press "HOLD FOR SOS" on the radio screen raises a beacon (long-press
+    only — a tap-to-fire distress control beside a 240dp PTT target would
+    misfire constantly). Re-broadcasts on the core-owned 5s cadence until
+    stood down; "I'M OK" sends the one-shot clear.
+  - Inbound beacons render as a full-width red card above everything else,
+    with sender, kind, age, note and coordinates when present.
+  - **Payloads are AEAD-sealed with the session key.** Control frames
+    otherwise cross the relay in cleartext, so an attached GPS fix would have
+    handed the relay operator a live location feed for whoever is in distress.
+    With no session key the beacon still goes out — a distress call is not
+    gated on key state — but without coordinates, and the receiver labels it
+    "unverified sender".
+  - 12 instrumented tests exercise the real JNI + sealing on-device; 5 unit
+    tests guard the opcode space.
+
+### Changed
+- **Opcode registry unified in `core/src/protocol.rs`.** `emergency.rs` had
+  self-allocated OP_MANDOWN=0x1B / OP_EMERGENCY_CLEAR=0x1C after checking only
+  the Rust constants — but Kotlin's `ControlFrame` held a second, larger
+  registry that already used 0x1B/0x1C for the hybrid PQC handshake. Wiring
+  emergency as written would have routed a man-down beacon into
+  `handleHybridInit`, parsing a life-safety frame as a key exchange. Man-down
+  moved to 0x1D, clear to 0x1E, every opcode now lives in one file, and
+  `all_opcodes_are_unique` (Rust) + `EmergencyOpcodeTest` (Kotlin) guard both
+  halves. Nothing shipped at the colliding values, so there is no interop
+  break.
+
 ## [3.1.16] (68) — 2026-08-08
 
 ### Fixed

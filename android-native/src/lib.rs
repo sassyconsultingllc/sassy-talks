@@ -42,6 +42,10 @@ pub use sassytalkie_core::pqc;
 pub use sassytalkie_core::audio_cache;
 pub use sassytalkie_core::cohort_history;
 pub use sassytalkie_core::protocol;
+// Life-safety signalling (SOS / man-down beacons + stand-down). The wire
+// codec and beacon cadence are core-owned so Android/iOS/desktop stay
+// byte-identical; this crate supplies only the JNI glue in jni_bridge.rs.
+pub use sassytalkie_core::emergency;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

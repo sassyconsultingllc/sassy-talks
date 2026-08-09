@@ -23,7 +23,11 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.pointerInteropFilter
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -121,6 +125,17 @@ fun MainScreen(
 
     // Talk-over indicator (Task 6.2)
     val peerSpeaking by (walkieService?.pttCoordinator?.peerSpeaking ?: falseFallback).collectAsState()
+
+    // Life-safety: our own beacon state + any peer currently in distress.
+    val emergencyFallback = remember {
+        kotlinx.coroutines.flow.MutableStateFlow(
+            emptyMap<String, com.sassyconsulting.sassytalkie.PttCoordinator.PeerEmergency>()
+        )
+    }
+    val peerEmergencies by (walkieService?.pttCoordinator?.peerEmergencies ?: emergencyFallback)
+        .collectAsState()
+    val selfEmergencyActive by (walkieService?.pttCoordinator?.selfEmergencyActive ?: falseFallback)
+        .collectAsState()
 
     // Half-duplex: while WE transmit, hard-mute incoming RX playback so the
     // remote stream isn't played out the speaker into our hot mic (acoustic
@@ -335,6 +350,22 @@ fun MainScreen(
                     }
                 }
             }
+        }
+
+        // ── Life-safety banners ──
+        // Deliberately the FIRST thing under the header, above connection
+        // status: a distress call must never be below the fold or competing
+        // with routine transport chatter for attention.
+        peerEmergencies.values.sortedByDescending { it.timestampMs }.forEach { em ->
+            PeerEmergencyCard(em)
+            Spacer(modifier = Modifier.height(6.dp))
+        }
+
+        if (selfEmergencyActive) {
+            SelfEmergencyBanner(
+                onClear = { walkieService?.pttCoordinator?.clearEmergency() }
+            )
+            Spacer(modifier = Modifier.height(6.dp))
         }
 
         // Connection status — single line for encrypted audio plane
@@ -637,11 +668,33 @@ fun MainScreen(
 
         Spacer(modifier = Modifier.weight(1f))
 
-        // Live translation — slim full-bleed bar above PTT (cancels Column's 16.dp inset).
+        // Live translation — slim full-bleed bar above PTT (cancels the
+        // Column's 16.dp inset).
+        //
+        // This CANNOT be `.padding(horizontal = (-16).dp)`: Compose's padding
+        // modifier requires non-negative values and throws
+        // `IllegalArgumentException: Padding must be non-negative` at modifier
+        // construction — i.e. on every composition of this screen, which took
+        // the whole radio screen down (shipped that way in 3.1.15/3.1.16).
+        // The supported way to draw outside a parent's inset is a custom
+        // layout that measures wider and places itself back by the inset.
         LiveTranslationOverlay(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = (-16).dp)
+                .layout { measurable, constraints ->
+                    val bleed = 16.dp.roundToPx()
+                    val widened = constraints.copy(
+                        maxWidth = constraints.maxWidth + bleed * 2,
+                        minWidth = (constraints.minWidth + bleed * 2)
+                            .coerceAtMost(constraints.maxWidth + bleed * 2),
+                    )
+                    val placeable = measurable.measure(widened)
+                    // Report the ORIGINAL width so siblings lay out unchanged;
+                    // only the drawn bar extends past the inset.
+                    layout(constraints.maxWidth, placeable.height) {
+                        placeable.place(-bleed, 0)
+                    }
+                }
                 .padding(bottom = 10.dp),
         )
 
@@ -774,7 +827,20 @@ fun MainScreen(
             )
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // SOS — long-press only. A tap-to-fire distress control next to a
+        // 240dp PTT button would be triggered by accident constantly, and a
+        // false SOS on a shared channel is expensive. Held for ~600ms it
+        // raises the beacon; clearing is a separate deliberate tap on the
+        // banner above. Hidden while our own beacon is already live.
+        if (!selfEmergencyActive) {
+            SosTrigger(
+                enabled = walkieService?.pttCoordinator != null,
+                onTrigger = { walkieService?.pttCoordinator?.raiseEmergency() },
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+        }
 
         // Encryption warning only when session is not encrypted
         if (!SassyTalkNative.isEncrypted()) {
@@ -1029,6 +1095,160 @@ fun MainScreen(
                 )
             },
             containerColor = CardBg
+        )
+    }
+}
+
+// ── Life-safety UI ──────────────────────────────────────────────────────────
+
+/** Distress red. Deliberately not reused for any routine warning state so the
+ *  colour alone reads as "emergency", not "degraded transport". */
+private val EmergencyRed = Color(0xFFD32F2F)
+private val EmergencyRedDim = Color(0xFF7F1D1D)
+
+/**
+ * A peer is in distress. Maximum prominence: filled red, top of the screen,
+ * shows who, what kind, how long ago, and any note or coordinates they sent.
+ */
+@Composable
+private fun PeerEmergencyCard(em: com.sassyconsulting.sassytalkie.PttCoordinator.PeerEmergency) {
+    val ageSec = ((System.currentTimeMillis() - em.timestampMs) / 1000).coerceAtLeast(0)
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = EmergencyRed),
+        shape = RoundedCornerShape(12.dp),
+    ) {
+        Column(modifier = Modifier.fillMaxWidth().padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.Warning,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(22.dp),
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = if (em.kind == "mandown") "MAN DOWN" else "EMERGENCY",
+                    color = Color.White,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "${em.senderId} · ${ageSec}s ago",
+                color = Color.White,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            em.note?.let {
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(text = it, color = Color.White, fontSize = 13.sp, maxLines = 3)
+            }
+            if (em.lat != null && em.lon != null) {
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = "%.5f, %.5f".format(em.lat, em.lon),
+                    color = Color.White,
+                    fontSize = 12.sp,
+                )
+            }
+            // An unsealed beacon means the sender had no session key, so the
+            // name on it is unauthenticated. Say so rather than implying the
+            // identity was verified.
+            if (!em.sealed) {
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = "unverified sender (no session key)",
+                    color = Color.White.copy(alpha = 0.85f),
+                    fontSize = 11.sp,
+                )
+            }
+        }
+    }
+}
+
+/** Our own beacon is live. Persistent, with the only way to stand down. */
+@Composable
+private fun SelfEmergencyBanner(onClear: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = EmergencyRedDim),
+        shape = RoundedCornerShape(12.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Default.Warning,
+                contentDescription = null,
+                tint = EmergencyRed,
+                modifier = Modifier.size(20.dp),
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = "Broadcasting SOS",
+                color = Color.White,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = onClear) {
+                Text("I'M OK", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+/**
+ * Long-press-to-fire SOS control.
+ *
+ * Long-press (not tap) is the whole point: this sits on the same screen as a
+ * large PTT target, and an accidental distress broadcast costs everyone on the
+ * channel. Progress is shown while held so the gesture is discoverable.
+ */
+@OptIn(ExperimentalComposeUiApi::class)
+@Composable
+private fun SosTrigger(enabled: Boolean, onTrigger: () -> Unit) {
+    var pressed by remember { mutableStateOf(false) }
+    val holdMs = 600L
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(22.dp))
+            .border(2.dp, if (enabled) EmergencyRed else TextMuted, RoundedCornerShape(22.dp))
+            .background(if (pressed) EmergencyRedDim else Color.Transparent)
+            .height(44.dp)
+            .pointerInput(enabled) {
+                if (!enabled) return@pointerInput
+                detectTapGestures(
+                    onPress = {
+                        pressed = true
+                        // Fire only if the press survives the hold window;
+                        // tryAwaitRelease returns when the finger lifts.
+                        val completed = withTimeoutOrNull(holdMs) { tryAwaitRelease() } == null
+                        pressed = false
+                        if (completed) onTrigger()
+                    },
+                )
+            },
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            Icons.Default.Warning,
+            contentDescription = null,
+            tint = if (enabled) EmergencyRed else TextMuted,
+            modifier = Modifier.size(18.dp),
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = if (pressed) "KEEP HOLDING…" else "HOLD FOR SOS",
+            color = if (enabled) EmergencyRed else TextMuted,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
         )
     }
 }
