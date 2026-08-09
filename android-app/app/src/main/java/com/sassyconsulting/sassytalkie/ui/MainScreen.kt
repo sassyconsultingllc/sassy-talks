@@ -207,14 +207,33 @@ fun MainScreen(
         }
     }
 
+    // Hoisted JNI reads. These were called straight from the composition body,
+    // so every recompose crossed JNI — and this screen recomposes constantly
+    // (pulse animation, TX/RX state, peer roster, emergency banners). Refreshed
+    // on the advisory tick and whenever the connection state changes, which is
+    // when either value can actually differ. The PTT press-time
+    // `isEncrypted()` check below is deliberately NOT hoisted: that one gates
+    // transmission and must read live state, not a cached copy.
+    var isEncrypted by remember { mutableStateOf(SassyTalkNative.isEncrypted()) }
+    var transportName by remember { mutableStateOf(SassyTalkNative.getTransportName()) }
+
     // Transport advisory refresh only — cache status polled centrally in TranscriptionBridge.
+    // Woke every 2s but only did work on every 5th tick, so four of every five
+    // wakeups computed nothing. Same effective 10s refresh, 1/5 the wakeups.
     LaunchedEffect(Unit) {
-        var tick = 0
         while (true) {
-            if (tick % 5 == 0) autoConnect.refreshTransportAdvisory()
-            kotlinx.coroutines.delay(2_000L)
-            tick++
+            autoConnect.refreshTransportAdvisory()
+            isEncrypted = SassyTalkNative.isEncrypted()
+            transportName = SassyTalkNative.getTransportName()
+            kotlinx.coroutines.delay(10_000L)
         }
+    }
+
+    // Connection transitions are the other moment these can change — pick them
+    // up immediately rather than waiting out the 10s tick.
+    LaunchedEffect(connectState) {
+        isEncrypted = SassyTalkNative.isEncrypted()
+        transportName = SassyTalkNative.getTransportName()
     }
 
     // Auto-connect and set cache to queue mode (cache-first). Re-run when the
@@ -390,8 +409,7 @@ fun MainScreen(
                             .background(planeColor)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
-                    val planeLabel = transportAdvisory?.activeLabel
-                        ?: SassyTalkNative.getTransportName()
+                    val planeLabel = transportAdvisory?.activeLabel ?: transportName
                     Text(
                         text = planeLabel,
                         fontSize = 13.sp,
@@ -843,7 +861,7 @@ fun MainScreen(
         }
 
         // Encryption warning only when session is not encrypted
-        if (!SassyTalkNative.isEncrypted()) {
+        if (!isEncrypted) {
             Text(
                 text = "⚠ Not encrypted — set up a session to protect audio",
                 fontSize = 11.sp,

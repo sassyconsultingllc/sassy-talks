@@ -23,6 +23,18 @@ on:
       - main
     paths:
       - 'android-app/**'
+      # The Rust sources are part of the shipped artifact — this job compiles
+      # them into the AAB. Without these paths a change to the audio engine,
+      # transport or protocol produced no build at all, which is half of how
+      # x86_64 silently shipped three releases stale (v3.1.16 changelog).
+      - 'android-native/**'
+      - 'core/**'
+      - '.github/workflows/build-aab.yml'
+
+env:
+  # Must match android-app/app/build.gradle.kts `ndkVersion`, or the libs CI
+  # builds are compiled against a different sysroot than Gradle expects.
+  NDK_VERSION: 27.1.12297006
 
 jobs:
   build-aab:
@@ -50,6 +62,84 @@ jobs:
           key: ${{ runner.os }}-gradle-${{ hashFiles('android-app/**/*.gradle.kts') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
+
+      # ── Native (Rust) ────────────────────────────────────────────────────
+      # Until now this workflow never compiled Rust: it packaged whatever
+      # libsassytalkie.so happened to be committed. That made the checked-in
+      # binary the real release artifact, and it drifted — x86_64 shipped
+      # 3.1.12-era audio code while the app reported 3.1.15, because only
+      # arm64 had been rebuilt by hand. CI now builds BOTH ABIs from source
+      # on every release build, so the committed .so can never decide what
+      # ships again.
+
+      - name: Set up Rust with Android targets
+        uses: dtolnay/rust-toolchain@1ff72ee08e3cb84d84adba594e0a297990fc1ed3 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            android-native/target
+          key: ${{ runner.os }}-cargo-ndk-${{ hashFiles('android-native/Cargo.toml', 'core/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ndk-
+
+      - name: Install NDK ${{ env.NDK_VERSION }}
+        run: |
+          yes | sdkmanager --install "ndk;$NDK_VERSION" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Run core unit tests
+        working-directory: core
+        run: cargo test --lib
+
+      - name: Build native libs (arm64-v8a + x86_64)
+        working-directory: android-native
+        # ONE invocation for both ABIs. Building them separately is how they
+        # drifted apart in the first place — it makes it possible to forget
+        # one and impossible to notice.
+        run: |
+          cargo ndk -t arm64-v8a -t x86_64 \
+            -o ../android-app/app/src/main/jniLibs build --release
+
+      - name: Verify both ABIs were produced and export the JNI surface
+        run: |
+          fail=0
+          for abi in arm64-v8a x86_64; do
+            so="android-app/app/src/main/jniLibs/$abi/libsassytalkie.so"
+            if [ ! -s "$so" ]; then
+              echo "::error::$abi: libsassytalkie.so missing or empty"; fail=1; continue
+            fi
+            echo "$abi: $(stat -c%s "$so") bytes"
+            # Spot-check symbols from three independent subsystems so a
+            # partial/misconfigured build fails here rather than at runtime.
+            for sym in nativeInit nativePttStart nativeEmergencyActivate; do
+              if ! grep -aq "$sym" "$so"; then
+                echo "::error::$abi: missing exported symbol $sym"; fail=1
+              fi
+            done
+          done
+          exit $fail
+
+      - name: Report drift from the committed prebuilt
+        # Informational only — CI's freshly built lib is authoritative now.
+        # A diff here means someone changed Rust without rebuilding locally,
+        # which is worth seeing in the log but is no longer a shipping risk.
+        run: |
+          if git diff --quiet -- android-app/app/src/main/jniLibs; then
+            echo "Committed .so matches the CI build."
+          else
+            echo "::notice::Committed .so differs from the CI build — CI's build is what ships."
+            git diff --stat -- android-app/app/src/main/jniLibs
+          fi
 
       - name: Make gradlew executable
         run: chmod +x android-app/gradlew

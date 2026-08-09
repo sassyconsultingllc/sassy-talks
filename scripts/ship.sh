@@ -46,9 +46,63 @@ WORKER_CFG="${SASSYCONSULTINGLLC_WORKER_DIR:-/v/Projects/sassyconsultingllc-clou
 
 echo "── ship.sh v${VERSION} ─────────────────────────────────────────────"
 
+# 0) native-lib staleness guard
+#
+# This script uploads whatever is already built, and Gradle packages whatever
+# .so is committed — neither compiles Rust. That combination shipped x86_64
+# three releases stale (3.1.13/14/15 all carried a 3.1.12-era lib) because
+# only arm64 got rebuilt by hand and nothing anywhere complained. CI now
+# builds both ABIs from source; this is the same guard for the local path.
+#
+# Rule: no Rust source may be newer than either committed .so, and no .so may
+# be newer than the artifacts about to ship.
+JNILIBS="$ROOT/android-app/app/src/main/jniLibs"
+RUST_SRC_DIRS=("$ROOT/android-native/src" "$ROOT/core/src")
+stale=0
+for abi in arm64-v8a x86_64; do
+  so="$JNILIBS/$abi/libsassytalkie.so"
+  if [ ! -s "$so" ]; then
+    echo "FAIL: $abi/libsassytalkie.so missing or empty" >&2
+    stale=1
+    continue
+  fi
+  newer=$(find "${RUST_SRC_DIRS[@]}" -type f \( -name '*.rs' -o -name '*.toml' \) \
+            -newer "$so" -print -quit 2>/dev/null || true)
+  if [ -n "$newer" ]; then
+    echo "FAIL: $abi native lib is OLDER than Rust source ($newer)" >&2
+    stale=1
+  fi
+done
+if [ "$stale" -ne 0 ]; then
+  cat >&2 <<'HINT'
+
+Rebuild BOTH ABIs in one invocation, then re-package, then re-run ship.sh:
+
+  (cd android-native && cargo ndk -t arm64-v8a -t x86_64 \
+      -o ../android-app/app/src/main/jniLibs build --release)
+  (cd android-app && ./gradlew assembleDirectRelease bundlePlayRelease)
+
+Build the two ABIs together — building them separately is what let one go
+stale unnoticed.
+HINT
+  exit 1
+fi
+echo "native libs: both ABIs present and newer than Rust sources"
+
 # 1) preflight
 for f in "$APK" "$AAB"; do
   [ -f "$f" ] || { echo "missing: $f" >&2; exit 1; }
+done
+
+# Artifacts must be newer than the libs they are supposed to contain.
+for abi in arm64-v8a x86_64; do
+  so="$JNILIBS/$abi/libsassytalkie.so"
+  for art in "$APK" "$AAB"; do
+    if [ "$so" -nt "$art" ]; then
+      echo "FAIL: $(basename "$art") predates $abi/libsassytalkie.so — re-package before shipping" >&2
+      exit 1
+    fi
+  done
 done
 APK_SIZE=$(stat -c %s "$APK")
 APK_HASH=$(sha256sum "$APK" | awk '{print $1}')

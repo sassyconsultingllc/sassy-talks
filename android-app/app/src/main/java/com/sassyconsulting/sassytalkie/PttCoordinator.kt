@@ -842,7 +842,15 @@ class PttCoordinator(
         // heartbeatJob loop above.
         staleCheckJob = scope.launch {
             while (isActive) {
-                delay(1_000L)
+                // Adaptive cadence: with no peers tracked there is nothing to
+                // evaluate — health, roster and stale-state are all trivially
+                // empty — so a 1s tick is pure battery burn on a radio sitting
+                // idle on a belt all shift (3,600 wakeups/hour to compute an
+                // empty set). Poll at 1s only while peers exist; otherwise
+                // idle at 5s. First peer is picked up within 5s and the loop
+                // immediately returns to 1s, which is well inside the 8s
+                // stale threshold, so detection latency is unaffected.
+                delay(if (liveness.peerIds().isEmpty()) 5_000L else 1_000L)
                 val nowMs = System.currentTimeMillis()
                 val allPeers = liveness.peerIds()
                 val stale = allPeers.isNotEmpty() && allPeers.any { liveness.health(it, nowMs) == PeerHealth.STALE }

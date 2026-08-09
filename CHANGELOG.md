@@ -9,6 +9,40 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.1.18] (70) — 2026-08-08
+
+### Changed
+- **CI builds the native libs from source.** The release workflow never
+  compiled Rust — it packaged whatever `libsassytalkie.so` happened to be
+  committed, which made the checked-in binary the real release artifact and
+  let x86_64 drift three releases behind (see 3.1.16). It also only triggered
+  on `android-app/**`, so a change to the audio engine, transport or protocol
+  produced no build at all. Now: triggers on `android-native/**` and `core/**`
+  too, installs NDK 27.1.12297006 (pinned to Gradle's `ndkVersion`), runs the
+  core unit tests, builds BOTH ABIs in one `cargo ndk` invocation, and fails
+  the build if either ABI is missing or has lost an exported JNI symbol.
+- **`ship.sh` refuses to ship a stale native lib.** New preflight: fails if
+  any Rust source is newer than either committed `.so`, or if the APK/AAB
+  predates the libs they are meant to contain — with the exact rebuild command
+  in the error. Caught a real staleness case on its first run.
+
+### Fixed
+- **Idle battery drain.** Three loops woke far more often than they did work:
+  the peer stale-check ticked every 1s even with zero peers tracked (3,600
+  wakeups/hour to evaluate an empty set — now 5s while idle, snapping back to
+  1s the moment a peer appears, well inside the 8s stale threshold); the
+  transport-advisory loop woke every 2s but only acted on every 5th tick (now
+  a plain 10s tick — same refresh rate, 1/5 the wakeups); and the cohort
+  snapshotter crossed JNI for the full user list every 30s even with no
+  session established (now early-outs on `isAuthenticated`).
+- **JNI calls in the composition body.** `isEncrypted()` and
+  `getTransportName()` were read directly during composition, so every
+  recompose of the radio screen — pulse animation, TX/RX state, roster
+  changes, emergency banners — crossed the JNI boundary. Hoisted into state
+  refreshed on the advisory tick and on connection-state changes. The
+  press-time `isEncrypted()` gate is deliberately left live: it authorises
+  transmission and must not read a cached value.
+
 ## [3.1.17] (69) — 2026-08-08
 
 ### Fixed

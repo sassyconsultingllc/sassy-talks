@@ -519,6 +519,15 @@ class WalkieService : Service() {
         cohortSnapshotJob = serviceScope.launch {
             while (isActive) {
                 try {
+                    // Cheapest possible early-out first. Without a session
+                    // there is no cohort to snapshot, yet this still crossed
+                    // JNI for the full user list every 30s for the entire
+                    // service lifetime — including the whole time the app sits
+                    // on the auth screen or idles unpaired.
+                    if (!SassyTalkNative.isAuthenticated()) {
+                        delay(30_000)
+                        continue
+                    }
                     val users = SassyTalkNative.getUsers()
                     if (users.isNotEmpty()) {
                         val arr = org.json.JSONArray()
