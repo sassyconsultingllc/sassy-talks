@@ -19,7 +19,14 @@ standalone-ui = ["eframe", "egui", "android-activity"]
 # Used only to force Cargo to fetch audiopus_sys so its bundled libopus C
 # source is unpacked into the registry, where build.rs reads it. The crate
 # itself is never linked — build.rs compiles libopus directly via the cc
-# crate. Activate with `cargo fetch --features _prefetch-opus-src`.
+# crate.
+#
+# NOTE: `cargo fetch --features _prefetch-opus-src` does NOT work — cargo
+# fetch accepts no --features flag, so that recipe never populated anything.
+# Enabling the feature via `cargo build` would compile audiopus_sys and run
+# the cmake path build.rs exists to bypass. On a clean machine, download the
+# published crate and point OPUS_SRC_DIR at its `opus/` dir; see the
+# "Fetch bundled libopus sources" step in .github/workflows/build-aab.yml.
 _prefetch-opus-src = ["audiopus_sys"]
 
 [dependencies]

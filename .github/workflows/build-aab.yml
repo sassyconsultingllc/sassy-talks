@@ -98,15 +98,31 @@ jobs:
         run: cargo install cargo-ndk --locked
 
       - name: Fetch bundled libopus sources
-        working-directory: android-native
         # build.rs compiles libopus itself via the `cc` crate (bypassing
         # audiopus_sys's cmake build, which is unreliable for Android
         # cross-compilation) but it takes the C sources from audiopus_sys's
-        # bundled copy in the cargo registry. audiopus_sys is an OPTIONAL
-        # dependency, so nothing downloads it on a clean machine — it was only
-        # ever present because one developer's registry happened to have it.
-        # This is the prefetch the crate documents for exactly that reason.
-        run: cargo fetch --features _prefetch-opus-src
+        # bundled copy. audiopus_sys is an OPTIONAL dependency, so a clean
+        # machine never downloads it — it was only ever present because one
+        # developer's registry happened to hold it, the same root cause as the
+        # hardcoded OPUS_SRC_DIR.
+        #
+        # Cargo.toml suggests `cargo fetch --features _prefetch-opus-src`, but
+        # `cargo fetch` takes no --features flag (that comment is stale). And
+        # enabling the feature via `cargo build` would compile audiopus_sys,
+        # running the very cmake path build.rs exists to avoid. So fetch the
+        # published crate directly and hand build.rs its documented override.
+        run: |
+          set -euo pipefail
+          ver=0.2.2
+          curl -sSfL "https://static.crates.io/crates/audiopus_sys/audiopus_sys-${ver}.crate" \
+            -o /tmp/audiopus_sys.crate
+          mkdir -p /tmp/opus-src
+          tar -xzf /tmp/audiopus_sys.crate -C /tmp/opus-src
+          src="/tmp/opus-src/audiopus_sys-${ver}/opus"
+          # Fail loudly here rather than let build.rs die further along.
+          test -f "$src/include/opus.h"
+          echo "OPUS_SRC_DIR=$src" >> "$GITHUB_ENV"
+          echo "libopus sources at $src"
 
       - name: Run core unit tests
         working-directory: core
