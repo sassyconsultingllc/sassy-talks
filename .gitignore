@@ -81,3 +81,11 @@ ios-native.zip
 **/playstore-complete.zip
 **/core.zip
 
+
+# Machine-local cargo overrides. A committed .cargo/config.toml pinned
+# OPUS_SRC_DIR and every Android linker to one developer's Windows paths
+# (and to NDK 26 while Gradle wanted 27), so the native build only ever
+# worked on that laptop — CI's first real Rust build failed on it
+# immediately. build.rs discovers the opus sources from the registry and
+# cargo-ndk supplies the linkers, so no committed override is needed.
+android-native/.cargo/config.toml
