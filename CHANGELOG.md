@@ -9,6 +9,30 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.1.22] (74) - 2026-08-10
+
+### Added
+- **Post-update state reset.** An in-place update keeps every byte of prior
+  state while the binary underneath it changes: native caches and counters
+  describe a process that no longer exists, and the relay socket is bound to
+  the old one. That is why "just reinstall it" kept working as a fix — the
+  update path never did the cleanup. On a version change the app now clears
+  the derived state (audio cache, timeline, diagnostic counters).
+  - Triggered by a startup version check, not only by
+    `ACTION_MY_PACKAGE_REPLACED`: a force-stopped app never receives that
+    broadcast and OEM battery managers force-stop aggressively, so the devices
+    most likely to need the reset are the least likely to get the broadcast.
+    The receiver is an accelerator that does the work before the app is opened.
+  - Session keys, profile and entitlement are deliberately PRESERVED. Wiping
+    them on every Play update would log every user out of their channel and
+    force a QR re-pair with their host, which is worse than the staleness it
+    fixes and would defeat the stored-credential rejoin path. Set
+    `update_full_reset` for literal fresh-install semantics; off by default
+    because the cost lands on the user.
+  - Verified on real in-place updates: reset fires on 73->74 before first
+    launch, does not fire on first install, does not repeat on relaunch, and a
+    session established before a 74->75 update is restored afterwards.
+
 ## [3.1.21] (73) - 2026-08-09
 
 ### Fixed

@@ -141,6 +141,20 @@
             </intent-filter>
         </service>
 
+        <!-- Post-update reset. Fires the moment Play replaces the package so
+             stale state from the previous binary is cleared before the user
+             opens the app. This is an accelerator only: a force-stopped app
+             never receives this broadcast, so UpdateReset also runs a version
+             check at startup, which is the actual guarantee. Not exported —
+             MY_PACKAGE_REPLACED is delivered only to the replaced package. -->
+        <receiver
+            android:name=".AppUpdateReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

@@ -150,6 +150,22 @@ fun AppNavigation(
                 initOk
             }
             if (success) {
+                // Post-update reset, BEFORE restoring anything. An in-place
+                // update keeps all prior state while the binary underneath it
+                // changed — stale native caches, counters describing a dead
+                // process, a relay socket bound to the old room. This is the
+                // cleanup the update path never did, which is why
+                // "reinstall it" kept working as a fix.
+                //
+                // Runs here rather than only in AppUpdateReceiver because a
+                // force-stopped app never receives MY_PACKAGE_REPLACED, and
+                // OEM battery managers force-stop aggressively — the devices
+                // most likely to need this are the ones least likely to get
+                // the broadcast. Costs one int comparison when it is a no-op.
+                withContext(Dispatchers.IO) {
+                    com.sassyconsulting.sassytalkie.UpdateReset.runIfUpdated(context)
+                }
+
                 // Restore persisted session (survives app restart)
                 val sessionRestored = withContext(Dispatchers.IO) {
                     val restored = SassyTalkNative.restoreSession()
