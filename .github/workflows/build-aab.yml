@@ -97,6 +97,17 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
+      - name: Fetch bundled libopus sources
+        working-directory: android-native
+        # build.rs compiles libopus itself via the `cc` crate (bypassing
+        # audiopus_sys's cmake build, which is unreliable for Android
+        # cross-compilation) but it takes the C sources from audiopus_sys's
+        # bundled copy in the cargo registry. audiopus_sys is an OPTIONAL
+        # dependency, so nothing downloads it on a clean machine — it was only
+        # ever present because one developer's registry happened to have it.
+        # This is the prefetch the crate documents for exactly that reason.
+        run: cargo fetch --features _prefetch-opus-src
+
       - name: Run core unit tests
         working-directory: core
         run: cargo test --lib
