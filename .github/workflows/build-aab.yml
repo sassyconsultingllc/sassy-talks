@@ -228,6 +228,26 @@ jobs:
           path: android-app/app/build/outputs/bundle/playRelease/*.aab
           retention-days: 30
 
+      - name: Verify Play credentials are present
+        # The upload action reports a missing/empty service account as a bare
+        # "Unknown error occurred" and exits in ~100ms, which reads like a Play
+        # API rejection rather than an unset secret. The keystore secrets above
+        # already get an explicit preflight; this gives the Play credential the
+        # same treatment so the failure names itself.
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_to_play == 'true'
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [ -z "${PLAY_SERVICE_ACCOUNT_JSON:-}" ]; then
+            echo "::error::PLAY_SERVICE_ACCOUNT_JSON secret is not set — cannot publish to Google Play."
+            echo "::error::Create a Play Console service account, grant it release permissions, and add the JSON as that repo secret."
+            echo "::error::The signed AAB is still attached to this run as an artifact and can be uploaded via the Play Console manually."
+            exit 1
+          fi
+          # Fail on a malformed secret too — a truncated paste is otherwise
+          # indistinguishable from an API rejection at the upload step.
+          echo "$PLAY_SERVICE_ACCOUNT_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("type")=="service_account", "not a service_account JSON"; print("service account:", d.get("client_email","<no client_email>"))'
+
       - name: Publish to Google Play
         # Only on manual workflow_dispatch with publish_to_play=true.
         # Pushes never auto-publish — they only build + upload artifact.
