@@ -204,7 +204,11 @@ fun AppNavigation(
                 // Entitlement gate overrides all of the above routing while
                 // locked. EncryptedSharedPreferences read — cheap, still on
                 // the IO-adjacent init path.
-                entitled = withContext(Dispatchers.IO) { Entitlements.isUnlockedCached(context) }
+                entitled = withContext(Dispatchers.IO) {
+                    // Trial users are "entitled" for routing purposes: the paywall
+                    // waits until 5 sessions have actually had a peer in them.
+                    com.sassyconsulting.sassytalkie.license.TrialGate.mayUseRadio(context)
+                }
                 if (!entitled) {
                     currentScreen = Screen.Gate
                 }
@@ -250,10 +254,12 @@ fun AppNavigation(
     LaunchedEffect(nativeReady, pendingShareUri) {
         val uri = pendingShareUri
         if (nativeReady && uri != null) {
-            // A tapped sassytalk:// (or https) invite should land on the session
-            // QR-entry screen while the session loads, so the user sees WHICH
-            // session they're joining rather than being dropped straight onto
-            // the radio. (Locked builds stay on the gate.)
+            // Show the auth screen only WHILE the invite is being decrypted and
+            // imported — it is the loading state, not the destination. On
+            // success we go straight to the radio (below): tapping an invite is
+            // already an explicit "join this" gesture, so asking the user to
+            // then find and press Continue is a second confirmation of a
+            // decision they just made. (Locked builds stay on the gate.)
             if (entitled) currentScreen = Screen.Auth
             val result = withContext(Dispatchers.IO) {
                 SessionShareLink.importFromShareUri(uri)
@@ -277,15 +283,28 @@ fun AppNavigation(
                         // toast left them guessing.
                         val ctx = describeImportedSession(result.json)
                         Toast.makeText(context, ctx, Toast.LENGTH_LONG).show()
-                        // Stay on the session QR-entry (Auth) screen with the
-                        // imported session now loaded — it shows the active
-                        // session + Continue so the user confirms before the
-                        // radio goes live. Bump the nonce so the Auth screen
-                        // recomposes and picks up the just-imported session.
-                        // Invite links don't bypass the entitlement gate: a
-                        // locked build stays on the gate.
+                        // Go straight onto the radio. Tapping an invite link is
+                        // the join gesture; parking on Auth so the user could
+                        // press Continue made every invite a two-step join and
+                        // read as "the link didn't work" — the toast already
+                        // names the host and channel, so nothing is hidden.
+                        //
+                        // autoConnect.disconnect() mirrors what the Continue
+                        // button does: it tears the relay client down so
+                        // MainScreen's auto-connect re-runs against the newly
+                        // imported session_id instead of the previous room.
+                        // Without it the joiner sits on the radio screen bound
+                        // to the wrong room — connected, and silent.
+                        //
+                        // Invite links still don't bypass the entitlement gate:
+                        // a locked build stays on the gate.
                         authRefreshNonce++
-                        currentScreen = if (entitled) Screen.Auth else Screen.Gate
+                        if (entitled) {
+                            autoConnect.disconnect()
+                            currentScreen = Screen.Main
+                        } else {
+                            currentScreen = Screen.Gate
+                        }
                     } else {
                         Toast.makeText(
                             context,
@@ -320,8 +339,13 @@ fun AppNavigation(
         val ok = suspendCancellableCoroutine { cont ->
             Entitlements.refresh(context) { result -> cont.resume(result) }
         }
-        entitled = ok
-        if (!ok) currentScreen = Screen.Gate
+        // The server/Play answer alone must NOT decide routing: a trial user
+        // legitimately has no entitlement, and taking `ok` at face value here
+        // would drop them onto the paywall a beat after launch — silently
+        // undoing the trial from a background coroutine.
+        val mayUse = ok || com.sassyconsulting.sassytalkie.license.TrialGate.inTrial(context)
+        entitled = mayUse
+        if (!mayUse) currentScreen = Screen.Gate
     }
 
     // Wait for both native init and the service binding before starting BLE/RFCOMM.

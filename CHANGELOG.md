@@ -9,6 +9,36 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.1.23] (75) - 2026-08-10
+
+### Changed
+- **Paywall now waits for 5 sessions that actually had a peer.** Previously the
+  gate could greet a user before they had ever heard the radio work. "Value" is
+  deliberately defined as a session with at least one peer present — not an app
+  launch, and not a session created, because a walkie-talkie with nobody on the
+  other end has demonstrated nothing, and hosting a QR nobody scans must not
+  cost a free session. Counting is by distinct session id, so rejoining the same
+  channel all day is one session, not a drained trial.
+  - Every gate routes through one predicate (`TrialGate.mayUseRadio`) — the UI
+    gate, `AutoConnectManager`, and all three `WalkieService` transport gates.
+    Changing only the UI would have produced the worst version of this: a trial
+    user on the radio screen whose transports silently refuse to connect.
+  - The silent post-launch entitlement refresh also had to be taught about the
+    trial; taking the server answer at face value would have dropped trial users
+    onto the paywall a beat after launch, from a background coroutine.
+  - Soft gate by design: it lives in SharedPreferences and clearing app data
+    resets it. Hardening would need a server round-trip per join, which breaks
+    the offline/mesh case the radio exists for.
+
+### Fixed
+- **Invite links now open straight into the session.** A tapped invite imported
+  the session and then parked on the Auth screen waiting for a Continue press —
+  a second confirmation of the decision the user just made by tapping the link,
+  which read as "the link didn't work". It now goes straight to the radio, with
+  the same relay teardown the Continue button did so the joiner lands in the
+  imported room rather than the previous one. Verified that a URL click opens
+  the app rather than the browser (App Links domain verification: verified).
+
 ## [3.1.22] (74) - 2026-08-10
 
 ### Added

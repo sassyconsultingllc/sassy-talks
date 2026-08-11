@@ -204,7 +204,7 @@ class AutoConnectManager(private val context: Context) {
 
     suspend fun autoConnect(walkieService: WalkieService?): Boolean {
         walkieServiceRef = walkieService
-        if (!Entitlements.isUnlockedCached(context)) {
+        if (!com.sassyconsulting.sassytalkie.license.TrialGate.mayUseRadio(context)) {
             Log.i(TAG, "autoConnect: not entitled — refusing to start transports")
             _state.value = ConnectState.FAILED
             _statusText.value = "Locked — unlock to connect"

@@ -228,7 +228,7 @@ class WalkieService : Service() {
      * a chance to bring them up so the wake actually re-attaches the relay.
      */
     private suspend fun kickCellularReconnect() {
-        if (!Entitlements.isUnlockedCached(this)) {
+        if (!com.sassyconsulting.sassytalkie.license.TrialGate.mayUseRadio(this)) {
             Log.i(TAG, "kickCellularReconnect: not entitled — skipping relay connect")
             return
         }
@@ -264,7 +264,7 @@ class WalkieService : Service() {
      * a service binder reference.
      */
     fun forceCellularReconnect() {
-        if (!Entitlements.isUnlockedCached(this)) {
+        if (!com.sassyconsulting.sassytalkie.license.TrialGate.mayUseRadio(this)) {
             Log.i(TAG, "forceCellularReconnect: not entitled — skipping relay connect")
             return
         }
@@ -445,7 +445,7 @@ class WalkieService : Service() {
      */
     @android.annotation.SuppressLint("MissingPermission")
     fun initBleTransport(): Boolean {
-        if (!Entitlements.isUnlockedCached(this)) {
+        if (!com.sassyconsulting.sassytalkie.license.TrialGate.mayUseRadio(this)) {
             Log.i(TAG, "initBleTransport: not entitled — refusing to start BLE/RFCOMM")
             return false
         }

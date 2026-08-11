@@ -139,6 +139,24 @@ fun MainScreen(
     val selfEmergencyActive by (walkieService?.pttCoordinator?.selfEmergencyActive ?: falseFallback)
         .collectAsState()
 
+    // Free-trial accounting: a session only counts once a peer is actually
+    // present. Creating a room nobody joins proves nothing to the user, so it
+    // must not burn a free session — see TrialGate for why "had a peer" is the
+    // threshold rather than "opened the app" or "made a QR".
+    val trialPeerIds by (walkieService?.pttCoordinator?.peerIds
+        ?: remember { kotlinx.coroutines.flow.MutableStateFlow(emptySet<String>()) })
+        .collectAsState()
+    LaunchedEffect(trialPeerIds.isNotEmpty()) {
+        if (trialPeerIds.isNotEmpty()) {
+            withContext(Dispatchers.IO) {
+                com.sassyconsulting.sassytalkie.license.TrialGate.noteQualifyingSession(
+                    context,
+                    SassyTalkNative.getSessionId(),
+                )
+            }
+        }
+    }
+
     // Half-duplex: while WE transmit, hard-mute incoming RX playback so the
     // remote stream isn't played out the speaker into our hot mic (acoustic
     // feedback) — radio convention is you don't hear others while keyed. This is
