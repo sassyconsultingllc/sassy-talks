@@ -34,7 +34,8 @@ import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -75,6 +76,7 @@ class MainActivity : ComponentActivity() {
     val inPictureInPictureMode = mutableStateOf(false)
     /** True while the main radio screen is active — enables auto-PiP on home press. */
     val pipEligible = mutableStateOf(false)
+    val radioUiVisible = mutableStateOf(false)
 
     // ── Hardware push-to-talk ──
     // Routes physical PTT buttons + Bluetooth PTT accessories through the
@@ -126,6 +128,10 @@ class MainActivity : ComponentActivity() {
         // A permanently-denied permission resolves instantly, so a re-request
         // here loops forever and ANRs. The gate screen button is the retry path.
         permissionsGranted.value = coreGranted()
+        if (!isGranted(Manifest.permission.RECORD_AUDIO)) {
+            walkieService.value?.pttCoordinator?.forceStop("microphone-permission-denied")
+                ?: SassyTalkNative.pttStop()
+        }
     }
 
     // ── Service binding ──
@@ -161,6 +167,7 @@ class MainActivity : ComponentActivity() {
 
         // Diagnostics overlay toggle — persisted, honoured in release builds.
         DiagnosticsPrefs.init(this)
+        RelayTlsPins.processEnabled = ManagedConfig.tlsPinningEnabled(this)
 
         // Live translation session (Settings configure; Main/PiP observe).
         com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge.init(this)
@@ -203,18 +210,23 @@ class MainActivity : ComponentActivity() {
                                 pipEligible.value = eligible
                                 updatePipAutoEnter()
                             },
+                            onRadioUiVisible = { radioUiVisible.value = it },
                         )
                     }
                     val diagOn by DiagnosticsPrefs.overlayEnabled.collectAsState()
-                    if (!pipActive && (BuildConfig.DEBUG || diagOn)) {
+                    val showHud = DiagnosticsPrefs.shouldShowOverlay(
+                        debugBuild = BuildConfig.DEBUG,
+                        diagEnabled = diagOn,
+                        radioUiVisible = radioUiVisible.value,
+                        managedAllowed = ManagedConfig.diagnosticsAllowed(this@MainActivity),
+                    )
+                    if (!pipActive && showHud) {
                         DebugOverlay(
                             modifier = Modifier
                                 .align(Alignment.TopEnd)
-                                // Clear the top toolbar (channel header +
-                                // QR/refresh/overflow icons) so the overlay
-                                // neither covers nor swallows taps on them.
                                 .padding(top = 80.dp, end = 8.dp)
-                                .width(280.dp),
+                                .wrapContentWidth()
+                                .widthIn(max = 280.dp),
                         )
                     }
                 }
@@ -267,6 +279,10 @@ class MainActivity : ComponentActivity() {
         // the permission gate must clear the moment mic + camera are granted.
         if (!permissionsGranted.value && coreGranted()) {
             permissionsGranted.value = true
+        }
+        if (!isGranted(Manifest.permission.RECORD_AUDIO)) {
+            walkieService.value?.pttCoordinator?.forceStop("microphone-permission-lost")
+                ?: SassyTalkNative.pttStop()
         }
         updatePipAutoEnter()
     }
@@ -323,7 +339,7 @@ class MainActivity : ComponentActivity() {
         val ok = (uri.scheme == "https" &&
             uri.host == "relay.sassyconsultingllc.com" &&
             (uri.path ?: "").startsWith("/v/")) ||
-            (uri.scheme == SessionShareLink.APP_SCHEME &&
+            (SessionShareLink.isAppScheme(uri.scheme) &&
                 uri.host == "v" &&
                 (uri.path ?: "").length > 1)
         if (ok) pendingShareUri.value = uri

@@ -10,6 +10,7 @@ import com.sassyconsulting.sassytalkie.ui.TransportAvailability
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -34,7 +35,7 @@ class TransportAdvisorTest {
     }
 
     @Test
-    fun relayActive_wifiAvailable_recommendsUpgrade() {
+    fun relayActive_wifiAvailable_staysOnRelay() {
         val avail = TransportAvailability(
             wifiActive = false,
             relayActive = true,
@@ -46,8 +47,27 @@ class TransportAdvisorTest {
             bluetoothAllowed = true,
         )
         val advisory = TransportAdvisor.evaluate("cellular", avail)
+        assertEquals(AudioPlane.RELAY, advisory.activePlane)
+        assertEquals(AdvisorySeverity.OK, advisory.severity)
+        assertNull(advisory.betterPlane)
+    }
+
+    @Test
+    fun bluetooth_withInternet_recommendsRelay() {
+        val avail = TransportAvailability(
+            wifiActive = false,
+            relayActive = false,
+            bluetoothPeers = 1,
+            osHasWifi = false,
+            osHasCellular = true,
+            osHasInternet = true,
+            wifiAllowed = true,
+            relayAllowed = true,
+            bluetoothAllowed = true,
+        )
+        val advisory = TransportAdvisor.evaluate("bluetooth", avail)
         assertEquals(AdvisorySeverity.UPGRADE, advisory.severity)
-        assertEquals(AudioPlane.BOTH_WIFI_RELAY, advisory.betterPlane)
+        assertEquals(AudioPlane.RELAY, advisory.betterPlane)
     }
 
     @Test

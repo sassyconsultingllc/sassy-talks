@@ -9,6 +9,7 @@
 //
 
 import SwiftUI
+import UIKit
 
 struct SettingsView: View {
     @ObservedObject var viewModel: SassyTalkieViewModel
@@ -84,6 +85,19 @@ struct SettingsView: View {
                     diagRow("Connection", viewModel.statusText)
                     diagRow("Transmitting", viewModel.isTransmitting ? "yes" : "no")
                     diagRow("Receiving", viewModel.isReceiving ? "yes" : "no")
+                }
+
+                Section(header: Text("TECHNICAL AUDIT"),
+                        footer: Text("technical audit export — not a legal chain of custody / not court-certified evidence")) {
+                    Button("Export technical audit") {
+                        guard let json = viewModel.exportAuditJson() else { return }
+                        let sheet = UIActivityViewController(activityItems: [json], applicationActivities: nil)
+                        UIApplication.shared.windows.first?.rootViewController?.present(sheet, animated: true)
+                    }
+                    Button("Clear session keys") {
+                        viewModel.wipeSession()
+                    }
+                    .foregroundColor(.red)
                 }
 
                 Section(header: Text("INFO")) {

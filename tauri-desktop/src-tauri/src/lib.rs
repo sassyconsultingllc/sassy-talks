@@ -33,19 +33,21 @@ pub mod tones;
 pub mod transport;
 
 // Re-exports
-pub use audio::{AudioEngine, AudioDeviceInfo, AudioState};
-pub use codec::{OpusEncoder, OpusDecoder, AudioFrame, SAMPLE_RATE, FRAME_SIZE};
+pub use audio::{AudioDeviceInfo, AudioEngine, AudioState};
+pub use codec::{AudioFrame, OpusDecoder, OpusEncoder, FRAME_SIZE, SAMPLE_RATE};
 pub use protocol::{Packet, PacketType};
 pub use security::CryptoEngine;
-pub use tones::{TonePlayer, ToneType, ToneError};
-pub use transport::{TransportManager, PeerInfo, TransportConfig};
+pub use tones::{ToneError, TonePlayer, ToneType};
+pub use transport::{PeerInfo, TransportConfig, TransportManager};
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use thiserror::Error;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
-use thiserror::Error;
 
 // Use centralized version constant
 pub use constants::VERSION;
@@ -55,19 +57,19 @@ pub use constants::VERSION;
 pub enum AppError {
     #[error("Audio error: {0}")]
     AudioError(#[from] audio::AudioError),
-    
+
     #[error("Codec error: {0}")]
     CodecError(#[from] codec::CodecError),
-    
+
     #[error("Transport error: {0}")]
     TransportError(#[from] transport::TransportError),
-    
+
     #[error("Already transmitting")]
     AlreadyTransmitting,
-    
+
     #[error("Not connected")]
     NotConnected,
-    
+
     #[error("Not transmitting")]
     NotTransmitting,
 }
@@ -82,32 +84,58 @@ pub enum ConnectionStatus {
     Receiving,
 }
 
+/// Send one Opus frame on every live plane so mixed-protocol peers hear us.
+/// XOR-routing (relay OR UDP) left LAN-only and relay-only peers deaf to each other.
+async fn send_opus_fanout(
+    opus_data: &[u8],
+    cellular: &Option<Arc<transport::CellularTransport>>,
+    transport: &Arc<Mutex<TransportManager>>,
+) {
+    let ts = sassytalkie_core::wire::now_ms();
+    let mut relay_ok = false;
+    if let Some(cell) = cellular {
+        match cell.send_audio_at(opus_data, ts) {
+            Ok(()) => relay_ok = true,
+            Err(e) => error!("Failed to send audio (cellular): {}", e),
+        }
+    }
+    let transport_lock = transport.lock().await;
+    if let Err(e) = transport_lock.send_audio_at(opus_data, Some(ts)) {
+        if relay_ok {
+            warn!("UDP send failed while relay is up: {}", e);
+        } else {
+            error!("Failed to send audio: {}", e);
+        }
+    }
+}
+
 /// Application state
 pub struct AppState {
     // Device info
     device_id: u32,
     device_name: String,
-    
+
     // Core engines
     audio: Arc<Mutex<AudioEngine>>,
     transport: Arc<Mutex<TransportManager>>,
     tone_player: Arc<TonePlayer>,
-    
+
     // Channel
     current_channel: Arc<AtomicU8>,
-    
+
     // Status
     connection_status: Arc<RwLock<ConnectionStatus>>,
     is_transmitting: Arc<AtomicBool>,
     is_receiving: Arc<AtomicBool>,
-    
+
     // PTT threads
     tx_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
     rx_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
 
     // Cellular relay session (internet transport via the Cloudflare relay).
-    // None when not joined. When Some, PTT TX routes here instead of UDP and a
-    // dedicated RX loop feeds decrypted Opus into the shared audio pipeline.
+    // None when not joined. When Some, PTT TX fans out here AND UDP multicast
+    // so mixed-protocol peers can hear each other. A dedicated RX loop feeds
+    // decrypted Opus into the shared audio pipeline.
     cellular: Arc<Mutex<Option<Arc<transport::CellularTransport>>>>,
     cellular_rx_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
 
@@ -129,16 +157,16 @@ impl AppState {
         info!("Creating AppState");
         info!("Device ID: {:08X}", device_id);
         info!("Device Name: {}", device_name);
-        
+
         let audio = Arc::new(Mutex::new(
-            AudioEngine::new().expect("Failed to create audio engine")
+            AudioEngine::new().expect("Failed to create audio engine"),
         ));
-        
+
         let transport = Arc::new(Mutex::new(
             TransportManager::new(device_id, device_name.clone())
-                .expect("Failed to create transport manager")
+                .expect("Failed to create transport manager"),
         ));
-        
+
         Self {
             device_id,
             device_name,
@@ -165,22 +193,22 @@ impl AppState {
             vox_threshold: Arc::new(RwLock::new(0.1)),
         }
     }
-    
+
     /// Start discovery and receiving
     pub async fn start_discovery(&self) -> Result<(), AppError> {
         info!("Starting discovery");
-        
+
         // Start transport
         let transport = self.transport.lock().await;
         transport.start().await?;
-        
+
         *self.connection_status.write().await = ConnectionStatus::Discovering;
-        
+
         // Start RX thread
         self.start_rx_thread().await?;
-        
+
         *self.connection_status.write().await = ConnectionStatus::Connected;
-        
+
         // Play connection success tone (3-tone chime) - use spawn_blocking since Stream is !Send
         let tone_player = Arc::clone(&self.tone_player);
         tokio::task::spawn_blocking(move || {
@@ -188,14 +216,14 @@ impl AppState {
                 warn!("Failed to play connection tone: {}", e);
             }
         });
-        
+
         Ok(())
     }
-    
+
     /// Stop discovery
     pub async fn stop_discovery(&self) -> Result<(), AppError> {
         info!("Stopping discovery");
-        
+
         // Stop transport
         let transport = self.transport.lock().await;
         transport.stop();
@@ -228,14 +256,17 @@ impl AppState {
             .get_session_id(channel)
             .ok_or_else(|| "imported session has no session_id".to_string())?;
 
-        // Install the same PSK into the UDP/multicast transport so the LAN audio
-        // plane uses the shared core::wire + core::crypto path and interoperates
-        // with Android/iOS phones on the same WiFi — independent of, and before,
-        // the relay dial (so LAN works even if the relay is unreachable).
-        if let Some(psk) = sm.get_psk_for_channel(channel) {
-            self.transport.lock().await.set_session_psk(&psk);
-            self.current_channel.store(channel, Ordering::Relaxed);
-            self.transport.lock().await.set_channel(channel);
+        let psk: [u8; 32] = *sm
+            .get_psk_for_channel(channel)
+            .ok_or_else(|| "imported session has no room secret".to_string())?;
+        if !sassytalkie_core::enrollment::join_authorized(&room_id, Some(&psk), None, None) {
+            return Err("enrollment rejected: room id is not authorization".to_string());
+        }
+        self.transport.lock().await.set_session_psk(&psk);
+        self.current_channel.store(channel, Ordering::Relaxed);
+        self.transport.lock().await.set_channel(channel);
+        if let Err(e) = crate::security::secret_store::persist_session_psk(&psk) {
+            warn!("Desktop secret store persist failed: {}", e);
         }
 
         // Replace any prior cellular session cleanly.
@@ -244,9 +275,9 @@ impl AppState {
         let config = transport::CellularConfig {
             room_id: room_id.clone(),
             device_name: self.device_name.clone(),
-            peer_id: format!("{:08X}", self.device_id),
+            peer_id: format!("desk-{:08x}", self.device_id),
         };
-        let cell = transport::CellularTransport::new(config, crypto);
+        let cell = transport::CellularTransport::new(config, crypto, psk);
         cell.set_channel(channel); // stamp the right channel into relay wire frames
 
         // Await the first dial so auth/connect failures surface to the caller.
@@ -285,6 +316,15 @@ impl AppState {
         *self.connection_status.write().await = ConnectionStatus::Disconnected;
     }
 
+    /// Clear keys, control plane, and persisted session material. In-app wipe
+    /// hook; enterprise silent wipe still requires MDM/EMM.
+    pub async fn wipe_session(&self) {
+        self.leave_cellular().await;
+        self.transport.lock().await.clear_session_psk();
+        let _ = crate::security::secret_store::wipe_session_psk();
+        info!("Session wiped (keys, control plane, secret store)");
+    }
+
     /// Cellular session stats as JSON, or None if not joined.
     pub async fn cellular_status(&self) -> Option<String> {
         self.cellular.lock().await.as_ref().map(|c| c.stats_json())
@@ -300,46 +340,46 @@ impl AppState {
         if self.is_transmitting.load(Ordering::Relaxed) {
             return Err(AppError::AlreadyTransmitting);
         }
-        
+
         info!("Starting transmission");
-        
+
         self.is_transmitting.store(true, Ordering::Relaxed);
         *self.connection_status.write().await = ConnectionStatus::Transmitting;
-        
+
         // Start audio recording
         let audio = self.audio.lock().await;
         audio.start_recording()?;
         drop(audio);
-        
+
         // Start TX thread
         self.start_tx_thread().await;
-        
+
         Ok(())
     }
-    
+
     /// Stop transmitting (PTT release)
     pub async fn stop_transmit(&self) -> Result<(), AppError> {
         if !self.is_transmitting.load(Ordering::Relaxed) {
             return Err(AppError::NotTransmitting);
         }
-        
+
         info!("Stopping transmission");
-        
+
         self.is_transmitting.store(false, Ordering::Relaxed);
-        
+
         // Stop TX thread
         self.stop_tx_thread().await;
-        
+
         // Stop audio recording
         let audio = self.audio.lock().await;
         audio.stop_recording()?;
         drop(audio);
-        
+
         // Send roger beep if enabled (network + local)
         if self.roger_beep.load(Ordering::Relaxed) {
             // Send over network to peers
             self.send_roger_beep().await;
-            
+
             // Play locally - use spawn_blocking since Stream is !Send
             let tone_player = Arc::clone(&self.tone_player);
             tokio::task::spawn_blocking(move || {
@@ -348,20 +388,20 @@ impl AppState {
                 }
             });
         }
-        
+
         *self.connection_status.write().await = ConnectionStatus::Connected;
-        
+
         Ok(())
     }
-    
+
     /// Start TX thread (recording and encoding)
     async fn start_tx_thread(&self) {
         let audio = Arc::clone(&self.audio);
         let transport = Arc::clone(&self.transport);
         let is_transmitting = Arc::clone(&self.is_transmitting);
         let _channel = self.current_channel.load(Ordering::Relaxed);
-        // Snapshot the active transport at PTT-press time: if a cellular
-        // session is joined, audio goes over the relay instead of UDP multicast.
+        // Snapshot transports at PTT-press time and fan out to every live plane
+        // (relay + UDP). XOR-routing here silenced mixed-protocol peers.
         let cellular = self.cellular.lock().await.clone();
 
         let handle = tokio::spawn(async move {
@@ -377,32 +417,20 @@ impl AppState {
                     return;
                 }
             };
-            
+
             let mut buffer = vec![0i16; FRAME_SIZE];
-            
+
             while is_transmitting.load(Ordering::Relaxed) {
                 // Read audio samples
                 let audio_lock = audio.lock().await;
                 let samples_read = audio_lock.read_samples(&mut buffer);
                 drop(audio_lock);
-                
+
                 if samples_read == FRAME_SIZE {
                     // Encode to Opus
                     match encoder.encode(&buffer) {
                         Ok(opus_data) => {
-                            // Send via the active transport (cellular if joined,
-                            // else UDP multicast). Both encrypt internally.
-                            if let Some(cell) = &cellular {
-                                if let Err(e) = cell.send_audio(&opus_data) {
-                                    error!("Failed to send audio (cellular): {}", e);
-                                }
-                            } else {
-                                let transport_lock = transport.lock().await;
-                                if let Err(e) = transport_lock.send_audio(&opus_data) {
-                                    error!("Failed to send audio: {}", e);
-                                }
-                                drop(transport_lock);
-                            }
+                            send_opus_fanout(&opus_data, &cellular, &transport).await;
                         }
                         Err(e) => {
                             error!("Encoding error: {}", e);
@@ -413,26 +441,27 @@ impl AppState {
                     tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
                 }
             }
-            
+
             info!("TX thread stopped");
         });
-        
+
         *self.tx_thread.lock().await = Some(handle);
     }
-    
+
     /// Stop TX thread
     async fn stop_tx_thread(&self) {
         if let Some(handle) = self.tx_thread.lock().await.take() {
             handle.abort();
         }
     }
-    
+
     /// Start RX thread (receiving and decoding) for the UDP transport.
     async fn start_rx_thread(&self) -> Result<(), AppError> {
         // Get audio receiver from the UDP transport (yields decrypted Opus).
         let audio_rx = {
             let transport_lock = self.transport.lock().await;
-            transport_lock.take_audio_receiver()
+            transport_lock
+                .take_audio_receiver()
                 .ok_or(AppError::NotConnected)?
         };
 
@@ -448,30 +477,30 @@ impl AppState {
 
         Ok(())
     }
-    
+
     /// Stop RX thread
     async fn stop_rx_thread(&self) {
         if let Some(handle) = self.rx_thread.lock().await.take() {
             handle.abort();
         }
     }
-    
+
     /// Get nearby devices
     pub async fn get_nearby_devices(&self) -> Vec<PeerInfo> {
         let transport = self.transport.lock().await;
         transport.get_peers()
     }
-    
+
     /// Get connection status
     pub async fn get_connection_status(&self) -> ConnectionStatus {
         *self.connection_status.read().await
     }
-    
+
     /// Get current channel
     pub fn get_channel(&self) -> u8 {
         self.current_channel.load(Ordering::Relaxed)
     }
-    
+
     /// Set channel (clamped to valid range 1-16)
     pub async fn set_channel(&self, channel: u8) {
         let channel = channel.clamp(1, 16);
@@ -487,7 +516,7 @@ impl AppState {
             cell.set_channel(channel);
         }
     }
-    
+
     /// Get audio devices
     pub async fn get_audio_devices(&self) -> (Vec<AudioDeviceInfo>, Vec<AudioDeviceInfo>) {
         let audio = self.audio.lock().await;
@@ -495,49 +524,49 @@ impl AppState {
         let outputs = audio.get_output_devices();
         (inputs, outputs)
     }
-    
+
     /// Set input device
     pub async fn set_input_device(&self, device_name: &str) -> Result<(), AppError> {
         let mut audio = self.audio.lock().await;
         audio.set_input_device(device_name)?;
         Ok(())
     }
-    
+
     /// Set output device
     pub async fn set_output_device(&self, device_name: &str) -> Result<(), AppError> {
         let mut audio = self.audio.lock().await;
         audio.set_output_device(device_name)?;
         Ok(())
     }
-    
+
     /// Get volume
     pub async fn get_volume(&self) -> (f32, f32) {
         let audio = self.audio.lock().await;
         (audio.get_input_volume(), audio.get_output_volume())
     }
-    
+
     /// Set volume
     pub async fn set_volume(&self, input: f32, output: f32) {
         let audio = self.audio.lock().await;
         audio.set_input_volume(input);
         audio.set_output_volume(output);
     }
-    
+
     /// Set roger beep
     pub fn set_roger_beep(&self, enabled: bool) {
         self.roger_beep.store(enabled, Ordering::Relaxed);
     }
-    
+
     /// Set VOX enabled
     pub fn set_vox_enabled(&self, enabled: bool) {
         self.vox_enabled.store(enabled, Ordering::Relaxed);
     }
-    
+
     /// Set VOX threshold
     pub async fn set_vox_threshold(&self, threshold: f32) {
         *self.vox_threshold.write().await = threshold;
     }
-    
+
     /// Send roger beep tone
     async fn send_roger_beep(&self) {
         // Generate a classic two-tone beep (800Hz + 1000Hz, 100ms total)
@@ -548,91 +577,90 @@ impl AppState {
                 return;
             }
         };
-        
+
         // Route to whichever transport is active.
         let cellular = self.cellular.lock().await.clone();
 
         // Generate 100ms of dual-tone beep (about 5 frames at 20ms each)
         let frames_to_send = 5;
         let mut samples = vec![0i16; FRAME_SIZE];
-        
+
         for frame_idx in 0..frames_to_send {
             // Generate dual-tone samples
             for (i, sample) in samples.iter_mut().enumerate() {
                 let t = (frame_idx * FRAME_SIZE + i) as f32 / SAMPLE_RATE as f32;
                 // 800Hz + 1000Hz dual tone with envelope
-                let envelope = if frame_idx < 2 { 
-                    (frame_idx as f32 * FRAME_SIZE as f32 + i as f32) / (2.0 * FRAME_SIZE as f32) 
+                let envelope = if frame_idx < 2 {
+                    (frame_idx as f32 * FRAME_SIZE as f32 + i as f32) / (2.0 * FRAME_SIZE as f32)
                 } else if frame_idx >= 3 {
-                    1.0 - ((frame_idx as f32 - 3.0) * FRAME_SIZE as f32 + i as f32) / (2.0 * FRAME_SIZE as f32)
-                } else { 
-                    1.0 
+                    1.0 - ((frame_idx as f32 - 3.0) * FRAME_SIZE as f32 + i as f32)
+                        / (2.0 * FRAME_SIZE as f32)
+                } else {
+                    1.0
                 };
                 let tone = (f32::sin(2.0 * std::f32::consts::PI * 800.0 * t) * 0.5
-                         + f32::sin(2.0 * std::f32::consts::PI * 1000.0 * t) * 0.5)
-                         * envelope * 8000.0;
+                    + f32::sin(2.0 * std::f32::consts::PI * 1000.0 * t) * 0.5)
+                    * envelope
+                    * 8000.0;
                 *sample = tone as i16;
             }
-            
-            // Encode and send via the active transport.
+
+            // Encode and fan out so LAN and relay peers both hear the roger.
             if let Ok(opus_data) = encoder.encode(&samples) {
-                if let Some(cell) = &cellular {
-                    if let Err(e) = cell.send_audio(&opus_data) {
-                        warn!("Failed to send roger beep frame (cellular): {}", e);
-                    }
-                } else {
-                    let transport = self.transport.lock().await;
-                    if let Err(e) = transport.send_audio(&opus_data) {
-                        warn!("Failed to send roger beep frame: {}", e);
-                    }
-                }
+                send_opus_fanout(&opus_data, &cellular, &self.transport).await;
             }
-            
+
             // Small delay between frames
             tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         }
-        
+
         info!("Roger beep sent");
     }
-    
+
     /// Get device info
     pub fn get_device_info(&self) -> (u32, String) {
         (self.device_id, self.device_name.clone())
     }
-    
+
     /// Get tone player
     pub fn get_tone_player(&self) -> Arc<TonePlayer> {
         Arc::clone(&self.tone_player)
     }
-    
+
     /// Get transport configuration
     pub async fn get_transport_config(&self) -> TransportConfig {
         let transport = self.transport.lock().await;
         transport.get_config()
     }
-    
+
     /// Update transport configuration
     pub async fn set_transport_config(&self, config: TransportConfig) {
         let transport = self.transport.lock().await;
         transport.update_config(config);
     }
-    
+
     /// Get current bound port
     pub async fn get_port(&self) -> u16 {
         let transport = self.transport.lock().await;
         transport.get_port()
     }
-    
+
     /// Check if encryption is active
     pub async fn is_encrypted(&self) -> bool {
         let transport = self.transport.lock().await;
         transport.is_encrypted()
     }
-    
+
     /// Get our public key (hex encoded)
     pub async fn get_public_key(&self) -> Option<String> {
         let transport = self.transport.lock().await;
         transport.get_public_key()
+    }
+
+    /// UDP audio ingress queue health for diagnostics.
+    pub async fn udp_queue_metrics(&self) -> transport::QueueMetricsSnapshot {
+        let transport = self.transport.lock().await;
+        transport.queue_metrics()
     }
 
     /// Get connection quality per peer
@@ -648,23 +676,13 @@ impl AppState {
 /// so the decode + playback path is identical and lives here once.
 fn spawn_audio_rx_loop(
     audio: Arc<Mutex<AudioEngine>>,
-    mut audio_rx: mpsc::UnboundedReceiver<transport::AudioFrame>,
+    mut audio_rx: transport::RealtimeReceiver<transport::AudioFrame>,
     is_receiving: Arc<AtomicBool>,
     is_transmitting: Arc<AtomicBool>,
     cache: Arc<Mutex<sassytalkie_core::audio_cache::AudioCache>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // Per-sender decode state. Opus is a STATEFUL codec, so every sender
-        // needs its own decoder — decoding multiple senders through one shared
-        // decoder (the old `remote` hack) corrupts audio when their frames
-        // interleave. `synth_ts` is a fallback clock for transports that carry
-        // no wire timestamp (the legacy per-peer path sends timestamp 0).
-        struct RxPeer {
-            decoder: OpusDecoder,
-            synth_ts: u64,
-        }
-        let mut peers: std::collections::HashMap<String, RxPeer> =
-            std::collections::HashMap::new();
+        let mut peers = RxPeerPool::new(MAX_RX_DECODERS, RX_DECODER_IDLE_TTL);
 
         // Start audio playback
         {
@@ -690,11 +708,7 @@ fn spawn_audio_rx_loop(
 
             is_receiving.store(true, Ordering::Relaxed);
 
-            let peer = peers.entry(frame.sender.clone()).or_insert_with(|| RxPeer {
-                // Decoder params are fixed (48 kHz mono), so this only fails on OOM.
-                decoder: OpusDecoder::new().expect("create Opus decoder"),
-                synth_ts: 0,
-            });
+            let peer = peers.get_or_insert(&frame.sender, Instant::now());
 
             // Decode Opus to PCM with THIS sender's decoder; PLC on error.
             let pcm = match peer.decoder.decode(&frame.opus) {
@@ -749,4 +763,93 @@ fn spawn_audio_rx_loop(
 
         info!("RX thread stopped");
     })
+}
+
+const MAX_RX_DECODERS: usize = 32;
+const RX_DECODER_IDLE_TTL: Duration = Duration::from_secs(30);
+
+struct RxPeer {
+    decoder: OpusDecoder,
+    synth_ts: u64,
+    last_used: Instant,
+}
+
+/// Per-sender Opus state with hard cardinality and idle-time bounds. On a full
+/// pool the least-recently-used sender is evicted before a new decoder is made.
+struct RxPeerPool {
+    peers: HashMap<String, RxPeer>,
+    max_peers: usize,
+    idle_ttl: Duration,
+}
+
+impl RxPeerPool {
+    fn new(max_peers: usize, idle_ttl: Duration) -> Self {
+        assert!(max_peers > 0, "decoder pool must allow at least one sender");
+        Self {
+            peers: HashMap::new(),
+            max_peers,
+            idle_ttl,
+        }
+    }
+
+    fn get_or_insert(&mut self, sender: &str, now: Instant) -> &mut RxPeer {
+        self.peers.retain(|_, peer| {
+            now.checked_duration_since(peer.last_used)
+                .unwrap_or_default()
+                <= self.idle_ttl
+        });
+
+        if !self.peers.contains_key(sender) && self.peers.len() >= self.max_peers {
+            if let Some(oldest) = self
+                .peers
+                .iter()
+                .min_by_key(|(_, peer)| peer.last_used)
+                .map(|(id, _)| id.clone())
+            {
+                self.peers.remove(&oldest);
+            }
+        }
+
+        let peer = self
+            .peers
+            .entry(sender.to_string())
+            .or_insert_with(|| RxPeer {
+                decoder: OpusDecoder::new().expect("create Opus decoder"),
+                synth_ts: 0,
+                last_used: now,
+            });
+        peer.last_used = now;
+        peer
+    }
+}
+
+#[cfg(test)]
+mod rx_peer_pool_tests {
+    use super::*;
+
+    #[test]
+    fn decoder_pool_never_exceeds_sender_cap() {
+        let now = Instant::now();
+        let mut pool = RxPeerPool::new(2, Duration::from_secs(60));
+        pool.get_or_insert("a", now);
+        pool.get_or_insert("b", now + Duration::from_millis(1));
+        pool.get_or_insert("c", now + Duration::from_millis(2));
+
+        assert_eq!(pool.peers.len(), 2);
+        assert!(!pool.peers.contains_key("a"));
+        assert!(pool.peers.contains_key("b"));
+        assert!(pool.peers.contains_key("c"));
+    }
+
+    #[test]
+    fn decoder_pool_expires_idle_senders() {
+        let now = Instant::now();
+        let mut pool = RxPeerPool::new(4, Duration::from_secs(5));
+        pool.get_or_insert("stale", now);
+        pool.get_or_insert("fresh", now + Duration::from_secs(6));
+
+        assert_eq!(pool.peers.len(), 1);
+        assert!(!pool.peers.contains_key("stale"));
+        assert!(pool.peers.contains_key("fresh"));
+    }
 }

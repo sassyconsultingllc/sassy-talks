@@ -25,10 +25,11 @@ object PresenceClient {
     private const val TAG = "PresenceClient"
 
     private val http: OkHttpClient by lazy {
-        OkHttpClient.Builder()
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(15, TimeUnit.SECONDS)
-            .build()
+        RelayTlsPins.apply(
+            OkHttpClient.Builder()
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(15, TimeUnit.SECONDS),
+        ).build()
     }
 
     private val JSON_MEDIA = "application/json".toMediaType()

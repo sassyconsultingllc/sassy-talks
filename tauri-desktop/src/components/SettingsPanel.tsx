@@ -230,6 +230,28 @@ function SettingsPanel({ onClose }: SettingsPanelProps) {
             )}
           </section>
 
+          {/* Session */}
+          <section className="settings-section">
+            <h3>Session</h3>
+            <p className="setting-description">
+              technical audit export — not a legal chain of custody / not court-certified evidence.
+              Desktop stores the PSK in an AES-256-GCM file (not OS Credential Manager / Keychain / libsecret).
+              Remote enterprise wipe requires MDM/EMM; this button only clears this app's keys.
+            </p>
+            <button
+              type="button"
+              onClick={async () => {
+                try {
+                  await invoke('wipe_session');
+                } catch (err) {
+                  console.error('Failed to wipe session:', err);
+                }
+              }}
+            >
+              Clear session keys
+            </button>
+          </section>
+
           {/* About */}
           <section className="settings-section">
             <h3>About</h3>

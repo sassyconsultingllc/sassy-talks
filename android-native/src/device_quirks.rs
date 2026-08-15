@@ -37,16 +37,20 @@ impl Default for EffectsConfig {
     /// PTT defaults: AEC off (half-duplex doesn't need it), NS off (OEM NS
     /// too aggressive on average), AGC on (helps distance-to-mic variation).
     fn default() -> Self {
-        Self { enable_aec: false, enable_ns: false, enable_agc: true }
+        Self {
+            enable_aec: false,
+            enable_ns: false,
+            enable_agc: true,
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Profile {
     pub effects: EffectsConfig,
-    /// Force `AudioManager.MODE_IN_COMMUNICATION` + speakerphone-on while
+    /// Force `AudioManager.MODE_IN_COMMUNICATION` + loudspeaker while
     /// the playback session is open. Bypasses STREAM_MUSIC OEM
-    /// post-processing on devices that do it aggressively (Moto, Xiaomi).
+    /// post-processing. RX never silently falls back to earpiece.
     pub output_force_comm_mode: bool,
     /// Order in which `MediaRecorder.AudioSource` constants are tried until
     /// one yields a STATE_INITIALIZED `AudioRecord`.
@@ -66,11 +70,11 @@ impl Default for Profile {
     fn default() -> Self {
         Self {
             effects: EffectsConfig::default(),
-            output_force_comm_mode: false,
+            output_force_comm_mode: true,
             source_fallback_chain: default_source_chain(),
             record_buffer_multiplier: 4,
             player_buffer_multiplier: 4,
-            notes: "Stock defaults.",
+            notes: "Stock defaults. Force comm-mode loudspeaker on RX.",
         }
     }
 }
@@ -88,7 +92,10 @@ pub fn current() -> &'static Profile {
         let profile = pick_profile(&mfr, &model, &device);
         log::info!(
             "DeviceQuirks: manufacturer='{}' model='{}' device='{}' → {}",
-            mfr, model, device, profile.notes
+            mfr,
+            model,
+            device,
+            profile.notes
         );
         profile
     })
@@ -117,7 +124,11 @@ fn pick_profile(mfr: &str, _model: &str, device: &str) -> Profile {
 
 fn moto_profile() -> Profile {
     Profile {
-        effects: EffectsConfig { enable_aec: false, enable_ns: false, enable_agc: false },
+        effects: EffectsConfig {
+            enable_aec: false,
+            enable_ns: false,
+            enable_agc: false,
+        },
         output_force_comm_mode: true,
         // MIC first on Moto — VOICE_RECOGNITION routes through the modem
         // path which is flaky on G-series.
@@ -133,16 +144,25 @@ fn moto_profile() -> Profile {
 
 fn samsung_profile() -> Profile {
     Profile {
-        effects: EffectsConfig { enable_aec: false, enable_ns: false, enable_agc: true },
-        output_force_comm_mode: false,
-        notes: "Samsung: NS too aggressive on quiet speakers; AGC works fine.",
+        effects: EffectsConfig {
+            enable_aec: false,
+            enable_ns: false,
+            enable_agc: true,
+        },
+        output_force_comm_mode: true,
+        notes: "Samsung: NS too aggressive on quiet speakers; AGC works fine. \
+                Force comm-mode loudspeaker on RX (earpiece is not the default).",
         ..Profile::default()
     }
 }
 
 fn xiaomi_profile() -> Profile {
     Profile {
-        effects: EffectsConfig { enable_aec: false, enable_ns: false, enable_agc: true },
+        effects: EffectsConfig {
+            enable_aec: false,
+            enable_ns: false,
+            enable_agc: true,
+        },
         output_force_comm_mode: true,
         notes: "Xiaomi: MIUI sound enhance mangles voice; force comm mode output.",
         ..Profile::default()
@@ -181,7 +201,8 @@ fn read_string_field(env: &mut jni::JNIEnv, cls: &jni::objects::JClass, name: &s
         Err(_) => return String::new(),
     };
     let jstr = jni::objects::JString::from(obj);
-    let s: String = env.get_string(&jstr)
+    let s: String = env
+        .get_string(&jstr)
         .map(|js| js.into())
         .unwrap_or_default();
     s
@@ -194,7 +215,11 @@ mod tests {
     #[test]
     fn default_profile_has_voice_recognition_first() {
         let p = Profile::default();
-        assert_eq!(p.source_fallback_chain.first(), Some(&SRC_VOICE_RECOGNITION));
+        assert_eq!(
+            p.source_fallback_chain.first(),
+            Some(&SRC_VOICE_RECOGNITION)
+        );
+        assert!(p.output_force_comm_mode);
     }
 
     #[test]
@@ -216,6 +241,7 @@ mod tests {
         assert!(p.notes.starts_with("Samsung"));
         assert!(p.effects.enable_agc);
         assert!(!p.effects.enable_ns);
+        assert!(p.output_force_comm_mode);
     }
 
     #[test]
@@ -228,5 +254,6 @@ mod tests {
     fn unknown_oem_gets_default_profile() {
         let p = pick_profile("Acme", "Phone Plus", "acme1");
         assert!(p.notes.starts_with("Stock"));
+        assert!(p.output_force_comm_mode);
     }
 }

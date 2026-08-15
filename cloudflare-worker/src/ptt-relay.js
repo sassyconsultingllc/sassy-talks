@@ -30,6 +30,12 @@ const MAX_DEVICE_NAME_LEN = 100;
 const MAX_PEER_ID_LEN = 64;
 const HEARTBEAT_STALE_MS = 8_000;
 const SWEEP_INTERVAL_MS  = 2_000;
+// Reserved server-administration messages. No current client needs these.
+// Keep the deny-list explicit so future handlers cannot accidentally make a
+// room-wide action available to ordinary/legacy sockets.
+const PRIVILEGED_TEXT_CONTROLS = new Set([
+  "kick", "kick_peer", "close_room", "set_role", "grant_terminal", "revoke_member",
+]);
 
 // FCM wake-push throttling. A push only fires when an OP_WAKE (0x17) or
 // OP_PTT_START_V2 (0x15) frame is broadcast AND a registered peer has no
@@ -56,8 +62,18 @@ const PUSH_TRIGGER_FRAME_SHAPES = {
   0x15: 12,  // OP_PTT_START_V2 — [epoch:u64][startSeq:u32]
   0x17: 16,  // OP_WAKE         — [epoch:u64][senderTsMs:u64]
 };
-function looksLikeTrigger(bytes) {
+export function looksLikeTrigger(bytes) {
   if (bytes.length < 3) return false;
+  // Authenticated control envelope v1:
+  // [0x18][len:u16][version=1][inner-opcode hint][nonce||ciphertext].
+  // The hint is GCM AAD and receivers reject tampering. The blind relay cannot
+  // verify it, so it is used only to request a rate-limited wake push—not as
+  // authorization for any privileged action.
+  if (bytes[0] === 0x18) {
+    const payloadLen = bytes[1] | (bytes[2] << 8);
+    return bytes.length === 3 + payloadLen && payloadLen >= 30 &&
+      bytes[3] === 1 && (bytes[4] === 0x15 || bytes[4] === 0x17);
+  }
   const expected = PUSH_TRIGGER_FRAME_SHAPES[bytes[0]];
   if (expected === undefined) return false;
   const payloadLen = bytes[1] | (bytes[2] << 8);
@@ -216,9 +232,13 @@ export class PttRoom extends DurableObject {
   async fetch(request) {
     const url = new URL(request.url);
     const upgradeHeader = request.headers.get("Upgrade");
+    const roomParam = url.searchParams.get("room") || "";
 
     if (!upgradeHeader || upgradeHeader !== "websocket") {
       return new Response("Expected WebSocket upgrade", { status: 426 });
+    }
+    if (this.roomId && roomParam !== this.roomId) {
+      return new Response("Room identity mismatch", { status: 409 });
     }
 
     // Enforce room capacity
@@ -244,9 +264,16 @@ export class PttRoom extends DurableObject {
     //   2. Persist across app restarts so a returning user doesn't accumulate
     //      stale presence rows.
     const rawPeer = url.searchParams.get("peer") || "";
-    const peer = safeDecode(rawPeer, "").substring(0, MAX_PEER_ID_LEN);
+    const queryPeer = safeDecode(rawPeer, "").substring(0, MAX_PEER_ID_LEN);
+    // Set only by the front-door worker after token verification. Prefer it to
+    // attacker-controlled query data so v2 identity survives into membership.
+    const verifiedPeer = request.headers.get("X-Sassy-Verified-Peer") || "";
+    const peer = verifiedPeer.substring(0, MAX_PEER_ID_LEN) || queryPeer;
+    const authClass = request.headers.get("X-Sassy-Verified-Auth-Class") || "none";
+    const tokenVersion = Number.parseInt(
+      request.headers.get("X-Sassy-Token-Version") || "0", 10,
+    ) || 0;
     // Also remember which room this DO is — needed when firing FCM pushes.
-    const roomParam = url.searchParams.get("room") || "";
     if (!this.roomId && roomParam) {
       this.roomId = roomParam;
       await this.ctx.storage.put("roomId", this.roomId);
@@ -256,6 +283,8 @@ export class PttRoom extends DurableObject {
       id: clientId,
       device,
       peer,
+      authClass,
+      tokenVersion,
       joinedAt: Date.now(),
       lastSeenMs: Date.now(),
       // Per-socket sliding-window rate limit state. Re-initialised on every
@@ -470,6 +499,26 @@ export class PttRoom extends DurableObject {
         }
         try {
           ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
+        } catch { /* peer gone */ }
+      } else if (PRIVILEGED_TEXT_CONTROLS.has(parsed.type)) {
+        const sess = this.sessions.get(ws);
+        if (!sess || sess.authClass !== "terminal" || sess.tokenVersion < 2) {
+          try {
+            ws.send(JSON.stringify({
+              type: "error",
+              code: "privileged_auth_required",
+            }));
+          } catch { /* peer gone */ }
+          return;
+        }
+        // Classification is wired, but no privileged operation is currently
+        // implemented. Fail closed instead of treating an authenticated class
+        // as authorization for behavior that has not been reviewed.
+        try {
+          ws.send(JSON.stringify({
+            type: "error",
+            code: "privileged_control_unsupported",
+          }));
         } catch { /* peer gone */ }
       }
     } catch {

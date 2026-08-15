@@ -1,25 +1,24 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-YIHO6JFHYYQB
+use log::{info, warn};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 /// Audio Module - Voice Capture and Playback via JNI
-/// 
+///
 /// Handles microphone recording (PTT press) and speaker playback (receiving)
 /// Uses Android AudioRecord/AudioTrack through JNI bridge
-
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use log::{info, warn};
 
-use crate::jni_bridge::{AndroidAudioRecord, AndroidAudioTrack};
 use crate::audio_effects::AppliedEffects;
+use crate::jni_bridge::{AndroidAudioRecord, AndroidAudioTrack};
 
 /// Audio configuration constants
-pub const SAMPLE_RATE: i32 = 48000;  // 48kHz high quality
-pub const CHANNEL_CONFIG_MONO: i32 = 16;  // AudioFormat.CHANNEL_IN_MONO
-pub const CHANNEL_CONFIG_OUT_MONO: i32 = 4;  // AudioFormat.CHANNEL_OUT_MONO
-pub const AUDIO_FORMAT_PCM_16: i32 = 2;  // AudioFormat.ENCODING_PCM_16BIT
-pub const FRAME_SIZE: usize = 960;  // 20ms at 48kHz
+pub const SAMPLE_RATE: i32 = 48000; // 48kHz high quality
+pub const CHANNEL_CONFIG_MONO: i32 = 16; // AudioFormat.CHANNEL_IN_MONO
+pub const CHANNEL_CONFIG_OUT_MONO: i32 = 4; // AudioFormat.CHANNEL_OUT_MONO
+pub const AUDIO_FORMAT_PCM_16: i32 = 2; // AudioFormat.ENCODING_PCM_16BIT
+pub const FRAME_SIZE: usize = 960; // 20ms at 48kHz
 
 /// Hard-floor recorder buffer multiplier when no quirks profile applies.
 /// Per-device profiles (`device_quirks::Profile.record_buffer_multiplier`)
@@ -194,13 +193,15 @@ impl AudioEngine {
         info!("Initializing audio recorder");
 
         let quirks = crate::device_quirks::current();
-        let multiplier = quirks.record_buffer_multiplier.max(RECORDER_BUFFER_FALLBACK);
+        let multiplier = quirks
+            .record_buffer_multiplier
+            .max(RECORDER_BUFFER_FALLBACK);
 
         // getMinBufferSize() — negative returns mean unsupported config.
         let buffer_size = match AndroidAudioRecord::get_min_buffer_size(
             SAMPLE_RATE,
             CHANNEL_CONFIG_MONO,
-            AUDIO_FORMAT_PCM_16
+            AUDIO_FORMAT_PCM_16,
         ) {
             Ok(size) if size > 0 => size,
             Ok(bad) => {
@@ -219,7 +220,10 @@ impl AudioEngine {
 
         let alloc_size = buffer_size.checked_mul(multiplier).ok_or_else(|| {
             *self.state.lock().unwrap() = AudioState::Error;
-            format!("Recorder buffer size {} would overflow i32 when scaled by {}", buffer_size, multiplier)
+            format!(
+                "Recorder buffer size {} would overflow i32 when scaled by {}",
+                buffer_size, multiplier
+            )
         })?;
 
         info!(
@@ -232,7 +236,13 @@ impl AudioEngine {
         let mut recorder_opt: Option<AndroidAudioRecord> = None;
         let mut chosen_source: i32 = -1;
         for src in &quirks.source_fallback_chain {
-            match AndroidAudioRecord::new_with_source(*src, SAMPLE_RATE, CHANNEL_CONFIG_MONO, AUDIO_FORMAT_PCM_16, alloc_size) {
+            match AndroidAudioRecord::new_with_source(
+                *src,
+                SAMPLE_RATE,
+                CHANNEL_CONFIG_MONO,
+                AUDIO_FORMAT_PCM_16,
+                alloc_size,
+            ) {
                 Ok(r) => {
                     chosen_source = *src;
                     recorder_opt = Some(r);
@@ -248,7 +258,10 @@ impl AudioEngine {
             Some(r) => r,
             None => {
                 *self.state.lock().unwrap() = AudioState::Error;
-                return Err(format!("All AudioRecord sources rejected — last error: {}", last_err));
+                return Err(format!(
+                    "All AudioRecord sources rejected — last error: {}",
+                    last_err
+                ));
             }
         };
 
@@ -281,7 +294,7 @@ impl AudioEngine {
         let buffer_size = match AndroidAudioTrack::get_min_buffer_size(
             SAMPLE_RATE,
             CHANNEL_CONFIG_OUT_MONO,
-            AUDIO_FORMAT_PCM_16
+            AUDIO_FORMAT_PCM_16,
         ) {
             Ok(size) if size > 0 => size,
             Ok(bad) => {
@@ -302,17 +315,23 @@ impl AudioEngine {
         let multiplier = quirks.player_buffer_multiplier.max(PLAYER_BUFFER_FALLBACK);
         let alloc_size = buffer_size.checked_mul(multiplier).ok_or_else(|| {
             *self.state.lock().unwrap() = AudioState::Error;
-            format!("Player buffer size {} would overflow i32 when scaled by {}", buffer_size, multiplier)
+            format!(
+                "Player buffer size {} would overflow i32 when scaled by {}",
+                buffer_size, multiplier
+            )
         })?;
 
-        info!("Player buffer size: {} bytes (x{} = {})", buffer_size, multiplier, alloc_size);
+        info!(
+            "Player buffer size: {} bytes (x{} = {})",
+            buffer_size, multiplier, alloc_size
+        );
 
         // Create player
         let player = match AndroidAudioTrack::new(
             SAMPLE_RATE,
             CHANNEL_CONFIG_OUT_MONO,
             AUDIO_FORMAT_PCM_16,
-            alloc_size
+            alloc_size,
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -321,6 +340,7 @@ impl AudioEngine {
             }
         };
 
+        player.pin_rx_output();
         *self.player.lock().unwrap() = Some(Arc::new(player));
         info!("✓ Audio player initialized");
 
@@ -382,10 +402,9 @@ impl AudioEngine {
         rec.read(buffer)
     }
 
-    /// Start playing audio. Also engages `AudioManager.MODE_IN_COMMUNICATION`
-    /// + force speakerphone if the active `DeviceQuirks` profile flags
-    /// `output_force_comm_mode` — bypasses OEM media post-processing for
-    /// devices that mangle voice (Moto, Xiaomi).
+    /// Start playing audio. Always re-asserts sticky RX routing: loudspeaker
+    /// by default. `USAGE_VOICE_COMMUNICATION` otherwise lands on the earpiece.
+    /// External BT/wired headsets are left in place. Failure is non-fatal.
     pub fn start_playing(&self) -> Result<(), String> {
         info!("Starting audio playback");
 
@@ -399,19 +418,16 @@ impl AudioEngine {
             None => return Err("Player not initialized".to_string()),
         };
 
+        // Route BEFORE play so the first samples are not earpiece.
+        if let Err(e) = crate::audio_routing::reassert() {
+            warn!("audio_routing reassert failed (continuing anyway): {}", e);
+        }
+        play.pin_rx_output();
+
         play.play()?;
         self.playing.store(true, Ordering::Relaxed);
         *self.state.lock().unwrap() = AudioState::Playing;
 
-        // Engage comm-mode routing if the active quirk profile wants it.
-        // Failure here is non-fatal — playback works either way; we just
-        // log so the field complaint matches a missing context.
-        let quirks = crate::device_quirks::current();
-        if quirks.output_force_comm_mode {
-            if let Err(e) = crate::audio_routing::engage_comm_mode(true) {
-                warn!("audio_routing engage failed (continuing anyway): {}", e);
-            }
-        }
         info!("✓ Playback started");
         Ok(())
     }
@@ -473,10 +489,13 @@ impl AudioEngine {
             play.write(buffer)
         } else {
             let g = gain as i32;
-            let scaled: Vec<i16> = buffer.iter().map(|&s| {
-                let v = (s as i32 * g) / 100;
-                v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
-            }).collect();
+            let scaled: Vec<i16> = buffer
+                .iter()
+                .map(|&s| {
+                    let v = (s as i32 * g) / 100;
+                    v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+                })
+                .collect();
             play.write(&scaled)
         };
         if result.is_ok() {
@@ -563,7 +582,9 @@ fn now_ms() -> u64 {
 /// the clock has never been written (i.e. AudioEngine just initialized).
 pub fn playback_idle_ms(clock: &Arc<AtomicU64>) -> u64 {
     let last = clock.load(Ordering::Relaxed);
-    if last == 0 { return u64::MAX; }
+    if last == 0 {
+        return u64::MAX;
+    }
     now_ms().saturating_sub(last)
 }
 
@@ -573,11 +594,7 @@ pub fn playback_idle_ms(clock: &Arc<AtomicU64>) -> u64 {
 /// caller should bail. Caller is expected to call this BEFORE each batch of
 /// frames it's about to write — RX activity in the meantime will reset the
 /// idle window and force another wait.
-pub fn wait_for_playback_idle(
-    clock: &Arc<AtomicU64>,
-    min_idle_ms: u64,
-    max_wait_ms: u64,
-) -> bool {
+pub fn wait_for_playback_idle(clock: &Arc<AtomicU64>, min_idle_ms: u64, max_wait_ms: u64) -> bool {
     use std::thread::sleep;
     use std::time::Duration;
     const POLL_INTERVAL_MS: u64 = 25;
@@ -618,7 +635,7 @@ mod gate_tests {
 
     #[test]
     fn wait_for_playback_idle_succeeds_when_already_cold() {
-        let clock = Arc::new(AtomicU64::new(0));  // never written = u64::MAX idle
+        let clock = Arc::new(AtomicU64::new(0)); // never written = u64::MAX idle
         assert!(wait_for_playback_idle(&clock, 100, 500));
     }
 
@@ -684,8 +701,7 @@ impl AudioFrame {
         }
 
         let timestamp = u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]);
 
         let audio_bytes = &bytes[8..];
@@ -698,10 +714,7 @@ impl AudioFrame {
             samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
         }
 
-        Ok(Self {
-            samples,
-            timestamp,
-        })
+        Ok(Self { samples, timestamp })
     }
 }
 

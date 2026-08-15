@@ -21,7 +21,7 @@
  *   presence-ver:<roomId>        value = monotonically-increasing version int
  */
 
-import { verifyCapabilityToken, extractToken, isValidRoomId, secretsFor } from "./relay-auth.js";
+import { verifyCapabilityIdentity, extractToken, isValidRoomId, secretsFor } from "./relay-auth.js";
 
 // FCM tokens rotate; a stale row should disappear on its own even if the app
 // never gets the chance to DELETE it. 30 days comfortably outlives a token.
@@ -75,8 +75,13 @@ async function registerPresence(request, env) {
   if (!isValidPeer(peer)) return json({ error: "Missing or invalid peer" }, 400);
   if (!isValidToken(token)) return json({ error: "Missing or invalid fcm_token" }, 400);
 
-  const capErr = await verifyCapabilityToken(extractToken(request, new URL(request.url)), room, secretsFor(env));
-  if (capErr) return json({ error: capErr }, 401);
+  const identity = await verifyCapabilityIdentity(
+    extractToken(request, new URL(request.url)), room, secretsFor(env),
+  );
+  if (identity.error) return json({ error: identity.error }, 401);
+  if (identity.peer && identity.peer !== peer) {
+    return json({ error: "Token peer identity mismatch" }, 403);
+  }
 
   await env.SHARES.put(presenceKey(room, peer), token, {
     expirationTtl: PRESENCE_TTL_SEC,
@@ -95,8 +100,13 @@ async function unregisterPresence(request, env) {
   if (!isValidRoomId(room)) return json({ error: "Missing or invalid room" }, 400);
   if (!isValidPeer(peer)) return json({ error: "Missing or invalid peer" }, 400);
 
-  const capErr = await verifyCapabilityToken(extractToken(request, new URL(request.url)), room, secretsFor(env));
-  if (capErr) return json({ error: capErr }, 401);
+  const identity = await verifyCapabilityIdentity(
+    extractToken(request, new URL(request.url)), room, secretsFor(env),
+  );
+  if (identity.error) return json({ error: identity.error }, 401);
+  if (identity.peer && identity.peer !== peer) {
+    return json({ error: "Token peer identity mismatch" }, 403);
+  }
 
   await dropPresence(env, room, peer);
   return json({ ok: true });

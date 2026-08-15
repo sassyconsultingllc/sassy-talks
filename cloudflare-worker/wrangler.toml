@@ -59,6 +59,8 @@ database_id = "be46952d-2e07-4c25-b0db-f1bc6d43c50d"
 #   AUTH_SECRET                — HMAC key for room capability tokens (/auth, /ws,
 #                                /presence, /share). Fail-closed: unset = relay
 #                                refuses /ws. Generate: `openssl rand -hex 32`.
+#   AUTH_SECRET_PREV           — optional outgoing key during bounded rotation.
+#   AUTH_SECRET_PREV_UNTIL     — required Unix-second deadline for PREV acceptance.
 #   FCM_SERVICE_ACCOUNT_JSON   — Firebase service-account JSON (project_id,
 #                                client_email, private_key) for wake pushes via
 #                                presence.js/fcm.js. Optional: if unset, the relay
@@ -76,6 +78,10 @@ database_id = "be46952d-2e07-4c25-b0db-f1bc6d43c50d"
 # so a tapped https://relay.../v/<id>#<key> invite opens the app directly.
 # `curl -sI .../.well-known/assetlinks.json` shows X-Wellknown-Configured.
 [vars]
+# Optional hard cutover. When "true", /auth requires a v1 HMAC proof made with
+# AUTH_SECRET and a peer identity. Leave unset/false while legacy mobile and
+# desktop clients still call /auth with only `room`; see SELF_HOST.md.
+# REQUIRE_AUTH_PROOF = "true"
 # Android App Link signing certs (public SHA-256 fingerprints, comma-separated;
 # NOT secret). An installed app's cert must appear here or its /v/ links won't
 # verify. Currently distributing the DIRECT (website/sideload) APK — no Play

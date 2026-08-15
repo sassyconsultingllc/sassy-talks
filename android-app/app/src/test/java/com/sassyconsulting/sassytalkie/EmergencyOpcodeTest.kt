@@ -52,7 +52,7 @@ class EmergencyOpcodeTest {
     }
 
     /**
-     * The relay client routes only `op in 0x10..0x1F` to the control-frame
+     * The relay client routes `op in 0x10..0x20` to the control-frame
      * handler; anything else is handed to the audio decoder. An emergency
      * opcode outside that window would be silently swallowed as audio.
      */
@@ -62,10 +62,11 @@ class EmergencyOpcodeTest {
             ControlFrame.OP_EMERGENCY,
             ControlFrame.OP_MANDOWN,
             ControlFrame.OP_EMERGENCY_CLEAR,
+            ControlFrame.OP_HYBRID_CONFIRM_ACK,
         )) {
             val v = op.toInt() and 0xFF
             assertTrue("0x${op.toString(16)} must be >= 0x10 (TLV-framed)", v >= 0x10)
-            assertTrue("0x${op.toString(16)} must be <= 0x1F (control window)", v <= 0x1F)
+            assertTrue("0x${op.toString(16)} must be <= 0x20 (control window)", v <= 0x20)
         }
     }
 
@@ -80,5 +81,8 @@ class EmergencyOpcodeTest {
         assertEquals(0x1A.toByte(), ControlFrame.OP_EMERGENCY)
         assertEquals(0x1D.toByte(), ControlFrame.OP_MANDOWN)
         assertEquals(0x1E.toByte(), ControlFrame.OP_EMERGENCY_CLEAR)
+        assertEquals(0x1F.toByte(), ControlFrame.OP_HYBRID_CONFIRM)
+        assertEquals(0x20.toByte(), ControlFrame.OP_HYBRID_CONFIRM_ACK)
+        assertEquals(0x19.toByte(), ControlFrame.OP_REPLAY_FRAME)
     }
 }

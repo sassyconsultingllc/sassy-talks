@@ -4,19 +4,27 @@
 /**
  * relay-auth.js — Shared capability-token helpers for the SassyTalk relay.
  *
- * Token format mirrors ptt-relay-worker.js exactly so a token minted by
- * GET /auth?room=... is accepted by every endpoint:
+ * Tokens minted by GET /auth?room=... are accepted by every endpoint:
  *
- *   token = "<expSec>.<hexSig>"  where  hexSig = HMAC-SHA256(`${roomId}.${expSec}`, AUTH_SECRET)
+ *   legacy: "<expSec>.<hexSig>"
+ *   v2:     "v2.<expSec>.<peerB64>.<authClass>.<hexSig>"
  *
- * presence.js and share.js import verifyCapabilityToken from here so that
+ * v2 binds the capability to both the room and peer identity. Legacy tokens
+ * remain verifiable while unmodified Android/iOS/desktop clients migrate.
+ *
+ * presence.js and share.js import the verifiers from here so that
  * registering an FCM token / minting a share blob requires the same room
- * capability as opening the WebSocket. The worker keeps its own inline copy on
- * the hot /ws path; this module is the single source of truth for the rest.
+ * capability as opening the WebSocket. This module is the single source of
+ * truth for every route, including the WebSocket front door.
  */
 
 // Allowed clock skew between worker and client when verifying token.exp.
 const CLOCK_SKEW_SEC = 30;
+const PROOF_CLOCK_SKEW_SEC = 60;
+const ROOM_RE = /^[A-Za-z0-9._:@-]{8,64}$/;
+const PEER_RE = /^[A-Za-z0-9._:@-]{1,64}$/;
+const NONCE_RE = /^[A-Za-z0-9_-]{16,128}$/;
+const AUTH_CLASSES = new Set(["member", "terminal"]);
 
 /**
  * Verify a capability token against a room id.
@@ -29,17 +37,37 @@ const CLOCK_SKEW_SEC = 30;
  * always *signed* with the current AUTH_SECRET only.
  */
 export async function verifyCapabilityToken(token, roomId, secret) {
+  const result = await verifyCapabilityIdentity(token, roomId, secret);
+  return result.error;
+}
+
+/**
+ * Verify a token and return its bound identity/classification.
+ *
+ * Legacy success: { error: null, version: 1, peer: null, authClass: "legacy" }
+ * v2 success:     { error: null, version: 2, peer, authClass }
+ */
+export async function verifyCapabilityIdentity(token, roomId, secret) {
   const secrets = (Array.isArray(secret) ? secret : [secret]).filter(Boolean);
-  if (secrets.length === 0) return "AUTH_SECRET not configured";
-  if (!token || typeof token !== "string") return "Missing token";
+  if (secrets.length === 0) return identityError("AUTH_SECRET not configured");
+  if (!token || typeof token !== "string") return identityError("Missing token");
+
+  if (token.startsWith("v2.")) {
+    return verifyV2Token(token, roomId, secrets);
+  }
+
   const dot = token.indexOf(".");
-  if (dot <= 0) return "Malformed token";
-  const expSec = Number.parseInt(token.slice(0, dot), 10);
+  if (dot <= 0) return identityError("Malformed token");
+  const expRaw = token.slice(0, dot);
+  if (!/^\d+$/.test(expRaw)) return identityError("Malformed token");
+  const expSec = Number.parseInt(expRaw, 10);
   const sig = token.slice(dot + 1);
-  if (!Number.isFinite(expSec) || !sig) return "Malformed token";
+  if (!Number.isSafeInteger(expSec) || !/^[0-9a-f]{64}$/.test(sig)) {
+    return identityError("Malformed token");
+  }
 
   const nowSec = Math.floor(Date.now() / 1000);
-  if (expSec + CLOCK_SKEW_SEC < nowSec) return "Token expired";
+  if (expSec + CLOCK_SKEW_SEC < nowSec) return identityError("Token expired");
 
   // Accept a signature from any active key. Loop over all candidates without
   // short-circuiting so verification time doesn't reveal which key matched.
@@ -48,7 +76,81 @@ export async function verifyCapabilityToken(token, roomId, secret) {
     const expected = await hmacSha256Hex(`${roomId}.${expSec}`, s);
     if (timingSafeEqualHex(sig, expected)) ok = true;
   }
-  return ok ? null : "Invalid token signature";
+  return ok
+    ? { error: null, version: 1, peer: null, authClass: "legacy", expSec }
+    : identityError("Invalid token signature");
+}
+
+async function verifyV2Token(token, roomId, secrets) {
+  const parts = token.split(".");
+  if (parts.length !== 5) return identityError("Malformed token");
+  const [, expRaw, peerB64, authClass, sig] = parts;
+  if (!/^\d+$/.test(expRaw)) return identityError("Malformed token");
+  const expSec = Number.parseInt(expRaw, 10);
+  const peer = decodeBase64Url(peerB64);
+  if (!Number.isSafeInteger(expSec) || !peer || !PEER_RE.test(peer) ||
+      !AUTH_CLASSES.has(authClass) || !/^[0-9a-f]{64}$/.test(sig)) {
+    return identityError("Malformed token");
+  }
+  if (expSec + CLOCK_SKEW_SEC < Math.floor(Date.now() / 1000)) {
+    return identityError("Token expired");
+  }
+
+  const canonical = tokenV2Canonical(roomId, expSec, peer, authClass);
+  let ok = false;
+  for (const secret of secrets) {
+    const expected = await hmacSha256Hex(canonical, secret);
+    if (timingSafeEqualHex(sig, expected)) ok = true;
+  }
+  return ok
+    ? { error: null, version: 2, peer, authClass, expSec }
+    : identityError("Invalid token signature");
+}
+
+/** Mint an identity-bound v2 capability token. */
+export async function signCapabilityTokenV2(roomId, expSec, peer, authClass, secret) {
+  if (!PEER_RE.test(peer || "") || !AUTH_CLASSES.has(authClass)) {
+    throw new TypeError("Invalid capability identity");
+  }
+  const sig = await hmacSha256Hex(
+    tokenV2Canonical(roomId, expSec, peer, authClass),
+    secret,
+  );
+  return `v2.${expSec}.${encodeBase64Url(peer)}.${authClass}.${sig}`;
+}
+
+/**
+ * Verify a versioned operator proof for token issuance.
+ *
+ * Proof v1:
+ * HMAC-SHA256("v1\n<class>\n<room>\n<peer>\n<unixSec>\n<nonce>", AUTH_SECRET)
+ *
+ * This deliberately reuses AUTH_SECRET: deployments need no new secret or
+ * service. It is suitable for trusted terminal/operator tooling that already
+ * has the relay secret. It is not an E2E room-key proof; the relay never has
+ * the clients' encryption key and therefore cannot validate one.
+ */
+export async function verifyIssuanceProof(request, roomId, peer, authClass, secret) {
+  if (!secret) return "AUTH_SECRET not configured";
+  if (request.headers.get("X-Sassy-Auth-Version") !== "1") {
+    return "Missing or unsupported proof version";
+  }
+  const tsRaw = request.headers.get("X-Sassy-Auth-Timestamp") || "";
+  const nonce = request.headers.get("X-Sassy-Auth-Nonce") || "";
+  const proof = (request.headers.get("X-Sassy-Auth-Proof") || "").toLowerCase();
+  if (!/^\d+$/.test(tsRaw)) return "Malformed proof";
+  const ts = Number.parseInt(tsRaw, 10);
+  if (!Number.isSafeInteger(ts) || Math.abs(Math.floor(Date.now() / 1000) - ts) > PROOF_CLOCK_SKEW_SEC) {
+    return "Proof timestamp outside allowed window";
+  }
+  if (!NONCE_RE.test(nonce) || !/^[0-9a-f]{64}$/.test(proof)) {
+    return "Malformed proof";
+  }
+  const expected = await hmacSha256Hex(
+    `v1\n${authClass}\n${roomId}\n${peer}\n${ts}\n${nonce}`,
+    secret,
+  );
+  return timingSafeEqualHex(proof, expected) ? null : "Invalid proof";
 }
 
 /**
@@ -121,5 +223,37 @@ export function timingSafeEqualHex(a, b) {
 }
 
 export function isValidRoomId(id) {
-  return typeof id === "string" && id.length >= 8 && id.length <= 64;
+  return typeof id === "string" && ROOM_RE.test(id);
+}
+
+export function isValidPeerId(id) {
+  return typeof id === "string" && PEER_RE.test(id);
+}
+
+function tokenV2Canonical(roomId, expSec, peer, authClass) {
+  return `v2\n${roomId}\n${expSec}\n${peer}\n${authClass}`;
+}
+
+function identityError(error) {
+  return { error, version: null, peer: null, authClass: null, expSec: null };
+}
+
+function encodeBase64Url(value) {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function decodeBase64Url(value) {
+  try {
+    if (!/^[A-Za-z0-9_-]+$/.test(value)) return null;
+    const padded = value.replace(/-/g, "+").replace(/_/g, "/")
+      + "=".repeat((4 - (value.length % 4)) % 4);
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
 }

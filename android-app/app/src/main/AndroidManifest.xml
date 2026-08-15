@@ -67,6 +67,9 @@
         <meta-data
             android:name="com.google.mlkit.vision.DEPENDENCIES"
             android:value="barcode" />
+        <meta-data
+            android:name="android.content.APP_RESTRICTIONS"
+            android:resource="@xml/app_restrictions" />
 
         <!-- No screenOrientation/resizeableActivity restrictions: Android 16+
              ignores them on large screens and Play flags them. The UI is
@@ -116,6 +119,16 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
+                <!-- Primary custom scheme: sassy-talks://v/<id>#<key>. Needs no
+                     App Links verification, so it opens the app even where the
+                     https link would bounce to a browser. -->
+                <data android:scheme="sassy-talks"
+                      android:host="v"
+                      android:pathPrefix="/" />
+                <!-- Legacy scheme, kept registered so invites already pasted
+                     into chats keep opening. Dropping it would turn every
+                     previously-shared link into a dead tap. New links are
+                     minted with sassy-talks:// only. -->
                 <data android:scheme="sassytalk"
                       android:host="v"
                       android:pathPrefix="/" />

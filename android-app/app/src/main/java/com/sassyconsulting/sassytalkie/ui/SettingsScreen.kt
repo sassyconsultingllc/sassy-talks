@@ -4,6 +4,7 @@
 package com.sassyconsulting.sassytalkie.ui
 
 import android.content.Context
+import android.content.Intent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -531,7 +532,7 @@ fun SettingsScreen(
             // for same-WiFi peers; turning WiFi off forces relay-only.
             SettingsCard(title = "Network") {
                 Text(
-                    text = "Local-first: WiFi multicast and Bluetooth are preferred for nearby peers; Cloudflare Relay is a long-distance backup. The app fails over WiFi → relay → Bluetooth when a path drops, and advises when a better path is available. Turning Relay off keeps audio LAN-local.",
+                    text = "Relay-first: Cloudflare Relay is the common path so everyone can hear each other, even if some peers are on WiFi or Bluetooth. WiFi multicast runs alongside relay for nearby devices. Bluetooth is last-resort when there's no internet. The app stays on relay through brief drops instead of hopping between methods. Turning Relay off keeps audio LAN-local.",
                     fontSize = 11.sp,
                     color = TextMuted
                 )
@@ -641,6 +642,85 @@ fun SettingsScreen(
                         com.sassyconsulting.sassytalkie.debug.DiagnosticsPrefs.setOverlayEnabled(it)
                     }
                 )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+            SettingsCard(title = "Background wake (OEM)") {
+                Text(
+                    text = com.sassyconsulting.sassytalkie.OemBatteryGuidance.summary() +
+                        " Open battery / autostart settings if radio wake from a killed app is delayed.",
+                    fontSize = 11.sp,
+                    color = TextMuted
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = {
+                        try {
+                            context.startActivity(
+                                com.sassyconsulting.sassytalkie.OemBatteryGuidance.primarySettingsIntent(context)
+                            )
+                        } catch (_: Throwable) {
+                            context.startActivity(
+                                com.sassyconsulting.sassytalkie.OemBatteryGuidance.appDetailsIntent(context)
+                            )
+                        }
+                    },
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Cyan),
+                    modifier = Modifier.fillMaxWidth().height(44.dp),
+                ) {
+                    Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Open battery / autostart settings", fontSize = 14.sp)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+            SettingsCard(title = "Technical audit") {
+                Text(
+                    text = com.sassyconsulting.sassytalkie.FipsProvider.ABOUT_STATUS + "\n" +
+                        com.sassyconsulting.sassytalkie.FipsProvider.ABOUT_DETAIL,
+                    fontSize = 11.sp,
+                    color = TextMuted
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = com.sassyconsulting.sassytalkie.EmergencyAuditStore.DISCLAIMER,
+                    fontSize = 11.sp,
+                    color = TextMuted
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = {
+                        val json = walkieService?.auditStore()?.exportJson() ?: return@OutlinedButton
+                        val send = Intent(Intent.ACTION_SEND).apply {
+                            type = "application/json"
+                            putExtra(Intent.EXTRA_TEXT, json)
+                            putExtra(
+                                Intent.EXTRA_SUBJECT,
+                                "SassyTalkie technical audit export — not a legal chain of custody",
+                            )
+                        }
+                        context.startActivity(Intent.createChooser(send, "Export technical audit"))
+                    },
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Cyan),
+                    modifier = Modifier.fillMaxWidth().height(44.dp),
+                    enabled = walkieService != null,
+                ) {
+                    Icon(Icons.Default.Description, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Export technical audit", fontSize = 14.sp)
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = { walkieService?.wipeSession("settings") },
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Cyan),
+                    modifier = Modifier.fillMaxWidth().height(44.dp),
+                    enabled = walkieService != null,
+                ) {
+                    Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Clear session keys", fontSize = 14.sp)
+                }
             }
         }
     }

@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-E74JPYJ2CRHF
+use log::{error, info, warn};
 /// Audio Pipeline - TX/RX threads that wire the full audio path
 ///
 /// TX path (on PTT press):
@@ -10,18 +11,16 @@
 ///   Transport::receive (decrypted) → unpack_wire_frame → VoiceDecoder::decode → AudioCache → AudioTrack
 ///
 /// Also handles the TranscriptionBridge callback to Kotlin for speech-to-text.
-
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use log::{error, info, warn};
 
 use crate::audio::AudioEngine;
-use crate::codec::{VoiceEncoder, VoiceDecoder, CODEC_FRAME_SIZE};
-use crate::transport::TransportManager;
 use crate::audio_cache::AudioCache;
+use crate::codec::{VoiceDecoder, VoiceEncoder, CODEC_FRAME_SIZE};
+use crate::transport::TransportManager;
 use crate::users::UserRegistry;
 
 /// Whether the Kotlin TranscriptionBridge.onAudioReceived callback should
@@ -68,7 +67,11 @@ pub fn get_mic_gain_x100() -> i32 {
 /// Set squelch threshold in dBFS. 0 disables squelch. Otherwise expects a
 /// negative integer in [-60, -10]; values outside that range are clamped.
 pub fn set_squelch_dbfs(threshold: i32) {
-    let clamped = if threshold == 0 { 0 } else { threshold.clamp(-60, -10) };
+    let clamped = if threshold == 0 {
+        0
+    } else {
+        threshold.clamp(-60, -10)
+    };
     SQUELCH_DBFS.store(clamped, Ordering::Relaxed);
     if clamped == 0 {
         info!("Squelch disabled");
@@ -83,7 +86,9 @@ pub fn get_squelch_dbfs() -> i32 {
 
 /// Apply mic gain to a PCM frame in place, clipping to i16 range.
 fn apply_mic_gain(pcm: &mut [i16], gain_x100: i32) {
-    if gain_x100 == 100 { return; } // unity — fast path
+    if gain_x100 == 100 {
+        return;
+    } // unity — fast path
     let g = gain_x100 as f32 / 100.0;
     for s in pcm.iter_mut() {
         let scaled = (*s as f32 * g).clamp(i16::MIN as f32, i16::MAX as f32);
@@ -93,14 +98,20 @@ fn apply_mic_gain(pcm: &mut [i16], gain_x100: i32) {
 
 /// Compute RMS dBFS for a PCM frame. Returns a very negative number for silence.
 fn frame_dbfs(pcm: &[i16]) -> f32 {
-    if pcm.is_empty() { return -120.0; }
+    if pcm.is_empty() {
+        return -120.0;
+    }
     let mut sum_sq: f64 = 0.0;
     for s in pcm {
         let v = *s as f64 / 32768.0;
         sum_sq += v * v;
     }
     let rms = (sum_sq / pcm.len() as f64).sqrt();
-    if rms <= 1e-9 { -120.0 } else { (20.0 * rms.log10()) as f32 }
+    if rms <= 1e-9 {
+        -120.0
+    } else {
+        (20.0 * rms.log10()) as f32
+    }
 }
 
 // ── Public helpers used by the BT TX path in jni_bridge.rs so both pipelines
@@ -116,7 +127,9 @@ pub fn apply_mic_gain_public(pcm: &mut [i16]) {
 /// is loud enough to transmit.
 pub fn squelch_drops_frame(pcm: &[i16]) -> bool {
     let squelch = SQUELCH_DBFS.load(Ordering::Relaxed);
-    if squelch == 0 { return false; }
+    if squelch == 0 {
+        return false;
+    }
     frame_dbfs(pcm) < squelch as f32
 }
 
@@ -140,8 +153,17 @@ pub fn call_transcription_bridge_public(
 // format, bounds checks, and MAX_* limits moved verbatim; re-exported under the
 // original names so every call site (and test) in this crate is unchanged.
 pub use sassytalkie_core::wire::{
-    pack_wire_frame, unpack_wire_frame, now_ms, MAX_SENDER_ID_LEN, MAX_DEVICE_NAME_LEN,
+    now_ms, pack_wire_frame, pack_wire_frame_v2, unpack_wire_frame, unpack_wire_frame_detailed,
+    MAX_DEVICE_NAME_LEN, MAX_SENDER_ID_LEN,
 };
+
+static STREAM_EPOCH_COUNTER: AtomicU64 = AtomicU64::new(1);
+static INVALID_FRAME_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+static TX_FAILURE_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn next_stream_epoch() -> u64 {
+    now_ms().rotate_left(17) ^ STREAM_EPOCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Spawn the TX thread: captures mic audio, encodes, encrypts, and sends while PTT is held.
 ///
@@ -201,7 +223,16 @@ pub fn spawn_tx_thread(
                     let channel = current_channel.load(Ordering::SeqCst);
                     let subch = current_subchannel.load(Ordering::SeqCst);
                     let ts = now_ms();
-                    let wire = pack_wire_frame(channel, subch, &local_sender_id, &local_device_name, ts, &compressed);
+                    let wire = pack_wire_frame_v2(
+                        channel,
+                        subch,
+                        &local_sender_id,
+                        &local_device_name,
+                        next_stream_epoch(),
+                        0,
+                        ts,
+                        &compressed,
+                    );
                     let mut tm = transport.lock().unwrap();
                     let _ = tm.send(&wire);
                     info!("TX: sent initial presence beacon");
@@ -246,7 +277,16 @@ pub fn spawn_tx_thread(
                             let ch = current_channel.load(Ordering::SeqCst);
                             let subch = current_subchannel.load(Ordering::SeqCst);
                             let ts = now_ms();
-                            let wire = pack_wire_frame(ch, subch, &local_sender_id, &local_device_name, ts, &compressed);
+                            let wire = pack_wire_frame_v2(
+                                ch,
+                                subch,
+                                &local_sender_id,
+                                &local_device_name,
+                                next_stream_epoch(),
+                                0,
+                                ts,
+                                &compressed,
+                            );
                             let mut tm = transport.lock().unwrap();
                             let _ = tm.send(&wire);
                         }
@@ -263,7 +303,7 @@ pub fn spawn_tx_thread(
                         Ok(()) => {
                             was_transmitting = true;
                             tx_frame_index = 0;
-                            tx_stream_epoch_ms = now_ms();
+                            tx_stream_epoch_ms = next_stream_epoch();
                             info!("TX: started recording (PTT pressed)");
                         }
                         Err(e) => {
@@ -292,7 +332,10 @@ pub fn spawn_tx_thread(
                         let eng = audio.lock().unwrap();
                         match eng.read_audio(&mut pcm_buffer[filled..CODEC_FRAME_SIZE]) {
                             Ok(n) => n,
-                            Err(e) => { warn!("TX: read_audio failed: {}", e); 0 }
+                            Err(e) => {
+                                warn!("TX: read_audio failed: {}", e);
+                                0
+                            }
                         }
                     };
                     if n == 0 {
@@ -302,14 +345,20 @@ pub fn spawn_tx_thread(
                     filled += n;
                 }
                 if filled < CODEC_FRAME_SIZE {
-                    warn!("TX: partial frame after {} attempts (filled={}/{}); dropping", read_attempts, filled, CODEC_FRAME_SIZE);
+                    warn!(
+                        "TX: partial frame after {} attempts (filled={}/{}); dropping",
+                        read_attempts, filled, CODEC_FRAME_SIZE
+                    );
                     continue;
                 }
 
                 // Apply user-configured mic gain in place (unity by default).
                 // For clogged-mic users this lifts a weak signal up; for
                 // headset users with hot mics, a fractional gain attenuates.
-                apply_mic_gain(&mut pcm_buffer[..CODEC_FRAME_SIZE], MIC_GAIN_X100.load(Ordering::Relaxed));
+                apply_mic_gain(
+                    &mut pcm_buffer[..CODEC_FRAME_SIZE],
+                    MIC_GAIN_X100.load(Ordering::Relaxed),
+                );
 
                 // Software noise suppression (spectral subtraction / Wiener).
                 // No-op when disabled (default). Runs AFTER gain so it cleans
@@ -350,7 +399,11 @@ pub fn spawn_tx_thread(
                 // which is never constructed, so the panel had no live source.
                 {
                     let frame = &pcm_buffer[..CODEC_FRAME_SIZE];
-                    let peak = frame.iter().map(|s| s.unsigned_abs() as u32).max().unwrap_or(0);
+                    let peak = frame
+                        .iter()
+                        .map(|s| s.unsigned_abs() as u32)
+                        .max()
+                        .unwrap_or(0);
                     let dbfs = if peak == 0 {
                         -120.0
                     } else {
@@ -366,9 +419,19 @@ pub fn spawn_tx_thread(
                 // Pack wire frame (includes device name for receiver display)
                 let channel = current_channel.load(Ordering::SeqCst);
                 let subch = current_subchannel.load(Ordering::SeqCst);
-                let timestamp = tx_stream_epoch_ms.saturating_add(tx_frame_index.saturating_mul(20));
+                let timestamp = now_ms();
+                let sequence = tx_frame_index.min(u32::MAX as u64) as u32;
                 tx_frame_index += 1;
-                let wire_data = pack_wire_frame(channel, subch, &local_sender_id, &local_device_name, timestamp, &compressed);
+                let wire_data = pack_wire_frame_v2(
+                    channel,
+                    subch,
+                    &local_sender_id,
+                    &local_device_name,
+                    tx_stream_epoch_ms,
+                    sequence,
+                    timestamp,
+                    &compressed,
+                );
 
                 if PTT_BUFFER_MODE.load(Ordering::SeqCst) {
                     // Buffer mode: accumulate frames, burst-send on PTT release
@@ -377,7 +440,16 @@ pub fn spawn_tx_thread(
                     // Live mode: send immediately frame-by-frame
                     let mut tm = transport.lock().unwrap();
                     if let Err(e) = tm.send(&wire_data) {
-                        warn!("TX: send failed: {}", e);
+                        let n = TX_FAILURE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n == 1 || n % 100 == 0 {
+                            warn!("TX: send failed: {} ({} failures, rate-limited)", e, n);
+                        }
+                        // Safety: TransportManager::send only fails when no
+                        // bearer accepted the frame (or encryption failed).
+                        // Drop the PTT latch immediately so capture cannot keep
+                        // running while the UI appears to transmit silently.
+                        ptt_pressed.store(false, Ordering::SeqCst);
+                        crate::diag::note_tx_failure();
                     }
                 }
             }
@@ -430,8 +502,9 @@ impl PlayoutPacer {
 /// produces garbled PCM that the post-decode jitter buffer cannot fix.
 struct SenderDecodeState {
     decoder: VoiceDecoder,
-    last_decoded_ts: Option<u64>,
-    pending: BTreeMap<u64, Vec<u8>>,
+    stream_epoch: Option<u64>,
+    last_decoded_seq: Option<u32>,
+    pending: BTreeMap<u32, (u64, Vec<u8>)>,
     /// Set when we're blocked waiting for the next in-sequence timestamp.
     reorder_wait_since: Option<Instant>,
 }
@@ -440,53 +513,82 @@ impl SenderDecodeState {
     fn new() -> Self {
         Self {
             decoder: VoiceDecoder::new(),
-            last_decoded_ts: None,
+            stream_epoch: None,
+            last_decoded_seq: None,
             pending: BTreeMap::new(),
             reorder_wait_since: None,
         }
     }
 
     /// Buffer one compressed frame and decode every in-sequence frame now ready.
-    fn ingest(&mut self, timestamp: u64, compressed: Vec<u8>, frame_period_ms: u64, max_plc_frames: u64, reorder_wait_ms: u64) -> Vec<(u64, Vec<i16>)> {
-        if let Some(last) = self.last_decoded_ts {
-            if timestamp <= last {
-                return vec![]; // duplicate or already-decoded
+    fn ingest(
+        &mut self,
+        stream_epoch: u64,
+        sequence: u32,
+        timestamp: u64,
+        compressed: Vec<u8>,
+        max_plc_frames: u64,
+        reorder_wait_ms: u64,
+    ) -> Vec<(u64, u32, u64, Vec<i16>)> {
+        if self.stream_epoch != Some(stream_epoch) {
+            self.reset_for_epoch(stream_epoch);
+        } else if let Some(last) = self.last_decoded_seq {
+            if sequence <= last {
+                // A substantial rollback is a sender restart that reused an
+                // epoch. Reset safely; a small rollback is a duplicate/reorder.
+                if last.saturating_sub(sequence) > 32 {
+                    self.reset_for_epoch(stream_epoch);
+                } else {
+                    return vec![];
+                }
             }
         }
         const MAX_PENDING: usize = 32;
         if self.pending.len() >= MAX_PENDING {
             self.pending.pop_first();
         }
-        self.pending.insert(timestamp, compressed);
-        self.drain_decodable(frame_period_ms, max_plc_frames, reorder_wait_ms)
+        self.pending.insert(sequence, (timestamp, compressed));
+        self.drain_decodable(max_plc_frames, reorder_wait_ms)
     }
 
-    fn drain_decodable(&mut self, frame_period_ms: u64, max_plc_frames: u64, reorder_wait_ms: u64) -> Vec<(u64, Vec<i16>)> {
+    fn reset_for_epoch(&mut self, epoch: u64) {
+        self.decoder.reset();
+        self.stream_epoch = Some(epoch);
+        self.last_decoded_seq = None;
+        self.pending.clear();
+        self.reorder_wait_since = None;
+    }
+
+    fn drain_decodable(
+        &mut self,
+        max_plc_frames: u64,
+        reorder_wait_ms: u64,
+    ) -> Vec<(u64, u32, u64, Vec<i16>)> {
         let mut out = Vec::new();
         loop {
-            let expected_ts = match self.last_decoded_ts {
-                Some(last) => last.saturating_add(frame_period_ms),
+            let expected_seq = match self.last_decoded_seq {
+                Some(last) => last.saturating_add(1),
                 None => match self.pending.keys().next().copied() {
-                    Some(t) => t,
+                    Some(s) => s,
                     None => break,
                 },
             };
 
-            if let Some(compressed) = self.pending.remove(&expected_ts) {
+            if let Some((timestamp, compressed)) = self.pending.remove(&expected_seq) {
                 self.reorder_wait_since = None;
                 let pcm = self.decoder.decode(&compressed);
-                self.last_decoded_ts = Some(expected_ts);
-                out.push((expected_ts, pcm));
+                self.last_decoded_seq = Some(expected_seq);
+                out.push((self.stream_epoch.unwrap_or(0), expected_seq, timestamp, pcm));
                 continue;
             }
 
             // Expected frame missing — wait briefly for reorder, then repair.
             let earliest = match self.pending.keys().next().copied() {
-                Some(t) => t,
+                Some(s) => s,
                 None => break,
             };
 
-            if earliest <= expected_ts {
+            if earliest <= expected_seq {
                 break;
             }
 
@@ -496,36 +598,46 @@ impl SenderDecodeState {
             }
             self.reorder_wait_since = None;
 
-            let gap_frames = (earliest - expected_ts) / frame_period_ms;
+            let gap_frames = (earliest - expected_seq) as u64;
             if gap_frames == 0 {
                 break;
             }
 
             if gap_frames == 1 {
-                let next_pkt = match self.pending.get(&earliest) {
-                    Some(p) => p.clone(),
+                let (next_ts, next_pkt) = match self.pending.get(&earliest) {
+                    Some((ts, p)) => (*ts, p.clone()),
                     None => break,
                 };
                 let fec_pcm = self.decoder.decode_fec_from_next(&next_pkt);
-                self.last_decoded_ts = Some(expected_ts);
-                out.push((expected_ts, fec_pcm));
+                self.last_decoded_seq = Some(expected_seq);
+                out.push((
+                    self.stream_epoch.unwrap_or(0),
+                    expected_seq,
+                    next_ts.saturating_sub(RX_FRAME_PERIOD_MS),
+                    fec_pcm,
+                ));
                 continue;
             }
 
             if gap_frames >= 2 && gap_frames <= max_plc_frames {
                 for i in 0..gap_frames {
-                    let synth_ts = expected_ts + frame_period_ms * i;
+                    let synth_seq = expected_seq.saturating_add(i as u32);
+                    let next_ts = self.pending.get(&earliest).map(|(ts, _)| *ts).unwrap_or(0);
+                    let synth_ts = next_ts.saturating_sub((gap_frames - i) * RX_FRAME_PERIOD_MS);
                     let plc_pcm = self.decoder.decode_plc();
-                    self.last_decoded_ts = Some(synth_ts);
-                    out.push((synth_ts, plc_pcm));
+                    self.last_decoded_seq = Some(synth_seq);
+                    out.push((self.stream_epoch.unwrap_or(0), synth_seq, synth_ts, plc_pcm));
                 }
                 continue;
             }
 
             if gap_frames > max_plc_frames {
                 self.decoder.reset();
-                self.last_decoded_ts = None;
-                info!("RX: large gap of {} frames — decoder reset, resync at ts={}", gap_frames, earliest);
+                self.last_decoded_seq = None;
+                info!(
+                    "RX: large gap of {} frames — decoder reset, resync at seq={}",
+                    gap_frames, earliest
+                );
                 continue;
             }
 
@@ -576,26 +688,57 @@ impl RxSharedState {
         &mut self,
         cache: &mut AudioCache,
         sender_id: &str,
+        stream_epoch: u64,
+        sequence: u32,
         timestamp: u64,
         compressed: Vec<u8>,
-    ) -> Vec<(u64, Vec<i16>)> {
+    ) -> Vec<(u64, u32, u64, Vec<i16>)> {
         let state = self
             .sender_states
             .entry(sender_id.to_string())
             .or_insert_with(SenderDecodeState::new);
         let decoded = state.ingest(
+            stream_epoch,
+            sequence,
             timestamp,
             compressed,
-            RX_FRAME_PERIOD_MS,
             RX_MAX_PLC_FRAMES,
             RX_REORDER_WAIT_MS,
         );
-        for (frame_ts, pcm) in &decoded {
-            if let Some(samples) = cache.ingest_frame(sender_id, *frame_ts, pcm.clone()) {
+        for (epoch, seq, frame_ts, pcm) in &decoded {
+            if let Some(samples) =
+                cache.ingest_logical_frame(sender_id, *epoch, *seq, *frame_ts, pcm.clone())
+            {
                 self.enqueue_playout(samples);
             }
         }
         decoded
+    }
+
+    /// Timer-driven reorder drain. Missing packets must age out even when no
+    /// later packet arrives to call `ingest`; otherwise the last frames of a
+    /// press can remain stranded forever.
+    pub fn drain_decode_timers(&mut self, cache: &mut AudioCache) {
+        let sender_ids: Vec<String> = self.sender_states.keys().cloned().collect();
+        for sender_id in sender_ids {
+            let decoded = self
+                .sender_states
+                .get_mut(&sender_id)
+                .map(|s| s.drain_decodable(RX_MAX_PLC_FRAMES, RX_REORDER_WAIT_MS))
+                .unwrap_or_default();
+            for (epoch, seq, timestamp, pcm) in decoded {
+                if let Some(samples) =
+                    cache.ingest_logical_frame(&sender_id, epoch, seq, timestamp, pcm)
+                {
+                    self.enqueue_playout(samples);
+                }
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.sender_states.clear();
+        self.playout_queue.clear();
     }
 
     /// Pull queue/jitter-drain frames from the cache into the playout queue.
@@ -628,6 +771,8 @@ pub fn process_incoming_wire_frame(
     sender_id: &str,
     device_name: &str,
     timestamp: u64,
+    stream_epoch: u64,
+    sequence: u32,
     compressed: &[u8],
     invoke_transcription: bool,
 ) {
@@ -665,6 +810,8 @@ pub fn process_incoming_wire_frame(
         let frames = rx.ingest_wire_frame(
             &mut cache,
             sender_id,
+            stream_epoch,
+            sequence,
             timestamp,
             compressed.to_vec(),
         );
@@ -677,7 +824,7 @@ pub fn process_incoming_wire_frame(
         let reg = user_registry.lock().unwrap();
         let is_favorite = reg.is_favorite(sender_id);
         let is_muted = reg.is_muted(sender_id);
-        for (_ts, pcm) in decoded {
+        for (_epoch, _seq, _ts, pcm) in decoded {
             call_transcription_bridge(sender_id, device_name, &pcm, is_favorite, is_muted, false);
         }
     }
@@ -707,6 +854,7 @@ pub fn spawn_rx_thread(
             let mut playback_started = false;
             let mut pacer = PlayoutPacer::new();
             let mut last_write_at: Option<Instant> = None;
+            let mut idle_backoff_ms = 1u64;
             // Release AudioTrack + MODE_IN_COMMUNICATION (via stop_playing)
             // when we've been silent this long. Matches the Kotlin
             // WalkieService `RX_STAY_HOT_MS` window — after this the phone
@@ -744,14 +892,19 @@ pub fn spawn_rx_thread(
                         }
                         received_any = true;
 
-                        let (channel, subchannel, sender_id, device_name, timestamp, compressed) =
-                            match unpack_wire_frame(&buf[..bytes_received]) {
-                                Ok(parsed) => parsed,
-                                Err(e) => {
-                                    warn!("RX: invalid wire frame: {}", e);
-                                    continue;
+                        let frame = match unpack_wire_frame_detailed(&buf[..bytes_received]) {
+                            Ok(parsed) => parsed,
+                            Err(e) => {
+                                let n = INVALID_FRAME_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n == 1 || n % 100 == 0 {
+                                    warn!(
+                                        "RX: invalid wire frame: {} ({} invalid, rate-limited)",
+                                        e, n
+                                    );
                                 }
-                            };
+                                continue;
+                            }
+                        };
 
                         process_incoming_wire_frame(
                             &rx_shared,
@@ -760,12 +913,14 @@ pub fn spawn_rx_thread(
                             &local_sender_id,
                             my_channel,
                             my_subchannel,
-                            channel,
-                            subchannel,
-                            &sender_id,
-                            &device_name,
-                            timestamp,
-                            &compressed,
+                            frame.channel,
+                            frame.subchannel,
+                            &frame.sender_id,
+                            &frame.device_name,
+                            frame.timestamp,
+                            frame.stream_epoch,
+                            frame.sequence,
+                            &frame.compressed,
                             true,
                         );
                     }
@@ -774,6 +929,7 @@ pub fn spawn_rx_thread(
                 let commits = {
                     let mut rx = rx_shared.lock().unwrap();
                     let mut cache = audio_cache.lock().unwrap();
+                    rx.drain_decode_timers(&mut cache);
                     cache.tick();
                     let commits = cache.take_newly_committed_ids();
                     rx.drain_cache_playout(&mut cache);
@@ -808,7 +964,10 @@ pub fn spawn_rx_thread(
                             }
                         }
                     }
-                    thread::sleep(Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(idle_backoff_ms));
+                    idle_backoff_ms = (idle_backoff_ms + 1).min(10);
+                } else {
+                    idle_backoff_ms = 1;
                 }
             }
 
@@ -832,7 +991,7 @@ fn dispatch_committed_utterances(commits: &[(u64, String, String, u64)]) {
     if commits.is_empty() {
         return;
     }
-    use jni::objects::{JValue, JClass, GlobalRef};
+    use jni::objects::{GlobalRef, JClass, JValue};
 
     let bridge_ref: &GlobalRef = match crate::jni_bridge::get_transcription_bridge_class() {
         Some(r) => r,
@@ -846,7 +1005,9 @@ fn dispatch_committed_utterances(commits: &[(u64, String, String, u64)]) {
         Ok(e) => e,
         Err(_) => return,
     };
-    if env.push_local_frame(8).is_err() { return; }
+    if env.push_local_frame(8).is_err() {
+        return;
+    }
 
     for (id, sender_id, sender_name, duration_ms) in commits {
         let _ = (|| -> Option<()> {
@@ -873,7 +1034,9 @@ fn dispatch_committed_utterances(commits: &[(u64, String, String, u64)]) {
         })();
     }
 
-    unsafe { let _ = env.pop_local_frame(&jni::objects::JObject::null()); }
+    unsafe {
+        let _ = env.pop_local_frame(&jni::objects::JObject::null());
+    }
 }
 
 /// Call the Kotlin TranscriptionBridge.onAudioReceived callback via JNI.
@@ -901,8 +1064,8 @@ fn call_transcription_bridge(
         return;
     }
 
-    use jni::objects::{JValue, JClass, GlobalRef};
-    use jni::sys::{JNI_TRUE, JNI_FALSE};
+    use jni::objects::{GlobalRef, JClass, JValue};
+    use jni::sys::{JNI_FALSE, JNI_TRUE};
 
     // Use the cached class ref (resolved on the main thread during nativeInit)
     let bridge_ref: &GlobalRef = match crate::jni_bridge::get_transcription_bridge_class() {
@@ -923,7 +1086,9 @@ fn call_transcription_bridge(
     // Bound the local-ref count: strings + short[] would otherwise accumulate
     // across every received audio frame and overflow the local-ref table on
     // the long-lived RX thread.
-    if env.push_local_frame(8).is_err() { return; }
+    if env.push_local_frame(8).is_err() {
+        return;
+    }
 
     // Closure so we can always pop_local_frame before returning.
     let _ = (|| -> Option<()> {
@@ -966,7 +1131,9 @@ fn call_transcription_bridge(
         Some(())
     })();
 
-    unsafe { let _ = env.pop_local_frame(&jni::objects::JObject::null()); }
+    unsafe {
+        let _ = env.pop_local_frame(&jni::objects::JObject::null());
+    }
 }
 
 #[cfg(test)]
@@ -982,7 +1149,14 @@ mod tests {
         let timestamp = 1700000000000u64;
         let compressed = vec![42u8; 40];
 
-        let packed = pack_wire_frame(channel, subchannel, sender_id, device_name, timestamp, &compressed);
+        let packed = pack_wire_frame(
+            channel,
+            subchannel,
+            sender_id,
+            device_name,
+            timestamp,
+            &compressed,
+        );
         let (ch, sub, sid, name, ts, audio) = unpack_wire_frame(&packed).unwrap();
 
         assert_eq!(ch, channel);

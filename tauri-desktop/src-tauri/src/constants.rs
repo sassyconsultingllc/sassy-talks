@@ -2,7 +2,7 @@
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-ZCDGNU6XVQQW
 /// Shared Constants - Common Configuration for SassyTalkie
-/// 
+///
 /// Centralized constants used across all platforms
 /// Copyright 2025 Sassy Consulting LLC. All rights reserved.
 
@@ -19,8 +19,8 @@ pub const DEFAULT_MULTICAST_ADDR: &str = "239.255.42.42";
 pub const DEFAULT_MULTICAST_PORT: u16 = 5555;
 
 /// Port range for random port selection
-pub const PORT_RANGE_START: u16 = 49152;  // Start of dynamic/private ports
-pub const PORT_RANGE_END: u16 = 65535;    // End of port range
+pub const PORT_RANGE_START: u16 = 49152; // Start of dynamic/private ports
+pub const PORT_RANGE_END: u16 = 65535; // End of port range
 
 /// Maximum UDP packet size
 pub const MAX_PACKET_SIZE: usize = 1500;
@@ -35,19 +35,19 @@ pub const BEACON_INTERVAL_SECS: u64 = 5;
 pub const KEEPALIVE_INTERVAL_SECS: u64 = 10;
 
 /// Audio configuration
-pub const SAMPLE_RATE: u32 = 48000;       // 48kHz for Opus
-pub const FRAME_SIZE: usize = 960;        // 20ms at 48kHz
+pub const SAMPLE_RATE: u32 = 48000; // 48kHz for Opus
+pub const FRAME_SIZE: usize = 960; // 20ms at 48kHz
 pub const FRAME_DURATION_MS: u32 = 20;
-pub const OPUS_BITRATE: i32 = 32000;      // 32kbps VBR
+pub const OPUS_BITRATE: i32 = 32000; // 32kbps VBR
 
 /// Channel configuration
 pub const MIN_CHANNEL: u8 = 1;
-pub const MAX_CHANNEL: u8 = 16;           // Standardized to 1-16
+pub const MAX_CHANNEL: u8 = 16; // Standardized to 1-16
 
 /// Encryption settings
-pub const KEY_ROTATION_SECS: u64 = 60;    // Rotate keys every 60 seconds
-pub const NONCE_SIZE: usize = 12;         // 96-bit nonce for AES-GCM
-pub const AUTH_TAG_SIZE: usize = 16;      // 128-bit auth tag
+pub const KEY_ROTATION_SECS: u64 = 60; // Rotate keys every 60 seconds
+pub const NONCE_SIZE: usize = 12; // 96-bit nonce for AES-GCM
+pub const AUTH_TAG_SIZE: usize = 16; // 128-bit auth tag
 
 /// Service UUID for Bluetooth RFCOMM (Android)
 pub const BLUETOOTH_SERVICE_UUID: &str = "8ce255c0-223a-11e0-ac64-0803450c9a66";

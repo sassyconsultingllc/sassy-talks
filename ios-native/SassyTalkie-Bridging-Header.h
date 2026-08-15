@@ -130,11 +130,24 @@ char* _Nullable sassytalkie_hybrid_handshake_init(void);
 /// Responder: given the peer's base64 initiator message, install the session and
 /// return the base64 responder message (must free with sassytalkie_free_string),
 /// or NULL on failure.
+/// Responder: stage the proposed session; install only after confirm.
 char* _Nullable sassytalkie_hybrid_handshake_respond(const char* _Nullable init_b64);
 
 /// Initiator: complete with the peer's base64 responder message, installing the
 /// post-quantum session. Returns true on success.
 bool sassytalkie_hybrid_handshake_complete(const char* _Nullable resp_b64);
+
+/// Responder: install the staged PQ session after authenticated confirm.
+bool sassytalkie_hybrid_handshake_confirm(void);
+
+/// Wipe keys, control plane, and staged hybrid. In-app hook; MDM/EMM triggers remote logout.
+void sassytalkie_wipe_session(void);
+
+/// Technical audit JSON (free with sassytalkie_free_string). Not a legal chain of custody.
+char* _Nullable sassytalkie_export_audit(void);
+
+/// Optional MDM enrollment token. Empty/NULL clears. Room id is not authorization.
+bool sassytalkie_set_enrollment_token(const char* _Nullable token);
 
 // ── Relay (Cloudflare WebSocket) ──
 // The WebSocket is owned by Swift (URLSessionWebSocketTask); these bridge the

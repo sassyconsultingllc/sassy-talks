@@ -70,6 +70,7 @@ pub struct TransportManager {
     /// single-active-session model — the channel byte lives inside the sealed
     /// frame, so channel switching re-installs the session for the new channel.
     crypto: Arc<Mutex<Option<CryptoSession>>>,
+    pending_rx: Arc<Mutex<Option<CryptoSession>>>,
 
     /// Relay (Cloudflare WebSocket) outbound mirror. When the relay is connected
     /// (`relay_active`), every sealed audio frame that goes out on multicast is
@@ -98,6 +99,7 @@ impl TransportManager {
             multicast_addr,
             peers: Arc::new(Mutex::new(HashMap::new())),
             crypto: Arc::new(Mutex::new(None)),
+            pending_rx: Arc::new(Mutex::new(None)),
             relay_active: Arc::new(AtomicBool::new(false)),
             relay_outbound: Arc::new(Mutex::new(VecDeque::new())),
         })
@@ -118,12 +120,37 @@ impl TransportManager {
         self.relay_outbound.lock().unwrap().pop_front()
     }
 
+    pub fn enqueue_relay_control(&self, frame: Vec<u8>) {
+        let mut q = self.relay_outbound.lock().unwrap();
+        q.push_back(frame);
+        while q.len() > RELAY_OUTBOUND_CAP {
+            q.pop_front();
+        }
+    }
+
     /// Decrypt + return the plaintext wire frame of a sealed relay datagram
     /// received over the WebSocket. `None` if there is no session or the frame
     /// fails authentication. (The caller then `unpack_wire_frame`s it.)
     pub fn open_sealed(&self, sealed: &[u8]) -> Option<Vec<u8>> {
-        let guard = self.crypto.lock().unwrap();
-        guard.as_ref().and_then(|c| c.decrypt(sealed).ok())
+        if let Some(pt) = self.crypto.lock().unwrap().as_ref().and_then(|c| c.decrypt(sealed).ok()) {
+            return Some(pt);
+        }
+        let mut pending = self.pending_rx.lock().unwrap();
+        if let Some(pt) = pending.as_ref().and_then(|c| c.decrypt(sealed).ok()) {
+            if let Some(session) = pending.take() {
+                *self.crypto.lock().unwrap() = Some(session);
+            }
+            return Some(pt);
+        }
+        None
+    }
+
+    pub fn arm_pending_rx(&self, session: CryptoSession) {
+        *self.pending_rx.lock().unwrap() = Some(session);
+    }
+
+    pub fn discard_pending_rx(&self) {
+        *self.pending_rx.lock().unwrap() = None;
     }
 
     /// Install the active channel's encryption session. One session is active at
@@ -257,23 +284,39 @@ impl TransportManager {
 
         // 2) MANDATORY DECRYPTION. Drop unencrypted / tampered / replayed frames
         //    (surfaced as WouldBlock so the RX loop just keeps polling).
-        let guard = self.crypto.lock().unwrap();
-        let crypto = match guard.as_ref() {
-            Some(c) => c,
-            None => return Err(TransportError::IoError(
-                std::io::Error::new(std::io::ErrorKind::WouldBlock, "No session — dropped")
-            )),
-        };
-        match crypto.decrypt(&raw[..size]) {
-            Ok(plaintext) => {
-                let copy_len = plaintext.len().min(buffer.len());
-                buffer[..copy_len].copy_from_slice(&plaintext[..copy_len]);
-                Ok((copy_len, addr))
+        let plaintext = {
+            let live = self.crypto.lock().unwrap();
+            if let Some(c) = live.as_ref() {
+                if let Ok(pt) = c.decrypt(&raw[..size]) {
+                    drop(live);
+                    pt
+                } else {
+                    drop(live);
+                    let mut pending = self.pending_rx.lock().unwrap();
+                    match pending.as_ref().and_then(|c| c.decrypt(&raw[..size]).ok()) {
+                        Some(pt) => {
+                            if let Some(session) = pending.take() {
+                                *self.crypto.lock().unwrap() = Some(session);
+                            }
+                            pt
+                        }
+                        None => {
+                            return Err(TransportError::IoError(
+                                std::io::Error::new(std::io::ErrorKind::WouldBlock, "Decrypt failed — dropped")
+                            ));
+                        }
+                    }
+                }
+            } else {
+                drop(live);
+                return Err(TransportError::IoError(
+                    std::io::Error::new(std::io::ErrorKind::WouldBlock, "No session — dropped")
+                ));
             }
-            Err(_) => Err(TransportError::IoError(
-                std::io::Error::new(std::io::ErrorKind::WouldBlock, "Decrypt failed — dropped")
-            )),
-        }
+        };
+        let copy_len = plaintext.len().min(buffer.len());
+        buffer[..copy_len].copy_from_slice(&plaintext[..copy_len]);
+        Ok((copy_len, addr))
     }
     
     /// Add or update peer

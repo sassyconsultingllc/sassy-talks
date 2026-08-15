@@ -317,10 +317,11 @@ class BleSignalingService(
      * Used by the heartbeat loop in PttCoordinator.
      */
     fun broadcastControl(bytes: ByteArray) {
+        val protected = protectControl(bytes) ?: return
         val count = peerGattClients.size
-        Log.d(TAG, "\u2192 broadcastControl ${bytes.size}B to $count BLE peers")
+        Log.d(TAG, "\u2192 broadcastControl ${protected.size}B to $count BLE peers")
         for ((address, gatt) in peerGattClients) {
-            writeBytes(gatt, bytes, address)
+            writeBytes(gatt, protected, address)
         }
     }
 
@@ -329,12 +330,22 @@ class BleSignalingService(
      * Used for heartbeat echo and targeted Capabilities delivery.
      */
     fun sendControl(peerId: String, bytes: ByteArray) {
+        val protected = protectControl(bytes) ?: return
         val gatt = peerGattClients[peerId]
         if (gatt != null) {
-            writeBytes(gatt, bytes, peerId)
+            writeBytes(gatt, protected, peerId)
         } else {
             Log.w(TAG, "No GATT client for $peerId, cannot sendControl")
         }
+    }
+
+    private fun protectControl(bytes: ByteArray): ByteArray? {
+        if (bytes.firstOrNull() == ControlFrame.OP_AUTHENTICATED) return bytes
+        val protected = AuthenticatedControlPlane.seal(bytes)
+        if (protected == null) {
+            Log.e(TAG, "Control send blocked: no authenticated room context")
+        }
+        return protected
     }
 
     private fun writeBytes(gatt: BluetoothGatt, bytes: ByteArray, address: String) {

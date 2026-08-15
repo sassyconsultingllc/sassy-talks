@@ -147,6 +147,7 @@ fn main() {
             commands::join_cellular_session,
             commands::import_share_link,
             commands::leave_cellular_session,
+            commands::wipe_session,
             commands::get_cellular_status,
         ])
         .setup(|_app| {

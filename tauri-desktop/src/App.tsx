@@ -458,7 +458,7 @@ export default function App() {
 
   const handlePttDown = useCallback(() => {
     // Allow PTT when local discovery is active OR a cellular relay session is
-    // joined (TX routes to whichever transport is active).
+    // joined (TX fans out to every live plane so mixed-protocol peers hear us).
     if (!isTransmitting && (isSearching || cellularRoom !== null)) {
       startTransmit();
     }

@@ -119,6 +119,85 @@ class LiveTranslationLifecycleTest {
         assertEquals(2, life.uiConsumers)
         assertFalse(life.shouldRun(pttActive = false))
     }
+
+    @Test
+    fun `incoming peer audio pauses captioning`() {
+        val life = LiveTranslationLifecycle()
+        life.acquireUi()
+        life.setEnabled(true)
+        assertTrue(life.shouldRun(pttActive = false))
+        assertEquals(LiveTranslationLifecycle.MicAction.STOP, life.onIncomingStarted())
+        assertTrue(life.pausedForIncoming)
+        assertFalse(life.shouldRun(pttActive = false))
+        assertEquals(
+            LiveTranslationLifecycle.MicAction.START,
+            life.onIncomingEnded(),
+        )
+        assertFalse(life.pausedForIncoming)
+        assertTrue(life.shouldRun(pttActive = false))
+    }
+
+    @Test
+    fun `duplicate incoming start is idempotent`() {
+        val life = LiveTranslationLifecycle()
+        life.acquireUi()
+        life.setEnabled(true)
+        assertEquals(LiveTranslationLifecycle.MicAction.STOP, life.onIncomingStarted())
+        assertEquals(LiveTranslationLifecycle.MicAction.NONE, life.onIncomingStarted())
+        assertTrue(life.pausedForIncoming)
+    }
+
+    @Test
+    fun `PTT resume while peer is speaking stays paused`() {
+        val life = LiveTranslationLifecycle()
+        life.acquireUi()
+        life.setEnabled(true)
+        life.onPttStarted()
+        life.onIncomingStarted()
+        assertEquals(
+            LiveTranslationLifecycle.MicAction.NONE,
+            life.onPttResumeReady(pttStillActive = false),
+        )
+        assertFalse(life.pausedForPtt)
+        assertTrue(life.pausedForIncoming)
+        assertFalse(life.shouldRun(pttActive = false))
+    }
+
+    @Test
+    fun `incoming end while PTT paused does not start`() {
+        val life = LiveTranslationLifecycle()
+        life.acquireUi()
+        life.setEnabled(true)
+        life.onPttStarted()
+        life.onIncomingStarted()
+        assertEquals(
+            LiveTranslationLifecycle.MicAction.NONE,
+            life.onIncomingEnded(),
+        )
+        assertFalse(life.pausedForIncoming)
+        assertTrue(life.pausedForPtt)
+        assertFalse(life.shouldRun(pttActive = false))
+    }
+
+    @Test
+    fun `setEnabled false clears incoming pause`() {
+        val life = LiveTranslationLifecycle()
+        life.acquireUi()
+        life.setEnabled(true)
+        life.onIncomingStarted()
+        assertTrue(life.pausedForIncoming)
+        assertEquals(LiveTranslationLifecycle.MicAction.STOP, life.setEnabled(false))
+        assertFalse(life.pausedForIncoming)
+    }
+
+    @Test
+    fun `incoming end is no-op when not paused`() {
+        val life = LiveTranslationLifecycle()
+        life.acquireUi()
+        life.setEnabled(true)
+        assertEquals(LiveTranslationLifecycle.MicAction.NONE, life.onIncomingEnded())
+        assertTrue(life.shouldRun(pttActive = false))
+    }
 }
 
 class LiveTranslationTextTest {
@@ -155,6 +234,16 @@ class LiveTranslationTextTest {
     }
 
     @Test
+    fun `canSpeakNow refuses TX RX and disabled feature`() {
+        assertTrue(LiveTranslationText.canSpeakNow(true, true, false, false, false))
+        assertFalse(LiveTranslationText.canSpeakNow(false, true, false, false, false))
+        assertFalse(LiveTranslationText.canSpeakNow(true, false, false, false, false))
+        assertFalse(LiveTranslationText.canSpeakNow(true, true, true, false, false))
+        assertFalse(LiveTranslationText.canSpeakNow(true, true, false, true, false))
+        assertFalse(LiveTranslationText.canSpeakNow(true, true, false, false, true))
+    }
+
+    @Test
     fun `shouldQueueTts when blocked by PTT or incoming`() {
         assertTrue(LiveTranslationText.shouldQueueTts(true, true, false))
         assertTrue(LiveTranslationText.shouldQueueTts(true, false, true))
@@ -174,8 +263,43 @@ class LiveTranslationTextTest {
     fun `needsOfflineSpeechPack detects pack errors`() {
         assertTrue(LiveTranslationText.needsOfflineSpeechPack("Offline language model not installed"))
         assertTrue(LiveTranslationText.needsOfflineSpeechPack("Language not supported offline"))
+        assertTrue(LiveTranslationText.needsOfflineSpeechPack("error 12"))
+        assertTrue(LiveTranslationText.needsOfflineSpeechPack("Recognition error (12)"))
+        assertTrue(LiveTranslationText.needsOfflineSpeechPack("Language not supported offline (error 12)"))
         assertFalse(LiveTranslationText.needsOfflineSpeechPack("Recognizer busy (PTT using mic?)"))
         assertFalse(LiveTranslationText.needsOfflineSpeechPack(null))
+    }
+
+    @Test
+    fun `radio overlay prefers speech pack over infinite download`() {
+        val downloadingButPackMissing = LiveTranslationText.radioOverlayPrimary(
+            pausedForPtt = false,
+            ttsEnabled = false,
+            modelDownloading = true,
+            needsSpeechPack = true,
+            statusError = false,
+            translation = "",
+            caption = "",
+            listening = false,
+            sourceCode = "en",
+            targetCode = "es",
+        )
+        assertTrue(downloadingButPackMissing.contains("speech pack", ignoreCase = true))
+        assertFalse(downloadingButPackMissing.contains("Downloading", ignoreCase = true))
+
+        val downloadingOk = LiveTranslationText.radioOverlayPrimary(
+            pausedForPtt = false,
+            ttsEnabled = false,
+            modelDownloading = true,
+            needsSpeechPack = false,
+            statusError = false,
+            translation = "",
+            caption = "",
+            listening = false,
+            sourceCode = "en",
+            targetCode = "es",
+        )
+        assertTrue(downloadingOk.contains("Downloading", ignoreCase = true))
     }
 
     @Test
@@ -187,7 +311,8 @@ class LiveTranslationTextTest {
             speechOk = false,
             wifiOnly = true,
         )
-        assertTrue(downloading.contains("Step 1"))
+        assertTrue(downloading.contains("speech pack", ignoreCase = true))
+        assertFalse(downloading.contains("downloading", ignoreCase = true))
 
         val speech = LiveTranslationText.setupHint(
             modelsReady = true,
@@ -196,8 +321,8 @@ class LiveTranslationTextTest {
             speechOk = false,
             wifiOnly = true,
         )
-        assertTrue(speech.contains("Step 2"))
         assertTrue(speech.contains("speech pack", ignoreCase = true))
+        assertTrue(speech.contains("Settings", ignoreCase = true))
 
         val ready = LiveTranslationText.setupHint(
             modelsReady = true,

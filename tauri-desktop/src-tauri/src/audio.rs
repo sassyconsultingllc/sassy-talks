@@ -2,20 +2,19 @@
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-NKD2IGRPWGD6
 /// Audio Engine - Cross-Platform Audio I/O
-/// 
+///
 /// Uses CPAL for portability across Windows, Mac, Linux
 /// Handles microphone input and speaker output with ring buffers
-
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Host, SampleRate, Stream, StreamConfig};
+use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::wrap::caching::{CachingCons, CachingProd};
 use ringbuf::HeapRb;
-use ringbuf::traits::{Producer, Consumer, Split};
-use ringbuf::wrap::caching::{CachingProd, CachingCons};
 use send_wrapper::SendWrapper;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use tracing::{error, info, warn};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
+use tracing::{error, info, warn};
 
 /// Ensure COM is initialized as MTA on the current thread (Windows only).
 /// WASAPI requires COM on the thread that calls IAudioClient::Initialize.
@@ -28,7 +27,10 @@ fn ensure_com_mta() {
         // S_OK (0) = success, S_FALSE (1) = already initialized as MTA
         // 0x80010106 = RPC_E_CHANGED_MODE = already initialized as STA
         if hr.is_err() {
-            warn!("COM MTA init returned 0x{:08X} (may already be STA on this thread)", hr.0);
+            warn!(
+                "COM MTA init returned 0x{:08X} (may already be STA on this thread)",
+                hr.0
+            );
         }
     }
 }
@@ -54,16 +56,16 @@ const BUFFER_SIZE: usize = SAMPLE_RATE as usize;
 pub enum AudioError {
     #[error("No audio device found")]
     NoDevice,
-    
+
     #[error("Failed to get device config: {0}")]
     ConfigError(String),
-    
+
     #[error("Failed to build stream: {0}")]
     StreamError(String),
-    
+
     #[error("Device not supported: {0}")]
     UnsupportedDevice(String),
-    
+
     #[error("Audio engine not initialized")]
     NotInitialized,
 }
@@ -88,15 +90,15 @@ pub enum AudioState {
 pub struct AudioEngine {
     // CPAL host
     host: Host,
-    
+
     // Devices
     input_device: Arc<Mutex<Option<Device>>>,
     output_device: Arc<Mutex<Option<Device>>>,
-    
+
     // Streams (wrapped for Send+Sync)
     input_stream: Arc<Mutex<Option<SendableStream>>>,
     output_stream: Arc<Mutex<Option<SendableStream>>>,
-    
+
     // Ring buffers for audio data. The RT callback owns its endpoint directly
     // (moved into the stream closure) so it never locks on the audio thread:
     //   - input  callback OWNS the producer; `input_consumer` is the non-RT read side
@@ -118,9 +120,13 @@ pub struct AudioEngine {
 
 /// Pack/unpack an f32 volume into an AtomicU32 (lock-free RT read).
 #[inline]
-fn store_volume(a: &AtomicU32, v: f32) { a.store(v.to_bits(), Ordering::Relaxed); }
+fn store_volume(a: &AtomicU32, v: f32) {
+    a.store(v.to_bits(), Ordering::Relaxed);
+}
 #[inline]
-fn load_volume(a: &AtomicU32) -> f32 { f32::from_bits(a.load(Ordering::Relaxed)) }
+fn load_volume(a: &AtomicU32) -> f32 {
+    f32::from_bits(a.load(Ordering::Relaxed))
+}
 
 /// Choose a stream config at 48 kHz (what Opus needs) when the device supports
 /// it — preferring the fewest channels — falling back to the device default
@@ -138,7 +144,9 @@ fn choose_config(
         for r in &ranges {
             if r.min_sample_rate().0 <= SAMPLE_RATE && SAMPLE_RATE <= r.max_sample_rate().0 {
                 let better = best.as_ref().map_or(true, |b| r.channels() < b.channels());
-                if better { best = Some(r.clone()); }
+                if better {
+                    best = Some(r.clone());
+                }
             }
         }
         if let Some(r) = best {
@@ -151,7 +159,9 @@ fn choose_config(
     warn!(
         "{}: device has no 48kHz config; using {}Hz/{}ch (audio may be degraded — \
          a resampler is the follow-up for non-48k hardware)",
-        label, def.sample_rate().0, def.channels()
+        label,
+        def.sample_rate().0,
+        def.channels()
     );
     let channels = def.channels();
     Ok((def.into(), channels))
@@ -161,9 +171,9 @@ impl AudioEngine {
     /// Create new audio engine
     pub fn new() -> Result<Self, AudioError> {
         info!("Initializing audio engine");
-        
+
         let host = cpal::default_host();
-        
+
         Ok(Self {
             host,
             input_device: Arc::new(Mutex::new(None)),
@@ -183,12 +193,11 @@ impl AudioEngine {
     /// Get list of input devices
     pub fn get_input_devices(&self) -> Vec<AudioDeviceInfo> {
         let mut devices = Vec::new();
-        
+
         if let Ok(input_devices) = self.host.input_devices() {
             let default_device = self.host.default_input_device();
-            let default_name = default_device.as_ref()
-                .and_then(|d| d.name().ok());
-            
+            let default_name = default_device.as_ref().and_then(|d| d.name().ok());
+
             for device in input_devices {
                 if let Ok(name) = device.name() {
                     devices.push(AudioDeviceInfo {
@@ -199,19 +208,18 @@ impl AudioEngine {
                 }
             }
         }
-        
+
         devices
     }
 
     /// Get list of output devices
     pub fn get_output_devices(&self) -> Vec<AudioDeviceInfo> {
         let mut devices = Vec::new();
-        
+
         if let Ok(output_devices) = self.host.output_devices() {
             let default_device = self.host.default_output_device();
-            let default_name = default_device.as_ref()
-                .and_then(|d| d.name().ok());
-            
+            let default_name = default_device.as_ref().and_then(|d| d.name().ok());
+
             for device in output_devices {
                 if let Ok(name) = device.name() {
                     devices.push(AudioDeviceInfo {
@@ -222,25 +230,25 @@ impl AudioEngine {
                 }
             }
         }
-        
+
         devices
     }
 
     /// Set input device by name
     pub fn set_input_device(&mut self, device_name: &str) -> Result<(), AudioError> {
         info!("Setting input device: {}", device_name);
-        
+
         let device = if device_name == "default" {
             self.host.default_input_device()
         } else {
-            self.host.input_devices()
-                .ok()
-                .and_then(|devices| {
-                    devices.filter(|d| d.name().ok().as_deref() == Some(device_name))
-                        .next()
-                })
-        }.ok_or(AudioError::NoDevice)?;
-        
+            self.host.input_devices().ok().and_then(|devices| {
+                devices
+                    .filter(|d| d.name().ok().as_deref() == Some(device_name))
+                    .next()
+            })
+        }
+        .ok_or(AudioError::NoDevice)?;
+
         *self.input_device.lock().unwrap() = Some(device);
         Ok(())
     }
@@ -248,18 +256,18 @@ impl AudioEngine {
     /// Set output device by name
     pub fn set_output_device(&mut self, device_name: &str) -> Result<(), AudioError> {
         info!("Setting output device: {}", device_name);
-        
+
         let device = if device_name == "default" {
             self.host.default_output_device()
         } else {
-            self.host.output_devices()
-                .ok()
-                .and_then(|devices| {
-                    devices.filter(|d| d.name().ok().as_deref() == Some(device_name))
-                        .next()
-                })
-        }.ok_or(AudioError::NoDevice)?;
-        
+            self.host.output_devices().ok().and_then(|devices| {
+                devices
+                    .filter(|d| d.name().ok().as_deref() == Some(device_name))
+                    .next()
+            })
+        }
+        .ok_or(AudioError::NoDevice)?;
+
         *self.output_device.lock().unwrap() = Some(device);
         Ok(())
     }
@@ -270,7 +278,10 @@ impl AudioEngine {
         #[cfg(target_os = "windows")]
         ensure_com_mta();
 
-        let device = self.input_device.lock().unwrap()
+        let device = self
+            .input_device
+            .lock()
+            .unwrap()
             .clone()
             .or_else(|| self.host.default_input_device())
             .ok_or(AudioError::NoDevice)?;
@@ -294,28 +305,32 @@ impl AudioEngine {
         let volume = Arc::clone(&self.input_volume);
         let recording = Arc::clone(&self.recording);
 
-        let stream = device.build_input_stream(
-            &config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                if !recording.load(Ordering::Relaxed) {
-                    return;
-                }
+        let stream = device
+            .build_input_stream(
+                &config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    if !recording.load(Ordering::Relaxed) {
+                        return;
+                    }
 
-                let vol = load_volume(&volume); // single relaxed load, no lock
-                // Downmix interleaved frames to mono (Opus capture is mono).
-                for frame in data.chunks_exact(channels) {
-                    let mono = frame.iter().sum::<f32>() / channels as f32;
-                    let scaled = (mono * vol * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                    let _ = producer.try_push(scaled);
-                }
-            },
-            |err| error!("Input stream error: {}", err),
-            None,
-        ).map_err(|e| AudioError::StreamError(e.to_string()))?;
-        
-        stream.play().map_err(|e| AudioError::StreamError(e.to_string()))?;
+                    let vol = load_volume(&volume); // single relaxed load, no lock
+                                                    // Downmix interleaved frames to mono (Opus capture is mono).
+                    for frame in data.chunks_exact(channels) {
+                        let mono = frame.iter().sum::<f32>() / channels as f32;
+                        let scaled = (mono * vol * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                        let _ = producer.try_push(scaled);
+                    }
+                },
+                |err| error!("Input stream error: {}", err),
+                None,
+            )
+            .map_err(|e| AudioError::StreamError(e.to_string()))?;
+
+        stream
+            .play()
+            .map_err(|e| AudioError::StreamError(e.to_string()))?;
         *self.input_stream.lock().unwrap() = Some(SendWrapper::new(stream));
-        
+
         Ok(())
     }
 
@@ -325,7 +340,10 @@ impl AudioEngine {
         #[cfg(target_os = "windows")]
         ensure_com_mta();
 
-        let device = self.output_device.lock().unwrap()
+        let device = self
+            .output_device
+            .lock()
+            .unwrap()
             .clone()
             .or_else(|| self.host.default_output_device())
             .ok_or(AudioError::NoDevice)?;
@@ -349,90 +367,95 @@ impl AudioEngine {
         let volume = Arc::clone(&self.output_volume);
         let playing = Arc::clone(&self.playing);
 
-        let stream = device.build_output_stream(
-            &config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                if !playing.load(Ordering::Relaxed) {
-                    for sample in data.iter_mut() {
-                        *sample = 0.0;
+        let stream = device
+            .build_output_stream(
+                &config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    if !playing.load(Ordering::Relaxed) {
+                        for sample in data.iter_mut() {
+                            *sample = 0.0;
+                        }
+                        return;
                     }
-                    return;
-                }
 
-                let vol = load_volume(&volume); // single relaxed load, no lock
-                // One mono sample from the 48 kHz stream fans out to all output
-                // channels (duplicate L/R) so a stereo device plays correctly.
-                for frame in data.chunks_mut(channels) {
-                    let s = consumer.try_pop()
-                        .map(|v| (v as f32 / 32767.0) * vol)
-                        .unwrap_or(0.0);
-                    for sample in frame.iter_mut() {
-                        *sample = s;
+                    let vol = load_volume(&volume); // single relaxed load, no lock
+                                                    // One mono sample from the 48 kHz stream fans out to all output
+                                                    // channels (duplicate L/R) so a stereo device plays correctly.
+                    for frame in data.chunks_mut(channels) {
+                        let s = consumer
+                            .try_pop()
+                            .map(|v| (v as f32 / 32767.0) * vol)
+                            .unwrap_or(0.0);
+                        for sample in frame.iter_mut() {
+                            *sample = s;
+                        }
                     }
-                }
-            },
-            |err| error!("Output stream error: {}", err),
-            None,
-        ).map_err(|e| AudioError::StreamError(e.to_string()))?;
-        
-        stream.play().map_err(|e| AudioError::StreamError(e.to_string()))?;
+                },
+                |err| error!("Output stream error: {}", err),
+                None,
+            )
+            .map_err(|e| AudioError::StreamError(e.to_string()))?;
+
+        stream
+            .play()
+            .map_err(|e| AudioError::StreamError(e.to_string()))?;
         *self.output_stream.lock().unwrap() = Some(SendWrapper::new(stream));
-        
+
         Ok(())
     }
 
     /// Start recording audio
     pub fn start_recording(&self) -> Result<(), AudioError> {
         info!("Starting audio recording");
-        
+
         if self.input_stream.lock().unwrap().is_none() {
             self.init_input_stream()?;
         }
-        
+
         self.recording.store(true, Ordering::Relaxed);
         *self.state.lock().unwrap() = AudioState::Recording;
-        
+
         Ok(())
     }
 
     /// Stop recording audio
     pub fn stop_recording(&self) -> Result<(), AudioError> {
         info!("Stopping audio recording");
-        
+
         self.recording.store(false, Ordering::Relaxed);
         *self.state.lock().unwrap() = AudioState::Idle;
-        
+
         Ok(())
     }
 
     /// Start playing audio
     pub fn start_playing(&self) -> Result<(), AudioError> {
         info!("Starting audio playback");
-        
+
         if self.output_stream.lock().unwrap().is_none() {
             self.init_output_stream()?;
         }
-        
+
         self.playing.store(true, Ordering::Relaxed);
         *self.state.lock().unwrap() = AudioState::Playing;
-        
+
         Ok(())
     }
 
     /// Stop playing audio
     pub fn stop_playing(&self) -> Result<(), AudioError> {
         info!("Stopping audio playback");
-        
+
         self.playing.store(false, Ordering::Relaxed);
         *self.state.lock().unwrap() = AudioState::Idle;
-        
+
         Ok(())
     }
 
     /// Read recorded audio samples
     pub fn read_samples(&self, buffer: &mut [i16]) -> usize {
         let mut consumer = self.input_consumer.lock().unwrap();
-        
+
         if let Some(ref mut c) = *consumer {
             let mut count = 0;
             for sample in buffer.iter_mut() {
@@ -452,7 +475,7 @@ impl AudioEngine {
     /// Write audio samples for playback
     pub fn write_samples(&self, buffer: &[i16]) -> usize {
         let mut producer = self.output_producer.lock().unwrap();
-        
+
         if let Some(ref mut p) = *producer {
             let mut count = 0;
             for &sample in buffer {
@@ -506,13 +529,13 @@ impl AudioEngine {
     /// Release audio resources
     pub fn shutdown(&self) -> Result<(), AudioError> {
         info!("Shutting down audio engine");
-        
+
         self.stop_recording()?;
         self.stop_playing()?;
-        
+
         *self.input_stream.lock().unwrap() = None;
         *self.output_stream.lock().unwrap() = None;
-        
+
         Ok(())
     }
 }
@@ -538,7 +561,7 @@ mod tests {
         let engine = AudioEngine::new().unwrap();
         let inputs = engine.get_input_devices();
         let outputs = engine.get_output_devices();
-        
+
         // Should have at least one device on most systems
         println!("Input devices: {}", inputs.len());
         println!("Output devices: {}", outputs.len());

@@ -35,11 +35,27 @@ object DiagnosticsPrefs {
     }
 
     fun setOverlayEnabled(enabled: Boolean) {
-        _overlayEnabled.value = enabled
+        val allowed = appContext?.let {
+            com.sassyconsulting.sassytalkie.ManagedConfig.diagnosticsAllowed(it)
+        } ?: true
+        val next = enabled && allowed
+        _overlayEnabled.value = next
         appContext
             ?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             ?.edit()
-            ?.putBoolean(KEY_OVERLAY, enabled)
+            ?.putBoolean(KEY_OVERLAY, next)
             ?.apply()
     }
+
+    /**
+     * Overlay is debug/diag only. Release builds show it solely when the
+     * operator enables Diagnostics. Never on Auth/Profile/Gate chrome.
+     * MDM can force it off via enable_diagnostics_overlay=false.
+     */
+    fun shouldShowOverlay(
+        debugBuild: Boolean,
+        diagEnabled: Boolean,
+        radioUiVisible: Boolean,
+        managedAllowed: Boolean = true,
+    ): Boolean = managedAllowed && radioUiVisible && (debugBuild || diagEnabled)
 }

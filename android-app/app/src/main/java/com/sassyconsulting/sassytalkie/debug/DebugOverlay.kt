@@ -158,7 +158,7 @@ private fun RelaySection(s: AudioTelemetry.State) {
         Mono("  ROOM MISMATCH — reconnect or re-import session", color = StatusErrorToken)
     }
     Mono(
-        "  cell=${s.cellularState.ifEmpty { "--" }}  ws=${if (s.wsRelayConnected) "up" else "down"}  " +
+        "  cell=${s.cellularState.ifEmpty { "--" }}  ws=${com.sassyconsulting.sassytalkie.RelayConnectionState.overlayWsLabel(s.wsRelayConnected)}  " +
             "ch=${s.activeChannel}",
     )
     Mono(

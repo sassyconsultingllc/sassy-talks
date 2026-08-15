@@ -2,9 +2,8 @@
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-WGFEYW3GJF44
 /// Tauri Commands - Frontend API
-/// 
+///
 /// These commands are called from the React frontend via invoke()
-
 use crate::{AppState, AudioDeviceInfo, ConnectionStatus, PeerInfo};
 use std::sync::Arc;
 use tauri::State;
@@ -12,17 +11,13 @@ use tauri::State;
 /// Start discovery and listening for peers
 #[tauri::command]
 pub async fn start_discovery(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.start_discovery()
-        .await
-        .map_err(|e| e.to_string())
+    state.start_discovery().await.map_err(|e| e.to_string())
 }
 
 /// Stop discovery
 #[tauri::command]
 pub async fn stop_discovery(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.stop_discovery()
-        .await
-        .map_err(|e| e.to_string())
+    state.stop_discovery().await.map_err(|e| e.to_string())
 }
 
 /// Get list of nearby devices
@@ -44,31 +39,27 @@ pub async fn connect_to_peer(
 /// Disconnect from all peers
 #[tauri::command]
 pub async fn disconnect(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.stop_discovery()
-        .await
-        .map_err(|e| e.to_string())
+    state.stop_discovery().await.map_err(|e| e.to_string())
 }
 
 /// Get connection status
 #[tauri::command]
-pub async fn get_connection_status(state: State<'_, Arc<AppState>>) -> Result<ConnectionStatus, String> {
+pub async fn get_connection_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<ConnectionStatus, String> {
     Ok(state.get_connection_status().await)
 }
 
 /// Start transmitting audio (PTT press)
 #[tauri::command]
 pub async fn start_transmit(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.start_transmit()
-        .await
-        .map_err(|e| e.to_string())
+    state.start_transmit().await.map_err(|e| e.to_string())
 }
 
 /// Stop transmitting audio (PTT release)
 #[tauri::command]
 pub async fn stop_transmit(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.stop_transmit()
-        .await
-        .map_err(|e| e.to_string())
+    state.stop_transmit().await.map_err(|e| e.to_string())
 }
 
 /// Start receiving audio (already handled by discovery)
@@ -105,7 +96,8 @@ pub async fn set_input_device(
     state: State<'_, Arc<AppState>>,
     device_name: String,
 ) -> Result<(), String> {
-    state.set_input_device(&device_name)
+    state
+        .set_input_device(&device_name)
         .await
         .map_err(|e| e.to_string())
 }
@@ -116,7 +108,8 @@ pub async fn set_output_device(
     state: State<'_, Arc<AppState>>,
     device_name: String,
 ) -> Result<(), String> {
-    state.set_output_device(&device_name)
+    state
+        .set_output_device(&device_name)
         .await
         .map_err(|e| e.to_string())
 }
@@ -154,10 +147,7 @@ pub async fn get_channel(state: State<'_, Arc<AppState>>) -> Result<u8, String> 
 
 /// Set channel
 #[tauri::command]
-pub async fn set_channel(
-    state: State<'_, Arc<AppState>>,
-    channel: u8,
-) -> Result<(), String> {
+pub async fn set_channel(state: State<'_, Arc<AppState>>, channel: u8) -> Result<(), String> {
     state.set_channel(channel).await;
     Ok(())
 }
@@ -178,7 +168,7 @@ pub async fn get_status(state: State<'_, Arc<AppState>>) -> Result<AppStatus, St
     let channel = state.get_channel();
     let peers = state.get_nearby_devices().await;
     let peer_count = peers.len();
-    
+
     Ok(AppStatus {
         connection_status,
         channel,
@@ -199,7 +189,7 @@ pub struct DeviceInfo {
 #[tauri::command]
 pub async fn get_device_info(state: State<'_, Arc<AppState>>) -> Result<DeviceInfo, String> {
     let (device_id, device_name) = state.get_device_info();
-    
+
     Ok(DeviceInfo {
         device_id: format!("{:08X}", device_id),
         device_name,
@@ -209,20 +199,14 @@ pub async fn get_device_info(state: State<'_, Arc<AppState>>) -> Result<DeviceIn
 
 /// Set roger beep enabled
 #[tauri::command]
-pub async fn set_roger_beep(
-    state: State<'_, Arc<AppState>>,
-    enabled: bool,
-) -> Result<(), String> {
+pub async fn set_roger_beep(state: State<'_, Arc<AppState>>, enabled: bool) -> Result<(), String> {
     state.set_roger_beep(enabled);
     Ok(())
 }
 
 /// Set VOX enabled
 #[tauri::command]
-pub async fn set_vox_enabled(
-    state: State<'_, Arc<AppState>>,
-    enabled: bool,
-) -> Result<(), String> {
+pub async fn set_vox_enabled(state: State<'_, Arc<AppState>>, enabled: bool) -> Result<(), String> {
     state.set_vox_enabled(enabled);
     Ok(())
 }
@@ -237,7 +221,6 @@ pub async fn set_vox_threshold(
     Ok(())
 }
 
-
 // ============================================================================
 // Tone Commands - Audio Feedback
 // ============================================================================
@@ -248,48 +231,40 @@ use crate::tones::ToneType;
 #[tauri::command]
 pub async fn play_connection_tone(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let tone_player = state.get_tone_player();
-    tokio::task::spawn_blocking(move || {
-        tone_player.play_sync(ToneType::ConnectionSuccess)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(move || tone_player.play_sync(ToneType::ConnectionSuccess))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 /// Play message delivered tone (2-tone low→high)
 #[tauri::command]
 pub async fn play_delivered_tone(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let tone_player = state.get_tone_player();
-    tokio::task::spawn_blocking(move || {
-        tone_player.play_sync(ToneType::MessageDelivered)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(move || tone_player.play_sync(ToneType::MessageDelivered))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 /// Play error/failed tone (2-tone mono)
 #[tauri::command]
 pub async fn play_failed_tone(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let tone_player = state.get_tone_player();
-    tokio::task::spawn_blocking(move || {
-        tone_player.play_sync(ToneType::Failed)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(move || tone_player.play_sync(ToneType::Failed))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 /// Play roger beep tone
 #[tauri::command]
 pub async fn play_roger_tone(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let tone_player = state.get_tone_player();
-    tokio::task::spawn_blocking(move || {
-        tone_player.play_sync(ToneType::RogerBeep)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(move || tone_player.play_sync(ToneType::RogerBeep))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 // ============================================================================
@@ -300,7 +275,9 @@ use crate::transport::TransportConfig;
 
 /// Get transport configuration
 #[tauri::command]
-pub async fn get_transport_config(state: State<'_, Arc<AppState>>) -> Result<TransportConfig, String> {
+pub async fn get_transport_config(
+    state: State<'_, Arc<AppState>>,
+) -> Result<TransportConfig, String> {
     Ok(state.get_transport_config().await)
 }
 
@@ -323,6 +300,7 @@ pub struct NetworkInfo {
     pub encryption_enabled: bool,
     pub is_encrypted: bool,
     pub public_key: Option<String>,
+    pub udp_audio_queue: crate::transport::QueueMetricsSnapshot,
 }
 
 /// Get network information
@@ -332,7 +310,8 @@ pub async fn get_network_info(state: State<'_, Arc<AppState>>) -> Result<Network
     let port = state.get_port().await;
     let is_encrypted = state.is_encrypted().await;
     let public_key = state.get_public_key().await;
-    
+    let udp_audio_queue = state.udp_queue_metrics().await;
+
     Ok(NetworkInfo {
         port,
         multicast_addr: config.multicast_addr,
@@ -340,6 +319,7 @@ pub async fn get_network_info(state: State<'_, Arc<AppState>>) -> Result<Network
         encryption_enabled: config.encryption_enabled,
         is_encrypted,
         public_key,
+        udp_audio_queue,
     })
 }
 
@@ -396,6 +376,14 @@ pub async fn join_cellular_session(
 #[tauri::command]
 pub async fn leave_cellular_session(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     state.leave_cellular().await;
+    Ok(())
+}
+
+/// Clear session keys, authenticated control plane, and persisted secret store.
+/// Requires an in-app invoke; silent enterprise wipe still needs MDM/EMM.
+#[tauri::command]
+pub async fn wipe_session(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.wipe_session().await;
     Ok(())
 }
 
@@ -471,4 +459,3 @@ async fn fetch_and_decrypt_share(link: &str) -> Result<String, String> {
 
     sassytalkie_core::share::decrypt_share_blob(&blob, key_b64url)
 }
-

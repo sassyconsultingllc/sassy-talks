@@ -1,23 +1,24 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-ZIXFDMTBKCCQ
-/// Transport Module - Unified abstraction over WiFi Direct and WiFi Multicast
+/// Transport Module - Unified abstraction over WiFi Direct, WiFi Multicast,
+/// and the Cloudflare relay.
 ///
-/// Transport priority:
-/// 1. WiFi Direct (Android-to-Android, no router needed) + multicast on top
-/// 2. WiFi Multicast (cross-platform: Android + iOS + Desktop, same WiFi network)
+/// Relay-first, fan-out:
+/// 1. Cloudflare relay is the preferred common meeting point (any internet).
+/// 2. WiFi multicast / WiFi Direct run *alongside* relay for nearby peers.
+/// 3. Bluetooth RFCOMM is last-resort when no IP path is up.
 ///
-/// WiFi Direct creates an ad-hoc network between devices, then multicast runs
-/// on that network. For cross-platform use, devices on the same WiFi use
-/// multicast directly (no WiFi Direct needed since a router already provides
-/// the shared network).
-
+/// Audio is fanned out to every live IP plane so mixed-protocol groups
+/// (one peer on relay, one on WiFi, one on BT+relay) can still hear each
+/// other. `active` is the preferred UI/PTT slot, not an XOR send gate.
 use log::{error, info, warn};
 
-use crate::wifi_transport::{WifiTransport, WifiState, WifiPeer};
-use crate::wifi_direct::{WifiDirectManager, WifiDirectState, WifiDirectPeer, GroupRole};
-use crate::cellular_transport::{CellularTransport, CellularState};
+use crate::cellular_transport::{CellularState, CellularTransport, PacketQueue};
 use crate::crypto::CryptoSession;
+use crate::wifi_direct::{GroupRole, WifiDirectManager, WifiDirectPeer, WifiDirectState};
+use crate::wifi_transport::{WifiPeer, WifiState, WifiTransport};
+use std::time::Duration;
 
 /// Which transport is currently active for data
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,11 +43,18 @@ pub struct TransportManager {
     wifi_direct: WifiDirectManager,
     cellular: CellularTransport,
     crypto: Option<CryptoSession>,
-    active: ActiveTransport,
+    /// Staged hybrid session: decrypt-only until the peer is live on the new
+    /// key. Prevents a lost CONFIRM_ACK from splitting TX keys.
+    pending_rx: Option<CryptoSession>,
+    /// Sticky user/UI preference. It survives bearer flaps and is never used
+    /// as proof that a bearer can transmit right now.
+    preferred: ActiveTransport,
     /// True while at least one RFCOMM peer is connected (Kotlin-managed).
     /// Used to re-promote Bluetooth when IP paths die without a fresh
     /// `on_bluetooth_connected` callback.
     bluetooth_connected: bool,
+    bluetooth_tx_allowed: bool,
+    bluetooth_outbound: PacketQueue,
     device_name: String,
 }
 
@@ -63,25 +71,21 @@ impl TransportManager {
             wifi_direct,
             cellular,
             crypto: None,
-            active: ActiveTransport::None,
+            pending_rx: None,
+            preferred: ActiveTransport::None,
             bluetooth_connected: false,
+            bluetooth_tx_allowed: false,
+            bluetooth_outbound: PacketQueue::new(32, Duration::from_millis(500)),
             device_name: device_name.to_string(),
         })
     }
 
-    /// Pick the best remaining plane after an IP path drops.
-    /// Local-first: WiFi multicast > Bluetooth > None (relay handled by caller
-    /// before this runs, or via a separate cellular-up event).
-    fn promote_after_ip_loss(&mut self) -> ActiveTransport {
-        if self.wifi.get_state() == WifiState::Active {
-            info!("TransportManager: IP loss — WiFi multicast still active, promoting to Wifi");
-            ActiveTransport::Wifi
-        } else if self.bluetooth_connected {
-            info!("TransportManager: IP loss — promoting Bluetooth (RFCOMM still up)");
-            ActiveTransport::Bluetooth
+    /// WiFi is an extra plane, not a replacement for a live relay hub.
+    fn adopt_wifi_as_active(&mut self) {
+        if self.cellular.get_state() == CellularState::Connected {
+            info!("TransportManager: WiFi up alongside relay — keeping Cellular as preferred active (fan-out)");
         } else {
-            info!("TransportManager: IP loss — no local path left");
-            ActiveTransport::None
+            self.preferred = ActiveTransport::Wifi;
         }
     }
 
@@ -93,12 +97,27 @@ impl TransportManager {
     /// Install the active encryption session (one channel active at a time).
     pub fn set_crypto(&mut self, session: CryptoSession) {
         self.crypto = Some(session);
+        self.pending_rx = None;
         info!("TransportManager: encryption enabled");
+    }
+
+    /// Arm a staged hybrid session for RX only. TX stays on the live (old) key
+    /// until [promote_pending_rx] or a successful decrypt of peer ciphertext.
+    pub fn arm_pending_rx(&mut self, session: CryptoSession) {
+        self.pending_rx = Some(session);
+        info!("TransportManager: staged hybrid RX armed (TX still on live key)");
+    }
+
+    pub fn discard_pending_rx(&mut self) {
+        if self.pending_rx.take().is_some() {
+            info!("TransportManager: staged hybrid RX discarded");
+        }
     }
 
     /// Set encryption from pre-shared key
     pub fn set_psk(&mut self, key: &[u8; 32]) {
         self.crypto = Some(CryptoSession::from_psk(key));
+        self.pending_rx = None;
         info!("TransportManager: PSK encryption enabled");
     }
 
@@ -138,9 +157,12 @@ impl TransportManager {
         // Initialize multicast on the WiFi Direct network interface
         self.wifi.init()?;
         self.wifi.activate();
-        self.active = ActiveTransport::WifiDirect;
-
-        info!("TransportManager: active transport = WifiDirect (multicast on P2P network)");
+        if self.cellular.get_state() == CellularState::Connected {
+            info!("TransportManager: WiFi Direct up alongside relay — keeping Cellular as preferred active (fan-out)");
+        } else {
+            self.preferred = ActiveTransport::WifiDirect;
+            info!("TransportManager: active transport = WifiDirect (multicast on P2P network)");
+        }
         Ok(())
     }
 
@@ -150,16 +172,10 @@ impl TransportManager {
         self.wifi.shutdown();
 
         if matches!(
-            self.active,
+            self.preferred,
             ActiveTransport::WifiDirect | ActiveTransport::Wifi
         ) {
-            // Prefer relay if still up; else Bluetooth; else None.
-            self.active = if self.cellular.get_state() == CellularState::Connected {
-                info!("TransportManager: WiFi Direct down — relay still up, promoting Cellular");
-                ActiveTransport::Cellular
-            } else {
-                self.promote_after_ip_loss()
-            };
+            info!("TransportManager: WiFi path down — retaining sticky preference");
         }
     }
 
@@ -170,8 +186,10 @@ impl TransportManager {
         info!("TransportManager: starting WiFi multicast (cross-platform mode)");
         self.wifi.init()?;
         self.wifi.activate();
-        self.active = ActiveTransport::Wifi;
-        info!("TransportManager: active transport = WiFi multicast");
+        self.adopt_wifi_as_active();
+        if self.preferred == ActiveTransport::Wifi {
+            info!("TransportManager: active transport = WiFi multicast");
+        }
         Ok(())
     }
 
@@ -221,12 +239,31 @@ impl TransportManager {
         }
     }
 
-    /// Decrypt raw data using the active session.
-    pub fn decrypt_raw(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+    /// Decrypt raw data using the live session, then the staged hybrid RX key.
+    /// A hit on the staged key promotes it to live TX+RX (peer completed ACK).
+    pub fn decrypt_raw(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        self.decrypt_live_or_pending(data)
+    }
+
+    fn decrypt_live_or_pending(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
         if let Some(ref crypto) = self.crypto {
-            crypto.decrypt(data)
-        } else {
+            if let Ok(pt) = crypto.decrypt(data) {
+                return Ok(pt);
+            }
+        }
+        if let Some(ref pending) = self.pending_rx {
+            if let Ok(pt) = pending.decrypt(data) {
+                if let Some(session) = self.pending_rx.take() {
+                    self.crypto = Some(session);
+                    info!("TransportManager: staged hybrid RX promoted to live TX");
+                }
+                return Ok(pt);
+            }
+        }
+        if self.crypto.is_none() && self.pending_rx.is_none() {
             Err("No encryption session".to_string())
+        } else {
+            Err("Decryption failed".to_string())
         }
     }
 
@@ -245,64 +282,76 @@ impl TransportManager {
         // taken on faith. No-op unless the diagnostic tooling armed it.
         crate::diag::trace_crypto(data, &payload);
 
-        // Send on primary transport
-        let primary_result = match self.active {
-            ActiveTransport::WifiDirect | ActiveTransport::Wifi => {
-                self.wifi.send_audio(&payload)
-            }
-            ActiveTransport::Cellular => {
-                self.cellular.send_audio(&payload)
-            }
-            ActiveTransport::Bluetooth => {
-                Ok(payload.len())
-            }
-            ActiveTransport::None => {
-                Err("No active transport".to_string())
-            }
-        };
+        // Fan-out to every live IP plane. Gating on `active` was the
+        // mixed-protocol silence bug: a relay peer never heard a WiFi-primary
+        // sender unless that sender happened to also be marked Wifi (the old
+        // dual-path block), and a Cellular-primary sender never hit LAN
+        // multicast at all. Bluetooth TX is a separate Kotlin RFCOMM pump;
+        // we still tee IP so a BT-labelled device with relay/WiFi up can
+        // reach remote peers.
+        let wifi_live = self.wifi.get_state() == WifiState::Active;
+        let cell_live = self.cellular.can_transmit_realtime();
 
-        // Also send on cellular relay if it's active and primary is WiFi
-        // (dual-path: local peers get multicast, remote peers get relay)
-        if matches!(self.active, ActiveTransport::Wifi | ActiveTransport::WifiDirect) {
-            if self.cellular.get_state() == CellularState::Connected {
-                // Soft-skip only near full; half-full dual-path skips looked
-                // like cellular loss while WiFi peers still heard audio.
-                if self.cellular.is_outbound_congested() {
-                    warn!("Dual-path: relay outbound queue congested, skipping relay send");
-                } else if let Err(e) = self.cellular.send_audio(&payload) {
-                    warn!("Dual-path: relay send failed: {}", e);
+        let mut sent_any = false;
+        let mut last_err: Option<String> = None;
+
+        if wifi_live {
+            match self.wifi.send_audio(&payload) {
+                Ok(_) => {
+                    sent_any = true;
+                    crate::diag::note_tx_success();
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if cell_live {
+            if self.cellular.is_outbound_congested() {
+                warn!("Fan-out: relay outbound queue congested, skipping relay send");
+            } else {
+                match self.cellular.send_audio(&payload) {
+                    Ok(_) => sent_any = true,
+                    Err(e) => {
+                        warn!("Fan-out: relay send failed: {}", e);
+                        last_err = Some(e);
+                    }
                 }
             }
         }
 
-        primary_result
+        if self.bluetooth_connected && self.bluetooth_tx_allowed {
+            self.bluetooth_outbound.push(payload.clone());
+            sent_any = true;
+        }
+
+        if sent_any {
+            Ok(payload.len())
+        } else {
+            Err(last_err.unwrap_or_else(|| "No active transport".to_string()))
+        }
     }
 
     /// Decrypt a raw transport payload into `buffer`. Returns 0 on failure/drop.
-    fn decrypt_into(&self, raw_data: &[u8], buffer: &mut [u8]) -> Result<usize, String> {
-        if let Some(ref crypto) = self.crypto {
-            match crypto.decrypt(raw_data) {
-                Ok(plaintext) => {
-                    crate::diag::note_decrypt_ok();
-                    let copy_len = plaintext.len().min(buffer.len());
-                    buffer[..copy_len].copy_from_slice(&plaintext[..copy_len]);
-                    Ok(copy_len)
-                }
-                Err(e) => {
-                    // Counted, not just logged. Frames arriving on the wire but
-                    // failing here is the signature of two peers on different
-                    // session keys — everything upstream looks healthy while no
-                    // audio is heard, and a log line nobody is tailing does not
-                    // surface that. The panel shows ok vs fail side by side.
+    fn decrypt_into(&mut self, raw_data: &[u8], buffer: &mut [u8]) -> Result<usize, String> {
+        match self.decrypt_live_or_pending(raw_data) {
+            Ok(plaintext) => {
+                crate::diag::note_decrypt_ok();
+                let copy_len = plaintext.len().min(buffer.len());
+                buffer[..copy_len].copy_from_slice(&plaintext[..copy_len]);
+                Ok(copy_len)
+            }
+            Err(e) => {
+                if self.crypto.is_none() && self.pending_rx.is_none() {
+                    crate::diag::note_decrypt_no_session();
+                    warn!(
+                        "RX: No encryption session, dropping {} bytes",
+                        raw_data.len()
+                    );
+                } else {
                     crate::diag::note_decrypt_fail(&e);
                     error!("Decryption failed (dropping packet): {}", e);
-                    Ok(0)
                 }
+                Ok(0)
             }
-        } else {
-            crate::diag::note_decrypt_no_session();
-            warn!("RX: No encryption session, dropping {} bytes", raw_data.len());
-            Ok(0)
         }
     }
 
@@ -370,7 +419,7 @@ impl TransportManager {
     pub fn receive(&mut self, buffer: &mut [u8]) -> Result<usize, String> {
         // Legacy single-source receive — prefer poll_wifi_into +
         // poll_cellular_into from the RX thread so both paths are drained.
-        let raw_data = match self.active {
+        let raw_data = match self.live_transport() {
             ActiveTransport::Wifi | ActiveTransport::WifiDirect => {
                 match self.poll_wifi_into(buffer)? {
                     0 if self.cellular.get_state() == CellularState::Connected => {
@@ -379,12 +428,10 @@ impl TransportManager {
                     n => n,
                 }
             }
-            ActiveTransport::Cellular => {
-                match self.poll_cellular_into(buffer)? {
-                    0 => self.poll_wifi_into(buffer)?,
-                    n => n,
-                }
-            }
+            ActiveTransport::Cellular => match self.poll_cellular_into(buffer)? {
+                0 => self.poll_wifi_into(buffer)?,
+                n => n,
+            },
             ActiveTransport::Bluetooth => {
                 return Ok(0);
             }
@@ -419,24 +466,20 @@ impl TransportManager {
 
     /// Called by Kotlin when WebSocket connects successfully.
     ///
-    /// Like Bluetooth (see `on_bluetooth_connected`), the relay must NOT steal
-    /// the active slot from an established WiFi path: `send()` routes the
-    /// primary TX by `active` and only mirrors WiFi→relay (there is no
-    /// relay→WiFi mirror), so promoting to Cellular here silenced LAN
-    /// multicast TX for the rest of the session whenever both paths were up.
-    /// With `active` left on Wifi, the dual-path block in `send()` still
-    /// carries every frame to the relay too.
+    /// Relay is the preferred hub. `send()` fans out to every live IP plane,
+    /// so promoting Cellular here does not silence WiFi multicast (or BT).
     pub fn on_cellular_connected(&mut self) -> Result<(), String> {
         info!("TransportManager: cellular WebSocket connected");
         self.cellular.on_connected();
-        match self.active {
-            ActiveTransport::Wifi | ActiveTransport::WifiDirect => {
-                info!("TransportManager: relay up alongside {:?} — active unchanged (dual-path)", self.active);
-            }
-            _ => {
-                self.active = ActiveTransport::Cellular;
-                info!("TransportManager: active transport = Cellular");
-            }
+        let previous = self.preferred;
+        self.preferred = ActiveTransport::Cellular;
+        if matches!(
+            previous,
+            ActiveTransport::Wifi | ActiveTransport::WifiDirect
+        ) {
+            info!("TransportManager: relay up alongside {:?} — Cellular is preferred active (fan-out keeps WiFi TX)", previous);
+        } else {
+            info!("TransportManager: active transport = Cellular");
         }
         Ok(())
     }
@@ -446,24 +489,20 @@ impl TransportManager {
         info!("TransportManager: cellular disconnected: {}", reason);
         self.cellular.on_disconnected(reason);
 
-        if self.active == ActiveTransport::Cellular {
-            // Fall back to a still-live local path instead of going dark:
-            // leaving `active = None` hard-blocked PTT even with WiFi or
-            // RFCOMM fully up. Prefer WiFi, then re-promote Bluetooth.
-            self.active = self.promote_after_ip_loss();
+        if self.preferred == ActiveTransport::Cellular {
+            info!("TransportManager: relay down — retaining sticky Cellular preference");
         }
     }
 
     /// True while an IP transport (WiFi multicast or the relay) is live —
     /// i.e. the shared audio TX/RX threads still have a path to serve.
     pub fn has_live_ip_transport(&self) -> bool {
-        self.wifi.get_state() == WifiState::Active
-            || self.cellular.get_state() == CellularState::Connected
+        self.wifi.get_state() == WifiState::Active || self.cellular.can_transmit_realtime()
     }
 
     /// True while any plane can carry audio (IP or Bluetooth RFCOMM).
     pub fn has_live_audio_path(&self) -> bool {
-        self.has_live_ip_transport() || self.bluetooth_connected
+        self.has_live_ip_transport() || (self.bluetooth_connected && self.bluetooth_tx_allowed)
     }
 
     /// Called by Kotlin when WebSocket receives a binary message
@@ -481,6 +520,10 @@ impl TransportManager {
         self.cellular.poll_outbound()
     }
 
+    pub fn report_cellular_send_result(&mut self, success: bool) {
+        self.cellular.report_send_result(success);
+    }
+
     /// Get cellular stats JSON
     pub fn get_cellular_stats(&self) -> String {
         self.cellular.get_stats()
@@ -490,17 +533,15 @@ impl TransportManager {
 
     /// Called by Kotlin when BT RFCOMM connects.
     ///
-    /// Bluetooth is the FALLBACK plane: it only takes the active audio slot when
-    /// no IP transport (WiFi multicast / relay) is carrying audio. Otherwise a BT
-    /// peer wandering into range while we're on WiFi would silently steal `active`
-    /// and stop WiFi TX, since `send()` routes by `active`. BT's own audio path
-    /// (Kotlin `btEncodeFrame`/`btDecodeFrame` pump) runs in parallel regardless
-    /// of this flag, so promoting it is unnecessary while an IP path is healthy —
-    /// and harmful, because it would knock IP peers off the air.
+    /// Bluetooth is the last-resort plane: it only takes the active audio slot
+    /// when no IP transport (relay / WiFi) is carrying audio. BT's own Kotlin
+    /// RFCOMM pump runs in parallel regardless, and `send()` fans out to any
+    /// live IP path so mixed-protocol peers still hear us.
     pub fn on_bluetooth_connected(&mut self) {
         self.bluetooth_connected = true;
-        if self.active == ActiveTransport::None {
-            self.active = ActiveTransport::Bluetooth;
+        self.bluetooth_tx_allowed = true;
+        if self.preferred == ActiveTransport::None {
+            self.preferred = ActiveTransport::Bluetooth;
             info!("TransportManager: Bluetooth RFCOMM connected — now the active path (no IP transport up)");
         } else {
             info!("TransportManager: Bluetooth RFCOMM connected — IP path still active, BT runs in parallel");
@@ -511,20 +552,60 @@ impl TransportManager {
     pub fn on_bluetooth_disconnected(&mut self) {
         info!("TransportManager: Bluetooth disconnected");
         self.bluetooth_connected = false;
-        if self.active == ActiveTransport::Bluetooth {
-            self.active = if self.wifi.get_state() == WifiState::Active {
-                ActiveTransport::Wifi
-            } else if self.cellular.get_state() == CellularState::Connected {
-                ActiveTransport::Cellular
-            } else {
-                ActiveTransport::None
-            };
+        self.bluetooth_tx_allowed = false;
+        self.bluetooth_outbound.clear();
+        if self.preferred == ActiveTransport::Bluetooth {
+            info!("TransportManager: Bluetooth down — retaining sticky preference");
         }
     }
 
-    /// Get which transport is currently active
+    /// Poll a Bluetooth packet produced by the shared capture/encode pass.
+    pub fn poll_bluetooth_outbound(&self) -> Option<Vec<u8>> {
+        self.bluetooth_outbound.pop()
+    }
+
+    pub fn report_bluetooth_send_result(&mut self, success: bool) {
+        self.bluetooth_tx_allowed = success;
+        if success {
+            crate::diag::note_tx_success();
+        } else {
+            crate::diag::note_tx_failure();
+        }
+    }
+
+    /// Best bearer that can transmit right now.
     pub fn active_transport(&self) -> ActiveTransport {
-        self.active
+        self.live_transport()
+    }
+
+    /// Sticky preferred bearer, independent from current liveness.
+    pub fn preferred_transport(&self) -> ActiveTransport {
+        self.preferred
+    }
+
+    fn live_transport(&self) -> ActiveTransport {
+        if self.preferred == ActiveTransport::Cellular && self.cellular.can_transmit_realtime() {
+            ActiveTransport::Cellular
+        } else if matches!(
+            self.preferred,
+            ActiveTransport::Wifi | ActiveTransport::WifiDirect
+        ) && self.wifi.get_state() == WifiState::Active
+        {
+            self.preferred
+        } else if self.preferred == ActiveTransport::Bluetooth
+            && self.bluetooth_connected
+            && self.bluetooth_tx_allowed
+        {
+            ActiveTransport::Bluetooth
+        } else if self.cellular.can_transmit_realtime() {
+            ActiveTransport::Cellular
+        } else if self.wifi.get_state() == WifiState::Active {
+            ActiveTransport::Wifi
+        } else if self.bluetooth_connected && self.bluetooth_tx_allowed {
+            ActiveTransport::Bluetooth
+        } else {
+            ActiveTransport::None
+        }
     }
 
     /// Get the local device name
@@ -546,7 +627,9 @@ impl TransportManager {
         self.cellular.shutdown();
         self.crypto = None;
         self.bluetooth_connected = false;
-        self.active = ActiveTransport::None;
+        self.bluetooth_tx_allowed = false;
+        self.bluetooth_outbound.clear();
+        self.preferred = ActiveTransport::None;
 
         Ok(())
     }
@@ -572,7 +655,8 @@ mod tests {
         let mut tm = TransportManager::new("test").unwrap();
         // Simulate cellular as active primary with BT connected in parallel.
         tm.bluetooth_connected = true;
-        tm.active = ActiveTransport::Cellular;
+        tm.bluetooth_tx_allowed = true;
+        tm.preferred = ActiveTransport::Cellular;
         // cellular state starts Disconnected; mark active Cellular then disconnect
         // via the public path which clears cellular and re-promotes.
         tm.on_cellular_disconnected("test flap");
@@ -583,9 +667,9 @@ mod tests {
     fn wifi_preferred_over_bluetooth_on_connect() {
         let mut tm = TransportManager::new("test").unwrap();
         tm.bluetooth_connected = true;
-        tm.active = ActiveTransport::Wifi;
+        tm.preferred = ActiveTransport::Wifi;
         tm.on_bluetooth_connected();
-        assert_eq!(tm.active_transport(), ActiveTransport::Wifi);
+        assert_eq!(tm.preferred_transport(), ActiveTransport::Wifi);
         assert!(tm.bluetooth_connected);
     }
 
@@ -604,5 +688,41 @@ mod tests {
         tm.on_bluetooth_connected();
         assert!(tm.has_live_audio_path());
         assert!(!tm.has_live_ip_transport());
+    }
+
+    #[test]
+    fn relay_takes_preferred_slot_even_when_wifi_was_active() {
+        let mut tm = TransportManager::new("test").unwrap();
+        tm.preferred = ActiveTransport::Wifi;
+        tm.on_cellular_connected().unwrap();
+        assert_eq!(tm.active_transport(), ActiveTransport::Cellular);
+        assert_eq!(tm.preferred_transport(), ActiveTransport::Cellular);
+    }
+
+    #[test]
+    fn bluetooth_does_not_steal_relay() {
+        let mut tm = TransportManager::new("test").unwrap();
+        tm.on_cellular_connected().unwrap();
+        tm.on_bluetooth_connected();
+        assert_eq!(tm.active_transport(), ActiveTransport::Cellular);
+        assert!(tm.bluetooth_connected);
+    }
+
+    #[test]
+    fn relay_disconnect_keeps_preference_but_not_live_state() {
+        let mut tm = TransportManager::new("test").unwrap();
+        tm.on_cellular_connected().unwrap();
+        tm.on_cellular_disconnected("blip");
+        assert_eq!(tm.preferred_transport(), ActiveTransport::Cellular);
+        assert_eq!(tm.active_transport(), ActiveTransport::None);
+    }
+
+    #[test]
+    fn wifi_direct_down_promotes_relay_when_connected() {
+        let mut tm = TransportManager::new("test").unwrap();
+        tm.on_cellular_connected().unwrap();
+        tm.preferred = ActiveTransport::WifiDirect;
+        tm.on_wifi_direct_disconnected();
+        assert_eq!(tm.active_transport(), ActiveTransport::Cellular);
     }
 }

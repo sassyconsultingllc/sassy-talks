@@ -4,7 +4,12 @@
 package com.sassyconsulting.sassytalkie.input
 
 import android.content.Context
+import android.content.BroadcastReceiver
 import android.content.Intent
+import android.content.IntentFilter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothHeadset
+import android.bluetooth.BluetoothProfile
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Build
@@ -119,6 +124,8 @@ class HardwarePttController(context: Context) {
             KeyEvent.KEYCODE_MEDIA_NEXT,
             KeyEvent.KEYCODE_MEDIA_PREVIOUS,
         )
+        /** Keys with reliable down/up semantics; the rest retain toggle mode. */
+        private val HOLD_MEDIA_KEYCODES: Set<Int> = setOf(KeyEvent.KEYCODE_HEADSETHOOK)
     }
 
     private val appContext = context.applicationContext
@@ -166,6 +173,8 @@ class HardwarePttController(context: Context) {
 
     /** Framework MediaSession that captures BT/media-button events. */
     private var mediaSession: MediaSession? = null
+    @Volatile private var mediaHoldActive = false
+    private var accessoryReceiver: BroadcastReceiver? = null
 
     /**
      * For BT pucks that send a *single* media key per press (toggle style,
@@ -188,6 +197,7 @@ class HardwarePttController(context: Context) {
         if (enabled) return
         enabled = true
         if (btPttEnabled) registerMediaSession()
+        registerAccessoryReceiver()
         _armed.value = true
         Log.i(TAG, "Hardware PTT armed (keyCode=$pttKeyCode, btPtt=$btPttEnabled)")
     }
@@ -204,7 +214,9 @@ class HardwarePttController(context: Context) {
         if (_transmitting.value) stopPtt(reason = "disable")
         hwKeyHeld = false
         mediaToggleActive = false
+        mediaHoldActive = false
         releaseMediaSession()
+        unregisterAccessoryReceiver()
         _armed.value = false
         Log.i(TAG, "Hardware PTT disarmed")
     }
@@ -400,14 +412,22 @@ class HardwarePttController(context: Context) {
 
         when (event.action) {
             KeyEvent.ACTION_DOWN -> {
-                if (event.repeatCount == 0) mediaToggle(forceState = null)
+                if (event.repeatCount == 0) {
+                    if (event.keyCode in HOLD_MEDIA_KEYCODES) {
+                        mediaHoldActive = true
+                        startPtt(reason = "btMediaDown")
+                    } else {
+                        mediaToggle(forceState = null)
+                    }
+                }
             }
             KeyEvent.ACTION_UP -> {
-                // If a paired UP arrives quickly after a DOWN-driven toggle we
-                // ignore it (the toggle already flipped state on DOWN). Held
-                // hooks that we want to release on UP are handled by the
-                // mediaToggleActive guard inside mediaToggle when state was
-                // started by this same press.
+                // Explicit UP always ends hold-profile accessories. PLAY/PAUSE
+                // and similar single-event profiles remain toggle-driven.
+                if (event.keyCode in HOLD_MEDIA_KEYCODES && mediaHoldActive) {
+                    mediaHoldActive = false
+                    stopPtt(reason = "btMediaUp")
+                }
             }
         }
         return true
@@ -456,11 +476,10 @@ class HardwarePttController(context: Context) {
     }
 
     private fun stopPtt(reason: String) {
-        if (!_transmitting.value) return // guard double-stop
         try {
             val coord = pttCoordinatorProvider?.invoke()
             if (coord != null) {
-                coord.onPttReleased()
+                coord.forceStop(reason)
             } else {
                 SassyTalkNative.pttStop()
             }
@@ -473,5 +492,48 @@ class HardwarePttController(context: Context) {
             onTransmitChanged?.invoke(false)
             Log.d(TAG, "PTT stop ($reason)")
         }
+    }
+
+    /** Accessory disappearance must never strand a toggle/held transmission. */
+    private fun registerAccessoryReceiver() {
+        if (accessoryReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val disconnected = when (intent?.action) {
+                    BluetoothDevice.ACTION_ACL_DISCONNECTED -> true
+                    BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED ->
+                        intent.getIntExtra(BluetoothProfile.EXTRA_STATE, BluetoothProfile.STATE_DISCONNECTED) ==
+                            BluetoothProfile.STATE_DISCONNECTED
+                    else -> false
+                }
+                if (disconnected) {
+                    mediaToggleActive = false
+                    mediaHoldActive = false
+                    stopPtt("accessory-disconnect")
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
+            addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED)
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                appContext.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                appContext.registerReceiver(receiver, filter)
+            }
+            accessoryReceiver = receiver
+        } catch (e: Exception) {
+            Log.w(TAG, "accessory receiver failed: ${e.message}")
+        }
+    }
+
+    private fun unregisterAccessoryReceiver() {
+        accessoryReceiver?.let {
+            try { appContext.unregisterReceiver(it) } catch (_: Exception) {}
+        }
+        accessoryReceiver = null
     }
 }

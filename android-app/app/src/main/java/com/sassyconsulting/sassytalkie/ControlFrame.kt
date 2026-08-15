@@ -72,6 +72,9 @@ object ControlFrame {
      * Phase-2 follow-up). See [encodeWake] / [parseWake].
      */
     const val OP_WAKE: Byte          = 0x17
+    /** AES-GCM authenticated wrapper for every v2 control frame. Raw 0x10..0x1f
+     * frames are rejected by upgraded receivers instead of being trusted. */
+    const val OP_AUTHENTICATED: Byte = 0x18
 
     /** Hybrid PQC handshake (path a). INIT carries the initiator message
      *  (X25519 pub || ML-KEM encaps key), RESP carries the responder message
@@ -80,6 +83,13 @@ object ControlFrame {
      *  (cellular relay / RFCOMM), not a small-MTU BLE GATT write. */
     const val OP_HYBRID_INIT: Byte   = 0x1B
     const val OP_HYBRID_RESP: Byte   = 0x1C
+    const val OP_HYBRID_CONFIRM: Byte = 0x1F
+    /**
+     * Responder → initiator after installing on CONFIRM. Inner opcode 0x20;
+     * always wrapped in 0x18. Initiator must not install until this arrives.
+     */
+    const val OP_HYBRID_CONFIRM_ACK: Byte = 0x20
+    const val OP_REPLAY_FRAME: Byte = 0x19
 
     /**
      * Life-safety beacons. Payload bodies are built and parsed natively
@@ -119,8 +129,12 @@ object ControlFrame {
         "PTT_START_V2" to OP_PTT_START_V2,
         "PTT_STOP_V2" to OP_PTT_STOP_V2,
         "WAKE" to OP_WAKE,
+        "AUTHENTICATED" to OP_AUTHENTICATED,
+        "REPLAY_FRAME" to OP_REPLAY_FRAME,
         "HYBRID_INIT" to OP_HYBRID_INIT,
         "HYBRID_RESP" to OP_HYBRID_RESP,
+        "HYBRID_CONFIRM" to OP_HYBRID_CONFIRM,
+        "HYBRID_CONFIRM_ACK" to OP_HYBRID_CONFIRM_ACK,
         "EMERGENCY" to OP_EMERGENCY,
         "MANDOWN" to OP_MANDOWN,
         "EMERGENCY_CLEAR" to OP_EMERGENCY_CLEAR,
@@ -143,7 +157,7 @@ object ControlFrame {
         if (op.toInt() and 0xFF < 0x10) return DecodedFrame(op, ByteArray(0))
         if (bytes.size < 3) return null
         val len = ByteBuffer.wrap(bytes, 1, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
-        if (3 + len > bytes.size) return null  // reject truncated frames
+        if (3 + len != bytes.size) return null // reject truncation and trailing-data ambiguity
         val payload = bytes.copyOfRange(3, 3 + len)
         return DecodedFrame(op, payload)
     }
@@ -196,10 +210,20 @@ object ControlFrame {
         return encodeTlv(OP_PARTNER_OFFLINE, p)
     }
 
-    fun encodePttStartV2(epoch: Long, startSeq: Int): ByteArray {
-        val p = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
+    fun encodePttStartV2(epoch: Long, startSeq: Int, emergencyPriority: Boolean = false): ByteArray {
+        val p = ByteBuffer.allocate(13).order(ByteOrder.LITTLE_ENDIAN)
         p.putLong(epoch); p.putInt(startSeq)
+        p.put(if (emergencyPriority) 1 else 0)
         return encodeTlv(OP_PTT_START_V2, p.array())
+    }
+
+    fun parsePttStartV2(payload: ByteArray): Triple<Long, Int, Boolean>? {
+        if (payload.size < 12) return null
+        val p = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+        val epoch = p.long
+        val seq = p.int
+        val emergency = payload.size >= 13 && payload[12].toInt() and 0x01 != 0
+        return Triple(epoch, seq, emergency)
     }
 
     fun encodePttStopV2(epoch: Long, endSeq: Int): ByteArray {

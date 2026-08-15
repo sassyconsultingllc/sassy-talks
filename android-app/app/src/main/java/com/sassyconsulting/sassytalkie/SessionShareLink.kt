@@ -40,8 +40,26 @@ import javax.crypto.spec.SecretKeySpec
 object SessionShareLink {
 
     const val RELAY_BASE = "https://relay.sassyconsultingllc.com"
-    /** Custom scheme that opens the app directly (no App Links verification). */
-    const val APP_SCHEME = "sassytalk"
+    /**
+     * Custom scheme that opens the app directly, no App Links verification
+     * required. Primary scheme for newly minted invites.
+     */
+    const val APP_SCHEME = "sassy-talks"
+
+    /**
+     * Previous scheme, still accepted on the way IN.
+     *
+     * Invites get pasted into chats and left there — a link shared last week is
+     * a live invite until it expires, and dropping this scheme would turn every
+     * one of them into a dead tap with no explanation. Accepting both costs one
+     * comparison, and the manifest registers both filters for the same reason.
+     * New links are minted with [APP_SCHEME] only.
+     */
+    const val LEGACY_APP_SCHEME = "sassytalk"
+
+    /** True for either the current or the legacy app scheme. */
+    fun isAppScheme(scheme: String?): Boolean =
+        scheme == APP_SCHEME || scheme == LEGACY_APP_SCHEME
 
     private const val GCM_TAG_BITS = 128
     private const val IV_LEN = 12
@@ -51,10 +69,11 @@ object SessionShareLink {
     private val SHARE_ID_RE = Regex("^[A-Za-z0-9_-]{16,64}$")
 
     private val http: OkHttpClient by lazy {
-        OkHttpClient.Builder()
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(15, TimeUnit.SECONDS)
-            .build()
+        RelayTlsPins.apply(
+            OkHttpClient.Builder()
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(15, TimeUnit.SECONDS),
+        ).build()
     }
 
     sealed class Result {
@@ -192,7 +211,7 @@ object SessionShareLink {
     }
 
     private fun isInviteUri(uri: Uri): Boolean {
-        if (uri.scheme == APP_SCHEME && uri.host == "v") {
+        if (isAppScheme(uri.scheme) && uri.host == "v") {
             val id = (uri.path ?: "").removePrefix("/")
             return SHARE_ID_RE.matches(id)
         }
@@ -203,7 +222,7 @@ object SessionShareLink {
 
     private fun parseInviteParts(uri: Uri): Pair<String, String>? {
         val id = when {
-            uri.scheme == APP_SCHEME && uri.host == "v" ->
+            isAppScheme(uri.scheme) && uri.host == "v" ->
                 (uri.path ?: "").removePrefix("/")
             uri.scheme == "https" && uri.host == "relay.sassyconsultingllc.com" ->
                 (uri.path ?: "").removePrefix("/v/")

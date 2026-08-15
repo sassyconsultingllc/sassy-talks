@@ -117,6 +117,23 @@ fun AboutScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
+            StatusCard(title = "Compliance") {
+                Text(
+                    text = com.sassyconsulting.sassytalkie.FipsProvider.ABOUT_STATUS,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = StatusDisconnected
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = com.sassyconsulting.sassytalkie.FipsProvider.ABOUT_DETAIL,
+                    fontSize = 12.sp,
+                    color = TextMuted
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
             // Permissions card
             StatusCard(title = "Permissions") {
                 PermissionRow(label = "Microphone", reason = "Capture voice for push-to-talk")

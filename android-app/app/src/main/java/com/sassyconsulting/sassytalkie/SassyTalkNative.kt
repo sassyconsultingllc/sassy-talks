@@ -25,6 +25,8 @@ object SassyTalkNative {
     private const val SESSION_PREFS = "sassy_session"
     private var initialized = false
     var appContext: android.content.Context? = null
+    /** Optional technical-audit sink (WalkieService). Never log secrets here. */
+    @Volatile var auditHook: ((String, String) -> Unit)? = null
 
     /**
      * Open the session-prefs store backed by Android Keystore via
@@ -133,7 +135,7 @@ object SassyTalkNative {
 
     /**
      * Pass an Android Context down to the native layer so audio routing
-     * (MODE_IN_COMMUNICATION + speakerphone override on Moto/Xiaomi) can
+     * (MODE_IN_COMMUNICATION + loudspeaker override) can
      * obtain `AudioManager` via `getSystemService`. Idempotent — only the
      * first non-null Context sticks. Call from `WalkieService.onCreate`
      * once the foreground service is up.
@@ -198,8 +200,8 @@ object SassyTalkNative {
         val transport = getTransport()
         val btConnected = transport == TRANSPORT_BLUETOOTH
         val rfcommPeers = bluetoothTransport?.connectedPeerCount ?: 0
-        val hasIp = try { isConnected() } catch (_: Throwable) { false }
-        Log.i(TAG, "PTT START pressed — BT connected: $btConnected, RFCOMM peers: $rfcommPeers, ip=$hasIp, transport: ${getTransportName()}")
+        val hasIp = try { hasLiveAudioPath() } catch (_: Throwable) { false }
+        Log.i(TAG, "PTT START pressed — BT connected: $btConnected, RFCOMM peers: $rfcommPeers, live=$hasIp, transport: ${getTransportName()}")
 
         // IP plane or RFCOMM data plane required — BLE alone is not enough.
         if (!BtAudioPath.canTransmit(hasIp, rfcommPeers)) {
@@ -211,6 +213,10 @@ object SassyTalkNative {
         // be dropped at the transport layer anyway — fail closed instead.
         if (!isEncrypted()) {
             Log.w(TAG, "PTT blocked: session not encrypted")
+            return
+        }
+        if (!FipsProvider.txAllowed(appContext?.let { ManagedConfig.requireFipsProvider(it) } == true)) {
+            Log.w(TAG, "PTT blocked: FIPS module required by policy but not present")
             return
         }
 
@@ -242,6 +248,7 @@ object SassyTalkNative {
 
         // Restore RX after TX releases the mic.
         setRxMuted(false)
+        reassertRxRoute()
 
         // Resume on-device captioning after TX releases the mic.
         try {
@@ -283,7 +290,26 @@ object SassyTalkNative {
         }
     }
 
-    fun isConnected(): Boolean = getTransport() != TRANSPORT_NONE
+    fun isConnected(): Boolean = hasLiveAudioPath()
+
+    /** True while a live audio bearer exists. Sticky Cellular after disconnect is not live. */
+    fun hasLiveAudioPath(): Boolean {
+        if (!initialized) return false
+        return try {
+            nativeHasLiveAudioPath()
+        } catch (_: Throwable) {
+            getTransport() != TRANSPORT_NONE
+        }
+    }
+
+    fun getPreferredTransport(): Int {
+        if (!initialized) return TRANSPORT_NONE
+        return try {
+            nativeGetPreferredTransport().toInt()
+        } catch (_: Throwable) {
+            TRANSPORT_NONE
+        }
+    }
 
     fun getTransportName(): String {
         return when (getTransport()) {
@@ -339,8 +365,30 @@ object SassyTalkNative {
     fun importSessionFromQR(qrJson: String): Boolean {
         if (!initialized) return false
         return try {
+            val obj = try { org.json.JSONObject(qrJson) } catch (_: Exception) { null }
+            val roomId = obj?.optString("session_id").orEmpty()
+            val keyB64 = obj?.optString("key").orEmpty()
+            val key = try {
+                android.util.Base64.decode(keyB64, android.util.Base64.DEFAULT)
+            } catch (_: Throwable) {
+                ByteArray(0)
+            }
+            val ctx = appContext
+            val required = ctx?.let { ManagedConfig.enrollmentToken(it) }.orEmpty()
+            if (!EnrollmentProof.joinAuthorized(
+                    roomId,
+                    key.takeIf { it.size == 32 },
+                    required.takeIf { it.isNotBlank() },
+                    required.takeIf { it.isNotBlank() },
+                )
+            ) {
+                Log.w(TAG, "importSessionFromQR rejected: enrollment/room-secret proof failed")
+                try { auditHook?.invoke("enrollment_rejected", "reason=proof") } catch (_: Throwable) {}
+                return false
+            }
             val ok = nativeImportSessionFromQR(qrJson)
             if (ok) {
+                try { auditHook?.invoke("enrollment", "ok") } catch (_: Throwable) {}
                 // Extract channel from JSON to persist per-channel
                 val channel = try {
                     org.json.JSONObject(qrJson).optInt("channel", 1)
@@ -522,6 +570,7 @@ object SassyTalkNative {
         for (ch in 1..8) editor.remove("session_ch_$ch")
         editor.remove("session_json")
         editor.apply()
+        try { AuthenticatedControlPlane.clear() } catch (_: Throwable) {}
 
         // Fire-and-forget presence DELETE on a worker thread — must not block
         // the UI thread typically driving clearSession, and we don't want a
@@ -629,12 +678,31 @@ object SassyTalkNative {
         } catch (e: Exception) { Log.e(TAG, "hybridHandshakeRespond failed: ${e.message}"); null }
     }
 
-    /** Initiator: complete with the peer's base64 reply, establishing the session. */
+    /** Initiator: complete with the peer's base64 reply, staging the session pending ack. */
     fun hybridHandshakeComplete(respB64: String): Boolean {
         if (!initialized) return false
         return try {
             nativeHybridHandshakeComplete(respB64)
         } catch (e: Exception) { Log.e(TAG, "hybridHandshakeComplete failed: ${e.message}"); false }
+    }
+
+    fun hybridHandshakeConfirm(): Boolean {
+        if (!initialized) return false
+        return try {
+            nativeHybridHandshakeConfirm()
+        } catch (e: Exception) { Log.e(TAG, "hybridHandshakeConfirm failed: ${e.message}"); false }
+    }
+
+    fun hybridHandshakeDiscard() {
+        if (!initialized) return
+        try { nativeHybridHandshakeDiscard() } catch (_: Exception) {}
+    }
+
+    fun hybridHandshakeInstallAck(): Boolean {
+        if (!initialized) return false
+        return try {
+            nativeHybridHandshakeInstallAck()
+        } catch (e: Exception) { Log.e(TAG, "hybridHandshakeInstallAck failed: ${e.message}"); false }
     }
 
     // ── Permissions ──
@@ -900,15 +968,42 @@ object SassyTalkNative {
 
     /**
      * Force audio output to the loudspeaker (true) or the earpiece (false).
-     * Engages Android's MODE_IN_COMMUNICATION + setSpeakerphoneOn under the
-     * hood — see `audio_routing.rs`.
+     * Engages Android's MODE_IN_COMMUNICATION and pins the built-in speaker
+     * (setCommunicationDevice on API 31+, setSpeakerphoneOn everywhere).
+     * Does not steal a connected BT/wired headset.
      * @return true if the routing was applied, false if AudioManager wasn't
      *         reachable (rare — usually means initContext wasn't called).
      */
     fun setSpeakerphone(on: Boolean): Boolean {
         if (!initialized) return false
-        return try { nativeSetSpeakerphone(on) } catch (e: Exception) {
+        return try {
+            nativeSetSpeakerPreference(on)
+            if (isCommModeActive() || isPttActive()) {
+                nativeSetSpeakerphone(on)
+            } else {
+                true
+            }
+        } catch (e: Exception) {
             Log.e(TAG, "setSpeakerphone failed: ${e.message}")
+            false
+        }
+    }
+
+    /** Persist loudspeaker vs earpiece without entering MODE_IN_COMMUNICATION. */
+    fun setSpeakerphonePreference(on: Boolean) {
+        if (!initialized) return
+        try { nativeSetSpeakerPreference(on) } catch (_: Exception) {}
+    }
+
+    /**
+     * Re-apply sticky RX output (loudspeaker default) without changing the
+     * Settings toggle. No-ops when already on the desired sink, or when a
+     * real BT/wired headset is connected.
+     */
+    fun reassertRxRoute(): Boolean {
+        if (!initialized) return false
+        return try { nativeReassertRxRoute() } catch (e: Exception) {
+            Log.e(TAG, "reassertRxRoute failed: ${e.message}")
             false
         }
     }
@@ -1239,6 +1334,7 @@ object SassyTalkNative {
      * left on.
      */
     fun setCryptoTrace(on: Boolean, frames: Int = 3) {
+        if (!com.sassyconsulting.sassytalkie.BuildConfig.DEBUG) return
         if (!initialized) return
         try { nativeSetCryptoTrace(on, frames) } catch (_: Exception) {}
     }
@@ -1376,6 +1472,8 @@ object SassyTalkNative {
 
     // Transport
     @JvmStatic private external fun nativeGetTransport(): Byte
+    @JvmStatic private external fun nativeGetPreferredTransport(): Byte
+    @JvmStatic private external fun nativeHasLiveAudioPath(): Boolean
 
     // Connection
     @JvmStatic private external fun nativeDisconnect(): Boolean
@@ -1406,6 +1504,9 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeHybridHandshakeInit(channel: Int): String?
     @JvmStatic private external fun nativeHybridHandshakeRespond(channel: Int, initB64: String): String?
     @JvmStatic private external fun nativeHybridHandshakeComplete(respB64: String): Boolean
+    @JvmStatic private external fun nativeHybridHandshakeConfirm(): Boolean
+    @JvmStatic private external fun nativeHybridHandshakeInstallAck(): Boolean
+    @JvmStatic private external fun nativeHybridHandshakeDiscard()
     @JvmStatic private external fun nativeCheckPermissions(): String
     @JvmStatic private external fun nativeOnPermissionResult(permission: String, granted: Boolean)
     @JvmStatic private external fun nativeGetMissingPermissions(): String
@@ -1437,6 +1538,8 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeGetRxGainX100(): Int
     @JvmStatic private external fun nativeSetRxMuted(muted: Boolean)
     @JvmStatic private external fun nativeSetSpeakerphone(on: Boolean): Boolean
+    @JvmStatic private external fun nativeSetSpeakerPreference(on: Boolean)
+    @JvmStatic private external fun nativeReassertRxRoute(): Boolean
     @JvmStatic private external fun nativeIsCommModeActive(): Boolean
     @JvmStatic private external fun nativeSetJitterPrebufferFrames(frames: Int)
     @JvmStatic private external fun nativeGetJitterPrebufferFrames(): Int

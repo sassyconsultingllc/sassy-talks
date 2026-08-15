@@ -1,20 +1,25 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-A6XSZ4VDBSXO
+use super::control;
+use super::liveness::LivenessTracker;
 /// Transport Manager - UDP Multicast Communication with Encryption
-/// 
+///
 /// Features:
 /// - Random port selection per session
 /// - X25519 key exchange with peers
 /// - AES-256-GCM encrypted audio packets
 /// - Automatic peer discovery
-/// 
+///
 /// Copyright 2025 Sassy Consulting LLC. All rights reserved.
-
-use super::{TransportError, MAX_PACKET_SIZE, PEER_TIMEOUT_SECS, AudioFrame};
-use super::liveness::LivenessTracker;
-use super::control;
-use crate::constants::{DEFAULT_MULTICAST_ADDR, DEFAULT_MULTICAST_PORT, PORT_RANGE_START, PORT_RANGE_END, KEEPALIVE_INTERVAL_SECS};
+use super::{
+    realtime_channel, AudioFrame, RealtimeReceiver, RealtimeSender, TransportError,
+    MAX_PACKET_SIZE, PEER_TIMEOUT_SECS,
+};
+use crate::constants::{
+    DEFAULT_MULTICAST_ADDR, DEFAULT_MULTICAST_PORT, KEEPALIVE_INTERVAL_SECS, PORT_RANGE_END,
+    PORT_RANGE_START,
+};
 use crate::protocol::{Packet, PacketType};
 use crate::security::CryptoEngine;
 // Shared cross-platform crypto + audio wire frame. The desktop audio plane now
@@ -22,18 +27,20 @@ use crate::security::CryptoEngine;
 // CryptoSession (AES-256-GCM, nonce||ct||tag) and multicast on the shared group,
 // instead of the legacy per-peer X25519 ECDH + bincode Packet path (kept only as
 // a desktop↔desktop fallback when no QR session is installed).
+use rand::Rng;
 use sassytalkie_core::crypto::CryptoSession;
 use sassytalkie_core::wire;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
-use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time;
-use rand::Rng;
-use tracing::{error, info, warn, debug};
+use tracing::{debug, error, info, warn};
+
+const UDP_AUDIO_CAPACITY: usize = 64;
+const UDP_AUDIO_MAX_AGE: Duration = Duration::from_millis(250);
 
 /// Transport configuration
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -58,7 +65,7 @@ impl Default for TransportConfig {
             // App-layer AES-256-GCM is the security boundary, not port obscurity.
             use_random_port: false,
             fixed_port: DEFAULT_MULTICAST_PORT,
-            encryption_enabled: true,  // Default to encrypted
+            encryption_enabled: true, // Default to encrypted
         }
     }
 }
@@ -87,7 +94,7 @@ impl PeerInfo {
             .as_secs();
         now - self.last_seen < PEER_TIMEOUT_SECS
     }
-    
+
     /// Get public key as bytes
     pub fn get_public_key_bytes(&self) -> Option<[u8; 32]> {
         self.public_key.as_ref().and_then(|hex| {
@@ -108,21 +115,21 @@ pub struct TransportManager {
     // Socket for sending/receiving
     socket: Arc<Socket>,
     multicast_addr: SocketAddr,
-    
+
     // Actual bound port (may be random)
     bound_port: Arc<AtomicU16>,
-    
+
     // Local device info
     device_id: u32,
     device_name: String,
     current_channel: Arc<RwLock<u8>>,
-    
+
     // Configuration
     config: Arc<RwLock<TransportConfig>>,
-    
+
     // Peer tracking
     peers: Arc<RwLock<HashMap<u32, PeerInfo>>>,
-    
+
     // Encryption engines per peer (legacy desktop↔desktop X25519 ECDH path).
     crypto_engines: Arc<RwLock<HashMap<u32, CryptoEngine>>>,
 
@@ -134,7 +141,7 @@ pub struct TransportManager {
 
     // Stable per-install sender id placed in every core::wire frame (<= 32 bytes).
     sender_id: String,
-    
+
     // Our public key for sharing
     our_public_key: Arc<RwLock<Option<[u8; 32]>>>,
 
@@ -147,8 +154,8 @@ pub struct TransportManager {
     running: Arc<AtomicBool>,
 
     // Channels for audio data
-    audio_tx: mpsc::UnboundedSender<AudioFrame>,
-    audio_rx: Arc<RwLock<Option<mpsc::UnboundedReceiver<AudioFrame>>>>,
+    audio_tx: RealtimeSender<AudioFrame>,
+    audio_rx: Arc<RwLock<Option<RealtimeReceiver<AudioFrame>>>>,
 
     // Liveness tracking
     liveness: Arc<Mutex<LivenessTracker>>,
@@ -165,14 +172,18 @@ impl TransportManager {
     pub fn new(device_id: u32, device_name: String) -> Result<Self, TransportError> {
         Self::with_config(device_id, device_name, TransportConfig::default())
     }
-    
+
     /// Create with custom configuration
-    pub fn with_config(device_id: u32, device_name: String, config: TransportConfig) -> Result<Self, TransportError> {
+    pub fn with_config(
+        device_id: u32,
+        device_name: String,
+        config: TransportConfig,
+    ) -> Result<Self, TransportError> {
         info!("Initializing transport manager");
         info!("Device ID: {:08X}", device_id);
         info!("Device Name: {}", device_name);
         info!("Config: {:?}", config);
-        
+
         // Determine port and create bound socket.
         // For random ports, bind_random_udp() atomically selects and binds to avoid
         // the TOCTOU race that existed in the old probe-drop-rebind pattern.
@@ -195,31 +206,35 @@ impl TransportManager {
 
         info!("Using port: {}", port);
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-        
+
         // Parse and join multicast group
-        let multicast_ip: Ipv4Addr = config.multicast_addr.parse()
-            .map_err(|e| TransportError::MulticastError(format!("Invalid multicast address: {}", e)))?;
-        
-        socket.join_multicast_v4(&multicast_ip, &Ipv4Addr::UNSPECIFIED)
+        let multicast_ip: Ipv4Addr = config.multicast_addr.parse().map_err(|e| {
+            TransportError::MulticastError(format!("Invalid multicast address: {}", e))
+        })?;
+
+        socket
+            .join_multicast_v4(&multicast_ip, &Ipv4Addr::UNSPECIFIED)
             .map_err(|e| TransportError::MulticastError(e.to_string()))?;
-        
+
         // Set multicast TTL
-        socket.set_multicast_ttl_v4(32)
+        socket
+            .set_multicast_ttl_v4(32)
             .map_err(|e| TransportError::MulticastError(e.to_string()))?;
-        
+
         // Set non-blocking
-        socket.set_nonblocking(true)
+        socket
+            .set_nonblocking(true)
             .map_err(|e| TransportError::BindError(e.to_string()))?;
-        
+
         // Multicast sends go to this address
         let multicast_addr = SocketAddr::new(IpAddr::V4(multicast_ip), port);
-        
+
         info!("✓ UDP socket bound to {}", bind_addr);
         info!("✓ Joined multicast group {}", multicast_addr);
-        
+
         // Create audio channel
-        let (audio_tx, audio_rx) = mpsc::unbounded_channel();
-        
+        let (audio_tx, audio_rx) = realtime_channel(UDP_AUDIO_CAPACITY, UDP_AUDIO_MAX_AGE);
+
         // Generate our session keypair for encryption. We KEEP this engine (as
         // `identity`) — it holds the static secret behind `our_public` and is reused
         // to derive every per-peer session key.
@@ -251,7 +266,7 @@ impl TransportManager {
             heartbeat_seq: Arc::new(AtomicU32::new(0)),
         })
     }
-    
+
     /// Bind a UDP socket to a random available port in the dynamic range.
     ///
     /// SECURITY FIX (CRITICAL-4): Previously this function used a probe-drop-rebind
@@ -280,9 +295,7 @@ impl TransportManager {
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
                         Err(e) => {
-                            return Err(TransportError::BindError(
-                                format!("Port {}: {}", port, e),
-                            ));
+                            return Err(TransportError::BindError(format!("Port {}: {}", port, e)));
                         }
                     }
                 }
@@ -292,13 +305,13 @@ impl TransportManager {
 
         Err(TransportError::NoPortAvailable)
     }
-    
+
     /// Start transport (discovery + receive loop)
     pub async fn start(&self) -> Result<(), TransportError> {
         info!("Starting transport manager");
-        
+
         self.running.store(true, Ordering::Relaxed);
-        
+
         // Start discovery beacon with our public key
         let device_id = self.device_id;
         let device_name = self.device_name.clone();
@@ -308,24 +321,29 @@ impl TransportManager {
         let running = Arc::clone(&self.running);
         let our_public_key = Arc::clone(&self.our_public_key);
         let config = Arc::clone(&self.config);
-        
+
         tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(super::BEACON_INTERVAL_SECS));
-            
+
             while running.load(Ordering::Relaxed) {
                 interval.tick().await;
-                
+
                 let current_channel = *channel.read().unwrap();
                 let public_key = our_public_key.read().unwrap().clone();
                 let encryption_enabled = config.read().unwrap().encryption_enabled;
-                
+
                 // Include our public key in discovery for key exchange
                 let packet = if encryption_enabled {
-                    Packet::discovery_with_key(device_id, device_name.clone(), current_channel, public_key)
+                    Packet::discovery_with_key(
+                        device_id,
+                        device_name.clone(),
+                        current_channel,
+                        public_key,
+                    )
                 } else {
                     Packet::discovery(device_id, device_name.clone(), current_channel)
                 };
-                
+
                 if let Ok(data) = packet.serialize() {
                     if let Err(e) = socket.send_to(&data, &multicast_addr.into()) {
                         error!("Failed to send discovery: {}", e);
@@ -333,25 +351,25 @@ impl TransportManager {
                 }
             }
         });
-        
+
         // Start keepalive loop (sends between discovery beacons to maintain peer connections)
         let device_id_ka = self.device_id;
         let socket_ka = Arc::clone(&self.socket);
         let multicast_addr_ka = self.multicast_addr;
         let running_ka = Arc::clone(&self.running);
         let peers_ka = Arc::clone(&self.peers);
-        
+
         tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
-            
+
             while running_ka.load(Ordering::Relaxed) {
                 interval.tick().await;
-                
+
                 // Only send keepalive if we have active peers
                 let has_peers = !peers_ka.read().unwrap().is_empty();
                 if has_peers {
                     let packet = Packet::keep_alive(device_id_ka);
-                    
+
                     if let Ok(data) = packet.serialize() {
                         if let Err(e) = socket_ka.send_to(&data, &multicast_addr_ka.into()) {
                             warn!("Failed to send keepalive: {}", e);
@@ -362,7 +380,7 @@ impl TransportManager {
                 }
             }
         });
-        
+
         // Start heartbeat emit loop (every 2 seconds)
         let socket_hb = Arc::clone(&self.socket);
         let multicast_addr_hb = self.multicast_addr;
@@ -386,7 +404,9 @@ impl TransportManager {
                     .as_millis() as u64;
 
                 // Record that we sent this heartbeat (for RTT calculation when echoed back)
-                liveness_hb.lock().unwrap()
+                liveness_hb
+                    .lock()
+                    .unwrap()
                     .on_heartbeat_sent(&peer_key, hb_epoch, seq, now_ms);
 
                 let frame = control::encode_heartbeat(
@@ -458,7 +478,7 @@ impl TransportManager {
                             {
                                 // Skip our own multicast loopback.
                                 if sender != sender_id_rx {
-                                    let _ = audio_tx.send(AudioFrame {
+                                    let _ = audio_tx.try_send(AudioFrame {
                                         sender,
                                         timestamp: ts,
                                         opus,
@@ -502,7 +522,7 @@ impl TransportManager {
                             if packet.device_id == device_id_rx {
                                 continue;
                             }
-                            
+
                             match packet.packet_type {
                                 PacketType::Discovery { device_name, channel } => {
                                     // Skip (don't panic) if the source isn't an IP
@@ -525,7 +545,7 @@ impl TransportManager {
                                         public_key: None,
                                         key_exchanged: false,
                                     };
-                                    
+
                                     peers.write().unwrap().insert(packet.device_id, peer);
                                 }
                                 PacketType::DiscoveryWithKey { device_name, channel, public_key } => {
@@ -546,11 +566,11 @@ impl TransportManager {
                                         public_key: public_key.map(|k| hex::encode(k)),
                                         key_exchanged: false,
                                     };
-                                    
+
                                     // Perform key exchange if we have their public key
                                     if let Some(peer_public) = peer.get_public_key_bytes() {
                                         let encryption_enabled = config.read().unwrap().encryption_enabled;
-                                        
+
                                         if encryption_enabled {
                                             // Lock ordering: always acquire crypto_engines BEFORE peers.
                                             // Complete all crypto_engines mutations first, then drop the
@@ -591,13 +611,13 @@ impl TransportManager {
                                                 || crypto_engines.read().unwrap().contains_key(&packet.device_id);
                                         }
                                     }
-                                    
+
                                     peers.write().unwrap().insert(packet.device_id, peer);
                                 }
                                 PacketType::Audio { channel, data } => {
                                     // Decrypt if encryption is enabled
                                     let encryption_enabled = config.read().unwrap().encryption_enabled;
-                                    
+
                                     let decrypted_data = if encryption_enabled {
                                         if let Some(engine) = crypto_engines.read().unwrap().get(&packet.device_id) {
                                             if engine.is_ready() && data.len() > 28 {
@@ -605,7 +625,7 @@ impl TransportManager {
                                                 let nonce: [u8; 12] = data[..12].try_into().unwrap_or([0u8; 12]);
                                                 let tag: [u8; 16] = data[12..28].try_into().unwrap_or([0u8; 16]);
                                                 let ciphertext = &data[28..];
-                                                
+
                                                 match engine.decrypt(ciphertext, &nonce, &tag) {
                                                     Ok(decrypted) => decrypted,
                                                     Err(e) => {
@@ -625,10 +645,10 @@ impl TransportManager {
                                     } else {
                                         data.clone()
                                     };
-                                    
+
                                     // Forward audio to audio channel (legacy
                                     // per-peer path — no wire timestamp).
-                                    let _ = audio_tx.send(AudioFrame {
+                                    let _ = audio_tx.try_send(AudioFrame {
                                         sender: format!("legacy-{:08X}", packet.device_id),
                                         timestamp: 0,
                                         opus: decrypted_data,
@@ -640,7 +660,7 @@ impl TransportManager {
                                         if engine.is_ready() {
                                             match engine.decrypt(&data, &nonce, &auth_tag) {
                                                 Ok(decrypted) => {
-                                                    let _ = audio_tx.send(AudioFrame {
+                                                    let _ = audio_tx.try_send(AudioFrame {
                                                         sender: format!("legacy-{:08X}", packet.device_id),
                                                         timestamp: 0,
                                                         opus: decrypted,
@@ -666,7 +686,7 @@ impl TransportManager {
                                     // Handle explicit key exchange request
                                     debug!("Received key exchange from {:08X}", packet.device_id);
                                     let encryption_enabled = config.read().unwrap().encryption_enabled;
-                                    
+
                                     if encryption_enabled {
                                         let mut engines = crypto_engines.write().unwrap();
                                         if !engines.contains_key(&packet.device_id) {
@@ -685,7 +705,7 @@ impl TransportManager {
                                     if success {
                                         debug!("Key exchange response (success) from {:08X}", packet.device_id);
                                         let encryption_enabled = config.read().unwrap().encryption_enabled;
-                                        
+
                                         if encryption_enabled {
                                             let mut engines = crypto_engines.write().unwrap();
                                             if !engines.contains_key(&packet.device_id) {
@@ -716,7 +736,7 @@ impl TransportManager {
         info!("✓ Transport manager started");
         Ok(())
     }
-    
+
     /// Stop transport
     pub fn stop(&self) {
         info!("Stopping transport manager");
@@ -732,9 +752,24 @@ impl TransportManager {
         info!("Transport: group session installed (core::wire audio plane active)");
     }
 
+    pub fn clear_session_psk(&self) {
+        *self.group_crypto.write().unwrap() = None;
+        info!("Transport: group session cleared");
+    }
+
     /// Send audio data (with encryption if enabled)
     pub fn send_audio(&self, audio_data: &[u8]) -> Result<(), TransportError> {
+        self.send_audio_at(audio_data, None)
+    }
+
+    /// Stamp a shared timestamp so relay+UDP fan-out dedups as one frame on RX.
+    pub fn send_audio_at(
+        &self,
+        audio_data: &[u8],
+        timestamp: Option<u64>,
+    ) -> Result<(), TransportError> {
         let channel = *self.current_channel.read().unwrap();
+        let ts = timestamp.unwrap_or_else(wire::now_ms);
 
         // ── Cross-platform GROUP path (matches Android/iOS) ──
         // With a QR session PSK installed, seal the WHOLE core::wire frame with the
@@ -750,10 +785,14 @@ impl TransportManager {
                         wire::SUBCH_MAIN,
                         &self.sender_id,
                         &self.device_name,
-                        wire::now_ms(),
+                        ts,
                         audio_data,
                     );
-                    Some(crypto.encrypt(&frame).map_err(TransportError::EncryptionError)?)
+                    Some(
+                        crypto
+                            .encrypt(&frame)
+                            .map_err(TransportError::EncryptionError)?,
+                    )
                 }
                 None => None,
             }
@@ -770,8 +809,11 @@ impl TransportManager {
         if !encryption_enabled {
             // Plaintext mode keeps the single multicast send.
             let packet = Packet::audio(self.device_id, channel, audio_data.to_vec());
-            let data = packet.serialize().map_err(TransportError::SerializationError)?;
-            self.socket.send_to(&data, &self.multicast_addr.into())
+            let data = packet
+                .serialize()
+                .map_err(TransportError::SerializationError)?;
+            self.socket
+                .send_to(&data, &self.multicast_addr.into())
                 .map_err(TransportError::IoError)?;
             return Ok(());
         }
@@ -856,65 +898,67 @@ impl TransportManager {
             }))
         }
     }
-    
+
     /// Get received audio receiver
-    pub fn take_audio_receiver(&self) -> Option<mpsc::UnboundedReceiver<AudioFrame>> {
+    pub fn take_audio_receiver(&self) -> Option<RealtimeReceiver<AudioFrame>> {
         self.audio_rx.write().unwrap().take()
     }
-    
+
+    /// Bounded UDP ingress queue counters for diagnostics.
+    pub fn queue_metrics(&self) -> super::QueueMetricsSnapshot {
+        self.audio_tx.metrics()
+    }
+
     /// Get list of active peers
     pub fn get_peers(&self) -> Vec<PeerInfo> {
         let peers = self.peers.read().unwrap();
-        peers.values()
-            .filter(|p| p.is_active())
-            .cloned()
-            .collect()
+        peers.values().filter(|p| p.is_active()).cloned().collect()
     }
-    
+
     /// Get peer count
     pub fn peer_count(&self) -> usize {
         self.get_peers().len()
     }
-    
+
     /// Set channel
     pub fn set_channel(&self, channel: u8) {
-        use crate::constants::{MIN_CHANNEL, MAX_CHANNEL};
+        use crate::constants::{MAX_CHANNEL, MIN_CHANNEL};
         let clamped = channel.clamp(MIN_CHANNEL, MAX_CHANNEL);
         *self.current_channel.write().unwrap() = clamped;
         info!("Channel changed to {}", clamped);
     }
-    
+
     /// Get current channel
     pub fn get_channel(&self) -> u8 {
         *self.current_channel.read().unwrap()
     }
-    
+
     /// Get bound port
     pub fn get_port(&self) -> u16 {
         self.bound_port.load(Ordering::Relaxed)
     }
-    
+
     /// Update configuration
     pub fn update_config(&self, new_config: TransportConfig) {
         *self.config.write().unwrap() = new_config;
     }
-    
+
     /// Get current configuration
     pub fn get_config(&self) -> TransportConfig {
         self.config.read().unwrap().clone()
     }
-    
+
     /// Check if running
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
     }
-    
+
     /// Check if encryption is active with any peer
     pub fn is_encrypted(&self) -> bool {
         let engines = self.crypto_engines.read().unwrap();
         engines.values().any(|e| e.is_ready())
     }
-    
+
     /// Get our public key (hex encoded)
     pub fn get_public_key(&self) -> Option<String> {
         self.our_public_key.read().unwrap().map(|k| hex::encode(k))
@@ -931,15 +975,16 @@ impl TransportManager {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        peers.values()
+        peers
+            .values()
             .filter(|p| p.is_active())
             .map(|p| {
                 // Liveness is keyed by socket address string
                 let addr_key = p.address.to_string();
                 let health = match liveness.health(&addr_key, now_ms) {
-                    super::liveness::PeerHealth::Healthy  => "healthy",
+                    super::liveness::PeerHealth::Healthy => "healthy",
                     super::liveness::PeerHealth::Degraded => "degraded",
-                    super::liveness::PeerHealth::Stale    => "stale",
+                    super::liveness::PeerHealth::Stale => "stale",
                 };
                 let rtt = liveness.rtt_ms(&addr_key);
                 let peer_id_hex = format!("{:08X}", p.device_id);
@@ -970,38 +1015,40 @@ mod tests {
     #[tokio::test]
     async fn test_channel_change() {
         let transport = TransportManager::new(0x12345678, "Test Device".to_string()).unwrap();
-        
+
         assert_eq!(transport.get_channel(), 1);
         transport.set_channel(42);
         // Should be clamped to MAX_CHANNEL (16)
         assert_eq!(transport.get_channel(), 16);
-        
+
         transport.set_channel(8);
         assert_eq!(transport.get_channel(), 8);
     }
-    
+
     #[tokio::test]
     async fn test_random_port() {
         let config = TransportConfig {
             use_random_port: true,
             ..Default::default()
         };
-        
-        let transport = TransportManager::with_config(0x12345678, "Test".to_string(), config).unwrap();
+
+        let transport =
+            TransportManager::with_config(0x12345678, "Test".to_string(), config).unwrap();
         let port = transport.get_port();
-        
+
         assert!(port >= PORT_RANGE_START);
         assert!(port <= PORT_RANGE_END);
     }
-    
+
     #[tokio::test]
     async fn test_encryption_disabled() {
         let config = TransportConfig {
             encryption_enabled: false,
             ..Default::default()
         };
-        
-        let transport = TransportManager::with_config(0x12345678, "Test".to_string(), config).unwrap();
+
+        let transport =
+            TransportManager::with_config(0x12345678, "Test".to_string(), config).unwrap();
         assert!(!transport.is_encrypted());
     }
 }

@@ -18,11 +18,15 @@ import androidx.core.content.getSystemService
  * compress / spectrally shape voice packets into mush, especially low-amplitude
  * speech. STREAM_VOICE_CALL with MODE_IN_COMMUNICATION skips that chain.
  *
+ * MODE_IN_COMMUNICATION defaults to the earpiece. RX therefore always pins
+ * the loudspeaker unless a real BT/wired/USB headset is connected, or the
+ * caller asked for earpiece.
+ *
  * Side effect: while engaged, system media volume controls switch to voice-call
  * volume. UI should reflect that.
  *
- * Lifecycle: call engageCommMode() when receive session opens, release() on
- * close. Saves and restores prior mode/output-device state.
+ * Lifecycle: call engageCommMode() when receive session opens (safe to call
+ * again to re-assert). release() on close restores prior mode/device.
  */
 class AudioOutputRouter(context: Context) {
 
@@ -35,26 +39,29 @@ class AudioOutputRouter(context: Context) {
     private var active = false
 
     fun engageCommMode(forceSpeaker: Boolean = true) {
-        if (active) return
-        savedMode = am.mode
-        am.mode = AudioManager.MODE_IN_COMMUNICATION
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // isSpeakerphoneOn is deprecated in API 31 and increasingly a no-op
-            // on newer OEM builds; setCommunicationDevice is the reliable way to
-            // force the built-in speaker under MODE_IN_COMMUNICATION.
-            savedCommDevice = am.communicationDevice
-            if (forceSpeaker) {
-                am.availableCommunicationDevices
-                    .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
-                    ?.let { am.setCommunicationDevice(it) }
+        val first = !active
+        if (first) {
+            savedMode = am.mode
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                savedCommDevice = am.communicationDevice
+            } else {
+                @Suppress("DEPRECATION")
+                savedSpeakerOn = am.isSpeakerphoneOn
             }
-        } else {
-            @Suppress("DEPRECATION")
-            savedSpeakerOn = am.isSpeakerphoneOn
-            @Suppress("DEPRECATION")
-            am.isSpeakerphoneOn = forceSpeaker
         }
+        am.mode = AudioManager.MODE_IN_COMMUNICATION
+        applyTarget(forceSpeaker)
         active = true
+    }
+
+    /** Re-apply the sticky sink without resetting saved restore state. */
+    fun reassert(forceSpeaker: Boolean = true) {
+        if (!active) {
+            engageCommMode(forceSpeaker)
+            return
+        }
+        am.mode = AudioManager.MODE_IN_COMMUNICATION
+        applyTarget(forceSpeaker)
     }
 
     fun release() {
@@ -72,4 +79,59 @@ class AudioOutputRouter(context: Context) {
     }
 
     val isActive: Boolean get() = active
+
+    private fun applyTarget(forceSpeaker: Boolean) {
+        val types = outputTypes()
+        val target = RxOutputPolicy.resolve(forceSpeaker, types)
+        val current = currentType()
+        if (!RxOutputPolicy.shouldApply(target, current)) return
+        when (target) {
+            RxOutputPolicy.Target.LOUDSPEAKER -> pinBuiltin(speaker = true)
+            RxOutputPolicy.Target.EARPIECE -> pinBuiltin(speaker = false)
+            RxOutputPolicy.Target.EXTERNAL -> clearBuiltinPin()
+        }
+    }
+
+    private fun outputTypes(): IntArray =
+        am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).map { it.type }.toIntArray()
+
+    private fun currentType(): Int? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            return am.communicationDevice?.type
+        }
+        @Suppress("DEPRECATION")
+        return if (am.isSpeakerphoneOn) {
+            RxOutputPolicy.TYPE_BUILTIN_SPEAKER
+        } else {
+            RxOutputPolicy.TYPE_BUILTIN_EARPIECE
+        }
+    }
+
+    private fun pinBuiltin(speaker: Boolean) {
+        val wanted = if (speaker) {
+            intArrayOf(
+                RxOutputPolicy.TYPE_BUILTIN_SPEAKER,
+                RxOutputPolicy.TYPE_BUILTIN_SPEAKER_SAFE,
+            )
+        } else {
+            intArrayOf(RxOutputPolicy.TYPE_BUILTIN_EARPIECE)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val device = am.availableCommunicationDevices.firstOrNull { it.type in wanted }
+                ?: am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { it.type in wanted }
+            if (device != null) {
+                am.setCommunicationDevice(device)
+            }
+        }
+        @Suppress("DEPRECATION")
+        am.isSpeakerphoneOn = speaker
+    }
+
+    private fun clearBuiltinPin() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            am.clearCommunicationDevice()
+        }
+        @Suppress("DEPRECATION")
+        am.isSpeakerphoneOn = false
+    }
 }

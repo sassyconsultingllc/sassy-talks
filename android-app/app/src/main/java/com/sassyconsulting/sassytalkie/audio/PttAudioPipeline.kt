@@ -178,7 +178,7 @@ class PttAudioPipeline(
     }
 
     fun engageReceive() {
-        if (quirks.outputForceCommMode) router.engageCommMode(forceSpeaker = true)
+        router.engageCommMode(forceSpeaker = true)
         AudioTelemetry.updateEffects(
             aec = false, ns = false, agc = false,
             audioSource = activeSourceName,

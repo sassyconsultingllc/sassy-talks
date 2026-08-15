@@ -1,25 +1,24 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-OCHBVFKEDGW5
+use log::{info, warn};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 /// State Machine - Central coordinator for all subsystems
 ///
 /// Manages audio engine, transport, crypto, users, audio cache, and the
 /// TX/RX audio pipeline threads. Provides the API surface consumed by
 /// both the JNI exports (Kotlin app) and the legacy egui UI.
-
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::JoinHandle;
-use log::{info, warn};
 
 use crate::audio::AudioEngine;
-use crate::audio_pipeline;
-use crate::transport::{TransportManager, ActiveTransport};
 use crate::audio_cache::AudioCache;
-use crate::users::UserRegistry;
-use crate::crypto::CryptoSession;
-use crate::wifi_direct::{WifiDirectState, WifiDirectPeer, GroupRole};
+use crate::audio_pipeline;
 use crate::cellular_transport::CellularState;
+use crate::crypto::CryptoSession;
+use crate::transport::{ActiveTransport, TransportManager};
+use crate::users::UserRegistry;
+use crate::wifi_direct::{GroupRole, WifiDirectPeer, WifiDirectState};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppState {
@@ -153,7 +152,9 @@ impl StateMachine {
             self.local_sender_id.clone(),
             self.device_name.clone(),
         ) {
-            Ok(tx) => { *self.tx_handle.lock().unwrap() = Some(tx); }
+            Ok(tx) => {
+                *self.tx_handle.lock().unwrap() = Some(tx);
+            }
             Err(e) => {
                 warn!("StateMachine: failed to spawn TX thread: {}", e);
                 self.tx_running.store(false, Ordering::SeqCst);
@@ -171,7 +172,9 @@ impl StateMachine {
             Arc::clone(&self.rx_shared),
             self.local_sender_id.clone(),
         ) {
-            Ok(rx) => { *self.rx_handle.lock().unwrap() = Some(rx); }
+            Ok(rx) => {
+                *self.rx_handle.lock().unwrap() = Some(rx);
+            }
             Err(e) => {
                 warn!("StateMachine: failed to spawn RX thread: {}", e);
                 self.rx_running.store(false, Ordering::SeqCst);
@@ -190,11 +193,16 @@ impl StateMachine {
         let tx = self.tx_handle.lock().unwrap().take();
         let rx = self.rx_handle.lock().unwrap().take();
         if let Some(h) = tx {
-            if let Err(e) = h.join() { warn!("TX thread join panicked: {:?}", e); }
+            if let Err(e) = h.join() {
+                warn!("TX thread join panicked: {:?}", e);
+            }
         }
         if let Some(h) = rx {
-            if let Err(e) = h.join() { warn!("RX thread join panicked: {:?}", e); }
+            if let Err(e) = h.join() {
+                warn!("RX thread join panicked: {:?}", e);
+            }
         }
+        self.rx_shared.lock().unwrap().reset();
         info!("StateMachine: audio pipeline stopped");
     }
 
@@ -226,7 +234,10 @@ impl StateMachine {
         }
 
         let current = *self.state.lock().unwrap();
-        if current == AppState::Connected || current == AppState::Transmitting || current == AppState::Receiving {
+        if current == AppState::Connected
+            || current == AppState::Transmitting
+            || current == AppState::Receiving
+        {
             *self.state.lock().unwrap() = AppState::Ready;
         }
     }
@@ -312,7 +323,10 @@ impl StateMachine {
         self.stop_audio_threads();
 
         let current = *self.state.lock().unwrap();
-        if current == AppState::Connected || current == AppState::Transmitting || current == AppState::Receiving {
+        if current == AppState::Connected
+            || current == AppState::Transmitting
+            || current == AppState::Receiving
+        {
             *self.state.lock().unwrap() = AppState::Ready;
         }
     }
@@ -332,6 +346,24 @@ impl StateMachine {
     /// Poll outbound cellular queue (called by Kotlin timer)
     pub fn poll_cellular_outbound(&self) -> Option<Vec<u8>> {
         self.transport.lock().unwrap().poll_cellular_outbound()
+    }
+
+    pub fn report_cellular_send_result(&self, success: bool) {
+        self.transport
+            .lock()
+            .unwrap()
+            .report_cellular_send_result(success);
+    }
+
+    pub fn poll_bluetooth_outbound(&self) -> Option<Vec<u8>> {
+        self.transport.lock().unwrap().poll_bluetooth_outbound()
+    }
+
+    pub fn report_bluetooth_send_result(&self, success: bool) {
+        self.transport
+            .lock()
+            .unwrap()
+            .report_bluetooth_send_result(success);
     }
 
     /// Get cellular transport state
@@ -376,14 +408,19 @@ impl StateMachine {
         };
 
         if ip_still_live {
-            info!("StateMachine: Bluetooth down but an IP path is live — audio pipeline kept running");
+            info!(
+                "StateMachine: Bluetooth down but an IP path is live — audio pipeline kept running"
+            );
             return;
         }
 
         self.stop_audio_threads();
 
         let current = *self.state.lock().unwrap();
-        if current == AppState::Connected || current == AppState::Transmitting || current == AppState::Receiving {
+        if current == AppState::Connected
+            || current == AppState::Transmitting
+            || current == AppState::Receiving
+        {
             *self.state.lock().unwrap() = AppState::Ready;
         }
     }
@@ -431,7 +468,11 @@ impl StateMachine {
     }
 
     pub fn get_wifi_direct_peers(&self) -> Vec<WifiDirectPeer> {
-        self.transport.lock().unwrap().get_wifi_direct_peers().to_vec()
+        self.transport
+            .lock()
+            .unwrap()
+            .get_wifi_direct_peers()
+            .to_vec()
     }
 
     pub fn has_wifi_direct_peers(&self) -> bool {
@@ -448,6 +489,10 @@ impl StateMachine {
         self.transport.lock().unwrap().active_transport()
     }
 
+    pub fn get_preferred_transport(&self) -> ActiveTransport {
+        self.transport.lock().unwrap().preferred_transport()
+    }
+
     pub fn is_encrypted(&self) -> bool {
         self.transport.lock().unwrap().is_encrypted()
     }
@@ -455,6 +500,15 @@ impl StateMachine {
     pub fn set_crypto_session(&self, session: CryptoSession) {
         self.transport.lock().unwrap().set_crypto(session);
         info!("StateMachine: crypto session set");
+    }
+
+    pub fn arm_pending_rx(&self, session: CryptoSession) {
+        self.transport.lock().unwrap().arm_pending_rx(session);
+        info!("StateMachine: staged hybrid RX armed");
+    }
+
+    pub fn discard_pending_rx(&self) {
+        self.transport.lock().unwrap().discard_pending_rx();
     }
 
     pub fn set_psk(&self, key: &[u8; 32]) {

@@ -30,6 +30,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import com.sassyconsulting.sassytalkie.BuildConfig
+import com.sassyconsulting.sassytalkie.audio.RxAudioRouteKeeper
 import com.sassyconsulting.sassytalkie.debug.AudioTelemetry
 import com.sassyconsulting.sassytalkie.license.Entitlements
 import com.sassyconsulting.sassytalkie.service.BluetoothTransport
@@ -97,9 +98,28 @@ class WalkieService : Service() {
     @Volatile private var lastWakeRenewMs = 0L
     private var audioFocusRequest: AudioFocusRequest? = null
     private var hasAudioFocus = false
+    private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { change ->
+        when (change) {
+            AudioManager.AUDIOFOCUS_GAIN,
+            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
+            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK -> {
+                hasAudioFocus = true
+                try { SassyTalkNative.reassertRxRoute() } catch (_: Throwable) {}
+            }
+            AudioManager.AUDIOFOCUS_LOSS,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                hasAudioFocus = false
+                pttCoordinator?.forceStop("audio-focus-loss")
+            }
+        }
+    }
     private var rxWakeHoldJob: Job? = null
     private var inboundAudioWatchJob: Job? = null
     private var processLifecycleObserver: DefaultLifecycleObserver? = null
+    private var rxRouteKeeper: RxAudioRouteKeeper? = null
+    @Volatile private var rxRouteActive = false
+    @Volatile private var txRouteActive = false
     /** Jitter frames preferred while the UI process is in the foreground. */
     @Volatile private var foregroundJitterFrames: Int = 3
     @Volatile private var backgroundJitterApplied = false
@@ -112,6 +132,8 @@ class WalkieService : Service() {
 
     private var cohortSnapshotJob: Job? = null
     private var telemetryBridgeJob: Job? = null
+    private lateinit var emergencyAuditStore: EmergencyAuditStore
+    @Volatile private var lastActivityMs = System.currentTimeMillis()
 
     // Tracks the toggle state for the notification's PTT action — flipped only
     // when the action button is tapped from the shade, NOT for in-app PTT.
@@ -136,12 +158,25 @@ class WalkieService : Service() {
         Log.i(TAG, "Service created")
         createNotificationChannel()
         registerPttToggleReceiver()
+        emergencyAuditStore = EmergencyAuditStore(this)
+        SassyTalkNative.auditHook = { event, detail ->
+            try { emergencyAuditStore.append(event, detail) } catch (_: Throwable) {}
+        }
+        SessionWipe.applyManagedWipeIfRequested(this, emergencyAuditStore)
+        ProfileChecker.profileKind(this)
+        // Exists independently of Bluetooth so relay-only PTT and SOS remain
+        // available when the adapter is off or permissions are denied.
+        pttCoordinator = PttCoordinator().also {
+            it.maxTxMs = ManagedConfig.maxTxMs(this)
+            wireCoordinatorCallbacks(it)
+            it.restoreLocalEmergencyIndicator(emergencyAuditStore.selfActive)
+        }
         // Snapshotter is keyed to service lifetime, not multicast.
         // getActiveCohortId() guard makes it a no-op when no channel has an
         // active session — so it's safe to run regardless of transport.
         startCohortSnapshotter()
-        // Telemetry JNI poll only while diagnostics overlay is on (or debug builds).
         startTelemetryBridgeIfNeeded()
+        startIdleWatchdog()
         // Notification can mirror captions, but the service must NOT acquire the
         // recognizer mic — that held AudioRecord for the whole radio session and
         // drained battery in the background. Mic ownership is UI + process-foreground.
@@ -151,6 +186,18 @@ class WalkieService : Service() {
             Log.w(TAG, "LiveTranslationBridge init failed: ${t.message}")
         }
         startTranslationNotificationBridge()
+        // Hand Context to native so RX routing can reach AudioManager even
+        // when the UI has not run AppNavigation yet (FCM wake → FGS).
+        try {
+            SassyTalkNative.appContext = applicationContext
+            SassyTalkNative.initContext(applicationContext)
+            SassyTalkNative.setSpeakerphonePreference(
+                getSharedPreferences("sassy_settings", MODE_PRIVATE)
+                    .getBoolean("speakerphone_on", true),
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "native audio-route init: ${t.message}")
+        }
         // Do NOT request audio focus here. Holding focus with
         // USAGE_VOICE_COMMUNICATION for the whole service lifetime tells
         // Android "a voice call is in progress" — the volume rocker snaps
@@ -160,6 +207,7 @@ class WalkieService : Service() {
         // [noteInboundRx]/[rxWakeHoldJob].
         startInboundAudioWatch()
         registerProcessLifecycleForJitter()
+        startRxAudioRouteKeeper()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -190,7 +238,7 @@ class WalkieService : Service() {
                 ServiceCompat.startForeground(
                     this,
                     NOTIFICATION_ID,
-                    buildNotification("Radio standby"),
+                    buildNotification("Radio standby", showPttAction = false),
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
                         ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
                         ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
@@ -199,12 +247,12 @@ class WalkieService : Service() {
                 ServiceCompat.startForeground(
                     this,
                     NOTIFICATION_ID,
-                    buildNotification("Radio standby"),
+                    buildNotification("Radio standby", showPttAction = false),
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
                         ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
                 )
             } else {
-                startForeground(NOTIFICATION_ID, buildNotification("Radio standby"))
+                startForeground(NOTIFICATION_ID, buildNotification("Radio standby", showPttAction = false))
             }
         } catch (e: Exception) {
             // Foreground promotion failed (denied permission, policy, etc). Stop
@@ -315,14 +363,18 @@ class WalkieService : Service() {
     override fun onDestroy() {
         Log.i(TAG, "Service destroyed")
         isRunning = false
+        pttCoordinator?.forceStop("service-destroy")
         stopTranslationNotificationBridge()
         stopCohortSnapshotter()
         stopTelemetryBridge()
         stopInboundAudioWatch()
         unregisterProcessLifecycleForJitter()
+        stopRxAudioRouteKeeper()
         abandonRadioAudioFocus()
-        serviceScope.cancel()
         shutdownBleTransport()
+        pttCoordinator?.shutdown()
+        pttCoordinator = null
+        serviceScope.cancel()
         releaseMulticastLock()
         releaseWakeLock()
         unregisterPttToggleReceiver()
@@ -465,8 +517,10 @@ class WalkieService : Service() {
 
         val ble = BleSignalingService(this, adapter)
         val bt = BluetoothTransport(this)
-        val coord = PttCoordinator(ble, bt)
-        coord.onRadioActivity = { renewActivityWakeLock() }
+        val coord = pttCoordinator ?: PttCoordinator().also {
+            pttCoordinator = it
+            wireCoordinatorCallbacks(it)
+        }
 
         return try {
             // Start BLE
@@ -479,7 +533,7 @@ class WalkieService : Service() {
 
             bleSignaling = ble
             btTransport = bt
-            pttCoordinator = coord
+            coord.attachBluetooth(ble, bt)
 
             // Wire BT transport reference so SassyTalkNative.pttStart() can start TX pump
             SassyTalkNative.bluetoothTransport = bt
@@ -491,7 +545,7 @@ class WalkieService : Service() {
             // Permission revoked mid-flight or OEM quirk — tear down the
             // half-started stack and stay in IP-only mode.
             Log.e(TAG, "initBleTransport: SecurityException — ${e.message}")
-            try { coord.shutdown() } catch (_: Exception) {}
+            try { coord.attachBluetooth(null, null) } catch (_: Exception) {}
             try { bt.shutdown() } catch (_: Exception) {}
             try { ble.shutdown() } catch (_: Exception) {}
             false
@@ -499,17 +553,42 @@ class WalkieService : Service() {
     }
 
     private fun shutdownBleTransport() {
-        pttCoordinator?.shutdown()
+        pttCoordinator?.forceStop("bluetooth-teardown")
+        pttCoordinator?.attachBluetooth(null, null)
         btTransport?.shutdown()
         bleSignaling?.shutdown()
 
         SassyTalkNative.bluetoothTransport = null
-        pttCoordinator = null
         btTransport = null
         bleSignaling = null
         bleInitialized = false
 
         Log.i(TAG, "BLE + RFCOMM transport shut down")
+    }
+
+    private fun wireCoordinatorCallbacks(coord: PttCoordinator) {
+        coord.selfPeerId = InstallId.get(this)
+        coord.onRadioActivity = {
+            lastActivityMs = System.currentTimeMillis()
+            renewActivityWakeLock()
+        }
+        coord.onTxStateChanged = { active ->
+            txRouteActive = active
+            updateRouteKeeper()
+            if (active) {
+                requestRadioAudioFocus()
+            } else if (!rxRouteActive) {
+                abandonRadioAudioFocus()
+            }
+        }
+        coord.onEmergencyAudit = { event, detail ->
+            emergencyAuditStore.selfActive = when (event) {
+                "self_raised" -> true
+                "self_cleared" -> false
+                else -> emergencyAuditStore.selfActive
+            }
+            emergencyAuditStore.append(event, detail)
+        }
     }
 
     // ── Cohort participant snapshotter ──
@@ -582,13 +661,13 @@ class WalkieService : Service() {
             while (isActive) {
                 try {
                     val path = SassyTalkNative.getTransportName().ifBlank { "offline" }
-                    val wsState = if (pttCoordinator?.cellularClient?.isConnected() == true) {
-                        "connected"
-                    } else if (SassyTalkNative.isConnected()) {
-                        "transport-up"
-                    } else {
-                        "idle"
-                    }
+                    val kotlinWs = pttCoordinator?.cellularClient?.isConnected() == true
+                    val nativeLive = try { SassyTalkNative.hasLiveAudioPath() } catch (_: Throwable) { false }
+                    val cellState = try {
+                        com.sassyconsulting.sassytalkie.debug.DiagnosticsCollector
+                            .parseCellularStats(SassyTalkNative.cellularGetStats()).state
+                    } catch (_: Throwable) { "" }
+                    val wsState = RelayConnectionState.telemetryWsState(kotlinWs, cellState, nativeLive)
                     val nowMs = System.currentTimeMillis()
                     val liv = pttCoordinator?.liveness
                     val peerSet = liv?.peerIds().orEmpty()
@@ -778,7 +857,10 @@ class WalkieService : Service() {
      */
     fun noteInboundRx() {
         renewActivityWakeLock()
+        rxRouteActive = true
+        updateRouteKeeper()
         if (!hasAudioFocus) requestRadioAudioFocus()
+        try { SassyTalkNative.reassertRxRoute() } catch (_: Throwable) {}
         rxWakeHoldJob?.cancel()
         rxWakeHoldJob = serviceScope.launch {
             delay(RX_STAY_HOT_MS)
@@ -787,6 +869,8 @@ class WalkieService : Service() {
             // phone line free again (conference-call add-line, incoming
             // ring routing, etc. all depend on this).
             abandonRadioAudioFocus()
+            rxRouteActive = false
+            updateRouteKeeper()
         }
     }
 
@@ -813,27 +897,7 @@ class WalkieService : Service() {
                 val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                     .setAudioAttributes(attrs)
                     .setAcceptsDelayedFocusGain(true)
-                    .setOnAudioFocusChangeListener { change ->
-                        when (change) {
-                            AudioManager.AUDIOFOCUS_GAIN,
-                            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
-                            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK -> {
-                                hasAudioFocus = true
-                                // Re-assert speakerphone / comm mode after focus return.
-                                try {
-                                    val prefs = getSharedPreferences("sassy_settings", MODE_PRIVATE)
-                                    SassyTalkNative.setSpeakerphone(
-                                        prefs.getBoolean("speakerphone_on", true),
-                                    )
-                                } catch (_: Throwable) {}
-                            }
-                            AudioManager.AUDIOFOCUS_LOSS,
-                            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
-                            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                                hasAudioFocus = false
-                            }
-                        }
-                    }
+                    .setOnAudioFocusChangeListener(audioFocusChangeListener)
                     .build()
                 audioFocusRequest = req
                 val result = am.requestAudioFocus(req)
@@ -841,11 +905,14 @@ class WalkieService : Service() {
             } else {
                 @Suppress("DEPRECATION")
                 val result = am.requestAudioFocus(
-                    null,
+                    audioFocusChangeListener,
                     AudioManager.STREAM_VOICE_CALL,
                     AudioManager.AUDIOFOCUS_GAIN,
                 )
                 hasAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            }
+            if (hasAudioFocus) {
+                try { SassyTalkNative.reassertRxRoute() } catch (_: Throwable) {}
             }
             Log.i(TAG, "AudioFocus requested granted=$hasAudioFocus")
         } catch (t: Throwable) {
@@ -860,7 +927,7 @@ class WalkieService : Service() {
                 audioFocusRequest?.let { am.abandonAudioFocusRequest(it) }
             } else {
                 @Suppress("DEPRECATION")
-                am.abandonAudioFocus(null)
+                am.abandonAudioFocus(audioFocusChangeListener)
             }
         } catch (t: Throwable) {
             Log.w(TAG, "AudioFocus abandon failed: ${t.message}")
@@ -881,6 +948,23 @@ class WalkieService : Service() {
     private fun stopInboundAudioWatch() {
         inboundAudioWatchJob?.cancel()
         inboundAudioWatchJob = null
+    }
+
+    private fun startRxAudioRouteKeeper() {
+        if (rxRouteKeeper != null) return
+        rxRouteKeeper = RxAudioRouteKeeper(this)
+        updateRouteKeeper()
+    }
+
+    private fun stopRxAudioRouteKeeper() {
+        rxRouteKeeper?.stop()
+        rxRouteKeeper = null
+        rxRouteActive = false
+        txRouteActive = false
+    }
+
+    private fun updateRouteKeeper() {
+        rxRouteKeeper?.setActive(rxRouteActive || txRouteActive)
     }
 
     private fun registerProcessLifecycleForJitter() {
@@ -943,7 +1027,7 @@ class WalkieService : Service() {
             ).apply {
                 description = "Keeps the walkie-talkie radio active"
                 setShowBadge(true)
-                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                lockscreenVisibility = Notification.VISIBILITY_PRIVATE
                 // No sound for ongoing updates — only visual presence
                 setSound(null, null)
                 enableVibration(false)
@@ -988,17 +1072,7 @@ class WalkieService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val translationLine = try {
-            val bridge = com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge
-            if (bridge.enabled.value) {
-                bridge.translation.value.ifBlank { bridge.caption.value }.take(80)
-            } else ""
-        } catch (_: Throwable) { "" }
-        val contentText = if (translationLine.isNotBlank()) {
-            "$status · $translationLine"
-        } else {
-            status
-        }
+        val contentText = status
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Sassy-Talk")
@@ -1007,7 +1081,15 @@ class WalkieService : Service() {
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setSilent(true)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(
+                NotificationCompat.Builder(this, CHANNEL_ID)
+                    .setContentTitle("Sassy-Talk")
+                    .setContentText("Radio active")
+                    .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                    .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                    .build()
+            )
             .setShowWhen(true)
             .setWhen(System.currentTimeMillis())
             .setNumber(1)
@@ -1018,17 +1100,19 @@ class WalkieService : Service() {
         // Quick-send PTT action — toggles transmit directly from the shade so
         // the user never has to reopen the app. State is local to the
         // notification's tap cycle and reflected in the label/icon.
-        val toggleIntent = Intent(ACTION_TOGGLE_PTT).setPackage(packageName)
-        val togglePendingIntent = PendingIntent.getBroadcast(
-            this, 2, toggleIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val toggleLabel = if (notificationPttActive) "Stop" else "Push to talk"
-        builder.addAction(
-            android.R.drawable.ic_btn_speak_now,
-            toggleLabel,
-            togglePendingIntent
-        )
+        if (showPttAction) {
+            val toggleIntent = Intent(ACTION_TOGGLE_PTT).setPackage(packageName)
+            val togglePendingIntent = PendingIntent.getBroadcast(
+                this, 2, toggleIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val toggleLabel = if (notificationPttActive) "Stop" else "Push to talk"
+            builder.addAction(
+                android.R.drawable.ic_btn_speak_now,
+                toggleLabel,
+                togglePendingIntent
+            )
+        }
 
         // Legacy "Open PTT" action — kept behind the existing preference for
         // users who explicitly want the in-app PTT experience from lock screen.
@@ -1054,8 +1138,7 @@ class WalkieService : Service() {
     fun updateNotification(status: String) {
         lastNotificationStatus = status
         val lockScreenPtt = try {
-            getSharedPreferences("sassy_settings", Context.MODE_PRIVATE)
-                .getBoolean("lock_screen_ptt", false)
+            ManagedConfig.lockScreenPttActionsAllowed(this)
         } catch (_: Exception) { false }
 
         try {
@@ -1063,6 +1146,30 @@ class WalkieService : Service() {
             nm.notify(NOTIFICATION_ID, buildNotification(status, showPttAction = lockScreenPtt))
         } catch (e: Exception) {
             Log.w(TAG, "Failed to update notification: ${e.message}")
+        }
+    }
+
+    fun auditStore(): EmergencyAuditStore = emergencyAuditStore
+
+    fun wipeSession(source: String = "in_app") {
+        SessionWipe.wipe(this, source, emergencyAuditStore)
+    }
+
+    private fun startIdleWatchdog() {
+        serviceScope.launch {
+            while (isActive) {
+                val timeout = try {
+                    ManagedConfig.sessionIdleTimeoutMs(this@WalkieService)
+                } catch (_: Throwable) {
+                    0L
+                }
+                if (timeout > 0L && System.currentTimeMillis() - lastActivityMs > timeout) {
+                    Log.i(TAG, "Session idle timeout — wiping keys")
+                    SessionWipe.wipe(this@WalkieService, "idle_timeout", emergencyAuditStore)
+                    lastActivityMs = System.currentTimeMillis()
+                }
+                delay(30_000)
+            }
         }
     }
 }

@@ -14,7 +14,7 @@ name = "sassytalkie_ios"
 # staticlib only: Xcode links libsassytalkie_ios.a into the app (project.yml
 # OTHER_LDFLAGS -lsassytalkie_ios). A cdylib (.dylib) can't be built/loaded for
 # an iOS device target and was failing the link step.
-crate-type = ["staticlib"]
+crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 # Shared cross-platform core — the SAME crypto/session/PQC engine Android and

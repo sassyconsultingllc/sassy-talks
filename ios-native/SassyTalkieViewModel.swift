@@ -69,6 +69,7 @@ class SassyTalkieViewModel: ObservableObject {
     func importSessionQR(_ json: String) -> Int {
         let ch = json.withCString { Int(sassytalkie_import_session_qr($0)) }
         if ch > 0 {
+            KeychainStore.saveSessionQR(json)
             DispatchQueue.main.async {
                 self.channel = UInt8(ch)
                 self.isPaired = true
@@ -171,6 +172,7 @@ class SassyTalkieViewModel: ObservableObject {
             return String(cString: c)
         }
         if let json = json {
+            KeychainStore.saveSessionQR(json)
             DispatchQueue.main.async {
                 self.isPaired = true
                 self.hostQRJSON = json
@@ -246,12 +248,33 @@ class SassyTalkieViewModel: ObservableObject {
             
             // Start state polling
             startStatePolling()
+            if let stored = KeychainStore.loadSessionQR(), importSessionQR(stored) > 0 {
+                print("Restored session from Keychain")
+            }
         } else {
             print("❌ Failed to initialize SassyTalkie")
             statusText = "Error"
         }
     }
     
+    func wipeSession() {
+        sassytalkie_wipe_session()
+        KeychainStore.deleteSession()
+        relayClient.disconnect()
+        DispatchQueue.main.async {
+            self.isPaired = false
+            self.hostQRJSON = nil
+            self.statusText = "Session cleared"
+        }
+    }
+
+    /// Technical audit export — not a legal chain of custody / not court-certified evidence.
+    func exportAuditJson() -> String? {
+        guard let c = sassytalkie_export_audit() else { return nil }
+        defer { sassytalkie_free_string(c) }
+        return String(cString: c)
+    }
+
     deinit {
         stateTimer?.invalidate()
         relayClient.disconnect()

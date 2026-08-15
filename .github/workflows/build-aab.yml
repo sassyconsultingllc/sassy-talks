@@ -128,6 +128,10 @@ jobs:
         working-directory: core
         run: cargo test --lib
 
+      - name: Run Android native host tests
+        working-directory: android-native
+        run: cargo test --lib --locked
+
       - name: Build native libs (arm64-v8a + x86_64)
         working-directory: android-native
         # ONE invocation for both ABIs. Building them separately is how they
@@ -156,6 +160,9 @@ jobs:
           done
           exit $fail
 
+      - name: Verify Android 16 KiB ELF page compatibility
+        run: python3 scripts/check-elf-alignment.py android-app/app/src/main/jniLibs
+
       - name: Report drift from the committed prebuilt
         # Informational only — CI's freshly built lib is authoritative now.
         # A diff here means someone changed Rust without rebuilding locally,
@@ -170,6 +177,10 @@ jobs:
 
       - name: Make gradlew executable
         run: chmod +x android-app/gradlew
+
+      - name: Run Android JVM unit tests
+        working-directory: android-app
+        run: ./gradlew testPlayDebugUnitTest testDirectDebugUnitTest --stacktrace
 
       - name: Decode release keystore
         env:

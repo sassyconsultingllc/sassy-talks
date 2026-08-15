@@ -66,6 +66,7 @@ fun AppNavigation(
     pendingShareUri: android.net.Uri? = null,
     onShareConsumed: () -> Unit = {},
     onPipEligibilityChanged: (Boolean) -> Unit = {},
+    onRadioUiVisible: (Boolean) -> Unit = {},
 ) {
     val context = LocalContext.current
     var currentScreen by remember { mutableStateOf(Screen.Auth) }
@@ -142,7 +143,7 @@ fun AppNavigation(
                     true
                 }
                 // Hand a Context down to the native layer so audio routing
-                // (MODE_IN_COMMUNICATION + speakerphone override) can obtain
+                // (MODE_IN_COMMUNICATION + loudspeaker override) can obtain
                 // AudioManager. Safe to call even if already initialized.
                 if (initOk) {
                     try { SassyTalkNative.initContext(context.applicationContext) } catch (_: Throwable) {}
@@ -240,7 +241,7 @@ fun AppNavigation(
                 // buffer preset so the user's prior choices stick across
                 // process death without requiring a Settings visit.
                 SassyTalkNative.setRxGain(micPrefs.getFloat("rx_gain", 1.0f))
-                SassyTalkNative.setSpeakerphone(micPrefs.getBoolean("speakerphone_on", true))
+                SassyTalkNative.setSpeakerphonePreference(micPrefs.getBoolean("speakerphone_on", true))
                 SassyTalkNative.setJitterPrebufferFrames(micPrefs.getInt("jitter_prebuffer_frames", 5))
             } else {
                 initFailed = true
@@ -403,6 +404,11 @@ fun AppNavigation(
 
     LaunchedEffect(currentScreen) {
         onPipEligibilityChanged(currentScreen == Screen.Main)
+        onRadioUiVisible(
+            currentScreen == Screen.Main ||
+                currentScreen == Screen.Users ||
+                currentScreen == Screen.Activity,
+        )
         // Allow QR screenshots on non-radio screens (release builds only).
         val allowCapture = currentScreen != Screen.Main
         (context as? MainActivity)?.setScreenshotsAllowed(allowCapture)

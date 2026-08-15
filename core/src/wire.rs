@@ -19,6 +19,9 @@
 //! ```text
 //! [channel:u8]
 //! [subchannel:u8]                 0=Main, 1=A, 2=B
+//! [marker=0xff:u8][version=2:u8]  absent in legacy frames
+//! [stream_epoch:u64 LE]           random/new for each PTT capture stream
+//! [sequence:u32 LE]               monotonic within stream_epoch
 //! [sender_id_len:u8]              <= MAX_SENDER_ID_LEN
 //! [sender_id: sender_id_len]      UTF-8, the stable per-install id
 //! [device_name_len:u8]           <= MAX_DEVICE_NAME_LEN
@@ -41,9 +44,26 @@ pub const MAX_SENDER_ID_LEN: usize = 32;
 /// reject-on-unpack contract as [`MAX_SENDER_ID_LEN`].
 pub const MAX_DEVICE_NAME_LEN: usize = 64;
 
-/// Minimum decodable frame: channel + subchannel + id_len + name_len +
+/// Minimum decodable legacy frame: channel + subchannel + id_len + name_len +
 /// timestamp, with zero-length id and name = 12 bytes.
 const MIN_FRAME_LEN: usize = 12;
+const V2_MARKER: u8 = 0xff;
+const V2_VERSION: u8 = 2;
+const V2_PREFIX_LEN: usize = 2 + 1 + 1 + 8 + 4;
+
+/// Parsed logical audio frame. `stream_epoch == 0` identifies a legacy frame;
+/// for legacy input `sequence` is derived from the low 32 bits of timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireAudioFrame {
+    pub channel: u8,
+    pub subchannel: u8,
+    pub sender_id: String,
+    pub device_name: String,
+    pub stream_epoch: u64,
+    pub sequence: u32,
+    pub timestamp: u64,
+    pub compressed: Vec<u8>,
+}
 
 /// Subchannel: main/default.
 pub const SUBCH_MAIN: u8 = 0;
@@ -91,6 +111,86 @@ pub fn pack_wire_frame(
     packet
 }
 
+/// Pack a v2 logical audio frame with an explicit stream epoch and sequence.
+///
+/// The `0xff` marker is impossible for a valid legacy sender-id length, so the
+/// shared decoder can accept both layouts without guessing. Legacy frames
+/// remain accepted indefinitely; transmitters can migrate independently.
+pub fn pack_wire_frame_v2(
+    channel: u8,
+    subchannel: u8,
+    sender_id: &str,
+    device_name: &str,
+    stream_epoch: u64,
+    sequence: u32,
+    timestamp: u64,
+    compressed: &[u8],
+) -> Vec<u8> {
+    let id_bytes = sender_id.as_bytes();
+    let id_len = id_bytes.len().min(MAX_SENDER_ID_LEN);
+    let name_bytes = device_name.as_bytes();
+    let name_len = name_bytes.len().min(MAX_DEVICE_NAME_LEN);
+    let mut packet =
+        Vec::with_capacity(V2_PREFIX_LEN + 1 + id_len + 1 + name_len + 8 + compressed.len());
+    packet.extend_from_slice(&[channel, subchannel, V2_MARKER, V2_VERSION]);
+    packet.extend_from_slice(&stream_epoch.to_le_bytes());
+    packet.extend_from_slice(&sequence.to_le_bytes());
+    packet.push(id_len as u8);
+    packet.extend_from_slice(&id_bytes[..id_len]);
+    packet.push(name_len as u8);
+    packet.extend_from_slice(&name_bytes[..name_len]);
+    packet.extend_from_slice(&timestamp.to_le_bytes());
+    packet.extend_from_slice(compressed);
+    packet
+}
+
+/// Parse either a legacy or v2 logical audio frame.
+pub fn unpack_wire_frame_detailed(data: &[u8]) -> Result<WireAudioFrame, String> {
+    if data.len() < MIN_FRAME_LEN {
+        return Err(format!("Wire frame too short: {} bytes", data.len()));
+    }
+    let channel = data[0];
+    let subchannel = data[1];
+    let is_v2 = data.get(2) == Some(&V2_MARKER);
+    let (stream_epoch, sequence, id_len_offset) = if is_v2 {
+        if data.len() < V2_PREFIX_LEN + 1 || data[3] != V2_VERSION {
+            return Err("Unsupported or truncated v2 wire frame".to_string());
+        }
+        (
+            u64::from_le_bytes(data[4..12].try_into().unwrap()),
+            u32::from_le_bytes(data[12..16].try_into().unwrap()),
+            16,
+        )
+    } else {
+        (0, 0, 2)
+    };
+    let id_len = data[id_len_offset] as usize;
+    if id_len > MAX_SENDER_ID_LEN || data.len() < id_len_offset + 1 + id_len + 1 {
+        return Err(format!("Invalid sender_id length: {}", id_len));
+    }
+    let id_start = id_len_offset + 1;
+    let sender_id = String::from_utf8_lossy(&data[id_start..id_start + id_len]).to_string();
+    let name_len_offset = id_start + id_len;
+    let name_len = data[name_len_offset] as usize;
+    if name_len > MAX_DEVICE_NAME_LEN || data.len() < name_len_offset + 1 + name_len + 8 {
+        return Err(format!("Invalid device_name length: {}", name_len));
+    }
+    let name_start = name_len_offset + 1;
+    let device_name = String::from_utf8_lossy(&data[name_start..name_start + name_len]).to_string();
+    let ts_offset = name_start + name_len;
+    let timestamp = u64::from_le_bytes(data[ts_offset..ts_offset + 8].try_into().unwrap());
+    Ok(WireAudioFrame {
+        channel,
+        subchannel,
+        sender_id,
+        device_name,
+        stream_epoch,
+        sequence: if is_v2 { sequence } else { timestamp as u32 },
+        timestamp,
+        compressed: data[ts_offset + 8..].to_vec(),
+    })
+}
+
 /// Parse a wire frame back into its components.
 ///
 /// Returns `(channel, subchannel, sender_id, device_name, timestamp,
@@ -98,40 +198,15 @@ pub fn pack_wire_frame(
 /// length fields are bounds-checked against `MAX_*` and the buffer length, so a
 /// crafted frame cannot index out of bounds.
 pub fn unpack_wire_frame(data: &[u8]) -> Result<(u8, u8, String, String, u64, Vec<u8>), String> {
-    if data.len() < MIN_FRAME_LEN {
-        return Err(format!("Wire frame too short: {} bytes", data.len()));
-    }
-
-    let channel = data[0];
-    let subchannel = data[1];
-    let id_len = data[2] as usize;
-
-    if id_len > MAX_SENDER_ID_LEN || data.len() < 3 + id_len + 1 {
-        return Err(format!("Invalid sender_id length: {}", id_len));
-    }
-
-    let sender_id = String::from_utf8_lossy(&data[3..3 + id_len]).to_string();
-
-    let name_len_offset = 3 + id_len;
-    let name_len = data[name_len_offset] as usize;
-
-    if name_len > MAX_DEVICE_NAME_LEN || data.len() < name_len_offset + 1 + name_len + 8 {
-        return Err(format!("Invalid device_name length: {}", name_len));
-    }
-
-    let name_start = name_len_offset + 1;
-    let device_name = String::from_utf8_lossy(&data[name_start..name_start + name_len]).to_string();
-
-    let ts_offset = name_start + name_len;
-    let timestamp = u64::from_le_bytes([
-        data[ts_offset], data[ts_offset + 1], data[ts_offset + 2], data[ts_offset + 3],
-        data[ts_offset + 4], data[ts_offset + 5], data[ts_offset + 6], data[ts_offset + 7],
-    ]);
-
-    let audio_offset = ts_offset + 8;
-    let compressed = data[audio_offset..].to_vec();
-
-    Ok((channel, subchannel, sender_id, device_name, timestamp, compressed))
+    let frame = unpack_wire_frame_detailed(data)?;
+    Ok((
+        frame.channel,
+        frame.subchannel,
+        frame.sender_id,
+        frame.device_name,
+        frame.timestamp,
+        frame.compressed,
+    ))
 }
 
 #[cfg(test)]
@@ -141,7 +216,14 @@ mod tests {
     #[test]
     fn round_trip_preserves_all_fields() {
         let audio = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
-        let frame = pack_wire_frame(3, SUBCH_A, "ios-deadbeef", "iPhone 99", 1_700_000_000_123, &audio);
+        let frame = pack_wire_frame(
+            3,
+            SUBCH_A,
+            "ios-deadbeef",
+            "iPhone 99",
+            1_700_000_000_123,
+            &audio,
+        );
         let (ch, sub, id, name, ts, got) = unpack_wire_frame(&frame).unwrap();
         assert_eq!(ch, 3);
         assert_eq!(sub, SUBCH_A);
@@ -170,14 +252,14 @@ mod tests {
         assert_eq!(
             frame,
             vec![
-                2,            // channel
-                0,            // subchannel
-                2,            // id_len
-                b'a', b'b',   // sender_id
-                1,            // name_len
-                b'c',         // device_name
-                1, 0, 0, 0, 0, 0, 0, 0, // timestamp u64 LE
-                0xEE,         // audio
+                2, // channel
+                0, // subchannel
+                2, // id_len
+                b'a', b'b', // sender_id
+                1,    // name_len
+                b'c', // device_name
+                1, 0, 0, 0, 0, 0, 0, 0,    // timestamp u64 LE
+                0xEE, // audio
             ]
         );
     }
@@ -192,7 +274,7 @@ mod tests {
     #[test]
     fn rejects_oversized_device_name_len() {
         let mut data = vec![0u8; 20];
-        data[2] = 0;   // sender_id_len = 0
+        data[2] = 0; // sender_id_len = 0
         data[3] = 200; // name_len > MAX_DEVICE_NAME_LEN
         assert!(unpack_wire_frame(&data).is_err());
     }
@@ -200,5 +282,23 @@ mod tests {
     #[test]
     fn rejects_too_short() {
         assert!(unpack_wire_frame(&[0u8; 4]).is_err());
+    }
+
+    #[test]
+    fn v2_round_trip_preserves_epoch_and_sequence() {
+        let packed = pack_wire_frame_v2(7, SUBCH_B, "sender", "Radio", 55, 42, 1_000, &[9, 8]);
+        let frame = unpack_wire_frame_detailed(&packed).unwrap();
+        assert_eq!((frame.stream_epoch, frame.sequence), (55, 42));
+        assert_eq!((frame.channel, frame.subchannel), (7, SUBCH_B));
+        assert_eq!(frame.compressed, vec![9, 8]);
+    }
+
+    #[test]
+    fn detailed_parser_maps_legacy_identity_without_breaking_tuple_api() {
+        let packed = pack_wire_frame(1, 0, "old", "Legacy", 1_234, &[3]);
+        let frame = unpack_wire_frame_detailed(&packed).unwrap();
+        assert_eq!(frame.stream_epoch, 0);
+        assert_eq!(frame.sequence, 1_234);
+        assert_eq!(unpack_wire_frame(&packed).unwrap().2, "old");
     }
 }

@@ -19,10 +19,13 @@ import { handleLicenseRoute } from "./license.js";
 // apart on what tokens they accept (the inline copy this replaced had already
 // diverged — it was missing a type guard in timingSafeEqualHex).
 import {
-  verifyCapabilityToken,
+  verifyCapabilityIdentity,
   secretsFor,
   hmacSha256Hex,
   isValidRoomId,
+  isValidPeerId,
+  signCapabilityTokenV2,
+  verifyIssuanceProof,
 } from "./relay-auth.js";
 
 // Token lifetime in seconds. Short enough to limit replay risk, long enough
@@ -101,12 +104,44 @@ export default {
         // weak/empty key. Operator must `wrangler secret put AUTH_SECRET`.
         return jsonResponse({ error: "AUTH_SECRET not configured" }, 500);
       }
+      const peer = url.searchParams.get("peer");
+      const requestedClass = url.searchParams.get("auth_class") || "member";
+      if (peer !== null && !isValidPeerId(peer)) {
+        return jsonResponse({ error: "Invalid peer ID" }, 400, false);
+      }
+      if (requestedClass !== "member" && requestedClass !== "terminal") {
+        return jsonResponse({ error: "Unsupported auth class" }, 400, false);
+      }
+
+      // Existing clients omit peer and receive the legacy room-bound token.
+      // Identity-bound v2 issuance requires peer. Terminal classification
+      // always requires a fresh cryptographic proof; operators may also make
+      // proof mandatory for every issuance with REQUIRE_AUTH_PROOF=true.
+      const proofRequired = requestedClass === "terminal" || env.REQUIRE_AUTH_PROOF === "true";
+      if (proofRequired) {
+        if (!peer) return jsonResponse({ error: "Proof-based auth requires peer" }, 400, false);
+        const proofErr = await verifyIssuanceProof(
+          request, roomId, peer, requestedClass, env.AUTH_SECRET,
+        );
+        if (proofErr) return jsonResponse({ error: proofErr }, 401, false);
+        const nonceErr = await consumeProofNonce(request, env);
+        if (nonceErr) return jsonResponse({ error: nonceErr }, 401, false);
+      }
+
       const expSec = Math.floor(Date.now() / 1000) + TOKEN_TTL_SEC;
-      const token = await signToken(roomId, expSec, env.AUTH_SECRET);
+      const token = peer
+        ? await signCapabilityTokenV2(roomId, expSec, peer, requestedClass, env.AUTH_SECRET)
+        : await signLegacyToken(roomId, expSec, env.AUTH_SECRET);
       // No CORS on the token response: native clients (OkHttp/reqwest) don't
       // enforce CORS, and withholding it stops a malicious web origin from
       // reading a freshly-minted room capability token.
-      return jsonResponse({ token, expires_at: expSec, ttl: TOKEN_TTL_SEC }, 200, false);
+      return jsonResponse({
+        token,
+        token_version: peer ? 2 : 1,
+        auth_class: peer ? requestedClass : "legacy",
+        expires_at: expSec,
+        ttl: TOKEN_TTL_SEC,
+      }, 200, false);
     }
 
     // Short-link redirects. 302 (not 301) so we can re-point later without
@@ -140,14 +175,24 @@ export default {
         return new Response("Server misconfigured: AUTH_SECRET unset", { status: 503 });
       }
       const token = url.searchParams.get("token");
-      const tokenError = await verifyCapabilityToken(token, roomId, secretsFor(env));
-      if (tokenError) {
-        return new Response(tokenError, { status: 401 });
+      const identity = await verifyCapabilityIdentity(token, roomId, secretsFor(env));
+      if (identity.error) {
+        return new Response(identity.error, { status: 401 });
+      }
+      const claimedPeer = url.searchParams.get("peer") || "";
+      if (identity.version === 2 && claimedPeer !== identity.peer) {
+        return new Response("Token peer identity mismatch", { status: 403 });
       }
 
       const doId = env.PTT_RELAY.idFromName(roomId);
       const room = env.PTT_RELAY.get(doId);
-      return room.fetch(request);
+      // Durable Objects are not publicly addressable. Overwrite (never trust)
+      // these internal headers so the DO can classify the authenticated socket.
+      const headers = new Headers(request.headers);
+      headers.set("X-Sassy-Verified-Auth-Class", identity.authClass);
+      headers.set("X-Sassy-Verified-Peer", identity.peer || claimedPeer);
+      headers.set("X-Sassy-Token-Version", String(identity.version));
+      return room.fetch(new Request(request, { headers }));
     }
 
     return new Response("Not found", { status: 404 });
@@ -164,7 +209,22 @@ function jsonResponse(body, status = 200, cors = true) {
  * Token format: "<expSec>.<hexSig>" where hexSig = HMAC-SHA256(roomId + "." + expSec, secret).
  * Compact, query-param-safe, no JSON parsing needed on either end.
  */
-async function signToken(roomId, expSec, secret) {
+async function signLegacyToken(roomId, expSec, secret) {
   const sig = await hmacSha256Hex(`${roomId}.${expSec}`, secret);
   return `${expSec}.${sig}`;
+}
+
+/**
+ * Best-effort replay rejection for proof nonces using the already-required
+ * SHARES KV binding. KV is eventually consistent, so the timestamp window and
+ * short-lived capability remain the primary bounds; this blocks ordinary
+ * accidental/captured replay without inventing another service.
+ */
+async function consumeProofNonce(request, env) {
+  if (!env.SHARES) return "Proof replay store unavailable";
+  const nonce = request.headers.get("X-Sassy-Auth-Nonce");
+  const key = `auth-proof-nonce:${nonce}`;
+  if (await env.SHARES.get(key)) return "Proof nonce already used";
+  await env.SHARES.put(key, "1", { expirationTtl: 120 });
+  return null;
 }

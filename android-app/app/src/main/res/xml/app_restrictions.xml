@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<restrictions xmlns:android="http://schemas.android.com/apk/res/android">
+    <restriction
+        android:key="lock_screen_ptt"
+        android:title="Allow lock-screen PTT"
+        android:restrictionType="bool"
+        android:defaultValue="false" />
+    <restriction
+        android:key="enable_wifi_multicast"
+        android:title="Allow Wi-Fi multicast"
+        android:restrictionType="bool"
+        android:defaultValue="true" />
+    <restriction
+        android:key="enable_cloudflare_relay"
+        android:title="Allow Cloudflare relay"
+        android:restrictionType="bool"
+        android:defaultValue="true" />
+    <restriction
+        android:key="require_relay"
+        android:title="Require relay (disable local transports)"
+        android:restrictionType="bool"
+        android:defaultValue="false" />
+    <restriction
+        android:key="enable_bluetooth"
+        android:title="Allow Bluetooth transport"
+        android:restrictionType="bool"
+        android:defaultValue="true" />
+    <restriction
+        android:key="enable_notifications"
+        android:title="Allow extra notifications (lock-screen PTT actions)"
+        android:restrictionType="bool"
+        android:defaultValue="true" />
+    <restriction
+        android:key="enable_translation"
+        android:title="Allow live translation"
+        android:restrictionType="bool"
+        android:defaultValue="true" />
+    <restriction
+        android:key="enable_diagnostics_overlay"
+        android:title="Allow diagnostics overlay"
+        android:restrictionType="bool"
+        android:defaultValue="false" />
+    <restriction
+        android:key="max_tx_seconds"
+        android:title="Maximum transmission seconds"
+        android:restrictionType="integer"
+        android:defaultValue="60" />
+    <restriction
+        android:key="session_idle_timeout_minutes"
+        android:title="Session idle timeout minutes (0 = disabled)"
+        android:restrictionType="integer"
+        android:defaultValue="0" />
+    <restriction
+        android:key="enrollment_token"
+        android:title="Enrollment token (room ID is not authorization)"
+        android:restrictionType="string"
+        android:defaultValue="" />
+    <restriction
+        android:key="operator_role"
+        android:title="Operator role (operator or supervisor)"
+        android:restrictionType="string"
+        android:defaultValue="operator" />
+    <restriction
+        android:key="force_session_wipe"
+        android:title="Force session wipe on next launch"
+        android:restrictionType="bool"
+        android:defaultValue="false" />
+    <restriction
+        android:key="require_fips_provider"
+        android:title="Require a FIPS module (fails closed if none is present)"
+        android:restrictionType="bool"
+        android:defaultValue="false" />
+    <restriction
+        android:key="require_tls_pinning"
+        android:title="Require TLS SPKI pinning for the Cloudflare relay (fails closed on mismatch). Default on when backup pins are present; set false for platform TLS."
+        android:restrictionType="bool"
+        android:defaultValue="true" />
+</restrictions>

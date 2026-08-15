@@ -5,15 +5,13 @@
 ///
 /// This module provides safe Rust wrappers around Android Java APIs via JNI.
 /// Implements bridges for: Audio, PackageManager, UI
-
 use jni::{
-    JNIEnv,
-    objects::{JClass, JObject, JString, JValue, GlobalRef},
-    sys::{jboolean, jbyte, JNI_TRUE, JNI_FALSE},
-    JavaVM,
+    objects::{GlobalRef, JClass, JObject, JString, JValue},
+    sys::{jboolean, jbyte, JNI_FALSE, JNI_TRUE},
+    JNIEnv, JavaVM,
 };
-use std::sync::Arc;
 use log::{error, info, warn};
+use std::sync::Arc;
 
 /// Global JavaVM instance (initialized once, thread-safe)
 static JAVA_VM: std::sync::OnceLock<Arc<JavaVM>> = std::sync::OnceLock::new();
@@ -40,7 +38,10 @@ pub fn init_jvm(vm: JavaVM) {
 
 /// Get JavaVM instance
 pub fn get_jvm() -> Result<Arc<JavaVM>, String> {
-    JAVA_VM.get().cloned().ok_or_else(|| "JavaVM not initialized".to_string())
+    JAVA_VM
+        .get()
+        .cloned()
+        .ok_or_else(|| "JavaVM not initialized".to_string())
 }
 
 //==============================================================================
@@ -58,8 +59,14 @@ impl AndroidAudioRecord {
     pub fn audio_source_id(name: &str) -> Option<i32> {
         let vm = get_jvm().ok()?;
         let mut env = vm.attach_current_thread().ok()?;
-        let source_class = env.find_class("android/media/MediaRecorder$AudioSource").ok()?;
-        let val = env.get_static_field(&source_class, name, "I").ok()?.i().ok()?;
+        let source_class = env
+            .find_class("android/media/MediaRecorder$AudioSource")
+            .ok()?;
+        let val = env
+            .get_static_field(&source_class, name, "I")
+            .ok()?
+            .i()
+            .ok()?;
         Some(val)
     }
 
@@ -67,53 +74,71 @@ impl AndroidAudioRecord {
     /// `MediaRecorder.AudioSource.VOICE_RECOGNITION`). Caller picks the
     /// source from `DeviceQuirks::current().source_fallback_chain` and
     /// retries with the next on `STATE_UNINITIALIZED`.
-    pub fn new_with_source(audio_source: i32, sample_rate: i32, channel_config: i32, audio_format: i32, buffer_size: i32) -> Result<Self, String> {
+    pub fn new_with_source(
+        audio_source: i32,
+        sample_rate: i32,
+        channel_config: i32,
+        audio_format: i32,
+        buffer_size: i32,
+    ) -> Result<Self, String> {
         let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
+        let mut env = vm
+            .attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
 
-        let recorder_class = env.find_class("android/media/AudioRecord")
+        let recorder_class = env
+            .find_class("android/media/AudioRecord")
             .map_err(|e| format!("Failed to find AudioRecord class: {}", e))?;
 
-        let recorder = env.new_object(
-            &recorder_class,
-            "(IIIII)V",
-            &[
-                JValue::Int(audio_source),
-                JValue::Int(sample_rate),
-                JValue::Int(channel_config),
-                JValue::Int(audio_format),
-                JValue::Int(buffer_size),
-            ]
-        )
-        .map_err(|e| format!("Failed to create AudioRecord: {}", e))?;
+        let recorder = env
+            .new_object(
+                &recorder_class,
+                "(IIIII)V",
+                &[
+                    JValue::Int(audio_source),
+                    JValue::Int(sample_rate),
+                    JValue::Int(channel_config),
+                    JValue::Int(audio_format),
+                    JValue::Int(buffer_size),
+                ],
+            )
+            .map_err(|e| format!("Failed to create AudioRecord: {}", e))?;
 
         // Verify the recorder actually initialized (some OEM HALs reject
         // certain sources silently — STATE_UNINITIALIZED = 0).
-        let state_initialized = env.get_static_field(&recorder_class, "STATE_INITIALIZED", "I")
+        let state_initialized = env
+            .get_static_field(&recorder_class, "STATE_INITIALIZED", "I")
             .map_err(|e| format!("Failed to get STATE_INITIALIZED: {}", e))?
             .i()
             .map_err(|e| format!("Failed to convert STATE_INITIALIZED: {}", e))?;
-        let state = env.call_method(&recorder, "getState", "()I", &[])
+        let state = env
+            .call_method(&recorder, "getState", "()I", &[])
             .map_err(|e| format!("Failed to call getState: {}", e))?
             .i()
             .map_err(|e| format!("Failed to convert getState: {}", e))?;
         if state != state_initialized {
             let _ = env.call_method(&recorder, "release", "()V", &[]);
-            return Err(format!("AudioRecord state={} (not STATE_INITIALIZED) for source={}", state, audio_source));
+            return Err(format!(
+                "AudioRecord state={} (not STATE_INITIALIZED) for source={}",
+                state, audio_source
+            ));
         }
 
-        let global_ref = env.new_global_ref(&recorder)
+        let global_ref = env
+            .new_global_ref(&recorder)
             .map_err(|e| format!("Failed to create global ref: {}", e))?;
 
-        Ok(Self { recorder: global_ref })
+        Ok(Self {
+            recorder: global_ref,
+        })
     }
 
     /// Get the AudioRecord's session ID — needed to attach AEC/NS/AGC
     /// effects to this specific recording chain.
     pub fn audio_session_id(&self) -> Result<i32, String> {
         let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
+        let mut env = vm
+            .attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
         env.call_method(self.recorder.as_obj(), "getAudioSessionId", "()I", &[])
             .map_err(|e| format!("Failed getAudioSessionId: {}", e))?
@@ -123,65 +148,80 @@ impl AndroidAudioRecord {
 
     /// Legacy constructor — defaults to MIC. Prefer `new_with_source` so
     /// per-device fallback chains pick the right source.
-    pub fn new(sample_rate: i32, channel_config: i32, audio_format: i32, buffer_size: i32) -> Result<Self, String> {
+    pub fn new(
+        sample_rate: i32,
+        channel_config: i32,
+        audio_format: i32,
+        buffer_size: i32,
+    ) -> Result<Self, String> {
         let mic = Self::audio_source_id("MIC").unwrap_or(1);
         Self::new_with_source(mic, sample_rate, channel_config, audio_format, buffer_size)
     }
-    
+
     /// Get minimum buffer size
-    pub fn get_min_buffer_size(sample_rate: i32, channel_config: i32, audio_format: i32) -> Result<i32, String> {
+    pub fn get_min_buffer_size(
+        sample_rate: i32,
+        channel_config: i32,
+        audio_format: i32,
+    ) -> Result<i32, String> {
         let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
+        let mut env = vm
+            .attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
-        let recorder_class = env.find_class("android/media/AudioRecord")
+
+        let recorder_class = env
+            .find_class("android/media/AudioRecord")
             .map_err(|e| format!("Failed to find AudioRecord class: {}", e))?;
-        
-        let size = env.call_static_method(
-            recorder_class,
-            "getMinBufferSize",
-            "(III)I",
-            &[
-                JValue::Int(sample_rate),
-                JValue::Int(channel_config),
-                JValue::Int(audio_format),
-            ]
-        )
-        .map_err(|e| format!("Failed to get min buffer size: {}", e))?
-        .i()
-        .map_err(|e| format!("Failed to convert result: {}", e))?;
-        
+
+        let size = env
+            .call_static_method(
+                recorder_class,
+                "getMinBufferSize",
+                "(III)I",
+                &[
+                    JValue::Int(sample_rate),
+                    JValue::Int(channel_config),
+                    JValue::Int(audio_format),
+                ],
+            )
+            .map_err(|e| format!("Failed to get min buffer size: {}", e))?
+            .i()
+            .map_err(|e| format!("Failed to convert result: {}", e))?;
+
         Ok(size)
     }
-    
+
     /// Start recording
     pub fn start_recording(&self) -> Result<(), String> {
         let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
+        let mut env = vm
+            .attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
+
         env.call_method(self.recorder.as_obj(), "startRecording", "()V", &[])
             .map_err(|e| format!("Failed to start recording: {}", e))?;
-        
+
         Ok(())
     }
-    
+
     /// Stop recording
     pub fn stop(&self) -> Result<(), String> {
         let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
+        let mut env = vm
+            .attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
+
         env.call_method(self.recorder.as_obj(), "stop", "()V", &[])
             .map_err(|e| format!("Failed to stop recording: {}", e))?;
-        
+
         Ok(())
     }
-    
+
     /// Read audio data
     pub fn read(&self, buffer: &mut [i16]) -> Result<usize, String> {
         let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
+        let mut env = vm
+            .attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
 
         // Push a local-ref frame so the short[] we allocate each call is freed
@@ -191,22 +231,24 @@ impl AndroidAudioRecord {
             .map_err(|e| format!("Failed to push local frame: {}", e))?;
 
         let result: Result<usize, String> = (|| {
-            let jarray = env.new_short_array(buffer.len() as i32)
+            let jarray = env
+                .new_short_array(buffer.len() as i32)
                 .map_err(|e| format!("Failed to create short array: {}", e))?;
             let jarray_obj = unsafe { JObject::from_raw(jarray.as_raw()) };
-            let bytes_read = env.call_method(
-                self.recorder.as_obj(),
-                "read",
-                "([SII)I",
-                &[
-                    JValue::Object(&jarray_obj),
-                    JValue::Int(0),
-                    JValue::Int(buffer.len() as i32),
-                ]
-            )
-            .map_err(|e| format!("Failed to read: {}", e))?
-            .i()
-            .map_err(|e| format!("Failed to convert result: {}", e))?;
+            let bytes_read = env
+                .call_method(
+                    self.recorder.as_obj(),
+                    "read",
+                    "([SII)I",
+                    &[
+                        JValue::Object(&jarray_obj),
+                        JValue::Int(0),
+                        JValue::Int(buffer.len() as i32),
+                    ],
+                )
+                .map_err(|e| format!("Failed to read: {}", e))?
+                .i()
+                .map_err(|e| format!("Failed to convert result: {}", e))?;
 
             if bytes_read <= 0 {
                 return Ok(0);
@@ -217,19 +259,22 @@ impl AndroidAudioRecord {
             Ok(bytes_read as usize)
         })();
 
-        unsafe { let _ = env.pop_local_frame(&JObject::null()); }
+        unsafe {
+            let _ = env.pop_local_frame(&JObject::null());
+        }
         result
     }
-    
+
     /// Release resources
     pub fn release(&self) -> Result<(), String> {
         let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
+        let mut env = vm
+            .attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
+
         env.call_method(self.recorder.as_obj(), "release", "()V", &[])
             .map_err(|e| format!("Failed to release: {}", e))?;
-        
+
         Ok(())
     }
 }
@@ -243,25 +288,32 @@ impl AndroidAudioTrack {
     /// Minimum AudioTrack buffer size for the given format. AudioTrack has
     /// different buffer-size requirements than AudioRecord, so we must query
     /// the correct class — otherwise playback under-allocates and glitches.
-    pub fn get_min_buffer_size(sample_rate: i32, channel_config: i32, audio_format: i32) -> Result<i32, String> {
+    pub fn get_min_buffer_size(
+        sample_rate: i32,
+        channel_config: i32,
+        audio_format: i32,
+    ) -> Result<i32, String> {
         let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
+        let mut env = vm
+            .attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        let track_class = env.find_class("android/media/AudioTrack")
+        let track_class = env
+            .find_class("android/media/AudioTrack")
             .map_err(|e| format!("Failed to find AudioTrack class: {}", e))?;
-        let size = env.call_static_method(
-            track_class,
-            "getMinBufferSize",
-            "(III)I",
-            &[
-                JValue::Int(sample_rate),
-                JValue::Int(channel_config),
-                JValue::Int(audio_format),
-            ]
-        )
-        .map_err(|e| format!("Failed to get min buffer size: {}", e))?
-        .i()
-        .map_err(|e| format!("Failed to convert result: {}", e))?;
+        let size = env
+            .call_static_method(
+                track_class,
+                "getMinBufferSize",
+                "(III)I",
+                &[
+                    JValue::Int(sample_rate),
+                    JValue::Int(channel_config),
+                    JValue::Int(audio_format),
+                ],
+            )
+            .map_err(|e| format!("Failed to get min buffer size: {}", e))?
+            .i()
+            .map_err(|e| format!("Failed to convert result: {}", e))?;
         Ok(size)
     }
 
@@ -276,32 +328,46 @@ impl AndroidAudioTrack {
     /// `STREAM_MUSIC, MODE_STREAM` constructor we used before routed audio
     /// through that chain by default and was the single biggest contributor
     /// to bad voice quality.
-    pub fn new(sample_rate: i32, channel_config: i32, audio_format: i32, buffer_size: i32) -> Result<Self, String> {
+    pub fn new(
+        sample_rate: i32,
+        channel_config: i32,
+        audio_format: i32,
+        buffer_size: i32,
+    ) -> Result<Self, String> {
         let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
+        let mut env = vm
+            .attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
 
-        let track_class = env.find_class("android/media/AudioTrack")
+        let track_class = env
+            .find_class("android/media/AudioTrack")
             .map_err(|e| format!("Failed to find AudioTrack class: {}", e))?;
-        let attrs_class = env.find_class("android/media/AudioAttributes")
+        let attrs_class = env
+            .find_class("android/media/AudioAttributes")
             .map_err(|e| format!("Failed to find AudioAttributes class: {}", e))?;
-        let attrs_builder_class = env.find_class("android/media/AudioAttributes$Builder")
+        let attrs_builder_class = env
+            .find_class("android/media/AudioAttributes$Builder")
             .map_err(|e| format!("Failed to find AudioAttributes.Builder class: {}", e))?;
-        let _format_class = env.find_class("android/media/AudioFormat")
+        let _format_class = env
+            .find_class("android/media/AudioFormat")
             .map_err(|e| format!("Failed to find AudioFormat class: {}", e))?;
-        let format_builder_class = env.find_class("android/media/AudioFormat$Builder")
+        let format_builder_class = env
+            .find_class("android/media/AudioFormat$Builder")
             .map_err(|e| format!("Failed to find AudioFormat.Builder class: {}", e))?;
 
-        let usage_voice_comm = env.get_static_field(&attrs_class, "USAGE_VOICE_COMMUNICATION", "I")
+        let usage_voice_comm = env
+            .get_static_field(&attrs_class, "USAGE_VOICE_COMMUNICATION", "I")
             .map_err(|e| format!("Failed to get USAGE_VOICE_COMMUNICATION: {}", e))?
             .i()
             .map_err(|e| format!("Failed to convert field: {}", e))?;
-        let content_speech = env.get_static_field(&attrs_class, "CONTENT_TYPE_SPEECH", "I")
+        let content_speech = env
+            .get_static_field(&attrs_class, "CONTENT_TYPE_SPEECH", "I")
             .map_err(|e| format!("Failed to get CONTENT_TYPE_SPEECH: {}", e))?
             .i()
             .map_err(|e| format!("Failed to convert field: {}", e))?;
 
-        let mode_stream = env.get_static_field(&track_class, "MODE_STREAM", "I")
+        let mode_stream = env
+            .get_static_field(&track_class, "MODE_STREAM", "I")
             .map_err(|e| format!("Failed to get MODE_STREAM field: {}", e))?
             .i()
             .map_err(|e| format!("Failed to convert field: {}", e))?;
@@ -312,125 +378,147 @@ impl AndroidAudioTrack {
         let session_id_none: i32 = 0;
 
         // Build AudioAttributes(usage=VOICE_COMMUNICATION, contentType=SPEECH)
-        let attrs_builder = env.new_object(&attrs_builder_class, "()V", &[])
+        let attrs_builder = env
+            .new_object(&attrs_builder_class, "()V", &[])
             .map_err(|e| format!("Failed to create AudioAttributes.Builder: {}", e))?;
-        let attrs_builder = env.call_method(
-            &attrs_builder,
-            "setUsage",
-            "(I)Landroid/media/AudioAttributes$Builder;",
-            &[JValue::Int(usage_voice_comm)],
-        )
+        let attrs_builder = env
+            .call_method(
+                &attrs_builder,
+                "setUsage",
+                "(I)Landroid/media/AudioAttributes$Builder;",
+                &[JValue::Int(usage_voice_comm)],
+            )
             .map_err(|e| format!("Failed setUsage: {}", e))?
             .l()
             .map_err(|e| format!("Failed setUsage return: {}", e))?;
-        let attrs_builder = env.call_method(
-            &attrs_builder,
-            "setContentType",
-            "(I)Landroid/media/AudioAttributes$Builder;",
-            &[JValue::Int(content_speech)],
-        )
+        let attrs_builder = env
+            .call_method(
+                &attrs_builder,
+                "setContentType",
+                "(I)Landroid/media/AudioAttributes$Builder;",
+                &[JValue::Int(content_speech)],
+            )
             .map_err(|e| format!("Failed setContentType: {}", e))?
             .l()
             .map_err(|e| format!("Failed setContentType return: {}", e))?;
-        let audio_attrs = env.call_method(
-            &attrs_builder,
-            "build",
-            "()Landroid/media/AudioAttributes;",
-            &[],
-        )
+        let audio_attrs = env
+            .call_method(
+                &attrs_builder,
+                "build",
+                "()Landroid/media/AudioAttributes;",
+                &[],
+            )
             .map_err(|e| format!("Failed AudioAttributes.build: {}", e))?
             .l()
             .map_err(|e| format!("Failed AudioAttributes.build return: {}", e))?;
 
         // Build AudioFormat(encoding=PCM_16, sampleRate, channelMask=channel_config)
-        let format_builder = env.new_object(&format_builder_class, "()V", &[])
+        let format_builder = env
+            .new_object(&format_builder_class, "()V", &[])
             .map_err(|e| format!("Failed to create AudioFormat.Builder: {}", e))?;
-        let format_builder = env.call_method(
-            &format_builder,
-            "setEncoding",
-            "(I)Landroid/media/AudioFormat$Builder;",
-            &[JValue::Int(audio_format)],
-        )
+        let format_builder = env
+            .call_method(
+                &format_builder,
+                "setEncoding",
+                "(I)Landroid/media/AudioFormat$Builder;",
+                &[JValue::Int(audio_format)],
+            )
             .map_err(|e| format!("Failed setEncoding: {}", e))?
             .l()
             .map_err(|e| format!("Failed setEncoding return: {}", e))?;
-        let format_builder = env.call_method(
-            &format_builder,
-            "setSampleRate",
-            "(I)Landroid/media/AudioFormat$Builder;",
-            &[JValue::Int(sample_rate)],
-        )
+        let format_builder = env
+            .call_method(
+                &format_builder,
+                "setSampleRate",
+                "(I)Landroid/media/AudioFormat$Builder;",
+                &[JValue::Int(sample_rate)],
+            )
             .map_err(|e| format!("Failed setSampleRate: {}", e))?
             .l()
             .map_err(|e| format!("Failed setSampleRate return: {}", e))?;
-        let format_builder = env.call_method(
-            &format_builder,
-            "setChannelMask",
-            "(I)Landroid/media/AudioFormat$Builder;",
-            &[JValue::Int(channel_config)],
-        )
+        let format_builder = env
+            .call_method(
+                &format_builder,
+                "setChannelMask",
+                "(I)Landroid/media/AudioFormat$Builder;",
+                &[JValue::Int(channel_config)],
+            )
             .map_err(|e| format!("Failed setChannelMask: {}", e))?
             .l()
             .map_err(|e| format!("Failed setChannelMask return: {}", e))?;
-        let audio_format_obj = env.call_method(
-            &format_builder,
-            "build",
-            "()Landroid/media/AudioFormat;",
-            &[],
-        )
+        let audio_format_obj = env
+            .call_method(
+                &format_builder,
+                "build",
+                "()Landroid/media/AudioFormat;",
+                &[],
+            )
             .map_err(|e| format!("Failed AudioFormat.build: {}", e))?
             .l()
             .map_err(|e| format!("Failed AudioFormat.build return: {}", e))?;
 
         // AudioTrack(AudioAttributes, AudioFormat, bufferSizeInBytes, mode, sessionId)
-        let track = env.new_object(
-            &track_class,
-            "(Landroid/media/AudioAttributes;Landroid/media/AudioFormat;III)V",
-            &[
-                JValue::Object(&audio_attrs),
-                JValue::Object(&audio_format_obj),
-                JValue::Int(buffer_size),
-                JValue::Int(mode_stream),
-                JValue::Int(session_id_none),
-            ],
-        )
-        .map_err(|e| format!("Failed to create AudioTrack (voice): {}", e))?;
+        let track = env
+            .new_object(
+                &track_class,
+                "(Landroid/media/AudioAttributes;Landroid/media/AudioFormat;III)V",
+                &[
+                    JValue::Object(&audio_attrs),
+                    JValue::Object(&audio_format_obj),
+                    JValue::Int(buffer_size),
+                    JValue::Int(mode_stream),
+                    JValue::Int(session_id_none),
+                ],
+            )
+            .map_err(|e| format!("Failed to create AudioTrack (voice): {}", e))?;
 
-        let global_ref = env.new_global_ref(&track)
+        let global_ref = env
+            .new_global_ref(&track)
             .map_err(|e| format!("Failed to create global ref: {}", e))?;
 
         info!("AudioTrack created with USAGE_VOICE_COMMUNICATION + CONTENT_TYPE_SPEECH (bypasses OEM media post-processing)");
         Ok(Self { track: global_ref })
     }
-    
+
     /// Start playback
     pub fn play(&self) -> Result<(), String> {
         let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
+        let mut env = vm
+            .attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
+
         env.call_method(self.track.as_obj(), "play", "()V", &[])
             .map_err(|e| format!("Failed to start playback: {}", e))?;
-        
+
         Ok(())
     }
-    
+
+    /// Pin this track to the sticky RX sink (loudspeaker unless a real
+    /// headset is connected). Best-effort — failure must not block play.
+    pub fn pin_rx_output(&self) {
+        if let Err(e) = crate::audio_routing::pin_track(&self.track.as_obj()) {
+            warn!("AudioTrack pin_rx_output: {}", e);
+        }
+    }
+
     /// Stop playback
     pub fn stop(&self) -> Result<(), String> {
         let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
+        let mut env = vm
+            .attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
+
         env.call_method(self.track.as_obj(), "stop", "()V", &[])
             .map_err(|e| format!("Failed to stop playback: {}", e))?;
-        
+
         Ok(())
     }
-    
+
     /// Write audio data
     pub fn write(&self, buffer: &[i16]) -> Result<usize, String> {
         let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
+        let mut env = vm
+            .attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
 
         // Bound local refs per call so the playback thread's ref table
@@ -439,41 +527,46 @@ impl AndroidAudioTrack {
             .map_err(|e| format!("Failed to push local frame: {}", e))?;
 
         let result: Result<usize, String> = (|| {
-            let jarray = env.new_short_array(buffer.len() as i32)
+            let jarray = env
+                .new_short_array(buffer.len() as i32)
                 .map_err(|e| format!("Failed to create short array: {}", e))?;
 
             env.set_short_array_region(&jarray, 0, buffer)
                 .map_err(|e| format!("Failed to copy shorts: {}", e))?;
 
-            let bytes_written = env.call_method(
-                self.track.as_obj(),
-                "write",
-                "([SII)I",
-                &[
-                    JValue::Object(&jarray.into()),
-                    JValue::Int(0),
-                    JValue::Int(buffer.len() as i32),
-                ]
-            )
-            .map_err(|e| format!("Failed to write: {}", e))?
-            .i()
-            .map_err(|e| format!("Failed to convert result: {}", e))?;
+            let bytes_written = env
+                .call_method(
+                    self.track.as_obj(),
+                    "write",
+                    "([SII)I",
+                    &[
+                        JValue::Object(&jarray.into()),
+                        JValue::Int(0),
+                        JValue::Int(buffer.len() as i32),
+                    ],
+                )
+                .map_err(|e| format!("Failed to write: {}", e))?
+                .i()
+                .map_err(|e| format!("Failed to convert result: {}", e))?;
             Ok(bytes_written as usize)
         })();
 
-        unsafe { let _ = env.pop_local_frame(&JObject::null()); }
+        unsafe {
+            let _ = env.pop_local_frame(&JObject::null());
+        }
         result
     }
-    
+
     /// Release resources
     pub fn release(&self) -> Result<(), String> {
         let vm = get_jvm()?;
-        let mut env = vm.attach_current_thread()
+        let mut env = vm
+            .attach_current_thread()
             .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        
+
         env.call_method(self.track.as_obj(), "release", "()V", &[])
             .map_err(|e| format!("Failed to release: {}", e))?;
-        
+
         Ok(())
     }
 }
@@ -483,14 +576,13 @@ impl AndroidAudioTrack {
 //==============================================================================
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::OnceLock;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
-use crate::state::StateMachine;
-use crate::session::SessionManager;
-use crate::users::UserRegistry;
-use crate::codec::{VoiceEncoder, CODEC_FRAME_SIZE};
 use crate::audio_pipeline;
+use crate::session::SessionManager;
+use crate::state::StateMachine;
+use crate::users::UserRegistry;
 
 /// Global state for JNI mode (when used from Kotlin instead of egui)
 static JNI_STATE: OnceLock<Arc<Mutex<JniAppState>>> = OnceLock::new();
@@ -508,13 +600,10 @@ struct JniAppState {
     /// held between nativeHybridHandshakeInit and ...Complete. Carries the QR PSK
     /// + ephemeral X25519/ML-KEM secrets; zeroizes on drop.
     pending_hybrid_initiator: Option<crate::pqc::PskHybridInitiator>,
-    /// BT TX buffer: Kotlin reads encoded frames from here for RFCOMM transmission
-    bt_tx_buffer: Arc<Mutex<Option<Vec<u8>>>>,
-    /// BT codec for TX (Kotlin reads encoded frames for RFCOMM transmission).
-    /// RX decode uses per-sender state inside RxSharedState on the StateMachine.
-    bt_encoder: VoiceEncoder,
-    /// Track whether BT mic capture is active for btEncodeFrame
-    bt_recording: bool,
+    /// Initiator session staged until authenticated OP_HYBRID_CONFIRM_ACK.
+    pending_hybrid_initiator_session: Option<crate::crypto::CryptoSession>,
+    /// Responder session staged until authenticated OP_HYBRID_CONFIRM.
+    pending_hybrid_responder: Option<crate::crypto::CryptoSession>,
     /// Manual-SOS beacon controller. Owns the active distress signal and its
     /// re-broadcast cadence; Kotlin drives it via nativeEmergency* and puts
     /// the returned frames on both transports. Lives here (not in Kotlin) so
@@ -540,9 +629,8 @@ impl JniAppState {
             current_subchannel,
             pending_key_exchange: None,
             pending_hybrid_initiator: None,
-            bt_tx_buffer: Arc::new(Mutex::new(None)),
-            bt_encoder: VoiceEncoder::new(),
-            bt_recording: false,
+            pending_hybrid_initiator_session: None,
+            pending_hybrid_responder: None,
             // Placeholder sender id — replaced with the live device name on
             // every activation (see nativeEmergencyActivate) so a profile
             // rename is reflected in the beacon a responder actually sees.
@@ -589,9 +677,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
             .with_max_level(log::LevelFilter::Info)
             .with_tag("SassyTalk-JNI"),
     );
-    
+
     info!("=== Sassy-Talk JNI Initializing ===");
-    
+
     // Initialize JVM for JNI bridge
     if let Ok(vm) = env.get_java_vm() {
         init_jvm(vm);
@@ -607,18 +695,22 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     {
         let class_name = "com/sassyconsulting/sassytalkie/TranscriptionBridge";
         match env.find_class(class_name) {
-            Ok(cls) => {
-                match env.new_global_ref(cls) {
-                    Ok(global) => {
-                        init_transcription_bridge_class(global);
-                    }
-                    Err(e) => {
-                        warn!("JNI: Failed to create GlobalRef for TranscriptionBridge: {:?}", e);
-                    }
+            Ok(cls) => match env.new_global_ref(cls) {
+                Ok(global) => {
+                    init_transcription_bridge_class(global);
                 }
-            }
+                Err(e) => {
+                    warn!(
+                        "JNI: Failed to create GlobalRef for TranscriptionBridge: {:?}",
+                        e
+                    );
+                }
+            },
             Err(e) => {
-                warn!("JNI: TranscriptionBridge class not found (transcription disabled): {:?}", e);
+                warn!(
+                    "JNI: TranscriptionBridge class not found (transcription disabled): {:?}",
+                    e
+                );
                 let _ = env.exception_clear();
             }
         }
@@ -671,21 +763,28 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     _class: JClass,
 ) {
     let state = get_jni_state();
-    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     // Connection guard: check if any transport has connected peers
-    let (bt_connected, transport_active) = if let Some(ref sm) = guard.state_machine {
-        let active = sm.get_active_transport();
-        let bt = active == crate::transport::ActiveTransport::Bluetooth;
-        let has_transport = active != crate::transport::ActiveTransport::None;
-        (bt, has_transport)
+        let (bt_connected, transport_active) = if let Some(ref sm) = guard.state_machine {
+        let tm = sm.get_transport().lock().unwrap_or_else(|e| e.into_inner());
+        let active = tm.active_transport();
+        let has_ip = tm.has_live_ip_transport();
+        let has_audio = tm.has_live_audio_path();
+        let bt = active == crate::transport::ActiveTransport::Bluetooth || (has_audio && !has_ip);
+        drop(tm);
+        // Sticky preferred slot is not authorization. Only a live bearer
+        // (IP or RFCOMM) may key the microphone.
+        (bt, has_audio)
     } else {
         (false, false)
     };
 
     let channel = guard.current_channel.load(Ordering::Relaxed);
-    info!("PTT START pressed — BT connected: {}, transport active: {}, channel: {}",
-          bt_connected, transport_active, channel);
+    info!(
+        "PTT START pressed — BT connected: {}, transport active: {}, channel: {}",
+        bt_connected, transport_active, channel
+    );
 
     if !transport_active && !bt_connected {
         warn!("PTT blocked: no connected peers (transport=None, BT=false)");
@@ -700,9 +799,6 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         }
     }
 
-    // Reset BT encoder state for new transmission
-    guard.bt_encoder.reset();
-    guard.bt_recording = false;
     info!("Native PTT started");
 }
 
@@ -715,31 +811,15 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     info!("JNI: PTT Stop");
 
     let state = get_jni_state();
-    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     guard.ptt_pressed.store(false, Ordering::SeqCst);
-
-    // Stop BT mic capture if active
-    if guard.bt_recording {
-        if let Some(ref sm) = guard.state_machine {
-            let audio = sm.get_audio();
-            if let Ok(eng) = audio.lock() {
-                let _ = eng.stop_recording();
-            }
-        }
-        guard.bt_recording = false;
-    }
 
     if let Some(ref sm) = guard.state_machine {
         if let Err(e) = sm.on_ptt_release() {
             error!("JNI: Failed to stop transmit: {}", e);
         }
     }
-
-    // Clear BT TX buffer
-    if let Ok(mut buf) = guard.bt_tx_buffer.lock() {
-        *buf = None;
-    };
 }
 
 /// JNI: Set PTT buffer mode (true = buffer and burst on release, false = live stream)
@@ -758,7 +838,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     _env: JNIEnv,
     _class: JClass,
 ) -> jni::sys::jboolean {
-    if crate::audio_pipeline::get_ptt_buffer_mode() { 1 } else { 0 }
+    if crate::audio_pipeline::get_ptt_buffer_mode() {
+        1
+    } else {
+        0
+    }
 }
 
 /// JNI: Enable/disable the per-frame TranscriptionBridge callback.
@@ -814,7 +898,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     _env: JNIEnv,
     _class: JClass,
 ) -> jboolean {
-    if crate::audio_effects::get_noise_suppression_enabled() { JNI_TRUE } else { JNI_FALSE }
+    if crate::audio_effects::get_noise_suppression_enabled() {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
 }
 
 /// JNI: Set max attenuation (dB) of the noise suppressor. Clamped on the Rust side.
@@ -843,7 +931,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 /// stable per-install peer id — used to derive per-epoch blinded room/peer
 /// handles. Returns false if the key isn't a valid 32-byte base64 blob.
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetSealedContext<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetSealedContext<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     key_b64: JString<'local>,
@@ -853,22 +943,23 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         Ok(s) => s.into(),
         Err(_) => return JNI_FALSE,
     };
-    let peer_id: String = env.get_string(&peer_id).map(|s| s.into()).unwrap_or_default();
+    let peer_id: String = env
+        .get_string(&peer_id)
+        .map(|s| s.into())
+        .unwrap_or_default();
 
-    let key_bytes = match base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &key_b64,
-    ) {
-        Ok(b) if b.len() == 32 => b,
-        Ok(b) => {
-            error!("JNI: sealed key wrong length: {} (expected 32)", b.len());
-            return JNI_FALSE;
-        }
-        Err(e) => {
-            error!("JNI: sealed key decode failed: {}", e);
-            return JNI_FALSE;
-        }
-    };
+    let key_bytes =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &key_b64) {
+            Ok(b) if b.len() == 32 => b,
+            Ok(b) => {
+                error!("JNI: sealed key wrong length: {} (expected 32)", b.len());
+                return JNI_FALSE;
+            }
+            Err(e) => {
+                error!("JNI: sealed key decode failed: {}", e);
+                return JNI_FALSE;
+            }
+        };
     let mut key_array = [0u8; 32];
     key_array.copy_from_slice(&key_bytes);
     crate::cellular_transport::set_sealed_context(key_array, peer_id);
@@ -957,6 +1048,34 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     }
 }
 
+/// JNI: Store loudspeaker vs earpiece preference without entering
+/// MODE_IN_COMMUNICATION. Idle standby must not engage comm-mode.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetSpeakerPreference(
+    _env: JNIEnv,
+    _class: JClass,
+    on: jni::sys::jboolean,
+) {
+    crate::audio_routing::set_desired_speaker(on != 0);
+}
+
+/// JNI: Re-apply sticky RX output (loudspeaker default) without changing
+/// the user's speakerphone preference. Safe to call after focus, PTT
+/// release, TTS, STT, or route-change broadcasts.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeReassertRxRoute(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jboolean {
+    match crate::audio_routing::reassert() {
+        Ok(()) => 1,
+        Err(e) => {
+            warn!("nativeReassertRxRoute failed: {}", e);
+            0
+        }
+    }
+}
+
 /// JNI: True if our COMM mode is currently engaged. Doesn't directly tell
 /// you speakerphone vs earpiece (that flag is internal to audio_routing),
 /// but the UI uses its own persisted preference for the toggle state — this
@@ -966,7 +1085,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     _env: JNIEnv,
     _class: JClass,
 ) -> jni::sys::jboolean {
-    if crate::audio_routing::is_active() { 1 } else { 0 }
+    if crate::audio_routing::is_active() {
+        1
+    } else {
+        0
+    }
 }
 
 /// JNI: Tune the Live-mode jitter buffer pre-buffer size. 3 = low-latency
@@ -1033,7 +1156,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     // Snapshot the frames out of the cache; we don't want to hold the cache
     // lock across the playback thread's lifetime.
     let frames = {
-        let cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let cache = sm
+            .get_audio_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match cache.get_history_frames(utterance_id as u64) {
             Some(f) if !f.is_empty() => f,
             _ => {
@@ -1056,7 +1182,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     //     resolution; two writes in the same ms still distinguishable)
     //   - playback_lock: self-exclusion so two replays can't overlap
     let (gate_clock, write_seq, playback_lock) = match audio.lock() {
-        Ok(eng) => (eng.write_clock(), eng.write_seq_handle(), eng.playback_lock_handle()),
+        Ok(eng) => (
+            eng.write_clock(),
+            eng.write_seq_handle(),
+            eng.playback_lock_handle(),
+        ),
         Err(e) => {
             warn!("Replay: failed to snapshot gate handles: {}", e);
             return JNI_FALSE;
@@ -1069,12 +1199,19 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     // nothing happened. Now we refuse synchronously and the snackbar
     // accurately reports the failure.
     if playback_lock.try_lock().is_err() {
-        warn!("Replay {}: another replay is already running, declining", utterance_id);
+        warn!(
+            "Replay {}: another replay is already running, declining",
+            utterance_id
+        );
         return JNI_FALSE;
     }
     drop(guard);
 
-    info!("JNI: Replaying utterance id={} ({} frames)", utterance_id, frames.len());
+    info!(
+        "JNI: Replaying utterance id={} ({} frames)",
+        utterance_id,
+        frames.len()
+    );
 
     let spawn_result = std::thread::Builder::new()
         .name(format!("sassy-replay-{}", utterance_id))
@@ -1098,7 +1235,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
             let _replay_guard = match playback_lock.try_lock() {
                 Ok(g) => g,
                 Err(_) => {
-                    warn!("Replay {}: lost race for replay lock after spawn", utterance_id);
+                    warn!(
+                        "Replay {}: lost race for replay lock after spawn",
+                        utterance_id
+                    );
                     return;
                 }
             };
@@ -1106,7 +1246,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
             // Wait for live RX to quiet down before starting. Polls the
             // wall-clock idle; if RX is hot, we wait up to 3 s and bail
             // if it never quiets.
-            if !crate::audio::wait_for_playback_idle(&gate_clock, GATE_MIN_IDLE_MS, GATE_MAX_WAIT_MS) {
+            if !crate::audio::wait_for_playback_idle(
+                &gate_clock,
+                GATE_MIN_IDLE_MS,
+                GATE_MAX_WAIT_MS,
+            ) {
                 warn!(
                     "Replay {}: gave up after {}ms — live audio still active",
                     utterance_id, GATE_MAX_WAIT_MS
@@ -1165,8 +1309,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
             }
             info!("Replay {} complete", utterance_id);
             // _replay_guard drops here → another replay can run.
-        })
-        ;
+        });
 
     // Thread spawn failure (rare — OOM, ulimit) shouldn't panic inside
     // a JNI call. Translate to a JNI_FALSE return so the UI snackbar
@@ -1190,7 +1333,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let cache = sm
+            .get_audio_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cache.last_history_id().map(|id| id as i64).unwrap_or(-1)
     } else {
         -1
@@ -1241,138 +1387,24 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Encode one audio frame for BT transmission.
 ///
-/// Reads mic → Opus encode → pack wire frame → return byte[] for Kotlin to send via RFCOMM.
-/// Returns null if no audio data available.
+/// Poll the Bluetooth copy of the frame captured and encoded once by the shared
+/// TX thread. Kotlin must no longer trigger a second AudioRecord read here.
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeBtEncodeFrame<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeBtEncodeFrame<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jni::sys::jbyteArray {
-    use jni::objects::JByteArray;
-
     let state = get_jni_state();
-    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-
-    if guard.state_machine.is_none() {
-        return std::ptr::null_mut();
-    }
-
-    // Start mic recording if not already
-    if !guard.bt_recording {
-        if let Some(ref sm) = guard.state_machine {
-            let audio = sm.get_audio();
-            if let Ok(eng) = audio.lock() {
-                match eng.start_recording() {
-                    Ok(()) => {}
-                    Err(e) => {
-                        error!("BT TX: failed to start recording: {}", e);
-                        return std::ptr::null_mut();
-                    }
-                }
-            }
-        }
-        guard.bt_recording = true;
-        info!("BT TX: started mic recording");
-    }
-
-    let sm = guard.state_machine.as_ref().unwrap();
-
-    // Read one frame from mic
-    let mut pcm_buffer = vec![0i16; CODEC_FRAME_SIZE];
-    let samples_read = {
-        let audio = sm.get_audio();
-        if let Ok(eng) = audio.lock() {
-            match eng.read_audio(&mut pcm_buffer) {
-                Ok(n) => n,
-                Err(_) => 0,
-            }
-        } else {
-            0
-        }
-    };
-
-    if samples_read < CODEC_FRAME_SIZE {
-        return std::ptr::null_mut(); // Incomplete frame, caller should retry
-    }
-
-    // Apply mic gain + squelch + activity-log feed symmetrically with the
-    // unified pipeline so BT users get the same Settings controls. If the
-    // squelch threshold drops this frame, we return null and Kotlin will
-    // simply not transmit it over RFCOMM.
-    audio_pipeline::apply_mic_gain_public(&mut pcm_buffer[..CODEC_FRAME_SIZE]);
-    if audio_pipeline::squelch_drops_frame(&pcm_buffer[..CODEC_FRAME_SIZE]) {
-        return std::ptr::null_mut();
-    }
-
-    // Encode with Opus
-    let compressed = guard.bt_encoder.encode(&pcm_buffer[..CODEC_FRAME_SIZE]);
-
-    // Mirror the unified-pipeline activity-log feed so BT speakers also
-    // appear in the timeline.
-    let bridge_sender_id;
-    let bridge_device_name;
-    {
-        let sm_for_bridge = guard.state_machine.as_ref();
-        bridge_sender_id = sm_for_bridge.map(|s| s.get_local_sender_id()).unwrap_or_default();
-        bridge_device_name = sm_for_bridge.map(|s| s.get_device_name()).unwrap_or_default();
-    }
-    audio_pipeline::call_transcription_bridge_public(
-        &bridge_sender_id,
-        &bridge_device_name,
-        &pcm_buffer[..CODEC_FRAME_SIZE],
-        false,
-        false,
-        true, // is_self — local BT transmit (timeline only, no "is speaking" UI)
-    );
-
-    // Pack wire frame
-    let channel = guard.current_channel.load(Ordering::SeqCst);
-    let subchannel = guard.current_subchannel.load(Ordering::SeqCst);
-    let (sender_id, device_name) = if let Some(ref sm) = guard.state_machine {
-        (sm.get_local_sender_id(), sm.get_device_name())
-    } else {
-        ("unknown".to_string(), "unknown".to_string())
-    };
-    let timestamp = audio_pipeline::now_ms();
-    let wire_data = audio_pipeline::pack_wire_frame(channel, subchannel, &sender_id, &device_name, timestamp, &compressed);
-
-    // Encrypt through the same AES-256-GCM path as WiFi/cellular.
-    //
-    // SECURITY + ROBUSTNESS: if there is no active crypto session, REFUSE to
-    // transmit. The old behaviour was to fall back to sending plaintext —
-    // which when paired with the matching "fallback to plaintext on decrypt
-    // failure" on the receive side meant any peer with a mismatched key
-    // (or no key) would receive AES-GCM ciphertext, feed it to the Opus
-    // decoder as if it were a wire frame, and emit garbled noise. That is
-    // the actual cause of the BT "garbled audio" symptom.
-    let encrypted = match guard.state_machine.as_ref() {
-        Some(sm) => {
-            let transport = sm.get_transport();
-            let mut tm = match transport.lock() {
-                Ok(t) => t,
-                Err(e) => {
-                    error!("BT TX: transport lock poisoned: {}", e);
-                    return std::ptr::null_mut();
-                }
-            };
-            match tm.encrypt_raw(&wire_data) {
-                Ok(enc) => enc,
-                Err(e) => {
-                    // No crypto session — drop the frame rather than leak
-                    // plaintext over BT. UI should surface "authenticate
-                    // via QR" if no session is established.
-                    warn!("BT TX: encrypt failed ({}), dropping frame", e);
-                    return std::ptr::null_mut();
-                }
-            }
-        }
-        None => return std::ptr::null_mut(),
-    };
-
-    // Return as byte array
-    match env.byte_array_from_slice(&encrypted) {
-        Ok(arr) => arr.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let data = guard
+        .state_machine
+        .as_ref()
+        .and_then(|sm| sm.poll_bluetooth_outbound());
+    match data.and_then(|bytes| env.byte_array_from_slice(&bytes).ok()) {
+        Some(arr) => arr.into_raw(),
+        None => std::ptr::null_mut(),
     }
 }
 
@@ -1381,7 +1413,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 /// Kotlin passes raw bytes received from RFCOMM → unpack wire frame → ADPCM decode → play.
 /// Returns true if frame was accepted, false if rejected (wrong channel, malformed, etc.)
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeBtDecodeFrame<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeBtDecodeFrame<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     data: jni::sys::jbyteArray,
@@ -1396,7 +1430,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     };
 
     let state = get_jni_state();
-    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     // Decrypt through the same AES-256-GCM path as WiFi/cellular.
     //
@@ -1410,7 +1444,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let decrypted = match guard.state_machine.as_ref() {
         Some(sm) => {
             let transport = sm.get_transport();
-            let tm = match transport.lock() {
+            let mut tm = match transport.lock() {
                 Ok(t) => t,
                 Err(e) => {
                     error!("BT RX: transport lock poisoned: {}", e);
@@ -1429,7 +1463,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     };
 
     // Unpack wire frame (now decrypted)
-    let (channel, subchannel, sender_id, device_name, timestamp, compressed) = match audio_pipeline::unpack_wire_frame(&decrypted) {
+    let frame = match audio_pipeline::unpack_wire_frame_detailed(&decrypted) {
         Ok(parsed) => parsed,
         Err(e) => {
             warn!("btDecodeFrame: invalid wire frame: {}", e);
@@ -1448,12 +1482,14 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
             &sm.get_local_sender_id(),
             my_channel,
             my_subchannel,
-            channel,
-            subchannel,
-            &sender_id,
-            &device_name,
-            timestamp,
-            &compressed,
+            frame.channel,
+            frame.subchannel,
+            &frame.sender_id,
+            &frame.device_name,
+            frame.timestamp,
+            frame.stream_epoch,
+            frame.sequence,
+            &frame.compressed,
             true,
         );
     } else {
@@ -1482,6 +1518,66 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         }
     } else {
         0
+    }
+}
+
+/// JNI: sticky preferred transport, independent of current bearer liveness.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetPreferredTransport(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jbyte {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .state_machine
+        .as_ref()
+        .map(|sm| match sm.get_preferred_transport() {
+            crate::transport::ActiveTransport::None => 0,
+            crate::transport::ActiveTransport::Wifi => 2,
+            crate::transport::ActiveTransport::WifiDirect => 3,
+            crate::transport::ActiveTransport::Cellular => 4,
+            crate::transport::ActiveTransport::Bluetooth => 5,
+        })
+        .unwrap_or(0)
+}
+
+/// JNI: true while any live audio bearer exists (not merely a sticky slot).
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHasLiveAudioPath(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let live = guard
+        .state_machine
+        .as_ref()
+        .map(|sm| {
+            sm.get_transport()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .has_live_audio_path()
+        })
+        .unwrap_or(false);
+    if live {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// JNI: report the result of the real RFCOMM write for the last polled frame.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeBtReportSendResult(
+    _env: JNIEnv,
+    _class: JClass,
+    success: jboolean,
+) {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref sm) = guard.state_machine {
+        sm.report_bluetooth_send_result(success != 0);
     }
 }
 
@@ -1532,7 +1628,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Generate a session QR code payload
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGenerateSessionQR<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGenerateSessionQR<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     duration_hours: jni::sys::jint,
@@ -1540,11 +1638,16 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     // Legacy: generate for current channel with default name
     let state = get_jni_state();
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    let channel = guard.current_channel.load(std::sync::atomic::Ordering::SeqCst);
+    let channel = guard
+        .current_channel
+        .load(std::sync::atomic::Ordering::SeqCst);
     drop(guard);
 
     Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGenerateChannelQR(
-        env, _class, channel as jni::sys::jint, duration_hours,
+        env,
+        _class,
+        channel as jni::sys::jint,
+        duration_hours,
         std::ptr::null_mut(), // null group_name = use default
         std::ptr::null_mut(), // null cohort_id = mint fresh
     )
@@ -1552,7 +1655,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Generate session QR for a specific channel with optional group name + cohort_id
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGenerateChannelQR<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGenerateChannelQR<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     channel: jni::sys::jint,
@@ -1563,7 +1668,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let ch = channel as u8;
     let name: String = if !group_name.is_null() {
         let j_name = unsafe { JString::from_raw(group_name) };
-        env.get_string(&j_name).map(|s| s.into()).unwrap_or_default()
+        env.get_string(&j_name)
+            .map(|s| s.into())
+            .unwrap_or_default()
     } else {
         String::new()
     };
@@ -1574,18 +1681,27 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         None
     };
 
-    info!("JNI: Generate session QR ch{} '{}' cohort={:?} ({}h)", ch, name, cohort, duration_hours);
+    info!(
+        "JNI: Generate session QR ch{} '{}' cohort={:?} ({}h)",
+        ch, name, cohort, duration_hours
+    );
 
     let state = get_jni_state();
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     let qr_json = match guard.session_manager.generate_session_qr_with_cohort(
-        ch, duration_hours as u32, &name, cohort.as_deref(),
+        ch,
+        duration_hours as u32,
+        &name,
+        cohort.as_deref(),
     ) {
         Ok(json) => json,
         Err(e) => {
             error!("JNI: Generate QR failed: {}", e);
-            return env.new_string("").map(|s| s.into()).unwrap_or_else(|_| JObject::null());
+            return env
+                .new_string("")
+                .map(|s| s.into())
+                .unwrap_or_else(|_| JObject::null());
         }
     };
 
@@ -1600,8 +1716,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     if !cid.is_empty() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs()).unwrap_or(0);
-        guard.cohort_history.upsert_host(ch, &name, Some(&cid), &sid, now);
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        guard
+            .cohort_history
+            .upsert_host(ch, &name, Some(&cid), &sid, now);
     }
 
     if let Some(ref sm) = guard.state_machine {
@@ -1634,7 +1753,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Import a session from scanned QR code
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeImportSessionFromQR<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeImportSessionFromQR<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     qr_json: JString<'local>,
@@ -1655,22 +1776,32 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
                 let mut tm = sm.get_transport().lock().unwrap_or_else(|e| e.into_inner());
                 tm.set_crypto(crypto);
             }
-            guard.current_channel.store(channel, std::sync::atomic::Ordering::SeqCst);
+            guard
+                .current_channel
+                .store(channel, std::sync::atomic::Ordering::SeqCst);
 
             let mut imported_sid = String::new();
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json) {
                 let host_dev = parsed["device"].as_str().unwrap_or("").to_string();
                 let sid = parsed["session_id"].as_str().unwrap_or("").to_string();
                 imported_sid = sid.clone();
-                let gname = parsed["group_name"].as_str()
+                let gname = parsed["group_name"]
+                    .as_str()
                     .map(|s| s.to_string())
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| format!("Channel {}", channel));
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs()).unwrap_or(0);
-                guard.cohort_history.upsert_joiner(channel, &gname, Some(&cohort_id),
-                                                   &host_dev, &sid, now);
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                guard.cohort_history.upsert_joiner(
+                    channel,
+                    &gname,
+                    Some(&cohort_id),
+                    &host_dev,
+                    &sid,
+                    now,
+                );
             }
 
             // Sync the cellular relay room to the imported session_id so the
@@ -1681,11 +1812,17 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
             if !imported_sid.is_empty() {
                 if let Some(ref sm) = guard.state_machine {
                     sm.set_cellular_room(imported_sid.clone());
-                    info!("JNI: Cellular room synced to imported session_id {}", imported_sid);
+                    info!(
+                        "JNI: Cellular room synced to imported session_id {}",
+                        imported_sid
+                    );
                 }
             }
 
-            info!("JNI: Session imported successfully for ch{} cohort {}", channel, cohort_id);
+            info!(
+                "JNI: Session imported successfully for ch{} cohort {}",
+                channel, cohort_id
+            );
             JNI_TRUE
         }
         Err(e) => {
@@ -1713,7 +1850,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Get session status as JSON
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetSessionStatus<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetSessionStatus<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JObject<'local> {
@@ -1730,7 +1869,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Get cohort history as JSON array
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetCohortHistory<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetCohortHistory<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JObject<'local> {
@@ -1738,12 +1879,16 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
     let json = guard.cohort_history.to_json();
     drop(guard);
-    env.new_string(&json).map(|s| s.into()).unwrap_or_else(|_| JObject::null())
+    env.new_string(&json)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| JObject::null())
 }
 
 /// JNI: Load cohort history from a previously-saved blob (called once on init)
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeLoadCohortHistory<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeLoadCohortHistory<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     blob: JString<'local>,
@@ -1755,13 +1900,16 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let state = get_jni_state();
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
     guard.cohort_history = crate::cohort_history::CohortHistory::load_from_json(
-        &json, crate::cohort_history::DEFAULT_HISTORY_CAP,
+        &json,
+        crate::cohort_history::DEFAULT_HISTORY_CAP,
     );
 }
 
 /// JNI: Remove a single cohort by id
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeRemoveCohort<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeRemoveCohort<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     cohort_id: JString<'local>,
@@ -1788,22 +1936,31 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Get the active cohort_id for a channel (empty string if no active session there)
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetActiveCohortId<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetActiveCohortId<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     channel: jni::sys::jint,
 ) -> JObject<'local> {
     let state = get_jni_state();
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    let cid = guard.session_manager.get_active_cohort_id(channel as u8).unwrap_or_default();
+    let cid = guard
+        .session_manager
+        .get_active_cohort_id(channel as u8)
+        .unwrap_or_default();
     drop(guard);
-    env.new_string(&cid).map(|s| s.into()).unwrap_or_else(|_| JObject::null())
+    env.new_string(&cid)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| JObject::null())
 }
 
 /// JNI: Snapshot participants for the active cohort on a given channel.
 /// Called by Kotlin every ~30s while a session is active.
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSnapshotCohortParticipants<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSnapshotCohortParticipants<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     channel: jni::sys::jint,
@@ -1819,7 +1976,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let state = get_jni_state();
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cid) = guard.session_manager.get_active_cohort_id(channel as u8) {
-        guard.cohort_history.snapshot_participants(&cid, participants);
+        guard
+            .cohort_history
+            .snapshot_participants(&cid, participants);
     }
 }
 
@@ -1829,7 +1988,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Get all known users as JSON array
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetUsers<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetUsers<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JObject<'local> {
@@ -1839,7 +2000,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     // Read from the StateMachine's registry (where RX thread registers users),
     // NOT from JniState.user_registry which is a separate instance.
     let json = if let Some(ref sm) = guard.state_machine {
-        let reg = sm.get_user_registry().lock().unwrap_or_else(|e| e.into_inner());
+        let reg = sm
+            .get_user_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reg.to_json()
     } else {
         guard.user_registry.to_json()
@@ -1853,7 +2017,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Set user mute status
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetMuted<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetMuted<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     user_id: JString<'local>,
@@ -1869,7 +2035,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
     // Write to StateMachine's registry (where RX thread reads), not JniState's copy
     if let Some(ref sm) = guard.state_machine {
-        let mut reg = sm.get_user_registry().lock().unwrap_or_else(|e| e.into_inner());
+        let mut reg = sm
+            .get_user_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reg.set_muted(&id, muted == JNI_TRUE);
     } else {
         drop(guard);
@@ -1880,7 +2049,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Set user favorite status
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetFavorite<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetFavorite<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     user_id: JString<'local>,
@@ -1896,7 +2067,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
     // Write to StateMachine's registry (where RX thread reads), not JniState's copy
     if let Some(ref sm) = guard.state_machine {
-        let mut reg = sm.get_user_registry().lock().unwrap_or_else(|e| e.into_inner());
+        let mut reg = sm
+            .get_user_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reg.set_favorite(&id, favorite == JNI_TRUE);
     } else {
         drop(guard);
@@ -1907,7 +2081,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Remove a user from the registry (peer left / out of contact).
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeRemoveUser<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeRemoveUser<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     user_id: JString<'local>,
@@ -1921,7 +2097,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let mut reg = sm.get_user_registry().lock().unwrap_or_else(|e| e.into_inner());
+        let mut reg = sm
+            .get_user_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reg.remove_user(&id);
     } else {
         drop(guard);
@@ -1975,7 +2154,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Get per-channel info as JSON array
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetChannelInfo<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetChannelInfo<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JObject<'local> {
@@ -1983,12 +2164,16 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
     let json = guard.session_manager.get_channel_info();
     drop(guard);
-    env.new_string(&json).map(|s| s.into()).unwrap_or_else(|_| JObject::null())
+    env.new_string(&json)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| JObject::null())
 }
 
 /// JNI: Set custom group name for a channel
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetGroupName<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetGroupName<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     channel: jni::sys::jint,
@@ -2000,12 +2185,16 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     };
     let state = get_jni_state();
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    guard.session_manager.set_group_name(channel as u8, &group_name);
+    guard
+        .session_manager
+        .set_group_name(channel as u8, &group_name);
 }
 
 /// JNI: Get group name for a specific channel
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetGroupName<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetGroupName<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     channel: jni::sys::jint,
@@ -2014,12 +2203,16 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
     let name = guard.session_manager.get_group_name(channel as u8);
     drop(guard);
-    env.new_string(&name).map(|s| s.into()).unwrap_or_else(|_| JObject::null())
+    env.new_string(&name)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| JObject::null())
 }
 
 /// JNI: Register a user in the registry (called when a peer connects)
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeRegisterUser<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeRegisterUser<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     user_id: JString<'local>,
@@ -2042,12 +2235,17 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     // Also check muted/favorite status for logging
     let is_muted = guard.user_registry.is_muted(&id);
     let is_fav = guard.user_registry.is_favorite(&id);
-    info!("JNI: Registered user {} ({}) muted={} fav={}", name, id, is_muted, is_fav);
+    info!(
+        "JNI: Registered user {} ({}) muted={} fav={}",
+        name, id, is_muted, is_fav
+    );
 }
 
 /// JNI: Get favorites as JSON array
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetFavorites<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetFavorites<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JObject<'local> {
@@ -2060,7 +2258,8 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let json = serde_json::json!({
         "favorites": favs,
         "others": others,
-    }).to_string();
+    })
+    .to_string();
 
     drop(guard);
 
@@ -2071,7 +2270,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Derive user ID from session key (for consistent identity)
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeDeriveUserId<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeDeriveUserId<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     session_key_b64: JString<'local>,
@@ -2081,13 +2282,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         Err(_) => return JObject::null(),
     };
 
-    let key_bytes = match base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &key_b64,
-    ) {
-        Ok(b) => b,
-        Err(_) => return JObject::null(),
-    };
+    let key_bytes =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &key_b64) {
+            Ok(b) => b,
+            Err(_) => return JObject::null(),
+        };
 
     let user_id = crate::users::UserRegistry::derive_user_id(&key_bytes);
 
@@ -2098,15 +2297,14 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Generate a fresh pre-shared key (base64 encoded)
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGeneratePsk<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGeneratePsk<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JObject<'local> {
     let psk = crate::crypto::generate_psk();
-    let psk_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        &psk,
-    );
+    let psk_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &psk);
 
     env.new_string(&psk_b64)
         .map(|s| s.into())
@@ -2125,20 +2323,18 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         Err(_) => return JNI_FALSE,
     };
 
-    let key_bytes = match base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &key_b64,
-    ) {
-        Ok(b) if b.len() == 32 => b,
-        Ok(b) => {
-            error!("JNI: PSK wrong length: {} (expected 32)", b.len());
-            return JNI_FALSE;
-        }
-        Err(e) => {
-            error!("JNI: PSK decode failed: {}", e);
-            return JNI_FALSE;
-        }
-    };
+    let key_bytes =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &key_b64) {
+            Ok(b) if b.len() == 32 => b,
+            Ok(b) => {
+                error!("JNI: PSK wrong length: {} (expected 32)", b.len());
+                return JNI_FALSE;
+            }
+            Err(e) => {
+                error!("JNI: PSK decode failed: {}", e);
+                return JNI_FALSE;
+            }
+        };
 
     let mut key_array = [0u8; 32];
     key_array.copy_from_slice(&key_bytes);
@@ -2157,7 +2353,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Check permissions via Android runtime (returns JSON with status)
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCheckPermissions<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCheckPermissions<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JObject<'local> {
@@ -2169,7 +2367,8 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         "all_granted": all_granted,
         "record_audio": format!("{:?}", perms.record_audio),
         "has_critical": pm.has_critical_permissions(),
-    }).to_string();
+    })
+    .to_string();
 
     env.new_string(&json)
         .map(|s| s.into())
@@ -2178,7 +2377,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Handle a permission result callback from the Activity
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeOnPermissionResult<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeOnPermissionResult<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     permission: JString<'local>,
@@ -2193,7 +2394,12 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     pm.on_permission_result(&perm, granted == JNI_TRUE);
 
     let explanation = pm.get_permission_explanation(&perm);
-    info!("JNI: Permission {} = {} ({})", perm, granted == JNI_TRUE, explanation);
+    info!(
+        "JNI: Permission {} = {} ({})",
+        perm,
+        granted == JNI_TRUE,
+        explanation
+    );
 }
 
 /// JNI: Get WiFi transport state (0=Inactive, 1=Discovering, 2=Active, 3=Error)
@@ -2219,7 +2425,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Start ECDH key exchange - returns local public key as base64
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeKeyExchangeInit<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeKeyExchangeInit<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JObject<'local> {
@@ -2227,10 +2435,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
     let kx = crate::crypto::KeyExchange::new();
     let pub_key = kx.public_key_bytes();
-    let pub_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        &pub_key,
-    );
+    let pub_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &pub_key);
 
     // Store the key exchange in JNI state for completion
     let state = get_jni_state();
@@ -2246,7 +2451,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Complete ECDH key exchange with remote public key (base64)
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeKeyExchangeComplete<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeKeyExchangeComplete<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     remote_pub_b64: JString<'local>,
@@ -2256,20 +2463,18 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         Err(_) => return JNI_FALSE,
     };
 
-    let remote_bytes = match base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &remote_b64,
-    ) {
-        Ok(b) if b.len() == 32 => b,
-        Ok(b) => {
-            error!("JNI: Remote pubkey wrong length: {} (expected 32)", b.len());
-            return JNI_FALSE;
-        }
-        Err(e) => {
-            error!("JNI: Remote pubkey decode failed: {}", e);
-            return JNI_FALSE;
-        }
-    };
+    let remote_bytes =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &remote_b64) {
+            Ok(b) if b.len() == 32 => b,
+            Ok(b) => {
+                error!("JNI: Remote pubkey wrong length: {} (expected 32)", b.len());
+                return JNI_FALSE;
+            }
+            Err(e) => {
+                error!("JNI: Remote pubkey decode failed: {}", e);
+                return JNI_FALSE;
+            }
+        };
 
     let mut key_array = [0u8; 32];
     key_array.copy_from_slice(&remote_bytes);
@@ -2321,7 +2526,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 /// init/respond MESSAGE EXCHANGE over a transport (which control opcode carries
 /// them, initiator/responder role assignment) is the remaining Phase-3 step.
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHybridHandshakeInit<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHybridHandshakeInit<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     channel: jni::sys::jint,
@@ -2356,7 +2563,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 /// returns the responder message (X25519 pub || ML-KEM ciphertext, base64) to
 /// send back. Returns "" on failure.
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHybridHandshakeRespond<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHybridHandshakeRespond<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     channel: jni::sys::jint,
@@ -2366,16 +2575,20 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         Ok(s) => s.into(),
         Err(_) => return JObject::null(),
     };
-    let init_bytes = match base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &init_str,
-    ) {
-        Ok(b) => b,
-        Err(e) => { error!("JNI: hybrid respond — b64 decode failed: {}", e); return JObject::null(); }
-    };
+    let init_bytes =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &init_str) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("JNI: hybrid respond — b64 decode failed: {}", e);
+                return JObject::null();
+            }
+        };
     let init_msg = match crate::pqc::HybridInitiatorMessage::from_bytes(&init_bytes) {
         Ok(m) => m,
-        Err(e) => { error!("JNI: hybrid respond — bad initiator msg: {}", e); return JObject::null(); }
+        Err(e) => {
+            error!("JNI: hybrid respond — bad initiator msg: {}", e);
+            return JObject::null();
+        }
     };
 
     let state = get_jni_state();
@@ -2383,33 +2596,38 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
     let psk = match guard.session_manager.get_psk_for_channel(channel as u8) {
         Some(p) => p,
-        None => { error!("JNI: hybrid respond — no valid PSK for channel {}", channel); return JObject::null(); }
+        None => {
+            error!("JNI: hybrid respond — no valid PSK for channel {}", channel);
+            return JObject::null();
+        }
     };
 
     match crate::pqc::psk_hybrid_respond(&psk, &init_msg) {
         Ok((resp, session)) => {
-            if let Some(ref sm) = guard.state_machine {
-                sm.set_crypto_session(session);
-            }
-            let resp_b64 = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                resp.to_bytes(),
-            );
+            // Stage only. Installing here lets a lost RESP diverge group keys.
+            guard.pending_hybrid_responder = Some(session);
+            let resp_b64 =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, resp.to_bytes());
             drop(guard);
-            info!("JNI: hybrid handshake responded (channel {})", channel);
+            info!("JNI: hybrid handshake responded (channel {}) — session staged pending confirm", channel);
             env.new_string(&resp_b64)
                 .map(|s| s.into())
                 .unwrap_or_else(|_| JObject::null())
         }
-        Err(e) => { error!("JNI: hybrid respond failed: {}", e); JObject::null() }
+        Err(e) => {
+            error!("JNI: hybrid respond failed: {}", e);
+            JObject::null()
+        }
     }
 }
 
 /// JNI: Complete the path-(a) hybrid handshake on the initiator side using the
-/// responder's message (base64). Establishes the session crypto. Returns true on
-/// success. Must follow a nativeHybridHandshakeInit on this device.
+/// responder's message (base64). Stages the session crypto pending CONFIRM_ACK.
+/// Returns true on success. Must follow a nativeHybridHandshakeInit on this device.
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHybridHandshakeComplete<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHybridHandshakeComplete<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     resp_b64: JString<'local>,
@@ -2418,16 +2636,20 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         Ok(s) => s.into(),
         Err(_) => return JNI_FALSE,
     };
-    let resp_bytes = match base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &resp_str,
-    ) {
-        Ok(b) => b,
-        Err(e) => { error!("JNI: hybrid complete — b64 decode failed: {}", e); return JNI_FALSE; }
-    };
+    let resp_bytes =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &resp_str) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("JNI: hybrid complete — b64 decode failed: {}", e);
+                return JNI_FALSE;
+            }
+        };
     let resp_msg = match crate::pqc::HybridResponderMessage::from_bytes(&resp_bytes) {
         Ok(m) => m,
-        Err(e) => { error!("JNI: hybrid complete — bad responder msg: {}", e); return JNI_FALSE; }
+        Err(e) => {
+            error!("JNI: hybrid complete — bad responder msg: {}", e);
+            return JNI_FALSE;
+        }
     };
 
     let state = get_jni_state();
@@ -2435,24 +2657,100 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
     let initiator = match guard.pending_hybrid_initiator.take() {
         Some(i) => i,
-        None => { error!("JNI: hybrid complete — no pending init (call nativeHybridHandshakeInit first)"); return JNI_FALSE; }
+        None => {
+            error!("JNI: hybrid complete — no pending init (call nativeHybridHandshakeInit first)");
+            return JNI_FALSE;
+        }
     };
 
     match initiator.complete(&resp_msg) {
         Ok(session) => {
+            // Stage only. Installing here lets a lost CONFIRM diverge keys:
+            // initiator would be on the new PQ session while the responder
+            // never confirmed and stayed on the QR PSK.
+            guard.pending_hybrid_initiator_session = Some(session);
+            info!("JNI: hybrid handshake completed — initiator session staged pending ack");
+            JNI_TRUE
+        }
+        Err(e) => {
+            error!("JNI: hybrid complete failed: {}", e);
+            JNI_FALSE
+        }
+    }
+}
+
+/// JNI: Arm staged responder hybrid session for RX after authenticated confirm.
+/// TX stays on the live (old) key until peer ciphertext promotes the stage.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHybridHandshakeConfirm(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.pending_hybrid_responder.take() {
+        Some(session) => {
+            if let Some(ref sm) = guard.state_machine {
+                sm.arm_pending_rx(session);
+            }
+            info!("JNI: hybrid handshake confirmed — staged PQ RX armed (TX still old key)");
+            JNI_TRUE
+        }
+        None => {
+            warn!("JNI: hybrid confirm — no staged responder session");
+            JNI_FALSE
+        }
+    }
+}
+
+/// JNI: Install the staged initiator hybrid session after authenticated CONFIRM_ACK.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHybridHandshakeInstallAck(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.pending_hybrid_initiator_session.take() {
+        Some(session) => {
             if let Some(ref sm) = guard.state_machine {
                 sm.set_crypto_session(session);
             }
-            info!("JNI: hybrid handshake completed (PQ-protected session established)");
+            info!("JNI: hybrid handshake ack — staged initiator PQ session installed");
             JNI_TRUE
         }
-        Err(e) => { error!("JNI: hybrid complete failed: {}", e); JNI_FALSE }
+        None => {
+            warn!("JNI: hybrid ack — no staged initiator session");
+            JNI_FALSE
+        }
+    }
+}
+
+/// JNI: Drop staged hybrid sessions (timeout, forged, or superseded INIT).
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHybridHandshakeDiscard(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    let state = get_jni_state();
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.pending_hybrid_responder.take().is_some() {
+        info!("JNI: hybrid staged responder session discarded");
+    }
+    if guard.pending_hybrid_initiator_session.take().is_some() {
+        info!("JNI: hybrid staged initiator session discarded");
+    }
+    guard.pending_hybrid_initiator = None;
+    if let Some(ref sm) = guard.state_machine {
+        sm.discard_pending_rx();
     }
 }
 
 /// JNI: Get missing permissions as JSON array of strings
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetMissingPermissions<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetMissingPermissions<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JObject<'local> {
@@ -2468,7 +2766,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Get permission rationale explanation for a specific permission
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetPermissionRationale<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetPermissionRationale<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     permission: JString<'local>,
@@ -2487,7 +2787,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Get WiFi peers as JSON array
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetWifiPeers<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetWifiPeers<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JObject<'local> {
@@ -2496,13 +2798,16 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
     let json = if let Some(ref sm) = guard.state_machine {
         let peers = sm.get_wifi_peers();
-        let arr: Vec<serde_json::Value> = peers.iter().map(|p| {
-            serde_json::json!({
-                "address": p.address.to_string(),
-                "device_name": p.device_name,
-                "channel": p.channel,
+        let arr: Vec<serde_json::Value> = peers
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "address": p.address.to_string(),
+                    "device_name": p.device_name,
+                    "channel": p.channel,
+                })
             })
-        }).collect();
+            .collect();
         serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
     } else {
         "[]".to_string()
@@ -2525,7 +2830,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        if sm.is_ptt_active() { JNI_TRUE } else { JNI_FALSE }
+        if sm.is_ptt_active() {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
     } else {
         JNI_FALSE
     }
@@ -2558,7 +2867,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Get device name from transport manager
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetDeviceName<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetDeviceName<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JObject<'local> {
@@ -2631,7 +2942,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Get audio cache status as JSON
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetCacheStatus<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetCacheStatus<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JObject<'local> {
@@ -2639,7 +2952,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     let json = if let Some(ref sm) = guard.state_machine {
-        let cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let cache = sm
+            .get_audio_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cache.status_json()
     } else {
         r#"{"mode":"Live","queued_utterances":0}"#.to_string()
@@ -2664,7 +2980,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = sm
+            .get_audio_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cache.skip_current();
     }
 }
@@ -2687,7 +3006,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = sm
+            .get_audio_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cache.set_mode(cache_mode);
     }
 }
@@ -2704,7 +3026,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = sm
+            .get_audio_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cache.clear();
     }
 }
@@ -2722,7 +3047,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = sm
+            .get_audio_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cache.clear_active();
     }
 }
@@ -2741,7 +3069,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = sm
+            .get_audio_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cache.set_mix_mode_enabled(enabled != 0);
     }
 }
@@ -2757,8 +3088,15 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
-        if cache.is_mix_mode_enabled() { 1 } else { 0 }
+        let cache = sm
+            .get_audio_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if cache.is_mix_mode_enabled() {
+            1
+        } else {
+            0
+        }
     } else {
         0
     }
@@ -2775,7 +3113,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = sm
+            .get_audio_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if cache.replay_from_history(index as usize) {
             info!("JNI: Replaying utterance at index {}", index);
             JNI_TRUE
@@ -2797,7 +3138,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        let mut cache = sm.get_audio_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = sm
+            .get_audio_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Parse user registry JSON to sync mute/favorite status into cache
         let users_json = guard.user_registry.to_json();
@@ -2826,7 +3170,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        if sm.is_encrypted() { JNI_TRUE } else { JNI_FALSE }
+        if sm.is_encrypted() {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
     } else {
         JNI_FALSE
     }
@@ -2858,7 +3206,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Get the WebSocket URL for Kotlin to connect to
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCellularGetWsUrl<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCellularGetWsUrl<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JString<'local> {
@@ -2871,7 +3221,8 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         String::new()
     };
 
-    env.new_string(&url).unwrap_or_else(|_| env.new_string("").unwrap())
+    env.new_string(&url)
+        .unwrap_or_else(|_| env.new_string("").unwrap())
 }
 
 /// JNI: Called when Kotlin WebSocket connects successfully
@@ -2897,7 +3248,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     _class: JClass,
     reason: JString,
 ) {
-    let reason_str: String = env.get_string(&reason).map(|s| s.into()).unwrap_or_default();
+    let reason_str: String = env
+        .get_string(&reason)
+        .map(|s| s.into())
+        .unwrap_or_default();
     info!("JNI: Cellular disconnected: {}", reason_str);
 
     let state = get_jni_state();
@@ -2945,7 +3299,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Poll outbound queue — returns byte array or null if empty
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCellularPollOutbound<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCellularPollOutbound<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jni::objects::JByteArray<'local> {
@@ -2954,7 +3310,8 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
     if let Some(ref sm) = guard.state_machine {
         if let Some(data) = sm.poll_cellular_outbound() {
-            return env.byte_array_from_slice(&data)
+            return env
+                .byte_array_from_slice(&data)
                 .unwrap_or_else(|_| jni::objects::JByteArray::default());
         }
     }
@@ -2963,9 +3320,26 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     jni::objects::JByteArray::default()
 }
 
+/// JNI: report the actual OkHttp `WebSocket.send` boolean for the last packet
+/// returned by nativeCellularPollOutbound.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCellularReportSendResult(
+    _env: JNIEnv,
+    _class: JClass,
+    success: jboolean,
+) {
+    let state = get_jni_state();
+    let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref sm) = guard.state_machine {
+        sm.report_cellular_send_result(success != 0);
+    }
+}
+
 /// JNI: Get cellular stats JSON
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCellularGetStats<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeCellularGetStats<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JString<'local> {
@@ -2978,7 +3352,8 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         "{}".to_string()
     };
 
-    env.new_string(&stats).unwrap_or_else(|_| env.new_string("{}").unwrap())
+    env.new_string(&stats)
+        .unwrap_or_else(|_| env.new_string("{}").unwrap())
 }
 
 /// JNI: Check if WiFi transport has discovered peers
@@ -2991,7 +3366,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        if sm.has_wifi_peers() { JNI_TRUE } else { JNI_FALSE }
+        if sm.has_wifi_peers() {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
     } else {
         JNI_FALSE
     }
@@ -3021,7 +3400,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 /// JNI: WiFi Direct peers changed (called by Kotlin after requestPeers)
 /// peers_json: JSON array of objects with device_name, device_address, is_group_owner
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeOnWifiDirectPeersChanged<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeOnWifiDirectPeersChanged<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     peers_json: JString<'local>,
@@ -3031,16 +3412,20 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         Err(_) => return,
     };
 
-    let peers: Vec<crate::wifi_direct::WifiDirectPeer> = match serde_json::from_str::<Vec<serde_json::Value>>(&json) {
-        Ok(arr) => arr.iter().filter_map(|v| {
-            Some(crate::wifi_direct::WifiDirectPeer {
-                device_name: v["device_name"].as_str()?.to_string(),
-                device_address: v["device_address"].as_str()?.to_string(),
-                is_group_owner: v["is_group_owner"].as_bool().unwrap_or(false),
-            })
-        }).collect(),
-        Err(_) => return,
-    };
+    let peers: Vec<crate::wifi_direct::WifiDirectPeer> =
+        match serde_json::from_str::<Vec<serde_json::Value>>(&json) {
+            Ok(arr) => arr
+                .iter()
+                .filter_map(|v| {
+                    Some(crate::wifi_direct::WifiDirectPeer {
+                        device_name: v["device_name"].as_str()?.to_string(),
+                        device_address: v["device_address"].as_str()?.to_string(),
+                        is_group_owner: v["is_group_owner"].as_bool().unwrap_or(false),
+                    })
+                })
+                .collect(),
+            Err(_) => return,
+        };
 
     let state = get_jni_state();
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -3055,7 +3440,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 /// JNI: WiFi Direct connection changed (called by Kotlin BroadcastReceiver)
 /// This is THE critical callback: when connected=true, we start multicast on the P2P network.
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeOnWifiDirectConnectionChanged<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeOnWifiDirectConnectionChanged<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     connected: jboolean,
@@ -3063,16 +3450,12 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     group_owner_ip: JString<'local>,
     interface_name: JString<'local>,
 ) {
-    let go_ip: Option<std::net::Ipv4Addr> = env.get_string(&group_owner_ip)
-        .ok()
-        .and_then(|s| {
-            let s: String = s.into();
-            s.parse().ok()
-        });
+    let go_ip: Option<std::net::Ipv4Addr> = env.get_string(&group_owner_ip).ok().and_then(|s| {
+        let s: String = s.into();
+        s.parse().ok()
+    });
 
-    let iface: Option<String> = env.get_string(&interface_name)
-        .ok()
-        .map(|s| s.into());
+    let iface: Option<String> = env.get_string(&interface_name).ok().map(|s| s.into());
 
     let is_connected = connected == JNI_TRUE;
     let is_group_owner = is_owner == JNI_TRUE;
@@ -3085,7 +3468,8 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         {
             let transport = sm.get_transport();
             let mut tm = transport.lock().unwrap_or_else(|e| e.into_inner());
-            tm.wifi_direct_mut().on_connection_changed(is_connected, is_group_owner, go_ip, iface);
+            tm.wifi_direct_mut()
+                .on_connection_changed(is_connected, is_group_owner, go_ip, iface);
         }
 
         // If connected, start multicast transport on the P2P network
@@ -3140,7 +3524,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
 /// JNI: Get WiFi Direct peers as JSON array
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetWifiDirectPeers<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeGetWifiDirectPeers<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JObject<'local> {
@@ -3149,13 +3535,16 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 
     let json = if let Some(ref sm) = guard.state_machine {
         let peers = sm.get_wifi_direct_peers();
-        let arr: Vec<serde_json::Value> = peers.iter().map(|p| {
-            serde_json::json!({
-                "device_name": p.device_name,
-                "device_address": p.device_address,
-                "is_group_owner": p.is_group_owner,
+        let arr: Vec<serde_json::Value> = peers
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "device_name": p.device_name,
+                    "device_address": p.device_address,
+                    "is_group_owner": p.is_group_owner,
+                })
             })
-        }).collect();
+            .collect();
         serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
     } else {
         "[]".to_string()
@@ -3222,7 +3611,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(ref sm) = guard.state_machine {
-        if sm.has_wifi_direct_peers() { JNI_TRUE } else { JNI_FALSE }
+        if sm.has_wifi_direct_peers() {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
     } else {
         JNI_FALSE
     }
@@ -3315,7 +3708,9 @@ fn emergency_can_seal(guard: &JniAppState) -> bool {
 /// Coordinates are attached only when `has_coord` is set AND a session key
 /// exists to seal them (see the privacy note above).
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeEmergencyActivate<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeEmergencyActivate<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     kind: jni::sys::jbyte,
@@ -3382,7 +3777,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 /// JNI: advance the beacon clock. Returns a re-broadcast frame once the
 /// cadence interval has elapsed, else null. Cheap to call on a timer.
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeEmergencyTick<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeEmergencyTick<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     now_ms: jni::sys::jlong,
@@ -3405,7 +3802,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 /// JNI: stand down. Returns the clear frame to broadcast once, or null when
 /// no emergency was active.
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeEmergencyClear<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeEmergencyClear<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     now_ms: jni::sys::jlong,
@@ -3452,7 +3851,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 /// JSON: {"op":"emergency"|"mandown"|"clear","sender":…,"ts":…,"kind":…,
 ///        "sealed":<bool>[,"lat":…,"lon":…][,"note":…]}
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeEmergencyDecode<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeEmergencyDecode<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     data: jni::sys::jbyteArray,
@@ -3482,7 +3883,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         let state = get_jni_state();
         let guard = state.lock().unwrap_or_else(|e| e.into_inner());
         guard.state_machine.as_ref().and_then(|sm| {
-            let tm = sm.get_transport().lock().ok()?;
+            let mut tm = sm.get_transport().lock().ok()?;
             tm.decrypt_raw(tlv.payload).ok()
         })
     };
@@ -3554,7 +3955,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
 /// means the peers hold different session keys — every other counter looks
 /// healthy in that state, which is why it went undiagnosed for so long.
 #[no_mangle]
-pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeDiagSnapshot<'local>(
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeDiagSnapshot<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> JObject<'local> {
@@ -3608,5 +4011,9 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     frames: jni::sys::jint,
 ) {
     crate::diag::set_crypto_trace(on != 0, frames);
-    info!("Crypto trace {} for {} frames", if on != 0 { "ARMED" } else { "off" }, frames);
+    info!(
+        "Crypto trace {} for {} frames",
+        if on != 0 { "ARMED" } else { "off" },
+        frames
+    );
 }

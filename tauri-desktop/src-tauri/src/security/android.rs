@@ -1,21 +1,18 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-KMHVILUIGU66
+use super::SecurityViolation;
+use log::{error, info, warn};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
-use log::{error, warn, info};
-use super::SecurityViolation;
-use sha2::{Sha256, Digest};
-
 
 /// Expected APK signature hash (SHA-256)
 /// Replace with actual signature after signing
 const EXPECTED_SIGNATURE: [u8; 32] = [
-    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-    0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
-    0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18,
+    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18,
 ];
 
 pub struct SecurityChecker {
@@ -51,7 +48,7 @@ impl SecurityChecker {
             x = x.wrapping_add(i);
         }
         let elapsed = start.elapsed();
-        
+
         // Normal execution should be < 1ms, debugger makes it much slower
         if elapsed.as_micros() > 5000 {
             warn!("Suspicious execution timing: {:?}", elapsed);
@@ -140,13 +137,7 @@ impl SecurityChecker {
     pub fn check_emulator(&self) -> Result<(), SecurityViolation> {
         // Check CPU info for emulator signatures
         if let Ok(cpu_info) = fs::read_to_string("/proc/cpuinfo") {
-            let emulator_signatures = [
-                "goldfish",
-                "ranchu",
-                "vbox",
-                "qemu",
-                "virtual",
-            ];
+            let emulator_signatures = ["goldfish", "ranchu", "vbox", "qemu", "virtual"];
 
             for signature in &emulator_signatures {
                 if cpu_info.to_lowercase().contains(signature) {
@@ -230,13 +221,13 @@ impl SecurityChecker {
     pub fn verify_signature(&self) -> Result<(), SecurityViolation> {
         // In production, this would verify the actual APK signature
         // For now, we'll do a basic check
-        
+
         // Note: Actual implementation would use Android's PackageManager
         // via JNI to get signature and verify it matches EXPECTED_SIGNATURE
-        
+
         // Placeholder: Always pass for development
         // TODO: Implement proper signature verification via JNI
-        
+
         info!("Signature verification: OK (placeholder)");
         Ok(())
     }
@@ -245,9 +236,9 @@ impl SecurityChecker {
     pub fn verify_integrity(&self) -> Result<(), SecurityViolation> {
         // Check if critical files have been modified
         // This is a simplified version - production would check all .so files
-        
+
         // TODO: Calculate checksum of libsassytalkie.so and compare
-        
+
         Ok(())
     }
 
@@ -255,9 +246,9 @@ impl SecurityChecker {
     pub fn check_memory_integrity(&self) -> Result<(), SecurityViolation> {
         // In native Rust, we can check if critical memory regions are modified
         // This is more effective than Java/Kotlin since we have direct memory access
-        
+
         // TODO: Implement memory region checksums
-        
+
         Ok(())
     }
 
@@ -296,7 +287,7 @@ mod tests {
     #[test]
     fn test_security_checker() {
         let checker = SecurityChecker::new();
-        
+
         // These should pass on a normal device
         assert!(checker.check_debugger().is_ok());
         // Root and emulator checks might fail in dev environment

@@ -36,6 +36,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import com.sassyconsulting.sassytalkie.RelayConnectionState
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.SessionShareLink
 import com.sassyconsulting.sassytalkie.TranscriptionBridge
@@ -109,12 +110,18 @@ fun MainScreen(
     val idleDeliveryFallback = remember {
         kotlinx.coroutines.flow.MutableStateFlow(com.sassyconsulting.sassytalkie.DeliveryState.Idle)
     }
+    val emptyDeliveryProgressFallback = remember {
+        kotlinx.coroutines.flow.MutableStateFlow(com.sassyconsulting.sassytalkie.DeliveryProgress())
+    }
 
     // Reaching-peer indicator — use reach-failed (watchdog) not inverted reachingPeer
     val peerReachFailed by (walkieService?.pttCoordinator?.peerReachFailed ?: falseFallback).collectAsState()
 
     // Delivery state indicator (Task 4.3)
     val deliveryState by (walkieService?.pttCoordinator?.deliveredState ?: idleDeliveryFallback).collectAsState()
+    val deliveryProgress by (
+        walkieService?.pttCoordinator?.deliveryProgress ?: emptyDeliveryProgressFallback
+    ).collectAsState()
 
     // Audio path degraded indicator (Task 7.1)
     val audioPathDegraded by (walkieService?.pttCoordinator?.audioPathDegraded ?: falseFallback).collectAsState()
@@ -537,25 +544,33 @@ fun MainScreen(
             }
         }
 
-        // Relay readiness indicator
-        if (connectState == ConnectState.CONNECTED && !relayReady && autoConnect.isUsingRelay()) {
-            Spacer(modifier = Modifier.height(4.dp))
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(10.dp),
-                    strokeWidth = 1.5.dp,
-                    color = Orange
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "Waiting for relay confirmation...",
-                    fontSize = 11.sp,
-                    color = Orange
-                )
+        // Relay readiness — socket-up vs Durable Object / room confirm.
+        if (connectState == ConnectState.CONNECTED && autoConnect.isUsingRelay()) {
+            val status = RelayConnectionState.radioStatusLine(
+                socketLive = true,
+                roomConfirmed = relayReady,
+                sealedSenderPending = sealedSenderOn && !relayReady,
+                usingRelay = true,
+            )
+            if (status != null) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(10.dp),
+                        strokeWidth = 1.5.dp,
+                        color = Orange
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = status,
+                        fontSize = 11.sp,
+                        color = Orange
+                    )
+                }
             }
         }
 
@@ -854,8 +869,12 @@ fun MainScreen(
             pressRejectedMsg != null -> pressRejectedMsg!! to Color(0xFFFF5252)
             deliveryState == com.sassyconsulting.sassytalkie.DeliveryState.Sending ->
                 "Sending…" to Color(0xFFFF9800)
-            deliveryState == com.sassyconsulting.sassytalkie.DeliveryState.Delivered ->
-                "Delivered" to Color(0xFF4CAF50)
+            deliveryState == com.sassyconsulting.sassytalkie.DeliveryState.Acknowledged ->
+                if (deliveryProgress.expected > 0) {
+                    "Acknowledged by ${deliveryProgress.acknowledged}/${deliveryProgress.expected}" to Color(0xFF4CAF50)
+                } else {
+                    "Acknowledged by ${deliveryProgress.acknowledged}/?" to Color(0xFF4CAF50)
+                }
             else -> (if (pttHoldMode) "Ready — tap PTT to talk" else "Ready — hold PTT to talk") to TextGray
         }
         Spacer(modifier = Modifier.height(12.dp))
@@ -868,7 +887,7 @@ fun MainScreen(
                 imageVector = when {
                     isTransmitting -> Icons.Default.Mic
                     pressRejectedMsg != null -> Icons.Default.Warning
-                    deliveryState == com.sassyconsulting.sassytalkie.DeliveryState.Delivered ->
+                    deliveryState == com.sassyconsulting.sassytalkie.DeliveryState.Acknowledged ->
                         Icons.Default.CheckCircle
                     deliveryState == com.sassyconsulting.sassytalkie.DeliveryState.Sending ->
                         Icons.Default.Upload

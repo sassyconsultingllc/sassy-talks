@@ -30,6 +30,11 @@ pub mod audio_cache;
 pub mod cohort_history;
 pub mod crypto;
 pub mod session;
+pub mod control_auth;
+pub mod hybrid_rekey;
+pub mod tls_pins;
+pub mod enrollment;
+pub mod audit;
 
 // ── 2026–2027 roadmap modules (pure logic, cross-platform) ─────────────────
 //   - `pqc`        — hybrid X25519 + ML-KEM-768 post-quantum key agreement,

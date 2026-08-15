@@ -4,7 +4,11 @@
 use std::collections::HashMap;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, serde::Serialize)]
-pub enum PeerHealth { Healthy, Degraded, Stale }
+pub enum PeerHealth {
+    Healthy,
+    Degraded,
+    Stale,
+}
 
 struct PeerState {
     epoch: u64,
@@ -19,21 +23,41 @@ pub struct LivenessTracker {
 }
 
 impl LivenessTracker {
-    pub fn new() -> Self { Self { peers: HashMap::new() } }
+    pub fn new() -> Self {
+        Self {
+            peers: HashMap::new(),
+        }
+    }
 
     pub fn on_heartbeat_sent(&mut self, peer: &str, _epoch: u64, seq: u32, ts_ms: u64) {
         let p = self.peers.entry(peer.to_string()).or_insert(PeerState {
-            epoch: 0, last_rx_ms: 0, last_presence: 0, rtt_ms: None, pending: HashMap::new(),
+            epoch: 0,
+            last_rx_ms: 0,
+            last_presence: 0,
+            rtt_ms: None,
+            pending: HashMap::new(),
         });
-        if p.pending.len() > 64 { p.pending.clear(); }
+        if p.pending.len() > 64 {
+            p.pending.clear();
+        }
         p.pending.insert(seq, ts_ms);
     }
 
-    pub fn on_heartbeat(&mut self, peer: &str, epoch: u64, seq: u32,
-                        _ts_ms: u64, now_ms: u64, state_byte: u8) {
+    pub fn on_heartbeat(
+        &mut self,
+        peer: &str,
+        epoch: u64,
+        seq: u32,
+        _ts_ms: u64,
+        now_ms: u64,
+        state_byte: u8,
+    ) {
         let p = self.peers.entry(peer.to_string()).or_insert(PeerState {
-            epoch, last_rx_ms: now_ms, last_presence: state_byte,
-            rtt_ms: None, pending: HashMap::new(),
+            epoch,
+            last_rx_ms: now_ms,
+            last_presence: state_byte,
+            rtt_ms: None,
+            pending: HashMap::new(),
         });
         p.epoch = epoch;
         p.last_rx_ms = now_ms;
@@ -44,11 +68,17 @@ impl LivenessTracker {
     }
 
     pub fn health(&self, peer: &str, now_ms: u64) -> PeerHealth {
-        let Some(p) = self.peers.get(peer) else { return PeerHealth::Stale; };
+        let Some(p) = self.peers.get(peer) else {
+            return PeerHealth::Stale;
+        };
         let age = now_ms.saturating_sub(p.last_rx_ms);
-        if age < 3_000 { PeerHealth::Healthy }
-        else if age < 8_000 { PeerHealth::Degraded }
-        else { PeerHealth::Stale }
+        if age < 3_000 {
+            PeerHealth::Healthy
+        } else if age < 8_000 {
+            PeerHealth::Degraded
+        } else {
+            PeerHealth::Stale
+        }
     }
 
     pub fn rtt_ms(&self, peer: &str) -> Option<u32> {
@@ -65,8 +95,11 @@ impl LivenessTracker {
 
     pub fn epoch_changed(&mut self, peer: &str, new_epoch: u64) -> bool {
         let p = self.peers.entry(peer.to_string()).or_insert(PeerState {
-            epoch: new_epoch, last_rx_ms: 0, last_presence: 0,
-            rtt_ms: None, pending: HashMap::new(),
+            epoch: new_epoch,
+            last_rx_ms: 0,
+            last_presence: 0,
+            rtt_ms: None,
+            pending: HashMap::new(),
         });
         let changed = p.epoch != 0 && p.epoch != new_epoch;
         p.epoch = new_epoch;

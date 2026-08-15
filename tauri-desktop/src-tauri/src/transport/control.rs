@@ -11,20 +11,19 @@ use rand::RngCore;
 // learned about, leading to the desktop client misclassifying those frames
 // as audio nonces.
 pub use sassytalkie_core::protocol::{
-    OP_PTT_START, OP_PTT_STOP,
-    OP_HEARTBEAT, OP_PARTNER_OFFLINE,
-    OP_PTT_START_V2, OP_PTT_STOP_V2,
-    OP_WAKE, OP_REPLAY_FRAME,
+    OP_AUTHENTICATED, OP_EMERGENCY, OP_EMERGENCY_CLEAR, OP_HEARTBEAT, OP_HYBRID_CONFIRM,
+    OP_HYBRID_INIT, OP_HYBRID_RESP, OP_MANDOWN, OP_PARTNER_OFFLINE, OP_PTT_START, OP_PTT_START_V2,
+    OP_PTT_STOP, OP_PTT_STOP_V2, OP_REPLAY_FRAME, OP_WAKE,
 };
 
 // Desktop-specific opcodes — not (yet) in core because they're not on the
 // Android wire path. Move to core if/when Android starts emitting them.
-pub const OP_READY_ACK: u8      = 0x03;
-pub const OP_PING: u8           = 0x04;
-pub const OP_CHANNEL_SYNC: u8   = 0x05;
-pub const OP_RECV_ACK: u8       = 0x11;
-pub const OP_EOT_ACK: u8        = 0x12;
-pub const OP_CAPABILITIES: u8   = 0x13;
+pub const OP_READY_ACK: u8 = 0x03;
+pub const OP_PING: u8 = 0x04;
+pub const OP_CHANNEL_SYNC: u8 = 0x05;
+pub const OP_RECV_ACK: u8 = 0x11;
+pub const OP_EOT_ACK: u8 = 0x12;
+pub const OP_CAPABILITIES: u8 = 0x13;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -50,7 +49,9 @@ impl PresenceState {
             _ => Self::Idle,
         }
     }
-    pub fn as_byte(self) -> u8 { self as u8 }
+    pub fn as_byte(self) -> u8 {
+        self as u8
+    }
 }
 
 #[derive(Debug)]
@@ -94,20 +95,31 @@ pub fn decode(bytes: &[u8]) -> Option<Decoded> {
     }
     let op = bytes[0];
     if op < 0x10 {
-        return Some(Decoded { opcode: op, payload: vec![] });
+        return Some(Decoded {
+            opcode: op,
+            payload: vec![],
+        });
     }
     if bytes.len() < 3 {
         return None;
     }
     let len = u16::from_le_bytes([bytes[1], bytes[2]]) as usize;
     if 3 + len > bytes.len() {
-        return None;  // reject truncated frames
+        return None; // reject truncated frames
     }
-    Some(Decoded { opcode: op, payload: bytes[3..3 + len].to_vec() })
+    Some(Decoded {
+        opcode: op,
+        payload: bytes[3..3 + len].to_vec(),
+    })
 }
 
-pub fn encode_heartbeat(epoch: u64, seq: u32, ts_ms: u64,
-                        state: PresenceState, rtt_ms: u16) -> Vec<u8> {
+pub fn encode_heartbeat(
+    epoch: u64,
+    seq: u32,
+    ts_ms: u64,
+    state: PresenceState,
+    rtt_ms: u16,
+) -> Vec<u8> {
     let mut p = Vec::with_capacity(23);
     p.extend_from_slice(&epoch.to_le_bytes());
     p.extend_from_slice(&seq.to_le_bytes());
@@ -118,12 +130,14 @@ pub fn encode_heartbeat(epoch: u64, seq: u32, ts_ms: u64,
 }
 
 pub fn parse_heartbeat(payload: &[u8]) -> Option<Heartbeat> {
-    if payload.len() < 23 { return None; }
+    if payload.len() < 23 {
+        return None;
+    }
     Some(Heartbeat {
-        epoch:  u64::from_le_bytes(payload[0..8].try_into().ok()?),
-        seq:    u32::from_le_bytes(payload[8..12].try_into().ok()?),
-        ts_ms:  u64::from_le_bytes(payload[12..20].try_into().ok()?),
-        state:  PresenceState::from_byte(payload[20]),
+        epoch: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        seq: u32::from_le_bytes(payload[8..12].try_into().ok()?),
+        ts_ms: u64::from_le_bytes(payload[12..20].try_into().ok()?),
+        state: PresenceState::from_byte(payload[20]),
         rtt_ms: u16::from_le_bytes(payload[21..23].try_into().ok()?),
     })
 }
@@ -137,7 +151,9 @@ pub fn encode_recv_ack(epoch: u64, last_seq: u32, ts_ms: u64) -> Vec<u8> {
 }
 
 pub fn parse_recv_ack(payload: &[u8]) -> Option<RecvAck> {
-    if payload.len() < 20 { return None; }
+    if payload.len() < 20 {
+        return None;
+    }
     Some(RecvAck {
         epoch: u64::from_le_bytes(payload[0..8].try_into().ok()?),
         last_seq: u32::from_le_bytes(payload[8..12].try_into().ok()?),
@@ -178,7 +194,9 @@ pub fn new_session_epoch() -> u64 {
     let mut rng = rand::thread_rng();
     loop {
         let v = rng.next_u64();
-        if v != 0 { return v; }
+        if v != 0 {
+            return v;
+        }
     }
 }
 
@@ -197,8 +215,13 @@ mod tests {
 
     #[test]
     fn heartbeat_round_trips() {
-        let hb = encode_heartbeat(0xCAFEBABEDEADBEEF, 42, 1_700_000_000_000,
-                                  PresenceState::Listening, 18);
+        let hb = encode_heartbeat(
+            0xCAFEBABEDEADBEEF,
+            42,
+            1_700_000_000_000,
+            PresenceState::Listening,
+            18,
+        );
         assert_eq!(hb[0], 0x10);
         let decoded = decode(&hb).unwrap();
         assert_eq!(decoded.opcode, OP_HEARTBEAT);
@@ -226,7 +249,7 @@ mod tests {
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.opcode, OP_PARTNER_OFFLINE);
         let len = decoded.payload[0] as usize;
-        let id = std::str::from_utf8(&decoded.payload[1..1+len]).unwrap();
+        let id = std::str::from_utf8(&decoded.payload[1..1 + len]).unwrap();
         assert_eq!(id, "alice-uuid");
     }
 

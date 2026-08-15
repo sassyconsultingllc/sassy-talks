@@ -246,6 +246,49 @@ pub unsafe extern "C" fn sassytalkie_key_exchange_complete(remote_b64: *const c_
     false
 }
 
+/// Wipe session keys, control plane, and staged hybrid. In-app hook; MDM/EMM
+/// must trigger this for remote logout.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_wipe_session() {
+    if let Ok(g) = app_state().lock() {
+        if let Some(s) = g.as_ref() { s.wipe_session(); }
+    }
+}
+
+/// Technical audit JSON (free with sassytalkie_free_string). Not a legal chain of custody.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_export_audit() -> *mut c_char {
+    if let Ok(g) = app_state().lock() {
+        if let Some(s) = g.as_ref() {
+            return match CString::new(s.export_audit()) {
+                Ok(c) => c.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            };
+        }
+    }
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_set_enrollment_token(token: *const c_char) -> bool {
+    let value = ffi::helpers::c_string_to_rust(token);
+    if let Ok(g) = app_state().lock() {
+        if let Some(s) = g.as_ref() {
+            s.set_enrollment_token(value);
+            return true;
+        }
+    }
+    false
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_hybrid_handshake_confirm() -> bool {
+    if let Ok(g) = app_state().lock() {
+        if let Some(s) = g.as_ref() { return s.hybrid_confirm(); }
+    }
+    false
+}
+
 /// This build's capability bitmap (hybrid-PQC support) — same value Android
 /// advertises in its heartbeat caps byte.
 #[no_mangle]

@@ -24,9 +24,11 @@ log = "0.4"
 aes-gcm        = "0.10"
 x25519-dalek   = { version = "2.0", features = ["static_secrets"] }
 hkdf           = "0.12"
+hmac           = "0.12"
 sha2           = "0.10"
 rand           = "0.8"
 zeroize        = "1.8"
+subtle         = "2.5"
 
 # Serde for cohort_history (LRU host/joiner persistence) + the QR JSON
 # helpers used inside session/qr building.

@@ -37,31 +37,32 @@
 /// existing TX/RX threads in `lib.rs` drive either transport with one branch.
 ///
 /// Copyright 2025 Sassy Consulting LLC. All rights reserved.
-
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async_tls_with_config, Connector};
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tracing::{debug, info, warn};
 
 use sassytalkie_core::crypto::CryptoSession;
 use sassytalkie_core::wire;
 
 use super::control;
+use super::control_plane::{ControlAction, ControlPlane};
+use super::{realtime_channel, RealtimeReceiver, RealtimeSender};
 
 /// Relay WebSocket base (scheme + host). Path (`/ws`, `/auth`) appended per call.
 pub const RELAY_WS_BASE: &str = "wss://relay.sassyconsultingllc.com";
 
-/// Reconnect backoff cap and attempt ceiling — mirrors the Android client
-/// (`CellularWebSocketClient`): exponential 3 s × 2^n, capped at 60 s, giving
-/// up after 8 consecutive failures.
-const MAX_RECONNECT_ATTEMPTS: u32 = 8;
+/// Reconnect forever on transient failures, with exponential delay capped at
+/// one minute. Authentication/configuration failures are terminal.
 const RECONNECT_BASE_MS: u64 = 3_000;
 const RECONNECT_CAP_MS: u64 = 60_000;
+const RELAY_OUTBOUND_CAPACITY: usize = 32;
+const RELAY_INBOUND_CAPACITY: usize = 64;
+const RELAY_FRAME_MAX_AGE: Duration = Duration::from_millis(250);
 
 /// Heartbeat cadence. Must be < the relay's 8 s staleness window so an idle
 /// (not actively talking) desktop peer is never swept.
@@ -119,13 +120,13 @@ pub struct CellularTransport {
 
     /// Outbound: `send_audio()` pushes ready-to-send wire frames here; the
     /// write pump forwards them to the socket.
-    outbound_tx: mpsc::UnboundedSender<Vec<u8>>,
-    outbound_rx: Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>>,
+    outbound_tx: RealtimeSender<Vec<u8>>,
+    outbound_rx: Mutex<Option<RealtimeReceiver<Vec<u8>>>>,
 
     /// Inbound: the read loop pushes DECRYPTED Opus frames here; the caller
     /// drains them via `take_audio_receiver()` (mirrors UDP transport).
-    inbound_tx: mpsc::UnboundedSender<super::AudioFrame>,
-    inbound_rx: Mutex<Option<mpsc::UnboundedReceiver<super::AudioFrame>>>,
+    inbound_tx: RealtimeSender<super::AudioFrame>,
+    inbound_rx: Mutex<Option<RealtimeReceiver<super::AudioFrame>>>,
 
     /// Lifecycle flag. `false` tears down the supervisor + pumps.
     running: AtomicBool,
@@ -142,14 +143,21 @@ pub struct CellularTransport {
     /// Stats (best-effort, relaxed).
     packets_sent: AtomicU32,
     packets_received: AtomicU32,
+
+    control: ControlPlane,
 }
 
 impl CellularTransport {
     /// Build a transport from config + the session cipher (PSK). Not connected
     /// until `connect()` is awaited.
-    pub fn new(config: CellularConfig, crypto: CryptoSession) -> Arc<Self> {
-        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+    pub fn new(config: CellularConfig, crypto: CryptoSession, psk: [u8; 32]) -> Arc<Self> {
+        let (outbound_tx, outbound_rx) =
+            realtime_channel(RELAY_OUTBOUND_CAPACITY, RELAY_FRAME_MAX_AGE);
+        let (inbound_tx, inbound_rx) =
+            realtime_channel(RELAY_INBOUND_CAPACITY, RELAY_FRAME_MAX_AGE);
+        let session_epoch = control::new_session_epoch();
+        let control = ControlPlane::new();
+        control.install_psk(psk, &config.room_id, &config.peer_id, session_epoch);
         Arc::new(Self {
             config,
             crypto: Arc::new(Mutex::new(crypto)),
@@ -160,10 +168,11 @@ impl CellularTransport {
             running: AtomicBool::new(false),
             state: AtomicU8::new(CellularState::Disconnected as u8),
             current_channel: AtomicU8::new(1),
-            session_epoch: control::new_session_epoch(),
+            session_epoch,
             heartbeat_seq: AtomicU32::new(0),
             packets_sent: AtomicU32::new(0),
             packets_received: AtomicU32::new(0),
+            control,
         })
     }
 
@@ -181,7 +190,7 @@ impl CellularTransport {
             Err(e) => {
                 self.set_state(CellularState::Error);
                 self.running.store(false, Ordering::SeqCst);
-                return Err(e);
+                return Err(e.to_string());
             }
         };
         self.set_state(CellularState::Connected);
@@ -202,19 +211,14 @@ impl CellularTransport {
     }
 
     /// Run the first session, then reconnect with capped backoff while running.
-    async fn supervise(self: Arc<Self>, first: WsStream, mut out_rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+    async fn supervise(self: Arc<Self>, first: WsStream, mut out_rx: RealtimeReceiver<Vec<u8>>) {
         self.clone().run_io(first, &mut out_rx).await;
         self.set_state(CellularState::Disconnected);
 
         let mut attempt: u32 = 0;
         while self.running.load(Ordering::Relaxed) {
-            attempt += 1;
-            if attempt > MAX_RECONNECT_ATTEMPTS {
-                warn!("Cellular: gave up after {} reconnect attempts", MAX_RECONNECT_ATTEMPTS);
-                break;
-            }
-            let shift = (attempt - 1).min(4);
-            let delay = (RECONNECT_BASE_MS << shift).min(RECONNECT_CAP_MS);
+            attempt = attempt.saturating_add(1);
+            let delay = reconnect_delay_ms(attempt);
             debug!("Cellular: reconnect attempt {} in {} ms", attempt, delay);
             tokio::time::sleep(Duration::from_millis(delay)).await;
             if !self.running.load(Ordering::Relaxed) {
@@ -230,8 +234,14 @@ impl CellularTransport {
                     self.set_state(CellularState::Disconnected);
                 }
                 Err(e) => {
-                    self.set_state(CellularState::Error);
-                    warn!("Cellular: reconnect dial failed: {}", e);
+                    if e.is_terminal() {
+                        self.set_state(CellularState::Error);
+                        self.running.store(false, Ordering::SeqCst);
+                        warn!("Cellular: terminal authentication failure: {}", e);
+                        break;
+                    }
+                    self.set_state(CellularState::Disconnected);
+                    warn!("Cellular: transient reconnect failure: {}", e);
                 }
             }
         }
@@ -240,7 +250,7 @@ impl CellularTransport {
     }
 
     /// Fetch a capability token, then open the authenticated WebSocket.
-    async fn dial(&self) -> Result<WsStream, String> {
+    async fn dial(&self) -> Result<WsStream, DialError> {
         let token = self.fetch_token().await?;
         let url = format!(
             "{}/ws?room={}&token={}&device={}&peer={}&client_id={}",
@@ -251,45 +261,71 @@ impl CellularTransport {
             urlencode(&self.config.peer_id),
             uuid::Uuid::new_v4(),
         );
-        let (stream, _resp) = connect_async(url.as_str())
-            .await
-            .map_err(|e| format!("ws connect failed: {}", e))?;
+        let tls = super::tls_pinning::client_config()
+            .map_err(|e| DialError::TerminalAuth(format!("tls config: {e}")))?;
+        let connector = Connector::Rustls(std::sync::Arc::new(tls));
+        let (stream, _resp) = connect_async_tls_with_config(
+            url.as_str(),
+            None,
+            false,
+            Some(connector),
+        )
+        .await
+        .map_err(|e| match &e {
+            WsError::Http(response) if is_terminal_http_status(response.status().as_u16()) => {
+                DialError::TerminalAuth(format!("ws upgrade http {}", response.status()))
+            }
+            _ => DialError::Retryable(format!("ws connect failed: {}", e)),
+        })?;
         Ok(stream)
     }
 
     /// GET the HMAC token from `/auth?room=` (required when the relay has
     /// AUTH_SECRET set, which production does).
-    async fn fetch_token(&self) -> Result<String, String> {
+    async fn fetch_token(&self) -> Result<String, DialError> {
         let auth_url = format!(
             "{}/auth?room={}",
             https_base(),
             urlencode(&self.config.room_id),
         );
-        let resp = reqwest::get(&auth_url)
+        let tls = super::tls_pinning::client_config()
+            .map_err(|e| DialError::Retryable(format!("tls config: {e}")))?;
+        let client = reqwest::Client::builder()
+            .use_preconfigured_tls(tls)
+            .build()
+            .map_err(|e| DialError::Retryable(format!("http client: {e}")))?;
+        let resp = client
+            .get(&auth_url)
+            .send()
             .await
-            .map_err(|e| format!("auth request failed: {}", e))?;
+            .map_err(|e| DialError::Retryable(format!("auth request failed: {}", e)))?;
         if !resp.status().is_success() {
-            return Err(format!("auth http {}", resp.status().as_u16()));
+            let status = resp.status().as_u16();
+            return Err(if is_terminal_http_status(status) {
+                DialError::TerminalAuth(format!("auth http {}", status))
+            } else {
+                DialError::Retryable(format!("auth http {}", status))
+            });
         }
         let body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| format!("auth body parse failed: {}", e))?;
+            .map_err(|e| DialError::TerminalAuth(format!("auth body parse failed: {}", e)))?;
         body.get("token")
             .and_then(|t| t.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
-            .ok_or_else(|| "auth token missing".to_string())
+            .ok_or_else(|| DialError::TerminalAuth("auth token missing".to_string()))
     }
 
     /// Drive one connected socket: forward outbound frames, emit heartbeats,
     /// and decrypt inbound audio. Returns when the socket closes or errors.
-    async fn run_io(self: Arc<Self>, stream: WsStream, out_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) {
+    async fn run_io(self: Arc<Self>, stream: WsStream, out_rx: &mut RealtimeReceiver<Vec<u8>>) {
         let (mut ws_tx, mut ws_rx) = stream.split();
 
         // Drop any frames that queued while disconnected — stale audio replayed
         // on reconnect is worse than a gap for a walkie.
-        while out_rx.try_recv().is_ok() {}
+        out_rx.discard_pending();
 
         let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -314,7 +350,10 @@ impl CellularTransport {
                 }
                 // Heartbeat keeps us off the relay's staleness sweeper.
                 _ = heartbeat.tick() => {
-                    let frame = self.encode_heartbeat();
+                    let Some(frame) = self.encode_heartbeat() else {
+                        warn!("Cellular: heartbeat blocked — no authenticated control context");
+                        continue;
+                    };
                     if ws_tx.send(Message::Binary(frame)).await.is_err() {
                         warn!("Cellular: heartbeat send failed; socket dropping");
                         break;
@@ -342,41 +381,68 @@ impl CellularTransport {
         }
     }
 
-    /// Route an inbound binary frame: skip control frames, decrypt audio.
+    /// Route an inbound binary frame: authenticated control first, else audio.
     fn handle_inbound(&self, bytes: Vec<u8>) {
-        if is_control_frame(&bytes) {
-            // Heartbeats / PTT markers / partner-offline / replay headers — not
-            // audio. (A future pass can feed these to a liveness tracker.)
-            return;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        match self.control.handle_inbound(&bytes, now_ms, |session| {
+            *self.crypto.lock().unwrap() = session;
+        }) {
+            ControlAction::NotControl => {}
+            ControlAction::Ignore => return,
+            ControlAction::Rejected { reason, opcode } => {
+                warn!(
+                    "Cellular: rejected control reason={} opcode={:#04x}",
+                    reason, opcode
+                );
+                return;
+            }
+            ControlAction::Heartbeat | ControlAction::Emergency | ControlAction::InstalledPq => {
+                return;
+            }
+            ControlAction::HybridOutbound(frame) => {
+                let _ = self.outbound_tx.try_send(frame);
+                return;
+            }
         }
-        match self.crypto.lock().unwrap().decrypt(&bytes) {
-            Ok(plain) => {
-                // The decrypted bytes are a shared core::wire frame (header + opus),
-                // matching the Android relay payload. Unpack to recover the Opus
-                // for the decode pipeline; drop our own frame echoed by the relay.
-                match wire::unpack_wire_frame(&plain) {
-                    Ok((_ch, _sub, sender, _name, ts, opus)) => {
-                        if sender == self.config.peer_id {
-                            return; // our own loopback
+        let plain = {
+            let live = self.crypto.lock().unwrap().decrypt(&bytes);
+            match live {
+                Ok(pt) => pt,
+                Err(_) => match self.control.try_decrypt_staged(&bytes) {
+                    Some(pt) => {
+                        if let Some(session) = self.control.promote_staged() {
+                            *self.crypto.lock().unwrap() = session;
                         }
-                        self.packets_received.fetch_add(1, Ordering::Relaxed);
-                        // Unbounded send to the audio pipeline; only fails if the
-                        // receiver was dropped (transport tearing down).
-                        let _ = self.inbound_tx.send(super::AudioFrame {
-                            sender,
-                            timestamp: ts,
-                            opus,
-                        });
+                        pt
                     }
-                    Err(e) => {
-                        debug!("Cellular: wire unpack failed ({} bytes): {}", plain.len(), e);
+                    None => {
+                        debug!("Cellular: decrypt failed ({} bytes)", bytes.len());
+                        return;
                     }
+                },
+            }
+        };
+        match wire::unpack_wire_frame(&plain) {
+            Ok((_ch, _sub, sender, _name, ts, opus)) => {
+                if sender == self.config.peer_id {
+                    return;
                 }
+                self.packets_received.fetch_add(1, Ordering::Relaxed);
+                let _ = self.inbound_tx.try_send(super::AudioFrame {
+                    sender,
+                    timestamp: ts,
+                    opus,
+                });
             }
             Err(e) => {
-                // Wrong key, truncated frame, or a frame from a peer on another
-                // session sharing the room id. Drop quietly at debug.
-                debug!("Cellular: decrypt failed ({} bytes): {}", bytes.len(), e);
+                debug!(
+                    "Cellular: wire unpack failed ({} bytes): {}",
+                    plain.len(),
+                    e
+                );
             }
         }
     }
@@ -387,13 +453,13 @@ impl CellularTransport {
         self.current_channel.store(channel, Ordering::Relaxed);
     }
 
-    fn encode_heartbeat(&self) -> Vec<u8> {
+    fn encode_heartbeat(&self) -> Option<Vec<u8>> {
         let seq = self.heartbeat_seq.fetch_add(1, Ordering::Relaxed);
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        control::encode_heartbeat(
+        self.control.encode_heartbeat_sealed(
             self.session_epoch,
             seq,
             now_ms,
@@ -405,19 +471,21 @@ impl CellularTransport {
     /// Encrypt an Opus frame and queue it for the relay. Mirrors the UDP
     /// `TransportManager::send_audio` signature so the TX thread is transport-agnostic.
     pub fn send_audio(&self, opus: &[u8]) -> Result<(), String> {
+        self.send_audio_at(opus, wire::now_ms())
+    }
+
+    /// Same as [send_audio] but stamps a caller-chosen timestamp so dual-path
+    /// TX (relay + UDP) can share a key for cross-transport RX dedup.
+    pub fn send_audio_at(&self, opus: &[u8], timestamp: u64) -> Result<(), String> {
         if self.state() != CellularState::Connected {
             return Err("cellular not connected".to_string());
         }
-        // Seal the WHOLE core::wire frame (header + opus), matching the Android
-        // relay payload exactly — Android pushes the same `encrypt(pack_wire_frame)`
-        // bytes onto the relay. (Previously this sealed bare Opus, which an Android
-        // peer in the same room could decrypt but then failed to parse as a frame.)
         let frame = wire::pack_wire_frame(
             self.current_channel.load(Ordering::Relaxed),
             wire::SUBCH_MAIN,
             &self.config.peer_id,
             &self.config.device_name,
-            wire::now_ms(),
+            timestamp,
             opus,
         );
         let sealed = self
@@ -426,15 +494,13 @@ impl CellularTransport {
             .unwrap()
             .encrypt(&frame)
             .map_err(|e| format!("encrypt failed: {}", e))?;
-        self.outbound_tx
-            .send(sealed)
-            .map_err(|_| "outbound channel closed".to_string())?;
+        self.outbound_tx.try_send(sealed).map_err(str::to_string)?;
         self.packets_sent.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     /// Hand out the decrypted-Opus receiver (once). Mirrors UDP transport.
-    pub fn take_audio_receiver(&self) -> Option<mpsc::UnboundedReceiver<super::AudioFrame>> {
+    pub fn take_audio_receiver(&self) -> Option<RealtimeReceiver<super::AudioFrame>> {
         self.inbound_rx.lock().unwrap().take()
     }
 
@@ -443,6 +509,7 @@ impl CellularTransport {
         info!("Cellular: stopping");
         self.running.store(false, Ordering::SeqCst);
         self.set_state(CellularState::Disconnected);
+        self.control.clear();
     }
 
     pub fn state(&self) -> CellularState {
@@ -455,13 +522,15 @@ impl CellularTransport {
 
     /// Stats as JSON (for diagnostics / status command).
     pub fn stats_json(&self) -> String {
-        format!(
-            r#"{{"state":"{}","room":"{}","sent":{},"received":{}}}"#,
-            self.state().as_str(),
-            self.config.room_id,
-            self.packets_sent.load(Ordering::Relaxed),
-            self.packets_received.load(Ordering::Relaxed),
-        )
+        serde_json::json!({
+            "state": self.state().as_str(),
+            "room": self.config.room_id,
+            "sent": self.packets_sent.load(Ordering::Relaxed),
+            "received": self.packets_received.load(Ordering::Relaxed),
+            "outbound_queue": self.outbound_tx.metrics(),
+            "inbound_queue": self.inbound_tx.metrics(),
+        })
+        .to_string()
     }
 
     fn set_state(&self, s: CellularState) {
@@ -469,13 +538,45 @@ impl CellularTransport {
     }
 }
 
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[derive(Debug)]
+enum DialError {
+    TerminalAuth(String),
+    Retryable(String),
+}
+
+impl DialError {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::TerminalAuth(_))
+    }
+}
+
+impl std::fmt::Display for DialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TerminalAuth(message) | Self::Retryable(message) => f.write_str(message),
+        }
+    }
+}
+
+fn is_terminal_http_status(status: u16) -> bool {
+    (400..500).contains(&status) && status != 408 && status != 429
+}
+
+fn reconnect_delay_ms(attempt: u32) -> u64 {
+    let shift = attempt.saturating_sub(1).min(31);
+    RECONNECT_BASE_MS
+        .saturating_mul(1_u64 << shift)
+        .min(RECONNECT_CAP_MS)
+}
 
 /// HTTPS base for the `/auth` fetch — same host as the WS, http(s) scheme.
 fn https_base() -> String {
-    RELAY_WS_BASE.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1)
+    RELAY_WS_BASE
+        .replacen("wss://", "https://", 1)
+        .replacen("ws://", "http://", 1)
 }
 
 /// Is this a non-audio control frame? Matches the relay/Kotlin classifier:
@@ -487,7 +588,7 @@ fn is_control_frame(b: &[u8]) -> bool {
         return false;
     }
     let op = b[0];
-    if !(0x10..=0x1F).contains(&op) {
+    if !(0x10..=0x20).contains(&op) {
         return false;
     }
     let payload_len = u16::from_le_bytes([b[1], b[2]]) as usize;
@@ -575,6 +676,25 @@ mod tests {
         assert_eq!(urlencode("abc-_.~"), "abc-_.~");
     }
 
+    #[test]
+    fn reconnect_backoff_is_exponential_capped_and_indefinite() {
+        assert_eq!(reconnect_delay_ms(1), 3_000);
+        assert_eq!(reconnect_delay_ms(2), 6_000);
+        assert_eq!(reconnect_delay_ms(5), 48_000);
+        assert_eq!(reconnect_delay_ms(6), 60_000);
+        assert_eq!(reconnect_delay_ms(10_000), 60_000);
+    }
+
+    #[test]
+    fn terminal_auth_statuses_do_not_retry() {
+        assert!(is_terminal_http_status(400));
+        assert!(is_terminal_http_status(401));
+        assert!(is_terminal_http_status(403));
+        assert!(!is_terminal_http_status(408));
+        assert!(!is_terminal_http_status(429));
+        assert!(!is_terminal_http_status(500));
+    }
+
     /// End-to-end functional check against the LIVE production relay: two
     /// clients sharing a PSK join the same room; a frame sent by A must arrive
     /// decrypted at B. Proves the whole path — /auth token, wss handshake,
@@ -596,6 +716,9 @@ mod tests {
         let mut joiner = SessionManager::new("DesktopJoiner");
         let (_ch, joiner_crypto, _cohort) = joiner.import_session(&qr).unwrap();
 
+        let host_psk: [u8; 32] = *host.get_psk_for_channel(1).unwrap();
+        let joiner_psk: [u8; 32] = *joiner.get_psk_for_channel(_ch).unwrap();
+
         let a = CellularTransport::new(
             CellularConfig {
                 room_id: room_id.clone(),
@@ -603,6 +726,7 @@ mod tests {
                 peer_id: "AAAA0001".into(),
             },
             host_crypto,
+            host_psk,
         );
         let b = CellularTransport::new(
             CellularConfig {
@@ -611,6 +735,7 @@ mod tests {
                 peer_id: "BBBB0002".into(),
             },
             joiner_crypto,
+            joiner_psk,
         );
 
         a.connect().await.expect("client A connect");
@@ -631,8 +756,15 @@ mod tests {
             .expect("timed out waiting for relayed frame")
             .expect("b receiver closed");
 
-        assert_eq!(&received.opus, payload, "decrypted frame must match what A sent");
-        println!("LIVE OK: room={} A→B {} bytes round-tripped through relay", room_id, received.opus.len());
+        assert_eq!(
+            &received.opus, payload,
+            "decrypted frame must match what A sent"
+        );
+        println!(
+            "LIVE OK: room={} A→B {} bytes round-tripped through relay",
+            room_id,
+            received.opus.len()
+        );
 
         a.stop();
         b.stop();

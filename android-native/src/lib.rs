@@ -11,16 +11,17 @@
 #[allow(unused_imports)]
 use log::{error, info, warn};
 
-pub mod jni_bridge;
 pub mod audio;
 pub mod audio_effects;
+pub mod audio_route_policy;
 pub mod audio_routing;
 pub mod device_quirks;
-pub mod state;
+pub mod jni_bridge;
 pub mod permissions;
-pub mod wifi_transport;
-pub mod wifi_direct;
+pub mod state;
 pub mod transport;
+pub mod wifi_direct;
+pub mod wifi_transport;
 // session module migrated to sassytalkie-core in v2.8 (pure logic — QR
 // generate/import, SessionManager — no JNI deps). Re-export keeps every
 // `crate::session::*` consumer in jni_bridge.rs etc. working without source
@@ -30,21 +31,21 @@ pub mod users;
 // Live counters for the diagnostics panel + relay transfer tracing. Lives in
 // this crate because capture, codec, crypto and transport all happen here —
 // Kotlin cannot count frames it never touches.
-pub mod diag;
-pub mod opus_ffi;
-pub mod codec;
 pub mod audio_pipeline;
 pub mod cellular_transport;
+pub mod codec;
+pub mod diag;
+pub mod opus_ffi;
 
 // ── v2.7.x: shared cross-platform core ────────────────────────────────────
 // crypto, audio_cache, cohort_history, and protocol opcodes live in the
 // `sassytalkie-core` crate. Re-exported here so existing `crate::crypto::*`
 // / `crate::audio_cache::*` import paths in the rest of android-native keep
 // working without a sweeping change.
-pub use sassytalkie_core::crypto;
-pub use sassytalkie_core::pqc;
 pub use sassytalkie_core::audio_cache;
 pub use sassytalkie_core::cohort_history;
+pub use sassytalkie_core::crypto;
+pub use sassytalkie_core::pqc;
 pub use sassytalkie_core::protocol;
 // Life-safety signalling (SOS / man-down beacons + stand-down). The wire
 // codec and beacon cadence are core-owned so Android/iOS/desktop stay

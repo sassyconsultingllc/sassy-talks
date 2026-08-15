@@ -16,10 +16,12 @@ mod android;
 pub use android::*;
 
 mod crypto;
+pub mod secret_store;
+mod os_vault;
 pub use crypto::CryptoEngine;
 
 use thiserror::Error;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 #[derive(Error, Debug, Clone)]
 pub enum SecurityViolation {
@@ -43,7 +45,7 @@ pub enum SecurityViolation {
 #[cfg(target_os = "android")]
 pub fn run_startup_checks() -> Result<(), SecurityViolation> {
     use crate::security::android::SecurityChecker;
-    
+
     let checker = SecurityChecker::new();
     checker.comprehensive_check()
 }
@@ -65,7 +67,7 @@ pub fn run_startup_checks() -> Result<(), SecurityViolation> {
     {
         warn!("Running in debug mode - security features reduced");
     }
-    
+
     // Could add binary signature verification here
     Ok(())
 }
@@ -74,7 +76,7 @@ pub fn run_startup_checks() -> Result<(), SecurityViolation> {
 #[cfg(target_os = "ios")]
 fn check_ios_jailbreak() -> Result<(), SecurityViolation> {
     use std::path::Path;
-    
+
     // Common jailbreak indicators
     let jailbreak_paths = [
         "/Applications/Cydia.app",
@@ -87,14 +89,14 @@ fn check_ios_jailbreak() -> Result<(), SecurityViolation> {
         "/bin/bash",
         "/usr/libexec/sftp-server",
     ];
-    
+
     for path in &jailbreak_paths {
         if Path::new(path).exists() {
             error!("Jailbreak indicator found: {}", path);
             return Err(SecurityViolation::RootDetected);
         }
     }
-    
+
     // Check if we can write outside sandbox (jailbroken devices allow this)
     let test_path = "/private/jailbreak_test";
     if std::fs::write(test_path, b"test").is_ok() {
@@ -102,7 +104,7 @@ fn check_ios_jailbreak() -> Result<(), SecurityViolation> {
         error!("Able to write outside sandbox - jailbreak detected");
         return Err(SecurityViolation::RootDetected);
     }
-    
+
     Ok(())
 }
 
@@ -110,7 +112,7 @@ fn check_ios_jailbreak() -> Result<(), SecurityViolation> {
 fn check_ios_debugger() -> Result<(), SecurityViolation> {
     // Use sysctl to check for debugger
     // This is a simplified version - production would use actual sysctl calls
-    
+
     // Check for LLDB
     if std::env::var("__LLDB").is_ok() {
         warn!("LLDB environment detected");
@@ -118,24 +120,22 @@ fn check_ios_debugger() -> Result<(), SecurityViolation> {
         #[cfg(not(debug_assertions))]
         return Err(SecurityViolation::DebuggerDetected);
     }
-    
+
     Ok(())
 }
 
 /// Continuous security monitoring (spawns background thread)
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub fn start_security_monitor() {
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            
-            if let Err(violation) = run_startup_checks() {
-                error!("Security violation in background monitor: {:?}", violation);
-                std::process::exit(1);
-            }
+    std::thread::spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+
+        if let Err(violation) = run_startup_checks() {
+            error!("Security violation in background monitor: {:?}", violation);
+            std::process::exit(1);
         }
     });
-    
+
     info!("Security monitor started");
 }
 

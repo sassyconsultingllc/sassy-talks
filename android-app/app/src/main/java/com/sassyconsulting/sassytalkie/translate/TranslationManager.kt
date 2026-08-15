@@ -12,10 +12,12 @@ import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeout
 import java.util.Collections
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -53,6 +55,9 @@ class TranslationManager {
 
         /** Max number of recent (text → translation) results kept in the LRU cache. */
         private const val CACHE_CAPACITY = 128
+
+        /** Fail closed to FAILED rather than spinning "Downloading…" forever. */
+        const val MODEL_DOWNLOAD_TIMEOUT_MS = 45_000L
 
         /**
          * Convenience: the BCP-47 codes ML Kit accepts for a handful of common
@@ -96,9 +101,8 @@ class TranslationManager {
 
     private val modelManager = RemoteModelManager.getInstance()
 
-    // Pool of live translators keyed by "src|dst". ML Kit Translator is cheap
-    // to keep and expensive to recreate; close them in release().
-    private val translators = Collections.synchronizedMap(HashMap<String, Translator>())
+    private val translatorLock = Any()
+    private val translators = HashMap<String, Translator>()
 
     // ── LRU cache of recent translations ────────────────────────────────
     // Keyed by "src|dst|text". accessOrder=true makes this a true LRU; we
@@ -126,12 +130,15 @@ class TranslationManager {
      */
     private fun translatorFor(src: String, dst: String): Translator {
         val key = pairKey(src, dst)
-        return translators.getOrPut(key) {
+        synchronized(translatorLock) {
+            translators[key]?.let { return it }
             val options = TranslatorOptions.Builder()
                 .setSourceLanguage(src)
                 .setTargetLanguage(dst)
                 .build()
-            Translation.getClient(options)
+            val created = Translation.getClient(options)
+            translators[key] = created
+            return created
         }
     }
 
@@ -158,9 +165,15 @@ class TranslationManager {
 
         _modelState.value = ModelState.DOWNLOADING
         return try {
-            awaitTask<Void>("downloadModelIfNeeded") { translator.downloadModelIfNeeded(conditions) }
+            withTimeout(MODEL_DOWNLOAD_TIMEOUT_MS) {
+                awaitTask<Void>("downloadModelIfNeeded") { translator.downloadModelIfNeeded(conditions) }
+            }
             _modelState.value = ModelState.READY
             true
+        } catch (e: TimeoutCancellationException) {
+            Log.w(TAG, "Model download timed out for $src→$dst")
+            _modelState.value = ModelState.FAILED
+            false
         } catch (e: CancellationException) {
             // Language switch cancelled this job — don't flash FAILED.
             throw e
@@ -196,16 +209,24 @@ class TranslationManager {
         // Avoid flashing "Downloading…" on every final once models are READY.
         val announceDownload = _modelState.value != ModelState.READY
         return try {
-            if (announceDownload) _modelState.value = ModelState.DOWNLOADING
+            if (announceDownload && _modelState.value != ModelState.DOWNLOADING) {
+                _modelState.value = ModelState.DOWNLOADING
+            }
             val conditions = DownloadConditions.Builder().apply {
                 if (requireWifi) requireWifi()
             }.build()
-            awaitTask<Void>("downloadModelIfNeeded") { translator.downloadModelIfNeeded(conditions) }
+            withTimeout(MODEL_DOWNLOAD_TIMEOUT_MS) {
+                awaitTask<Void>("downloadModelIfNeeded") { translator.downloadModelIfNeeded(conditions) }
+            }
             _modelState.value = ModelState.READY
 
             val result = awaitTask<String>("translate") { translator.translate(trimmed) }
             cache[cacheKey(src, dst, trimmed)] = result
             result
+        } catch (e: TimeoutCancellationException) {
+            Log.w(TAG, "translate($src→$dst) model download timed out")
+            if (announceDownload) _modelState.value = ModelState.FAILED
+            text
         } catch (e: CancellationException) {
             throw e
         } catch (t: Throwable) {
@@ -257,7 +278,7 @@ class TranslationManager {
      * is turned off or the owning scope is destroyed. Idempotent.
      */
     fun release() {
-        synchronized(translators) {
+        synchronized(translatorLock) {
             translators.values.forEach { runCatching { it.close() } }
             translators.clear()
         }

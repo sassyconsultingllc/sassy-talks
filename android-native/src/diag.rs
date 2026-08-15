@@ -54,6 +54,9 @@ static REPLAY_REJECTED: AtomicU64 = AtomicU64::new(0);
 /// asked when someone reports one-way audio.
 static LAST_TX_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_RX_OK_MS: AtomicU64 = AtomicU64::new(0);
+static TX_QUEUED: AtomicU64 = AtomicU64::new(0);
+static TX_SUCCEEDED: AtomicU64 = AtomicU64::new(0);
+static TX_FAILED: AtomicU64 = AtomicU64::new(0);
 
 /// Debug-only crypto tracing. When on, the first bytes of each audio frame are
 /// logged BEFORE and AFTER encryption so an operator can confirm with their own
@@ -66,22 +69,39 @@ static CRYPTO_TRACE: AtomicBool = AtomicBool::new(false);
 static TRACE_REMAINING: AtomicI32 = AtomicI32::new(0);
 
 pub fn set_crypto_trace(on: bool, frames: i32) {
+    // Production/release .so: no-op even if JNI is invoked. Debug APKs that
+    // ship a --release native library also cannot dump mic prefixes.
+    if !cfg!(debug_assertions) {
+        let _ = (on, frames);
+        return;
+    }
     CRYPTO_TRACE.store(on, Ordering::Relaxed);
     TRACE_REMAINING.store(if on { frames } else { 0 }, Ordering::Relaxed);
 }
 
 pub fn crypto_trace_enabled() -> bool {
+    if !cfg!(debug_assertions) {
+        return false;
+    }
     CRYPTO_TRACE.load(Ordering::Relaxed) && TRACE_REMAINING.load(Ordering::Relaxed) > 0
 }
 
 fn hex_prefix(b: &[u8], n: usize) -> String {
-    b.iter().take(n).map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+    b.iter()
+        .take(n)
+        .map(|x| format!("{x:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Log one frame's plaintext and ciphertext prefixes. Bounded by the frame
 /// budget passed to [set_crypto_trace] so a forgotten toggle cannot stream
 /// audio fragments into logcat indefinitely.
 pub fn trace_crypto(plain: &[u8], cipher: &[u8]) {
+    if !cfg!(debug_assertions) {
+        let _ = (plain, cipher);
+        return;
+    }
     if !crypto_trace_enabled() {
         return;
     }
@@ -123,10 +143,21 @@ pub fn note_encode(bytes: usize) {
     ENCODED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
-/// One audio payload handed to a transport.
+/// One audio payload handed to transport fanout (not proof of socket send).
 #[inline]
 pub fn note_tx() {
+    TX_QUEUED.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn note_tx_success() {
+    TX_SUCCEEDED.fetch_add(1, Ordering::Relaxed);
     LAST_TX_MS.store(now_ms(), Ordering::Relaxed);
+}
+
+#[inline]
+pub fn note_tx_failure() {
+    TX_FAILED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Inbound frame decrypted and authenticated.
@@ -190,7 +221,8 @@ pub fn snapshot_json() -> String {
             r#"{{"capture":{{"frames":{},"last_dbfs":{:.1}}},"#,
             r#""codec":{{"frames_encoded":{},"encoded_bytes":{},"avg_frame_bytes":{}}},"#,
             r#""crypto_rx":{{"ok":{},"fail":{},"no_session":{},"replay":{},"attempted":{},"ok_pct":{:.1}}},"#,
-            r#""activity":{{"last_tx_age_ms":{},"last_rx_ok_age_ms":{}}}}}"#
+            r#""tx":{{"queued":{},"succeeded":{},"failed":{}}},"#,
+            r#""activity":{{"last_tx_success_age_ms":{},"last_tx_age_ms":{},"last_rx_ok_age_ms":{}}}}}"#
         ),
         FRAMES_CAPTURED.load(Ordering::Relaxed),
         LAST_CAPTURE_DBFS_CENTI.load(Ordering::Relaxed) as f32 / 100.0,
@@ -198,7 +230,11 @@ pub fn snapshot_json() -> String {
         ENCODED_BYTES.load(Ordering::Relaxed),
         {
             let f = FRAMES_ENCODED.load(Ordering::Relaxed);
-            if f == 0 { 0 } else { ENCODED_BYTES.load(Ordering::Relaxed) / f }
+            if f == 0 {
+                0
+            } else {
+                ENCODED_BYTES.load(Ordering::Relaxed) / f
+            }
         },
         ok,
         fail,
@@ -206,6 +242,10 @@ pub fn snapshot_json() -> String {
         replay,
         attempted,
         ok_pct,
+        TX_QUEUED.load(Ordering::Relaxed),
+        TX_SUCCEEDED.load(Ordering::Relaxed),
+        TX_FAILED.load(Ordering::Relaxed),
+        age(LAST_TX_MS.load(Ordering::Relaxed)),
         age(LAST_TX_MS.load(Ordering::Relaxed)),
         age(LAST_RX_OK_MS.load(Ordering::Relaxed)),
     )
@@ -225,6 +265,9 @@ pub fn reset() {
         &REPLAY_REJECTED,
         &LAST_TX_MS,
         &LAST_RX_OK_MS,
+        &TX_QUEUED,
+        &TX_SUCCEEDED,
+        &TX_FAILED,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -279,5 +322,20 @@ mod tests {
         assert!(s.contains(r#""frames_encoded":2"#), "{s}");
         assert!(s.contains(r#""encoded_bytes":300"#), "{s}");
         assert!(s.contains(r#""avg_frame_bytes":150"#), "{s}");
+    }
+
+    #[test]
+    fn tx_success_is_distinct_from_queueing() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        note_tx();
+        note_tx_failure();
+        note_tx_success();
+        let s = snapshot_json();
+        assert!(
+            s.contains(r#""tx":{"queued":1,"succeeded":1,"failed":1}"#),
+            "{s}"
+        );
+        assert!(!s.contains(r#""last_tx_success_age_ms":-1"#), "{s}");
     }
 }

@@ -23,6 +23,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
 import java.util.Locale
 
 /**
@@ -114,9 +116,23 @@ class LiveCaptionTranslator(
     @Volatile private var dstLang = TranslationLangDefaults.DEFAULT_TARGET
     @Volatile private var requireWifiForModels = true
 
-    // Coalesce overlapping translation jobs so a fast stream of partials
-    // doesn't pile up — only the latest in-flight translate matters.
-    private var translateJob: Job? = null
+    private val translationQueue = TranslationWorkQueue()
+    private val translationSignal = Channel<Unit>(Channel.CONFLATED)
+    private var partialDebounceJob: Job? = null
+
+    init {
+        // One worker is the sole ML Kit caller. Finals are drained before the
+        // latest conflated partial, preventing stale partial completion from
+        // overwriting a final result.
+        scope.launch {
+            for (ignored in translationSignal) {
+                while (true) {
+                    val work = translationQueue.poll() ?: break
+                    translateSerialized(work)
+                }
+            }
+        }
+    }
 
     /**
      * Fired after a FINAL recognition result has been translated (caption +
@@ -172,10 +188,7 @@ class LiveCaptionTranslator(
         }
 
         try {
-            val rec = recognizer ?: SpeechRecognizer.createSpeechRecognizer(appContext).also {
-                it.setRecognitionListener(listener)
-                recognizer = it
-            }
+            val rec = obtainRecognizer()
             running = true
             consecutiveEmpty = 0
             _errorMessage.value = null
@@ -184,6 +197,7 @@ class LiveCaptionTranslator(
         } catch (t: Throwable) {
             Log.e(TAG, "start() failed: ${t.message}", t)
             running = false
+            destroyRecognizer()
             _status.value = Status.ERROR
             _errorMessage.value = "Could not start recognition"
         }
@@ -195,22 +209,38 @@ class LiveCaptionTranslator(
         consecutiveEmpty = 0
         pendingRestart?.let { mainHandler.removeCallbacks(it) }
         pendingRestart = null
-        translateJob?.cancel()
+        partialDebounceJob?.cancel()
+        partialDebounceJob = null
+        translationQueue.clearPartial()
+        destroyRecognizer()
+        if (_status.value == Status.LISTENING) _status.value = Status.IDLE
+    }
+
+    private fun obtainRecognizer(): SpeechRecognizer {
+        recognizer?.let { return it }
+        val rec = SpeechRecognizer.createSpeechRecognizer(appContext)
+        rec.setRecognitionListener(listener)
+        recognizer = rec
+        return rec
+    }
+
+    private fun destroyRecognizer() {
         try {
             recognizer?.stopListening()
             recognizer?.cancel()
             recognizer?.destroy()
         } catch (t: Throwable) {
-            Log.w(TAG, "stop() cleanup error: ${t.message}")
+            Log.w(TAG, "recognizer destroy error: ${t.message}")
         } finally {
             recognizer = null
-            if (_status.value == Status.LISTENING) _status.value = Status.IDLE
         }
     }
 
     /** Full teardown including the translation scope. Call when disposing. */
     fun release() {
         stop()
+        translationQueue.clear()
+        translationSignal.close()
         scope.coroutineContext[Job]?.cancel()
     }
 
@@ -237,34 +267,52 @@ class LiveCaptionTranslator(
     private fun recognizerTag(code: String): String =
         try { Locale.forLanguageTag(code).toLanguageTag() } catch (_: Throwable) { code }
 
-    /** Fire-and-forget translation of [text], cancelling any prior in-flight job. */
+    /**
+     * Fire-and-forget translation of [text]. Partials cancel prior partials so
+     * the UI tracks the latest hypothesis. Finals are never cancelled — a new
+     * partial used to abort the Timeline/TTS callback and drop the utterance.
+     */
     private fun translateAsync(text: String, isFinal: Boolean = false) {
-        translateJob?.cancel()
-        translateJob = scope.launch {
-            val out = translationManager.translate(
-                text = text,
-                src = srcLang,
-                dst = dstLang,
-                requireWifi = requireWifiForModels,
-            )
-            _translation.value = out
-            if (isFinal) {
-                try {
-                    onFinalUtterance?.invoke(text, out)
-                } catch (t: Throwable) {
-                    Log.w(TAG, "onFinalUtterance failed: ${t.message}")
-                }
+        partialDebounceJob?.cancel()
+        partialDebounceJob = null
+        if (isFinal) {
+            translationQueue.offer(text, true)
+            translationSignal.trySend(Unit)
+        } else {
+            partialDebounceJob = scope.launch {
+                delay(180L)
+                translationQueue.offer(text, false)
+                translationSignal.trySend(Unit)
+            }
+        }
+    }
+
+    private suspend fun translateSerialized(work: TranslationWorkQueue.Work) {
+        val out = translationManager.translate(
+            text = work.text,
+            src = srcLang,
+            dst = dstLang,
+            requireWifi = requireWifiForModels,
+        )
+        _translation.value = out
+        if (work.isFinal) {
+            try {
+                onFinalUtterance?.invoke(work.text, out)
+            } catch (t: Throwable) {
+                Log.w(TAG, "onFinalUtterance failed: ${t.message}")
             }
         }
     }
 
     private val listener = object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) {
+            if (!running) return
             _errorMessage.value = null
             _status.value = Status.LISTENING
         }
 
         override fun onPartialResults(partialResults: Bundle?) {
+            if (!running) return
             val text = firstResult(partialResults) ?: return
             if (text.isBlank()) return
             _caption.value = text
@@ -275,10 +323,11 @@ class LiveCaptionTranslator(
             val text = firstResult(results)
             if (!text.isNullOrBlank()) {
                 _caption.value = text
+                // Deliver the final even if stop() already ran (PTT raced the
+                // recognizer) so Timeline / deferred TTS still get the line.
                 translateAsync(text, isFinal = true)
-                // Real speech recognized — restart promptly, reset backoff.
-                scheduleRestart(backoff = false)
-            } else {
+                if (running) scheduleRestart(backoff = false)
+            } else if (running) {
                 // Session ended with nothing — treat as an empty result so the
                 // restart backs off instead of spinning.
                 scheduleRestart(backoff = true)
@@ -286,6 +335,7 @@ class LiveCaptionTranslator(
         }
 
         override fun onError(error: Int) {
+            if (!running) return
             val msg = errorText(error)
             Log.w(TAG, "recognizer error: $msg ($error)")
             when (error) {
@@ -299,6 +349,8 @@ class LiveCaptionTranslator(
                 SpeechRecognizer.ERROR_AUDIO,
                 SpeechRecognizer.ERROR_CLIENT -> {
                     _errorMessage.value = msg
+                    // These often leave the recognizer unusable until recreated.
+                    destroyRecognizer()
                     scheduleRestart(backoff = true)
                 }
                 // Offline pack / permission — surface and stop; Settings deep-link
@@ -307,6 +359,9 @@ class LiveCaptionTranslator(
                 SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE,
                 SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
                     running = false
+                    pendingRestart?.let { mainHandler.removeCallbacks(it) }
+                    pendingRestart = null
+                    destroyRecognizer()
                     _errorMessage.value = msg
                     _status.value = Status.UNAVAILABLE
                 }
@@ -346,6 +401,7 @@ class LiveCaptionTranslator(
                 Log.i(TAG, "captioning paused after $consecutiveEmpty empty results (silent mic?)")
                 running = false
                 pendingRestart = null
+                destroyRecognizer()
                 if (_status.value == Status.LISTENING) _status.value = Status.IDLE
                 try {
                     onGaveUpListening?.invoke()
@@ -366,13 +422,17 @@ class LiveCaptionTranslator(
                 if (!running) return
                 // Don't fight PTT for the mic — wait and retry without penalty.
                 if (onMicBusy?.invoke() == true) {
+                    consecutiveEmpty = 0
                     mainHandler.postDelayed(this, MIC_BUSY_RETRY_MS)
                     return
                 }
                 try {
-                    recognizer?.startListening(buildRecognizerIntent())
+                    obtainRecognizer().startListening(buildRecognizerIntent())
+                    _status.value = Status.LISTENING
+                    _errorMessage.value = null
                 } catch (t: Throwable) {
                     Log.w(TAG, "restart failed: ${t.message}")
+                    destroyRecognizer()
                     _status.value = Status.ERROR
                     _errorMessage.value = "Recognition restart failed"
                 }
@@ -392,9 +452,9 @@ class LiveCaptionTranslator(
         SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Recognizer busy (PTT using mic?)"
         SpeechRecognizer.ERROR_SERVER -> "Server error"
         SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech detected"
-        SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED -> "Language not supported offline"
+        SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED -> "Language not supported offline (error 12)"
         SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> "Offline language model not installed"
-        else -> "Recognition error ($error)"
+        else -> "Recognition error $error"
     }
 }
 

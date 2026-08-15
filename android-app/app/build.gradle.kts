@@ -26,8 +26,8 @@ android {
         applicationId = "com.sassyconsulting.sassytalkie"
         minSdk = 24
         targetSdk = 35
-        versionCode = 75
-        versionName = "3.1.23"
+        versionCode = 76
+        versionName = "3.2"
         
         // Feature flag: enable or disable cellular (relay) transport at build time
         buildConfigField("boolean", "ENABLE_CELLULAR_RELAY", "true")

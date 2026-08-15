@@ -3,11 +3,15 @@
 // CodeMark: SCLLC1-sassytalkie-FQRXO5OJTPWD
 package com.sassyconsulting.sassytalkie
 
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.os.Build
 import android.util.Log
+import androidx.core.app.NotificationCompat
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.google.firebase.messaging.FirebaseMessagingService
@@ -81,7 +85,15 @@ class SassyTalkFcmService : FirebaseMessagingService() {
     }
 
     override fun onNewToken(token: String) {
-        super.onNewToken(token)
+        try {
+            super.onNewToken(token)
+            persistAndUploadToken(token)
+        } catch (t: Throwable) {
+            Log.w(TAG, "FCM onNewToken failed closed (no crash): ${t.message}")
+        }
+    }
+
+    private fun persistAndUploadToken(token: String) {
         Log.i(TAG, "FCM token refreshed (len=${token.length})")
         wakePrefs()?.edit()
             ?.putString(WAKE_KEY_LAST_TOKEN, token)
@@ -97,7 +109,15 @@ class SassyTalkFcmService : FirebaseMessagingService() {
     }
 
     override fun onMessageReceived(message: RemoteMessage) {
-        super.onMessageReceived(message)
+        try {
+            super.onMessageReceived(message)
+            handleWakeMessage(message)
+        } catch (t: Throwable) {
+            Log.w(TAG, "FCM wake handler failed closed (no crash): ${t.message}")
+        }
+    }
+
+    private fun handleWakeMessage(message: RemoteMessage) {
         val data = message.data
         val kind = data["kind"]
         if (kind != "wake") {
@@ -118,26 +138,76 @@ class SassyTalkFcmService : FirebaseMessagingService() {
         // was not alive — required to bootstrap PttCoordinator from a killed
         // process (A14+ blocks startForegroundService+microphone from FCM alone).
         val serviceWasRunning = WalkieService.isRunning
-        val serviceIntent = Intent(applicationContext, WalkieService::class.java).apply {
-            action = WalkieService.ACTION_WAKE
+        when (FcmWakePolicy.path(serviceWasRunning)) {
+            FcmWakePolicy.Path.WarmService -> {
+                val serviceIntent = Intent(applicationContext, WalkieService::class.java).apply {
+                    action = WalkieService.ACTION_WAKE
+                    putExtra(WalkieService.EXTRA_ROOM, room)
+                }
+                try {
+                    applicationContext.startService(serviceIntent)
+                    Log.i(TAG, "WAKE → WalkieService ACTION_WAKE room=$room (warm)")
+                } catch (t: Throwable) {
+                    Log.d(TAG, "warm-path startService skipped: ${t.message}")
+                    postWakeNotification(room)
+                }
+            }
+            FcmWakePolicy.Path.VisibleNotification -> {
+                // API 34+ blocks microphone FGS from FCM. Do not startActivity
+                // from the background either (API 29+). A high-priority
+                // notification is the allowed bootstrap; the user tap opens
+                // MainActivity which then starts the radio FGS legally.
+                Log.i(TAG, "WAKE cold → visible notification room=$room")
+                postWakeNotification(room)
+            }
+        }
+    }
+
+    private fun postWakeNotification(room: String) {
+        val nm = getSystemService(NotificationManager::class.java) ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                FcmWakePolicy.WAKE_CHANNEL_ID,
+                "Radio wake",
+                FcmWakePolicy.wakeChannelImportance(),
+            ).apply {
+                description = "Tap to reconnect the radio after a wake push"
+                setShowBadge(true)
+            }
+            nm.createNotificationChannel(channel)
+        }
+        val launch = Intent(applicationContext, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
             putExtra(WalkieService.EXTRA_ROOM, room)
         }
+        val pi = PendingIntent.getActivity(
+            applicationContext,
+            41,
+            launch,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val n = NotificationCompat.Builder(this, FcmWakePolicy.WAKE_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentTitle("Sassy-Talk")
+            .setContentText("Radio wake — tap to reconnect")
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+            .setOngoing(false)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(
+                NotificationCompat.Builder(this, FcmWakePolicy.WAKE_CHANNEL_ID)
+                    .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                    .setContentTitle("Sassy-Talk")
+                    .setContentText("Incoming radio")
+                    .build()
+            )
+            .build()
         try {
-            applicationContext.startService(serviceIntent)
-            Log.i(TAG, "WAKE → WalkieService ACTION_WAKE room=$room runningWas=$serviceWasRunning")
+            nm.notify(FcmWakePolicy.WAKE_NOTIFICATION_ID, n)
         } catch (t: Throwable) {
-            Log.d(TAG, "warm-path startService skipped: ${t.message}")
-        }
-
-        if (!serviceWasRunning) {
-            val activityIntent = Intent(applicationContext, MainActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-            }
-            try {
-                applicationContext.startActivity(activityIntent)
-            } catch (t: Throwable) {
-                Log.w(TAG, "Failed to start MainActivity on wake: ${t.message}")
-            }
+            Log.w(TAG, "wake notification failed: ${t.message}")
         }
     }
 

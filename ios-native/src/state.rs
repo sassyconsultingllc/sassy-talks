@@ -48,6 +48,12 @@ pub enum AppState {
     Error,
 }
 
+struct StagedHybridResponder {
+    session: Option<crate::crypto::CryptoSession>,
+    token: [u8; 32],
+    staged_at_ms: u64,
+}
+
 /// State machine
 pub struct StateMachine {
     // Current state
@@ -84,8 +90,15 @@ pub struct StateMachine {
     psk: Arc<Mutex<Option<[u8; 32]>>>,
     // Pending path-(a) hybrid handshake (initiator side), between init & complete.
     pending_hybrid: Arc<Mutex<Option<crate::pqc::PskHybridInitiator>>>,
+    // Responder session staged until authenticated OP_HYBRID_CONFIRM.
+    staged_hybrid: Arc<Mutex<Option<StagedHybridResponder>>>,
+    // Initiator session staged until authenticated OP_HYBRID_CONFIRM_ACK.
+    staged_initiator: Arc<Mutex<Option<StagedHybridResponder>>>,
     // Pending classical X25519 key exchange, between init & complete.
     pending_key_exchange: Arc<Mutex<Option<crate::crypto::KeyExchange>>>,
+    control: Arc<Mutex<Option<sassytalkie_core::control_auth::ControlAuthCodec>>>,
+    audit: Arc<Mutex<sassytalkie_core::audit::AuditChain>>,
+    enrollment_token: Arc<Mutex<Option<String>>>,
 
     // ── Relay (Cloudflare WebSocket) ──
     // The relay room id = the QR session_id, retained on import so the Swift
@@ -130,7 +143,12 @@ impl StateMachine {
             should_stop_rx: Arc::new(AtomicBool::new(false)),
             psk: Arc::new(Mutex::new(None)),
             pending_hybrid: Arc::new(Mutex::new(None)),
+            staged_hybrid: Arc::new(Mutex::new(None)),
+            staged_initiator: Arc::new(Mutex::new(None)),
             pending_key_exchange: Arc::new(Mutex::new(None)),
+            control: Arc::new(Mutex::new(None)),
+            audit: Arc::new(Mutex::new(sassytalkie_core::audit::AuditChain::default())),
+            enrollment_token: Arc::new(Mutex::new(None)),
             room_id: Arc::new(Mutex::new(None)),
             session_epoch: {
                 // Non-zero random epoch for this process (heartbeat identity).
@@ -175,7 +193,29 @@ impl StateMachine {
     pub fn set_psk(&self, key: &[u8; 32]) {
         *self.psk.lock().unwrap() = Some(*key);
         self.transport.lock().unwrap().set_psk(key);
+        let room = self.room_id.lock().unwrap().clone().unwrap_or_else(|| "unpaired".into());
+        *self.control.lock().unwrap() =
+            sassytalkie_core::control_auth::ControlAuthCodec::new(*key, &room, &self.sender_id, self.session_epoch).ok();
         info!("Crypto: PSK session installed");
+    }
+
+    pub fn set_enrollment_token(&self, token: Option<String>) {
+        *self.enrollment_token.lock().unwrap() = token.filter(|s| !s.is_empty());
+    }
+
+    /// Clear keys, control plane, staged hybrid, and room. In-app wipe hook.
+    pub fn wipe_session(&self) {
+        self.audit.lock().unwrap().append(crate::control::now_ms(), "wipe", "source=in_app");
+        *self.psk.lock().unwrap() = None;
+        *self.pending_hybrid.lock().unwrap() = None;
+        *self.staged_hybrid.lock().unwrap() = None;
+        *self.staged_initiator.lock().unwrap() = None;
+        *self.pending_key_exchange.lock().unwrap() = None;
+        *self.control.lock().unwrap() = None;
+        *self.room_id.lock().unwrap() = None;
+        self.transport.lock().unwrap().clear_crypto();
+        self.transport.lock().unwrap().set_relay_active(false);
+        info!("Session wiped");
     }
 
     /// Replace the active AEAD session (e.g. with a key-exchange / hybrid result).
@@ -204,11 +244,21 @@ impl StateMachine {
         let mut mgr = crate::session::SessionManager::new(&self.device_name);
         let (channel, _crypto, _cohort) = mgr.import_session(qr_json).ok()?;
         let psk = mgr.get_psk_for_channel(channel)?;
+        let room = mgr.get_session_id(channel)?;
+        let required = self.enrollment_token.lock().unwrap().clone();
+        if !sassytalkie_core::enrollment::join_authorized(
+            &room,
+            Some(&psk),
+            required.as_deref(),
+            required.as_deref(),
+        ) {
+            warn!("Enrollment rejected: room id is not authorization");
+            return None;
+        }
+        *self.room_id.lock().unwrap() = Some(room);
         self.set_channel(channel);
-        self.set_psk(&psk); // stores PSK for hybrid + installs the AEAD into the transport
-        // Retain the relay room id (= QR session_id) so the Swift RelayClient can
-        // join `wss://…/ws?room=<id>`. Same room id Android/desktop derive.
-        *self.room_id.lock().unwrap() = mgr.get_session_id(channel);
+        self.set_psk(&psk);
+        self.audit.lock().unwrap().append(crate::control::now_ms(), "enrollment", "ok");
         info!("Crypto: session imported from QR on channel {}", channel);
         Some(channel)
     }
@@ -243,15 +293,51 @@ impl StateMachine {
         } else {
             crate::control::PRESENCE_IDLE
         };
-        crate::control::encode_heartbeat(self.session_epoch, seq, crate::control::now_ms(), state, 0)
+        let inner = crate::control::encode_heartbeat(
+            self.session_epoch,
+            seq,
+            crate::control::now_ms(),
+            state,
+            0,
+        );
+        let now = crate::control::now_ms();
+        match self.control.lock().unwrap().as_ref().and_then(|c| c.seal(&inner, now).ok()) {
+            Some(sealed) => sealed,
+            None => {
+                warn!("Control send blocked: no authenticated room context");
+                Vec::new()
+            }
+        }
     }
 
-    /// Process a sealed frame received from the relay (Swift hands us the raw WS
-    /// binary message): decrypt + unpack + channel-filter + decode + play —
-    /// identical to the multicast RX path. Returns true if it was a playable
-    /// audio frame for our channel. Control frames (heartbeats from peers) fail
-    /// the AEAD decrypt and return false, so audio vs control self-disambiguates.
+    /// Process a binary frame from the relay. Authenticated control is handled
+    /// fail-closed; remaining bytes are treated as sealed audio.
     pub fn process_relay_frame(&self, sealed: &[u8]) -> bool {
+        let now = crate::control::now_ms();
+        let classified = {
+            let codec = self.control.lock().unwrap();
+            sassytalkie_core::control_auth::classify_inbound(codec.as_ref(), sealed, now)
+        };
+        match classified {
+            sassytalkie_core::control_auth::InboundControl::NotControl => {}
+            sassytalkie_core::control_auth::InboundControl::LegacyHint { .. } => return false,
+            sassytalkie_core::control_auth::InboundControl::RejectedUnauthenticated { opcode } => {
+                self.audit.lock().unwrap().append(
+                    now,
+                    "control_rejected",
+                    &format!("reason=unauthenticated opcode={opcode}"),
+                );
+                return false;
+            }
+            sassytalkie_core::control_auth::InboundControl::AuthFailed => {
+                self.audit.lock().unwrap().append(now, "control_rejected", "reason=auth_or_replay");
+                return false;
+            }
+            sassytalkie_core::control_auth::InboundControl::Verified(verified) => {
+                self.dispatch_verified_control(verified, now);
+                return false;
+            }
+        }
         let plain = match self.transport.lock().unwrap().open_sealed(sealed) {
             Some(p) => p,
             None => return false,
@@ -292,6 +378,128 @@ impl StateMachine {
         Some(json)
     }
 
+    fn dispatch_verified_control(
+        &self,
+        verified: sassytalkie_core::control_auth::VerifiedControl,
+        now: u64,
+    ) {
+        let Some(decoded) = sassytalkie_core::control_auth::decode_control_frame(&verified.inner_frame) else {
+            return;
+        };
+        use sassytalkie_core::protocol::*;
+        match decoded.opcode {
+            OP_HYBRID_INIT => {
+                if let Some(frame) = self.hybrid_on_init(decoded.payload, now) {
+                    self.transport.lock().unwrap().enqueue_relay_control(frame);
+                }
+            }
+            OP_HYBRID_RESP => {
+                if let Some((channel, msg)) = sassytalkie_core::hybrid_rekey::parse_hybrid_frame(decoded.payload) {
+                    if self.hybrid_complete(msg) {
+                        let token = sassytalkie_core::hybrid_rekey::token_for(msg);
+                        let inner = sassytalkie_core::hybrid_rekey::encode_hybrid_frame(OP_HYBRID_CONFIRM, channel, &token);
+                        if let Some(sealed) = self.control.lock().unwrap().as_ref().and_then(|c| c.seal(&inner, now).ok()) {
+                            self.transport.lock().unwrap().enqueue_relay_control(sealed);
+                        }
+                    }
+                }
+            }
+            OP_HYBRID_CONFIRM => {
+                if let Some((channel, token)) = sassytalkie_core::hybrid_rekey::parse_hybrid_frame(decoded.payload) {
+                    if self.hybrid_on_confirm(decoded.payload, now) {
+                        let inner = sassytalkie_core::hybrid_rekey::encode_hybrid_frame(
+                            OP_HYBRID_CONFIRM_ACK,
+                            channel,
+                            token,
+                        );
+                        if let Some(sealed) = self.control.lock().unwrap().as_ref().and_then(|c| c.seal(&inner, now).ok()) {
+                            self.transport.lock().unwrap().enqueue_relay_control(sealed);
+                        }
+                    }
+                }
+            }
+            OP_HYBRID_CONFIRM_ACK => {
+                let _ = self.hybrid_on_ack(decoded.payload, now);
+            }
+            OP_EMERGENCY | OP_MANDOWN | OP_EMERGENCY_CLEAR => {
+                self.audit.lock().unwrap().append(now, "emergency_control", "authenticated");
+            }
+            _ => {}
+        }
+    }
+
+    fn hybrid_on_init(&self, payload: &[u8], now: u64) -> Option<Vec<u8>> {
+        let psk = (*self.psk.lock().unwrap())?;
+        let (channel, init_bytes) = sassytalkie_core::hybrid_rekey::parse_hybrid_frame(payload)?;
+        let init_msg = crate::pqc::HybridInitiatorMessage::from_bytes(init_bytes).ok()?;
+        let (resp, session) = crate::pqc::psk_hybrid_respond(&psk, &init_msg).ok()?;
+        let resp_bytes = resp.to_bytes();
+        let token = sassytalkie_core::hybrid_rekey::token_for(&resp_bytes);
+        *self.staged_hybrid.lock().unwrap() = Some(StagedHybridResponder {
+            session: Some(session),
+            token,
+            staged_at_ms: now,
+        });
+        let inner = sassytalkie_core::hybrid_rekey::encode_hybrid_frame(
+            sassytalkie_core::protocol::OP_HYBRID_RESP,
+            channel,
+            &resp_bytes,
+        );
+        self.control.lock().unwrap().as_ref()?.seal(&inner, now).ok()
+    }
+
+    fn hybrid_on_confirm(&self, payload: &[u8], now: u64) -> bool {
+        let token = sassytalkie_core::hybrid_rekey::parse_hybrid_frame(payload).map(|(_, m)| m);
+        let staged_guard = self.staged_hybrid.lock().unwrap();
+        let Some(staged) = staged_guard.as_ref() else { return false };
+        if !sassytalkie_core::hybrid_rekey::confirm_acceptable(
+            Some(&staged.token),
+            token,
+            now,
+            staged.staged_at_ms,
+        ) {
+            drop(staged_guard);
+            self.audit.lock().unwrap().append(now, "control_rejected", "reason=hybrid_confirm");
+            return false;
+        }
+        drop(staged_guard);
+        if let Some(session) = self.staged_hybrid.lock().unwrap().as_mut().and_then(|s| s.session.take()) {
+            self.transport.lock().unwrap().arm_pending_rx(session);
+        }
+        // ACK only — TX stays on the live key until peer ciphertext promotes.
+        self.audit.lock().unwrap().append(now, "rekey", "kind=hybrid_confirm_ack_sent");
+        info!("Crypto: hybrid PQC RX staged after confirm (TX still old key)");
+        true
+    }
+
+    fn hybrid_on_ack(&self, payload: &[u8], now: u64) -> bool {
+        let token = sassytalkie_core::hybrid_rekey::parse_hybrid_frame(payload).map(|(_, m)| m);
+        let staged = self.staged_initiator.lock().unwrap().take();
+        let Some(staged) = staged else { return false };
+        if !sassytalkie_core::hybrid_rekey::confirm_acceptable(
+            Some(&staged.token),
+            token,
+            now,
+            staged.staged_at_ms,
+        ) {
+            self.audit.lock().unwrap().append(now, "control_rejected", "reason=hybrid_confirm_ack");
+            return false;
+        }
+        let Some(session) = staged.session else { return false };
+        self.install_session(session);
+        self.audit.lock().unwrap().append(now, "rekey", "kind=hybrid_confirm_ack");
+        info!("Crypto: hybrid PQC session installed after confirm-ack");
+        true
+    }
+
+    pub fn export_audit(&self) -> String {
+        self.audit.lock().unwrap().export_package(
+            "com.sassyconsulting.sassytalkie",
+            env!("CARGO_PKG_VERSION"),
+            &self.sender_id,
+        )
+    }
+
     /// This build's capability bitmap (hybrid-PQC support) — same value Android
     /// advertises in its heartbeat.
     pub fn local_capabilities(&self) -> u8 {
@@ -308,19 +516,24 @@ impl StateMachine {
         Some(msg)
     }
 
-    /// Responder: given the peer's initiator message, install the session and
-    /// return the responder message bytes to send back. None on failure.
+    /// Responder: stage the proposed session; install only after OP_HYBRID_CONFIRM.
     pub fn hybrid_respond(&self, init_bytes: &[u8]) -> Option<Vec<u8>> {
         let psk = (*self.psk.lock().unwrap())?;
         let init_msg = crate::pqc::HybridInitiatorMessage::from_bytes(init_bytes).ok()?;
         let (resp, session) = crate::pqc::psk_hybrid_respond(&psk, &init_msg).ok()?;
-        self.install_session(session);
-        info!("Crypto: hybrid PQC session installed (responder)");
-        Some(resp.to_bytes())
+        let resp_bytes = resp.to_bytes();
+        let token = sassytalkie_core::hybrid_rekey::token_for(&resp_bytes);
+        *self.staged_hybrid.lock().unwrap() = Some(StagedHybridResponder {
+            session: Some(session),
+            token,
+            staged_at_ms: crate::control::now_ms(),
+        });
+        info!("Crypto: hybrid PQC session staged pending confirm (responder)");
+        Some(resp_bytes)
     }
 
-    /// Initiator: complete with the peer's responder message, installing the
-    /// session. Must follow a `hybrid_init` on this device.
+    /// Initiator: complete with the peer's responder message, staging the
+    /// session until CONFIRM_ACK. Must follow a `hybrid_init` on this device.
     pub fn hybrid_complete(&self, resp_bytes: &[u8]) -> bool {
         let initiator = match self.pending_hybrid.lock().unwrap().take() {
             Some(i) => i,
@@ -332,12 +545,28 @@ impl StateMachine {
         };
         match initiator.complete(&resp_msg) {
             Ok(session) => {
-                self.install_session(session);
-                info!("Crypto: hybrid PQC session installed (initiator)");
+                let token = sassytalkie_core::hybrid_rekey::token_for(resp_bytes);
+                *self.staged_initiator.lock().unwrap() = Some(StagedHybridResponder {
+                    session: Some(session),
+                    token,
+                    staged_at_ms: crate::control::now_ms(),
+                });
+                info!("Crypto: hybrid PQC session staged pending ack (initiator)");
                 true
             }
             Err(_) => false,
         }
+    }
+
+    pub fn hybrid_confirm(&self) -> bool {
+        let payload = {
+            let staged = self.staged_hybrid.lock().unwrap();
+            let token = staged.as_ref()?.token;
+            let mut p = vec![1u8];
+            p.extend_from_slice(&token);
+            p
+        };
+        self.hybrid_on_confirm(&payload, crate::control::now_ms())
     }
     
     /// Set channel

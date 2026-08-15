@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-DC5U3VCVO7XY
+use log::{info, warn};
 /// Audio Cache - Multi-Speaker Store/Replay System (Dane.com-style)
 ///
 /// Problem: When multiple people talk at once on a walkie-talkie channel,
@@ -22,11 +23,9 @@
 ///
 /// Wire format needed: [channel:1][sender_id:16][timestamp:8][samples:N*2]
 /// The sender_id comes from UserRegistry::derive_user_id()
-
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use log::{info, warn};
 
 /// Global monotonic utterance ID counter
 static NEXT_UTTERANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -102,25 +101,29 @@ pub struct CachedFrame {
 
 /// A complete utterance (contiguous speech) from one speaker
 pub struct Utterance {
-    pub id: u64,               // unique monotonic ID
+    pub id: u64, // unique monotonic ID
     pub sender_id: String,
     pub sender_name: String,
     pub is_favorite: bool,
-    pub started_at: u64,       // first frame timestamp
-    pub ended_at: u64,         // last frame timestamp
+    pub started_at: u64, // first frame timestamp
+    pub ended_at: u64,   // last frame timestamp
     pub frames: Vec<CachedFrame>,
     pub fully_played: bool,
 }
 
 impl Utterance {
     fn duration_ms(&self) -> u64 {
-        if self.frames.is_empty() { return 0; }
+        if self.frames.is_empty() {
+            return 0;
+        }
         // Saturating math — if `ended_at < started_at` (clock skew between
         // senders, NTP step, deliberately bad wire timestamp), raw
         // subtraction would underflow on u64 and produce an astronomical
         // duration that breaks the queue ordering's tie-break sort. Cap
         // at zero instead.
-        self.ended_at.saturating_sub(self.started_at).saturating_add(20)
+        self.ended_at
+            .saturating_sub(self.started_at)
+            .saturating_add(20)
     }
 
     fn frame_count(&self) -> usize {
@@ -221,7 +224,10 @@ impl SpeakerBuffer {
         if self.frames.len() < MAX_FRAMES_PER_SPEAKER {
             self.frames.push(frame);
         } else {
-            warn!("AudioCache: speaker {} buffer full, dropping frame", self.sender_id);
+            warn!(
+                "AudioCache: speaker {} buffer full, dropping frame",
+                self.sender_id
+            );
         }
     }
 
@@ -356,6 +362,10 @@ pub struct AudioCache {
     live_adaptive_extra: usize,
     /// Last Live-path frame arrival (for inter-arrival measurement).
     live_arrival_last: Option<Instant>,
+    /// Sender that produced [live_arrival_last]. A different peer's frame is
+    /// a talker change, not network jitter — measuring the gap between two
+    /// PTT peers inflated the adaptive prebuffer and chopped both streams.
+    live_arrival_sender: Option<String>,
     /// EWMA of |gap − 20 ms| in milliseconds.
     live_jitter_ewma_ms: f32,
 
@@ -388,7 +398,10 @@ pub struct AudioCache {
     /// — would otherwise be played twice. We remember a bounded set of recent
     /// `(hash(sender_id), timestamp)` keys and drop the second copy. Bounded so
     /// memory stays O(FRAME_DEDUP_WINDOW) regardless of session length.
-    recent_frames: (HashSet<(u64, u64)>, VecDeque<(u64, u64)>),
+    recent_frames: (HashSet<(u64, u64, u32)>, VecDeque<(u64, u64, u32)>),
+    /// Last explicit logical position per sender. Epoch changes and substantial
+    /// sequence rollback reset only that sender's live jitter state.
+    live_stream_positions: HashMap<String, (u64, u32)>,
 }
 
 /// Max recent (sender, timestamp) frame keys remembered for cross-transport
@@ -419,12 +432,14 @@ impl AudioCache {
             live_jitter: HashMap::new(),
             live_adaptive_extra: 0,
             live_arrival_last: None,
+            live_arrival_sender: None,
             live_jitter_ewma_ms: 0.0,
             newly_committed_ids: Vec::new(),
             enable_mix_mode: false,
             mix_pending: HashMap::new(),
             mix_gain: 1.0,
             recent_frames: (HashSet::new(), VecDeque::new()),
+            live_stream_positions: HashMap::new(),
         }
     }
 
@@ -437,18 +452,58 @@ impl AudioCache {
     /// Extra frames the adaptive controller is currently adding on top of the
     /// runtime setting. Exposed for diagnostics/telemetry.
     #[inline]
-    pub fn adaptive_extra_frames(&self) -> usize { self.live_adaptive_extra }
+    pub fn adaptive_extra_frames(&self) -> usize {
+        self.live_adaptive_extra
+    }
 
     /// Current EWMA of |inter-arrival gap − 20 ms| in milliseconds. Exposed
     /// for diagnostics/telemetry so the overlay can show the controller's
     /// input, not just its output.
     #[inline]
-    pub fn jitter_ewma_ms(&self) -> f32 { self.live_jitter_ewma_ms }
+    pub fn jitter_ewma_ms(&self) -> f32 {
+        self.live_jitter_ewma_ms
+    }
+
+    /// Single actively-speaking sender, if exactly one. Used so a second
+    /// peer's beacon cannot enter the live talker's jitter/playout path.
+    fn current_live_sender(&self) -> Option<&str> {
+        let mut found: Option<&str> = None;
+        for (id, buf) in &self.active_buffers {
+            if buf.is_actively_speaking() {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(id.as_str());
+            }
+        }
+        found
+    }
+
+    /// Move parked Live-mode frames into per-speaker buffers so a Live→Queue
+    /// overlap does not drop the first talker's prebuffer (the previous
+    /// `live_jitter.clear()` produced a chop right as the second PTT keyed).
+    fn flush_live_jitter_into_buffers(&mut self) {
+        let queues = std::mem::take(&mut self.live_jitter);
+        for (sid, q) in queues {
+            let buf = self
+                .active_buffers
+                .entry(sid.clone())
+                .or_insert_with(|| SpeakerBuffer::new(&sid));
+            for frame in q {
+                buf.push_frame(frame);
+            }
+        }
+    }
 
     /// Update adaptive extra frames from inter-arrival gap vs the nominal
     /// 20 ms Opus period. Decays toward 0 when the link is steady.
-    fn note_live_arrival_jitter(&mut self) {
+    fn note_live_arrival_jitter(&mut self, sender_id: &str) {
         let now = Instant::now();
+        if self.live_arrival_sender.as_deref() != Some(sender_id) {
+            self.live_arrival_sender = Some(sender_id.to_string());
+            self.live_arrival_last = Some(now);
+            return;
+        }
         if let Some(last) = self.live_arrival_last {
             let gap_ms = now.saturating_duration_since(last).as_secs_f32() * 1000.0;
             // Ignore sub-5 ms gaps (same-tick bursts / unit tests) and multi-
@@ -475,8 +530,8 @@ impl AudioCache {
     /// Record `(sender, timestamp)` and report whether it is NEW (true) or a
     /// duplicate already seen within the recent window (false). The window is
     /// bounded to [FRAME_DEDUP_WINDOW] keys (oldest evicted first).
-    fn accept_frame_once(&mut self, sender_id: &str, timestamp: u64) -> bool {
-        let key = (hash_sender(sender_id), timestamp);
+    fn accept_frame_once(&mut self, sender_id: &str, epoch: u64, sequence: u32) -> bool {
+        let key = (hash_sender(sender_id), epoch, sequence);
         let (set, order) = &mut self.recent_frames;
         if !set.insert(key) {
             return false; // duplicate delivery on another transport — drop
@@ -495,13 +550,18 @@ impl AudioCache {
     /// When disabled (default), legacy Queue behavior is preserved.
     /// Settings UI should call this from the audio-preferences screen.
     pub fn set_mix_mode_enabled(&mut self, enabled: bool) {
-        if self.enable_mix_mode == enabled { return; }
+        if self.enable_mix_mode == enabled {
+            return;
+        }
         self.enable_mix_mode = enabled;
         // Don't try to migrate state mid-mode — let the next ingest_frame
         // decide based on current active speakers.
         self.mix_pending.clear();
         self.mix_gain = 1.0;
-        info!("AudioCache: mix mode {}", if enabled { "enabled" } else { "disabled" });
+        info!(
+            "AudioCache: mix mode {}",
+            if enabled { "enabled" } else { "disabled" }
+        );
     }
 
     pub fn is_mix_mode_enabled(&self) -> bool {
@@ -515,7 +575,13 @@ impl AudioCache {
     }
 
     /// Update user info from UserRegistry (call periodically or on change)
-    pub fn update_user_info(&mut self, sender_id: &str, name: &str, is_favorite: bool, is_muted: bool) {
+    pub fn update_user_info(
+        &mut self,
+        sender_id: &str,
+        name: &str,
+        is_favorite: bool,
+        is_muted: bool,
+    ) {
         self.user_info.insert(
             sender_id.to_string(),
             (name.to_string(), is_favorite, is_muted),
@@ -526,16 +592,48 @@ impl AudioCache {
     ///
     /// Returns Some(samples) if frame should be played immediately (Live mode),
     /// or None if frame was cached for later playback (Queue mode).
-    pub fn ingest_frame(&mut self, sender_id: &str, timestamp: u64, samples: Vec<i16>) -> Option<Vec<i16>> {
+    pub fn ingest_frame(
+        &mut self,
+        sender_id: &str,
+        timestamp: u64,
+        samples: Vec<i16>,
+    ) -> Option<Vec<i16>> {
+        self.ingest_logical_frame(sender_id, 0, timestamp as u32, timestamp, samples)
+    }
+
+    /// Ingest an explicitly identified logical frame. Epoch+sequence is stable
+    /// across WiFi/relay/Bluetooth fanout and does not depend on wall-clock
+    /// precision or clock rollback.
+    pub fn ingest_logical_frame(
+        &mut self,
+        sender_id: &str,
+        stream_epoch: u64,
+        sequence: u32,
+        timestamp: u64,
+        samples: Vec<i16>,
+    ) -> Option<Vec<i16>> {
         // Cross-transport dedup. Every RX path converges here with the frame's
         // (sender_id, timestamp) from the shared wire header, so a frame delivered
         // on two transports at once (WiFi+Bluetooth, WiFi+relay, or our own
         // multicast loopback echoed by the relay) is dropped on the second copy
         // rather than double-played. timestamp is the per-frame capture time (ms),
         // so consecutive distinct frames (~20 ms apart) are never falsely merged.
-        if !self.accept_frame_once(sender_id, timestamp) {
+        if !self.accept_frame_once(sender_id, stream_epoch, sequence) {
             return None;
         }
+
+        let reset_sender = self
+            .live_stream_positions
+            .get(sender_id)
+            .map(|(epoch, last_seq)| {
+                *epoch != stream_epoch || sequence.saturating_add(32) < *last_seq
+            })
+            .unwrap_or(false);
+        if reset_sender {
+            self.live_jitter.remove(sender_id);
+        }
+        self.live_stream_positions
+            .insert(sender_id.to_string(), (stream_epoch, sequence));
 
         // Check mute status — drop silently
         if let Some((_, _, is_muted)) = self.user_info.get(sender_id) {
@@ -554,22 +652,27 @@ impl AudioCache {
         // Get or create speaker buffer
         if !self.active_buffers.contains_key(sender_id) {
             if self.active_buffers.len() >= MAX_CACHED_SPEAKERS {
-                warn!("AudioCache: max speakers reached, dropping new speaker {}", sender_id);
+                warn!(
+                    "AudioCache: max speakers reached, dropping new speaker {}",
+                    sender_id
+                );
                 return None;
             }
-            self.active_buffers.insert(
-                sender_id.to_string(),
-                SpeakerBuffer::new(sender_id),
-            );
+            self.active_buffers
+                .insert(sender_id.to_string(), SpeakerBuffer::new(sender_id));
         }
-        self.active_buffers.get_mut(sender_id).unwrap().push_frame(frame);
+        self.active_buffers
+            .get_mut(sender_id)
+            .unwrap()
+            .push_frame(frame);
 
         // Count only speakers whose last frame is within the active window.
         // A stale buffer (drained Live-mode entry, or a 10-second-ago presence
         // beacon) is NOT a concurrent speaker — counting it as one used to
         // flip the cache into Queue mode and trap the real talker's audio
         // behind an 800ms SPEECH_GAP_MS timeout.
-        let active_speakers = self.active_buffers
+        let active_speakers = self
+            .active_buffers
             .values()
             .filter(|b| b.is_actively_speaking())
             .count();
@@ -590,10 +693,9 @@ impl AudioCache {
                 active_speakers, next_mode
             );
             self.mode = next_mode;
-            // Drop any frames still parked in the Live-mode jitter buffer.
-            // In Queue/Mix mode audio flows through different paths; leaving
-            // stale jitter entries would orphan them until next mode flip.
-            self.live_jitter.clear();
+            // Migrate parked Live frames into speaker buffers. Clearing them
+            // used to chop the first talker the instant a second PTT overlapped.
+            self.flush_live_jitter_into_buffers();
         }
 
         // Promote Mix→Queue if speaker count exceeds the mix ceiling. We do
@@ -633,13 +735,27 @@ impl AudioCache {
         // pushed so it doesn't get re-queued when tick() finalizes the
         // SpeakerBuffer into an Utterance.
         if self.mode == CacheMode::Live && active_speakers <= 1 && self.now_playing.is_none() {
+            if let Some(live) = self.current_live_sender() {
+                if live != sender_id {
+                    // Second peer's beacon/stray frame during a live burst.
+                    // Parking it in live_jitter drained into the talker's
+                    // playout ~35 ms later as a click between two PTT peers.
+                    // Pop the frame we just pushed so tick() cannot later
+                    // queue it as a one-frame utterance either.
+                    if let Some(buf) = self.active_buffers.get_mut(sender_id) {
+                        buf.frames.pop();
+                    }
+                    return None;
+                }
+            }
             // Reclaim the frame we pushed above (it already holds a copy of
             // `samples`) and reuse it as the replay-history frame instead of
             // cloning `samples` a second time. This halves the per-frame heap
             // copies on the dominant single-speaker Live path: previously we
             // cloned once for active_buffers (immediately popped + discarded)
             // and again here for the accumulator.
-            let recycled = self.active_buffers
+            let recycled = self
+                .active_buffers
                 .get_mut(sender_id)
                 .and_then(|buf| buf.frames.pop());
 
@@ -659,7 +775,7 @@ impl AudioCache {
             // extra frames kick in when inter-arrival EWMA rises.
             // Residual frames at end-of-press are drained one-per-tick by
             // next_playback_frame() after LIVE_JITTER_DRAIN_AGE_MS.
-            self.note_live_arrival_jitter();
+            self.note_live_arrival_jitter(sender_id);
             let prebuffer = self.effective_live_prebuffer();
             let new_frame = CachedFrame {
                 sender_id: sender_id.to_string(),
@@ -667,7 +783,8 @@ impl AudioCache {
                 samples,
                 received_at: Instant::now(),
             };
-            let q = self.live_jitter
+            let q = self
+                .live_jitter
                 .entry(sender_id.to_string())
                 .or_insert_with(VecDeque::new);
             let pos = q
@@ -704,21 +821,30 @@ impl AudioCache {
         }
 
         // Finalize live-mode shadow accumulators into history for replay
-        let live_completed: Vec<String> = self.live_accumulator.iter()
+        let live_completed: Vec<String> = self
+            .live_accumulator
+            .iter()
             .filter(|(_, buf)| buf.is_speech_complete())
             .map(|(id, _)| id.clone())
             .collect();
 
         for id in live_completed {
             if let Some(mut buffer) = self.live_accumulator.remove(&id) {
-                let (name, is_fav, _) = self.user_info.get(&id)
+                let (name, is_fav, _) = self
+                    .user_info
+                    .get(&id)
                     .cloned()
                     .unwrap_or_else(|| (id.clone(), false, false));
 
                 let mut utterance = buffer.drain_to_utterance(&name, is_fav);
                 if !utterance.frames.is_empty() {
                     utterance.fully_played = true;
-                    let commit = (utterance.id, utterance.sender_id.clone(), utterance.sender_name.clone(), utterance.duration_ms());
+                    let commit = (
+                        utterance.id,
+                        utterance.sender_id.clone(),
+                        utterance.sender_name.clone(),
+                        utterance.duration_ms(),
+                    );
                     if self.history.len() >= self.max_history {
                         self.history.pop_front();
                     }
@@ -729,14 +855,18 @@ impl AudioCache {
         }
 
         // Check each active buffer for speech completion
-        let completed_ids: Vec<String> = self.active_buffers.iter()
+        let completed_ids: Vec<String> = self
+            .active_buffers
+            .iter()
             .filter(|(_, buf)| buf.is_speech_complete())
             .map(|(id, _)| id.clone())
             .collect();
 
         for id in completed_ids {
             if let Some(mut buffer) = self.active_buffers.remove(&id) {
-                let (name, is_fav, is_muted) = self.user_info.get(&id)
+                let (name, is_fav, is_muted) = self
+                    .user_info
+                    .get(&id)
                     .cloned()
                     .unwrap_or_else(|| (id.clone(), false, false));
 
@@ -749,8 +879,12 @@ impl AudioCache {
                     continue;
                 }
 
-                info!("AudioCache: utterance complete from {} ({} frames, {}ms)",
-                    name, utterance.frame_count(), utterance.duration_ms());
+                info!(
+                    "AudioCache: utterance complete from {} ({} frames, {}ms)",
+                    name,
+                    utterance.frame_count(),
+                    utterance.duration_ms()
+                );
 
                 // Insert in priority order: favorites first, then by timestamp
                 self.insert_prioritized(utterance);
@@ -762,8 +896,10 @@ impl AudioCache {
         // is the basis of is_actively_speaking; dropping the buffer too
         // eagerly would erase it after every Live passthrough and prevent
         // sustained-overlap detection.
-        self.active_buffers.retain(|_, b| !b.frames.is_empty() || !b.recent_pushes.is_empty());
-        self.live_accumulator.retain(|_, b| !b.frames.is_empty() || !b.recent_pushes.is_empty());
+        self.active_buffers
+            .retain(|_, b| !b.frames.is_empty() || !b.recent_pushes.is_empty());
+        self.live_accumulator
+            .retain(|_, b| !b.frames.is_empty() || !b.recent_pushes.is_empty());
         // Live-mode jitter buffer entries can outlive their owner if the
         // sender never sends another frame after a partial-press. The
         // drain in next_playback_frame() will eventually empty each queue;
@@ -783,12 +919,16 @@ impl AudioCache {
             && self.playback_queue.is_empty()
             && self.now_playing.is_none()
         {
-            let active = self.active_buffers
+            let active = self
+                .active_buffers
                 .values()
                 .filter(|b| b.is_actively_speaking())
                 .count();
             if active <= 1 {
-                info!("AudioCache: queue drained, switching back to Live mode (active speakers={})", active);
+                info!(
+                    "AudioCache: queue drained, switching back to Live mode (active speakers={})",
+                    active
+                );
                 self.mode = CacheMode::Live;
             }
         }
@@ -797,7 +937,11 @@ impl AudioCache {
         while self.playback_queue.len() > MAX_QUEUED_UTTERANCES {
             let dropped = self.playback_queue.pop_front();
             if let Some(u) = dropped {
-                warn!("AudioCache: dropping oldest utterance from {} (queue full, {} queued)", u.sender_name, self.playback_queue.len());
+                warn!(
+                    "AudioCache: dropping oldest utterance from {} (queue full, {} queued)",
+                    u.sender_name,
+                    self.playback_queue.len()
+                );
             }
         }
     }
@@ -817,10 +961,18 @@ impl AudioCache {
             // Current utterance finished
             let mut finished = self.now_playing.take().unwrap();
             finished.fully_played = true;
-            info!("AudioCache: finished playing utterance from {}", finished.sender_name);
+            info!(
+                "AudioCache: finished playing utterance from {}",
+                finished.sender_name
+            );
 
             // Move to history
-            let commit = (finished.id, finished.sender_id.clone(), finished.sender_name.clone(), finished.duration_ms());
+            let commit = (
+                finished.id,
+                finished.sender_id.clone(),
+                finished.sender_name.clone(),
+                finished.duration_ms(),
+            );
             if self.history.len() >= self.max_history {
                 self.history.pop_front();
             }
@@ -830,11 +982,17 @@ impl AudioCache {
 
         // Advance to next utterance in queue
         if let Some(next) = self.playback_queue.pop_front() {
-            info!("AudioCache: now playing from {} ({} frames)",
-                next.sender_name, next.frame_count());
+            info!(
+                "AudioCache: now playing from {} ({} frames)",
+                next.sender_name,
+                next.frame_count()
+            );
 
             let first_frame = if !next.frames.is_empty() {
-                Some((next.frames[0].sender_id.clone(), next.frames[0].samples.clone()))
+                Some((
+                    next.frames[0].sender_id.clone(),
+                    next.frames[0].samples.clone(),
+                ))
             } else {
                 None
             };
@@ -850,12 +1008,28 @@ impl AudioCache {
         // the back of the per-sender queue ages past LIVE_JITTER_DRAIN_AGE_MS,
         // and the held frames play out one-per-tick. Also covers the case
         // where a transmission is shorter than the prebuffer depth.
+        //
+        // Never drain a *different* sender while one talker is live — that
+        // interleaved two PTT peers into one AudioTrack write.
+        if self.mode == CacheMode::Live {
+            if let Some(live) = self.current_live_sender().map(|s| s.to_string()) {
+                self.live_jitter.retain(|sid, _| sid == &live);
+            }
+        }
         let now = Instant::now();
+        let live_sid = self.current_live_sender().map(|s| s.to_string());
         let mut drain_target: Option<String> = None;
         for (sid, q) in self.live_jitter.iter() {
+            if let Some(ref live) = live_sid {
+                if sid != live {
+                    continue;
+                }
+            }
             let aged = match q.back() {
-                Some(back) => now.saturating_duration_since(back.received_at)
-                    > Duration::from_millis(LIVE_JITTER_DRAIN_AGE_MS),
+                Some(back) => {
+                    now.saturating_duration_since(back.received_at)
+                        > Duration::from_millis(LIVE_JITTER_DRAIN_AGE_MS)
+                }
                 None => false,
             };
             if aged && !q.is_empty() {
@@ -876,14 +1050,14 @@ impl AudioCache {
 
     /// Get current cache status for UI
     pub fn status(&self) -> CacheStatus {
-        let queued_duration: u64 = self.playback_queue.iter()
-            .map(|u| u.duration_ms())
-            .sum();
+        let queued_duration: u64 = self.playback_queue.iter().map(|u| u.duration_ms()).sum();
 
         let current_speaker = self.now_playing.as_ref().map(|u| u.sender_id.clone());
         let current_speaker_name = self.now_playing.as_ref().map(|u| u.sender_name.clone());
 
-        let speakers_in_queue: Vec<String> = self.playback_queue.iter()
+        let speakers_in_queue: Vec<String> = self
+            .playback_queue
+            .iter()
             .map(|u| u.sender_name.clone())
             .collect();
 
@@ -968,7 +1142,10 @@ impl AudioCache {
         self.mode = CacheMode::Replay;
         self.now_playing = Some(replay);
         self.play_cursor = 0;
-        info!("AudioCache: replaying utterance id={} from {}", utterance_id, name);
+        info!(
+            "AudioCache: replaying utterance id={} from {}",
+            utterance_id, name
+        );
         true
     }
 
@@ -1011,7 +1188,8 @@ impl AudioCache {
         // otherwise pile up indefinitely if one sender went silent.
         let now = Instant::now();
         let stale_cutoff = Duration::from_millis(MIX_ALIGNMENT_WINDOW_MS * 2);
-        self.mix_pending.retain(|_, f| now.saturating_duration_since(f.received_at) < stale_cutoff);
+        self.mix_pending
+            .retain(|_, f| now.saturating_duration_since(f.received_at) < stale_cutoff);
         if self.mix_pending.len() < 2 {
             return None;
         }
@@ -1024,14 +1202,15 @@ impl AudioCache {
         let leading_ts = self.mix_pending.values().map(|f| f.timestamp).min()?;
         let window_end = leading_ts.saturating_add(MIX_ALIGNMENT_WINDOW_MS);
 
-        let aligned_keys: Vec<String> = self.mix_pending
+        let aligned_keys: Vec<String> = self
+            .mix_pending
             .iter()
             .filter(|(_, f)| f.timestamp <= window_end)
             .map(|(k, _)| k.clone())
             .collect();
 
         if aligned_keys.len() < 2 {
-            return None;  // Not enough overlap to justify mixing this tick.
+            return None; // Not enough overlap to justify mixing this tick.
         }
 
         // Determine frame length from the first aligned frame. All Opus
@@ -1069,7 +1248,7 @@ impl AudioCache {
         let target_gain = if rms > 0.001 {
             (MIX_TARGET_RMS / rms).clamp(0.1, 4.0)
         } else {
-            self.mix_gain  // signal is essentially silence — hold previous gain
+            self.mix_gain // signal is essentially silence — hold previous gain
         };
 
         // Smooth toward target — avoids audible AGC pumping.
@@ -1077,18 +1256,21 @@ impl AudioCache {
 
         // Apply gain + soft-clip, write into i16 output.
         let threshold = MIX_SOFT_CLIP_THRESHOLD * i16::MAX as f32;
-        let out: Vec<i16> = acc.iter().map(|&s| {
-            let scaled = (s as f32) * self.mix_gain;
-            let clipped = if scaled.abs() > threshold {
-                // tanh-style soft knee. Sign-preserving, asymptotes at i16::MAX.
-                let sign = scaled.signum();
-                let over = (scaled.abs() - threshold) / (i16::MAX as f32 - threshold);
-                sign * (threshold + (i16::MAX as f32 - threshold) * over.tanh())
-            } else {
-                scaled
-            };
-            clipped.clamp(i16::MIN as f32, i16::MAX as f32) as i16
-        }).collect();
+        let out: Vec<i16> = acc
+            .iter()
+            .map(|&s| {
+                let scaled = (s as f32) * self.mix_gain;
+                let clipped = if scaled.abs() > threshold {
+                    // tanh-style soft knee. Sign-preserving, asymptotes at i16::MAX.
+                    let sign = scaled.signum();
+                    let over = (scaled.abs() - threshold) / (i16::MAX as f32 - threshold);
+                    sign * (threshold + (i16::MAX as f32 - threshold) * over.tanh())
+                } else {
+                    scaled
+                };
+                clipped.clamp(i16::MIN as f32, i16::MAX as f32) as i16
+            })
+            .collect();
 
         Some(out)
     }
@@ -1100,6 +1282,14 @@ impl AudioCache {
         self.active_buffers.clear();
         self.live_accumulator.clear();
         self.playback_queue.clear();
+        self.live_jitter.clear();
+        self.live_stream_positions.clear();
+        self.recent_frames.0.clear();
+        self.recent_frames.1.clear();
+        self.live_arrival_last = None;
+        self.live_arrival_sender = None;
+        self.live_jitter_ewma_ms = 0.0;
+        self.live_adaptive_extra = 0;
         self.history.clear();
         self.now_playing = None;
         self.play_cursor = 0;
@@ -1123,13 +1313,20 @@ impl AudioCache {
         let drained: Vec<String> = self.live_accumulator.keys().cloned().collect();
         for id in drained {
             if let Some(mut buf) = self.live_accumulator.remove(&id) {
-                let (name, is_fav, _) = self.user_info.get(&id)
+                let (name, is_fav, _) = self
+                    .user_info
+                    .get(&id)
                     .cloned()
                     .unwrap_or_else(|| (id.clone(), false, false));
                 let mut utt = buf.drain_to_utterance(&name, is_fav);
                 if !utt.frames.is_empty() {
                     utt.fully_played = true;
-                    let commit = (utt.id, utt.sender_id.clone(), utt.sender_name.clone(), utt.duration_ms());
+                    let commit = (
+                        utt.id,
+                        utt.sender_id.clone(),
+                        utt.sender_name.clone(),
+                        utt.duration_ms(),
+                    );
                     if self.history.len() >= self.max_history {
                         self.history.pop_front();
                     }
@@ -1143,10 +1340,20 @@ impl AudioCache {
         self.live_accumulator.clear();
         self.playback_queue.clear();
         self.live_jitter.clear();
+        self.live_stream_positions.clear();
+        self.recent_frames.0.clear();
+        self.recent_frames.1.clear();
+        self.live_arrival_last = None;
+        self.live_arrival_sender = None;
+        self.live_jitter_ewma_ms = 0.0;
+        self.live_adaptive_extra = 0;
         self.now_playing = None;
         self.play_cursor = 0;
         self.mode = CacheMode::Live;
-        info!("AudioCache: cleared active buffers (history kept: {} entries)", self.history.len());
+        info!(
+            "AudioCache: cleared active buffers (history kept: {} entries)",
+            self.history.len()
+        );
     }
 
     /// Serialize cache status to JSON (for JNI bridge)
@@ -1164,7 +1371,8 @@ impl AudioCache {
             "jitter_adaptive_extra": self.live_adaptive_extra,
             "jitter_effective_frames": self.effective_live_prebuffer(),
             "jitter_ewma_ms": (self.live_jitter_ewma_ms * 10.0).round() / 10.0,
-        }).to_string()
+        })
+        .to_string()
     }
 
     // ── Internal ──
@@ -1186,13 +1394,17 @@ impl AudioCache {
         // Bound search to the priority tier of this utterance.
         let (tier_start, tier_end) = if utterance.is_favorite {
             // Favorites occupy [0, first non-favorite).
-            let end = self.playback_queue.iter()
+            let end = self
+                .playback_queue
+                .iter()
                 .position(|u| !u.is_favorite)
                 .unwrap_or(self.playback_queue.len());
             (0, end)
         } else {
             // Non-favorites occupy [first non-favorite, end).
-            let start = self.playback_queue.iter()
+            let start = self
+                .playback_queue
+                .iter()
                 .position(|u| !u.is_favorite)
                 .unwrap_or(self.playback_queue.len());
             (start, self.playback_queue.len())
@@ -1253,6 +1465,33 @@ mod tests {
     }
 
     #[test]
+    fn logical_identity_dedups_by_epoch_and_sequence_not_clock() {
+        let mut cache = AudioCache::new();
+        let samples = vec![1i16; FRAME_SIZE];
+        let _ = cache.ingest_logical_frame("peer", 9, 1, 1_000, samples.clone());
+        let _ = cache.ingest_logical_frame("peer", 9, 2, 1_000, samples.clone());
+        assert_eq!(cache.recent_frames.0.len(), 2);
+        let _ = cache.ingest_logical_frame("peer", 9, 2, 1_999, samples);
+        assert_eq!(
+            cache.recent_frames.0.len(),
+            2,
+            "duplicate logical frame was accepted"
+        );
+    }
+
+    #[test]
+    fn new_epoch_resets_only_sender_live_jitter() {
+        let mut cache = AudioCache::new();
+        let samples = vec![1i16; FRAME_SIZE];
+        let _ = cache.ingest_logical_frame("peer", 10, 0, 1_000, samples.clone());
+        let _ = cache.ingest_logical_frame("peer", 10, 1, 1_020, samples.clone());
+        assert_eq!(cache.live_jitter["peer"].len(), 2);
+        let _ = cache.ingest_logical_frame("peer", 11, 0, 2_000, samples);
+        assert_eq!(cache.live_jitter["peer"].len(), 1);
+        assert_eq!(cache.live_stream_positions["peer"], (11, 0));
+    }
+
+    #[test]
     fn test_cache_live_passthrough() {
         let mut cache = AudioCache::new();
         assert_eq!(cache.mode(), CacheMode::Live);
@@ -1268,7 +1507,10 @@ mod tests {
         for i in 0..=prebuffer {
             result = cache.ingest_frame("alice", 1000 + (i as u64) * 20, samples.clone());
         }
-        assert!(result.is_some(), "frame should pass through once prebuffer is exceeded");
+        assert!(
+            result.is_some(),
+            "frame should pass through once prebuffer is exceeded"
+        );
         assert_eq!(result.unwrap(), samples);
         assert_eq!(cache.mode(), CacheMode::Live);
     }
@@ -1282,8 +1524,8 @@ mod tests {
         // so the cache must flip to Queue.
         cache.ingest_frame("alice", 1000, vec![100i16; FRAME_SIZE]);
         cache.ingest_frame("alice", 1020, vec![100i16; FRAME_SIZE]);
-        cache.ingest_frame("bob",   1001, vec![200i16; FRAME_SIZE]);
-        cache.ingest_frame("bob",   1021, vec![200i16; FRAME_SIZE]);
+        cache.ingest_frame("bob", 1001, vec![200i16; FRAME_SIZE]);
+        cache.ingest_frame("bob", 1021, vec![200i16; FRAME_SIZE]);
         assert_eq!(cache.mode(), CacheMode::Queue);
     }
 
@@ -1305,17 +1547,27 @@ mod tests {
         // return isn't guaranteed on this single call; the invariant under
         // test is the MODE, not passthrough timing.)
         cache.ingest_frame("bob", 1040, vec![0i16; FRAME_SIZE]);
-        assert_eq!(cache.mode(), CacheMode::Live, "single beacon must not trigger Queue");
+        assert_eq!(
+            cache.mode(),
+            CacheMode::Live,
+            "single beacon must not trigger Queue"
+        );
 
         // Alice continues — stays in Live mode and her audio drains through
         // the jitter buffer once the prebuffer fills (no Queue-mode jam).
         let mut passthroughs = 0;
         for ts in (1060..1300).step_by(20) {
-            if cache.ingest_frame("alice", ts, vec![100i16; FRAME_SIZE]).is_some() {
+            if cache
+                .ingest_frame("alice", ts, vec![100i16; FRAME_SIZE])
+                .is_some()
+            {
                 passthroughs += 1;
             }
         }
-        assert!(passthroughs > 0, "alice's audio should drain in Live mode (Queue-mode jam)");
+        assert!(
+            passthroughs > 0,
+            "alice's audio should drain in Live mode (Queue-mode jam)"
+        );
         assert_eq!(cache.mode(), CacheMode::Live);
     }
 
@@ -1326,16 +1578,16 @@ mod tests {
         // Live so the continuing talker is heard in real time.
         let mut cache = AudioCache::new();
         cache.update_user_info("alice", "Alice", false, false);
-        cache.update_user_info("bob",   "Bob",   false, false);
+        cache.update_user_info("bob", "Bob", false, false);
 
         // Both speakers must each cross ACTIVE_SPEAKER_MIN_FRAMES (>=2)
         // before Queue engages.
         cache.ingest_frame("alice", 1000, vec![100i16; FRAME_SIZE]);
         cache.ingest_frame("alice", 1020, vec![100i16; FRAME_SIZE]);
         cache.ingest_frame("alice", 1040, vec![100i16; FRAME_SIZE]);
-        cache.ingest_frame("bob",   1000, vec![200i16; FRAME_SIZE]);
-        cache.ingest_frame("bob",   1020, vec![200i16; FRAME_SIZE]);
-        cache.ingest_frame("bob",   1040, vec![200i16; FRAME_SIZE]);
+        cache.ingest_frame("bob", 1000, vec![200i16; FRAME_SIZE]);
+        cache.ingest_frame("bob", 1020, vec![200i16; FRAME_SIZE]);
+        cache.ingest_frame("bob", 1040, vec![200i16; FRAME_SIZE]);
         assert_eq!(cache.mode(), CacheMode::Queue);
 
         // Drain anything that's playback-ready.
@@ -1354,7 +1606,8 @@ mod tests {
         // want to assert mode recovery, not the drain timing.
         assert!(
             cache.mode() == CacheMode::Live || cache.mode() == CacheMode::Queue,
-            "mode is {:?}", cache.mode()
+            "mode is {:?}",
+            cache.mode()
         );
 
         // Now alice resumes talking — should be back in Live mode, and her
@@ -1368,11 +1621,16 @@ mod tests {
         let prebuffer = live_jitter_prebuffer_frames();
         let mut got_audio = false;
         for i in 0..=prebuffer {
-            if cache.ingest_frame("alice", 5000 + (i as u64) * 20, vec![100i16; FRAME_SIZE]).is_some() {
+            if cache
+                .ingest_frame("alice", 5000 + (i as u64) * 20, vec![100i16; FRAME_SIZE])
+                .is_some()
+            {
                 got_audio = true;
             }
         }
-        while cache.next_playback_frame().is_some() { got_audio = true; }
+        while cache.next_playback_frame().is_some() {
+            got_audio = true;
+        }
         assert!(
             got_audio,
             "after bob ages out and alice resumes, audio should flow; mode={:?}",
@@ -1400,10 +1658,13 @@ mod tests {
         // Two active speakers (>=2 frames each within active window) → Mix
         cache.ingest_frame("alice", 1000, vec![100i16; FRAME_SIZE]);
         cache.ingest_frame("alice", 1020, vec![100i16; FRAME_SIZE]);
-        cache.ingest_frame("bob",   1010, vec![200i16; FRAME_SIZE]);
-        cache.ingest_frame("bob",   1030, vec![200i16; FRAME_SIZE]);
-        assert_eq!(cache.mode(), CacheMode::Mix,
-            "with mix enabled and 2 speakers, should be Mix not Queue");
+        cache.ingest_frame("bob", 1010, vec![200i16; FRAME_SIZE]);
+        cache.ingest_frame("bob", 1030, vec![200i16; FRAME_SIZE]);
+        assert_eq!(
+            cache.mode(),
+            CacheMode::Mix,
+            "with mix enabled and 2 speakers, should be Mix not Queue"
+        );
     }
 
     #[test]
@@ -1417,8 +1678,11 @@ mod tests {
             cache.ingest_frame(name, 1000, vec![100i16; FRAME_SIZE]);
             cache.ingest_frame(name, 1020, vec![100i16; FRAME_SIZE]);
         }
-        assert_eq!(cache.mode(), CacheMode::Queue,
-            "above MIX_MAX_SPEAKERS the cache must fall back to Queue");
+        assert_eq!(
+            cache.mode(),
+            CacheMode::Queue,
+            "above MIX_MAX_SPEAKERS the cache must fall back to Queue"
+        );
     }
 
     #[test]
@@ -1429,10 +1693,13 @@ mod tests {
 
         cache.ingest_frame("alice", 1000, vec![100i16; FRAME_SIZE]);
         cache.ingest_frame("alice", 1020, vec![100i16; FRAME_SIZE]);
-        cache.ingest_frame("bob",   1010, vec![200i16; FRAME_SIZE]);
-        cache.ingest_frame("bob",   1030, vec![200i16; FRAME_SIZE]);
-        assert_eq!(cache.mode(), CacheMode::Queue,
-            "mix disabled (default) must still go to Queue, not Mix");
+        cache.ingest_frame("bob", 1010, vec![200i16; FRAME_SIZE]);
+        cache.ingest_frame("bob", 1030, vec![200i16; FRAME_SIZE]);
+        assert_eq!(
+            cache.mode(),
+            CacheMode::Queue,
+            "mix disabled (default) must still go to Queue, not Mix"
+        );
     }
 
     #[test]
@@ -1472,8 +1739,11 @@ mod tests {
         cache.insert_prioritized(mk(3, 1000, 500));
 
         let ids: Vec<u64> = cache.playback_queue.iter().map(|u| u.id).collect();
-        assert_eq!(ids, vec![3, 2, 1],
-            "expected ordering: oldest start first, then shorter duration on ties");
+        assert_eq!(
+            ids,
+            vec![3, 2, 1],
+            "expected ordering: oldest start first, then shorter duration on ties"
+        );
     }
 
     #[test]
@@ -1482,11 +1752,17 @@ mod tests {
 
         fn mk(id: u64, ts: u64, dur: u64, fav: bool) -> Utterance {
             Utterance {
-                id, sender_id: format!("s{}", id), sender_name: format!("S{}", id),
-                is_favorite: fav, started_at: ts, ended_at: ts + dur.saturating_sub(20),
+                id,
+                sender_id: format!("s{}", id),
+                sender_name: format!("S{}", id),
+                is_favorite: fav,
+                started_at: ts,
+                ended_at: ts + dur.saturating_sub(20),
                 frames: vec![CachedFrame {
-                    sender_id: format!("s{}", id), timestamp: ts,
-                    samples: vec![0i16; FRAME_SIZE], received_at: Instant::now(),
+                    sender_id: format!("s{}", id),
+                    timestamp: ts,
+                    samples: vec![0i16; FRAME_SIZE],
+                    received_at: Instant::now(),
                 }],
                 fully_played: false,
             }
@@ -1495,11 +1771,14 @@ mod tests {
         // Two non-favs then a favorite that started LATER.
         cache.insert_prioritized(mk(1, 1000, 500, false));
         cache.insert_prioritized(mk(2, 1500, 500, false));
-        cache.insert_prioritized(mk(3, 5000, 500, true));  // favorite, latest ts
+        cache.insert_prioritized(mk(3, 5000, 500, true)); // favorite, latest ts
 
         let ids: Vec<u64> = cache.playback_queue.iter().map(|u| u.id).collect();
-        assert_eq!(ids, vec![3, 1, 2],
-            "favorite must jump ahead regardless of timestamp; non-favs keep their order");
+        assert_eq!(
+            ids,
+            vec![3, 1, 2],
+            "favorite must jump ahead regardless of timestamp; non-favs keep their order"
+        );
     }
 
     #[test]
@@ -1511,12 +1790,16 @@ mod tests {
         let loud = vec![30000i16; FRAME_SIZE];
         cache.ingest_frame("alice", 1000, loud.clone());
         cache.ingest_frame("alice", 1020, loud.clone());
-        cache.ingest_frame("bob",   1010, loud.clone());
+        cache.ingest_frame("bob", 1010, loud.clone());
         let mixed = cache.ingest_frame("bob", 1015, loud.clone());
 
         if let Some(samples) = mixed {
             for &s in &samples {
-                assert!(s >= i16::MIN && s <= i16::MAX, "sample out of i16 range: {}", s);
+                assert!(
+                    s >= i16::MIN && s <= i16::MAX,
+                    "sample out of i16 range: {}",
+                    s
+                );
             }
         }
     }
@@ -1525,7 +1808,7 @@ mod tests {
     fn test_favorite_priority_ordering() {
         let mut cache = AudioCache::new();
         cache.update_user_info("alice", "Alice", false, false); // regular
-        cache.update_user_info("bob", "Bob", true, false);       // favorite
+        cache.update_user_info("bob", "Bob", true, false); // favorite
 
         // Create utterances manually
         let u_alice = Utterance {
@@ -1574,19 +1857,23 @@ mod tests {
         let mut cache = AudioCache::new();
         cache.mode = CacheMode::Queue;
 
-        let frames_a: Vec<CachedFrame> = (0..3).map(|i| CachedFrame {
-            sender_id: "alice".into(),
-            timestamp: 1000 + i * 20,
-            samples: vec![100i16; FRAME_SIZE],
-            received_at: Instant::now(),
-        }).collect();
+        let frames_a: Vec<CachedFrame> = (0..3)
+            .map(|i| CachedFrame {
+                sender_id: "alice".into(),
+                timestamp: 1000 + i * 20,
+                samples: vec![100i16; FRAME_SIZE],
+                received_at: Instant::now(),
+            })
+            .collect();
 
-        let frames_b: Vec<CachedFrame> = (0..2).map(|i| CachedFrame {
-            sender_id: "bob".into(),
-            timestamp: 2000 + i * 20,
-            samples: vec![200i16; FRAME_SIZE],
-            received_at: Instant::now(),
-        }).collect();
+        let frames_b: Vec<CachedFrame> = (0..2)
+            .map(|i| CachedFrame {
+                sender_id: "bob".into(),
+                timestamp: 2000 + i * 20,
+                samples: vec![200i16; FRAME_SIZE],
+                received_at: Instant::now(),
+            })
+            .collect();
 
         cache.playback_queue.push_back(Utterance {
             id: next_utterance_id(),
@@ -1613,7 +1900,11 @@ mod tests {
         // Play through all of Alice's frames
         let mut played_alice = 0;
         while let Some((id, _)) = cache.next_playback_frame() {
-            if id == "alice" { played_alice += 1; } else { break; }
+            if id == "alice" {
+                played_alice += 1;
+            } else {
+                break;
+            }
         }
         // We get 3 alice frames, then the first call after that gives bob
         // Actually: first call starts alice utterance (frame 0), then 1, 2
@@ -1624,7 +1915,9 @@ mod tests {
         // Continue getting bob's frames
         let mut played_bob = 1; // We already got one bob frame from the break above
         while let Some((id, _)) = cache.next_playback_frame() {
-            if id == "bob" { played_bob += 1; }
+            if id == "bob" {
+                played_bob += 1;
+            }
         }
         assert_eq!(played_bob, 2);
 
@@ -1638,12 +1931,14 @@ mod tests {
         let mut cache = AudioCache::new();
         cache.mode = CacheMode::Queue;
 
-        let frames: Vec<CachedFrame> = (0..10).map(|i| CachedFrame {
-            sender_id: "alice".into(),
-            timestamp: 1000 + i * 20,
-            samples: vec![100i16; FRAME_SIZE],
-            received_at: Instant::now(),
-        }).collect();
+        let frames: Vec<CachedFrame> = (0..10)
+            .map(|i| CachedFrame {
+                sender_id: "alice".into(),
+                timestamp: 1000 + i * 20,
+                samples: vec![100i16; FRAME_SIZE],
+                received_at: Instant::now(),
+            })
+            .collect();
 
         cache.playback_queue.push_back(Utterance {
             id: next_utterance_id(),
@@ -1687,8 +1982,9 @@ mod tests {
         // Simulate several noisy arrivals with ~60ms gaps (nominal 20ms, err=40ms).
         // EWMA update is 0.85*prev + 0.15*err; needs a few iterations to climb.
         for _ in 0..40 {
+            cache.live_arrival_sender = Some("peer".into());
             cache.live_arrival_last = Some(Instant::now() - Duration::from_millis(60));
-            cache.note_live_arrival_jitter();
+            cache.note_live_arrival_jitter("peer");
         }
         assert!(
             cache.adaptive_extra_frames() >= 2,
@@ -1700,8 +1996,9 @@ mod tests {
         // Simulate a long stretch of on-time arrivals (~20ms gaps, err=0).
         // EWMA decays 15% per sample toward zero.
         for _ in 0..60 {
+            cache.live_arrival_sender = Some("peer".into());
             cache.live_arrival_last = Some(Instant::now() - Duration::from_millis(20));
-            cache.note_live_arrival_jitter();
+            cache.note_live_arrival_jitter("peer");
         }
         assert_eq!(
             cache.adaptive_extra_frames(),
@@ -1713,10 +2010,70 @@ mod tests {
     }
 
     #[test]
+    fn speaker_change_does_not_inflate_jitter_ewma() {
+        let mut cache = AudioCache::new();
+        cache.live_arrival_sender = Some("alice".into());
+        cache.live_arrival_last = Some(Instant::now() - Duration::from_millis(80));
+        cache.note_live_arrival_jitter("bob");
+        assert!(
+            cache.jitter_ewma_ms() < 0.01,
+            "gap between two PTT peers is not network jitter, ewma={}",
+            cache.jitter_ewma_ms()
+        );
+        assert_eq!(cache.adaptive_extra_frames(), 0);
+    }
+
+    #[test]
+    fn two_peer_overlap_migrates_jitter_instead_of_dropping() {
+        let mut cache = AudioCache::new();
+        let samples = vec![100i16; FRAME_SIZE];
+        let prebuffer = live_jitter_prebuffer_frames();
+        for i in 0..prebuffer {
+            cache.ingest_frame("alice", 1000 + (i as u64) * 20, samples.clone());
+        }
+        assert_eq!(cache.live_jitter["alice"].len(), prebuffer);
+        cache.ingest_frame("bob", 2000, vec![200i16; FRAME_SIZE]);
+        cache.ingest_frame("bob", 2020, vec![200i16; FRAME_SIZE]);
+        assert_eq!(cache.mode(), CacheMode::Queue);
+        assert!(
+            cache.live_jitter.values().all(|q| q.is_empty()),
+            "live jitter should be flushed on overlap"
+        );
+        let alice_frames = cache
+            .active_buffers
+            .get("alice")
+            .map(|b| b.frames.len())
+            .unwrap_or(0);
+        assert!(
+            alice_frames >= prebuffer,
+            "alice prebuffer must migrate, got {alice_frames}"
+        );
+    }
+
+    #[test]
+    fn second_peer_beacon_does_not_enter_live_playout() {
+        let mut cache = AudioCache::new();
+        let alice = vec![100i16; FRAME_SIZE];
+        let bob = vec![0i16; FRAME_SIZE];
+        let prebuffer = live_jitter_prebuffer_frames();
+        for i in 0..=prebuffer {
+            let _ = cache.ingest_frame("alice", 1000 + (i as u64) * 20, alice.clone());
+        }
+        cache.ingest_frame("bob", 2000, bob);
+        std::thread::sleep(Duration::from_millis(LIVE_JITTER_DRAIN_AGE_MS + 20));
+        while let Some((sid, samples)) = cache.next_playback_frame() {
+            assert_ne!(sid, "bob", "second peer must not interleave into live playout");
+            assert_eq!(samples, alice);
+        }
+    }
+
+    #[test]
     fn test_clear_resets_everything() {
         let mut cache = AudioCache::new();
         cache.mode = CacheMode::Queue;
-        cache.active_buffers.insert("test".into(), SpeakerBuffer::new("test"));
+        cache
+            .active_buffers
+            .insert("test".into(), SpeakerBuffer::new("test"));
         cache.clear();
 
         assert_eq!(cache.mode(), CacheMode::Live);

@@ -640,25 +640,22 @@ private fun StatusLine(
     } else {
         "Downloading language model…"
     }
+    val needsSpeechPack = LiveTranslationText.needsOfflineSpeechPack(errorMessage) ||
+        status == LiveCaptionTranslator.Status.UNAVAILABLE
     val (text, color) = when {
-        // Download notation wins even while the feature toggle is off —
-        // picking a language still kicks off the model fetch.
+        // Speech-pack / UNAVAILABLE wins over an in-flight model download so
+        // error 12 cannot look like a download that never finishes.
+        needsSpeechPack ->
+            "Install offline speech pack — use Speech settings below" to StatusDisconnected
+        status == LiveCaptionTranslator.Status.ERROR &&
+            LiveTranslationText.needsOfflineSpeechPack(errorMessage) ->
+            "Install offline speech pack — use Speech settings below" to StatusDisconnected
         modelState == TranslationManager.ModelState.DOWNLOADING ->
             downloadLine to StatusWarning
         !enabled -> "Off" to TextMuted
         pausedForPtt -> "Paused for PTT" to StatusWarning
-        status == LiveCaptionTranslator.Status.UNAVAILABLE ->
-            when {
-                LiveTranslationText.needsOfflineSpeechPack(errorMessage) ->
-                    "Install offline speech pack — use Speech settings below" to StatusDisconnected
-                else -> (errorMessage ?: "Unavailable") to StatusDisconnected
-            }
         status == LiveCaptionTranslator.Status.ERROR ->
-            when {
-                LiveTranslationText.needsOfflineSpeechPack(errorMessage) ->
-                    "Install offline speech pack — use Speech settings below" to StatusDisconnected
-                else -> (errorMessage ?: "Error") to StatusDisconnected
-            }
+            (errorMessage ?: "Error") to StatusDisconnected
         modelState == TranslationManager.ModelState.FAILED ->
             if (wifiOnly) {
                 "Model download failed — connect to Wi-Fi or disable Wi-Fi-only" to StatusDisconnected
@@ -680,7 +677,7 @@ private fun StatusLine(
     }
 
     Row(verticalAlignment = Alignment.CenterVertically) {
-        if (modelState == TranslationManager.ModelState.DOWNLOADING) {
+        if (modelState == TranslationManager.ModelState.DOWNLOADING && !needsSpeechPack) {
             CircularProgressIndicator(
                 color = StatusWarning,
                 strokeWidth = 2.dp,
@@ -743,27 +740,24 @@ fun LiveTranslationOverlay(
     val needsSpeechPack = LiveTranslationText.needsOfflineSpeechPack(errorMessage) ||
         status == LiveCaptionTranslator.Status.UNAVAILABLE
 
-    val primaryText = when {
-        pausedForPtt ->
-            if (ttsEnabled) "Transmitting — read-back after release"
-            else "Paused — transmitting"
-        modelState == TranslationManager.ModelState.DOWNLOADING ->
-            LiveTranslationText.downloadStatusLine(sourceLang, targetLang)
-        needsSpeechPack ->
-            "Need offline speech pack — open Settings"
-        status == LiveCaptionTranslator.Status.ERROR ->
-            "Translation unavailable — check Settings"
-        translation.isNotBlank() -> translation
-        caption.isNotBlank() -> caption
-        status == LiveCaptionTranslator.Status.LISTENING -> "Listening…"
-        else -> "Speak to translate"
-    }
+    val primaryText = LiveTranslationText.radioOverlayPrimary(
+        pausedForPtt = pausedForPtt,
+        ttsEnabled = ttsEnabled,
+        modelDownloading = modelState == TranslationManager.ModelState.DOWNLOADING,
+        needsSpeechPack = needsSpeechPack,
+        statusError = status == LiveCaptionTranslator.Status.ERROR,
+        translation = translation,
+        caption = caption,
+        listening = status == LiveCaptionTranslator.Status.LISTENING,
+        sourceCode = sourceLang,
+        targetCode = targetLang,
+    )
     val primaryColor = when {
         pausedForPtt -> StatusWarning
-        modelState == TranslationManager.ModelState.DOWNLOADING -> StatusWarning
         needsSpeechPack ||
             status == LiveCaptionTranslator.Status.ERROR ||
             status == LiveCaptionTranslator.Status.UNAVAILABLE -> StatusDisconnected
+        modelState == TranslationManager.ModelState.DOWNLOADING -> StatusWarning
         translation.isNotBlank() -> Coral
         else -> TextPrimary
     }
@@ -835,7 +829,7 @@ fun LiveTranslationOverlay(
                     )
                 }
             }
-            if (modelState == TranslationManager.ModelState.DOWNLOADING) {
+            if (modelState == TranslationManager.ModelState.DOWNLOADING && !needsSpeechPack) {
                 CircularProgressIndicator(
                     color = StatusWarning,
                     strokeWidth = 2.dp,

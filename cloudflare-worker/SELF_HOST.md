@@ -64,7 +64,7 @@ Put the returned `id` / `preview_id` into the `[[kv_namespaces]]` block in
 `wrangler.toml` (replace the values shipped in this repo — they point at our
 namespace and you do not have access to them).
 
-## 3. Set your secrets
+## 3. Set your secrets and auth policy
 
 ```bash
 # REQUIRED — HMAC key for room capability tokens. Fail-closed: without it the
@@ -76,6 +76,64 @@ openssl rand -hex 32 | npx wrangler secret put AUTH_SECRET
 # the relay still forwards audio, it just won't wake backgrounded peers.
 npx wrangler secret put FCM_SERVICE_ACCOUNT_JSON
 ```
+
+`AUTH_SECRET` is the only relay-auth secret. The proof flow deliberately reuses
+it; do not create or commit a second key. `SHARES` is also used for short-lived
+proof-nonce replay records.
+
+The default auth policy is compatibility mode:
+
+- Existing clients calling `GET /auth?room=<id>` receive the legacy v1
+  room-bound token and continue to work.
+- Updated tooling can add `peer=<stable-id>` and receives a v2 token bound to
+  room, peer, expiry, and auth class. The `/ws` and `/presence` routes reject a
+  peer claim that differs from a v2 token.
+- `auth_class=terminal` always requires the versioned proof below. Reserved
+  privileged text controls also fail closed: ordinary clients are rejected and
+  terminal-class clients receive `privileged_control_unsupported` until a
+  reviewed server-side operation exists.
+
+For a managed deployment, after **every client has been upgraded to send proof
+headers**, enable proof-required issuance:
+
+```toml
+[vars]
+REQUIRE_AUTH_PROOF = "true"
+```
+
+Do not enable this against the currently shipped Android/iOS/desktop clients:
+they use legacy `GET /auth?room=...` and will receive HTTP 400 until their auth
+request includes a peer identity and proof. This switch is intentionally
+fail-closed.
+
+### Versioned proof format
+
+Trusted terminal/operator tooling that already holds `AUTH_SECRET` sends:
+
+```text
+GET /auth?room=<room>&peer=<peer>&auth_class=terminal
+X-Sassy-Auth-Version: 1
+X-Sassy-Auth-Timestamp: <unix seconds>
+X-Sassy-Auth-Nonce: <16-128 URL-safe random characters>
+X-Sassy-Auth-Proof: <lowercase hex HMAC-SHA256>
+```
+
+The signed bytes are exactly:
+
+```text
+v1\n<auth_class>\n<room>\n<peer>\n<timestamp>\n<nonce>
+```
+
+The timestamp must be within 60 seconds of the Worker clock. A nonce is accepted
+once for 120 seconds (subject to Cloudflare KV's eventual-consistency model).
+Never put `AUTH_SECRET` itself in a URL, log, mobile build, or browser bundle.
+
+Important boundary: this proves possession of the **relay operator secret** and
+binds the issued token to a claimed room and peer. It is not proof of the
+end-to-end room encryption key. The blind relay intentionally never receives
+that key, so it cannot validate a room-key HMAC without weakening the E2E
+design. In normal client compatibility mode, the unguessable room identifier
+(or sealed-sender key-derived room handle) remains the membership capability.
 
 ## 4. Deploy
 
@@ -105,9 +163,11 @@ target a relay base URL. Override it to your domain:
   rebuild. (Wiring this as a user/admin setting is the one client change needed;
   the protocol and endpoints are unchanged.)
 
-Both endpoints use the same token flow: client `GET /auth?room=<id>` → opens
-`GET /ws?room=<id>&token=<t>`. As long as your `AUTH_SECRET` is set, tokens
-minted by your relay are accepted only by your relay.
+Legacy clients use `GET /auth?room=<id>` and then
+`GET /ws?room=<id>&token=<t>`. Identity-aware clients request
+`GET /auth?room=<id>&peer=<peer>` and must use the same peer on `/ws` and
+`/presence`. Tokens minted by one relay are accepted only by a relay with the
+same active `AUTH_SECRET`.
 
 ---
 
@@ -137,3 +197,9 @@ metadata in their own account while letting encrypted audio cross the boundary.
   msg/s are set in `src/ptt-relay.js`. Adjust for your deployment.
 - **Cost:** idle rooms use WebSocket Hibernation, so an empty room consumes no
   compute. DO + KV usage bills to your account.
+- **Key rotation:** `AUTH_SECRET_PREV` is accepted only while
+  `AUTH_SECRET_PREV_UNTIL` (Unix seconds) is in the future. Set both before
+  replacing `AUTH_SECRET`; remove them after the bounded grace period.
+- **Required config:** `PTT_RELAY` Durable Object, `SHARES` KV, and
+  `AUTH_SECRET`. Proof-required/terminal issuance fails if `SHARES` is absent.
+  `FCM_SERVICE_ACCOUNT_JSON` is optional and only enables wake pushes.

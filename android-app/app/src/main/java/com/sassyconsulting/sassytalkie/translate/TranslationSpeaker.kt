@@ -29,7 +29,7 @@ class TranslationSpeaker(context: Context) : TextToSpeech.OnInitListener {
     @Volatile private var langTag = TranslationLangDefaults.DEFAULT_TARGET
     private var utteranceSeq = 0
     /** Fired on the TTS callback thread when the current utterance ends/errors. */
-    @Volatile var onUtteranceDone: (() -> Unit)? = null
+    @Volatile var onUtteranceDone: ((utteranceId: String?) -> Unit)? = null
 
     init {
         try {
@@ -47,14 +47,14 @@ class TranslationSpeaker(context: Context) : TextToSpeech.OnInitListener {
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {}
                     override fun onDone(utteranceId: String?) {
-                        onUtteranceDone?.invoke()
+                        onUtteranceDone?.invoke(utteranceId)
                     }
                     @Deprecated("Deprecated in Java")
                     override fun onError(utteranceId: String?) {
-                        onUtteranceDone?.invoke()
+                        onUtteranceDone?.invoke(utteranceId)
                     }
                     override fun onError(utteranceId: String?, errorCode: Int) {
-                        onUtteranceDone?.invoke()
+                        onUtteranceDone?.invoke(utteranceId)
                     }
                 })
             } catch (t: Throwable) {
@@ -71,13 +71,14 @@ class TranslationSpeaker(context: Context) : TextToSpeech.OnInitListener {
     }
 
     /**
-     * Speak [text] if TTS is ready. Returns true when an utterance was queued.
-     * No-ops when blank or not initialized.
+     * Speak [text] if TTS is ready. Returns the utterance id when queued,
+     * or null when blank / not initialized. Callers should ignore [onUtteranceDone]
+     * for any id other than the latest returned value (stop() can race onDone).
      */
-    fun speak(text: String): Boolean {
-        val engine = tts ?: return false
+    fun speak(text: String): String? {
+        val engine = tts ?: return null
         val trimmed = text.trim()
-        if (!ready || trimmed.isEmpty()) return false
+        if (!ready || trimmed.isEmpty()) return null
         return try {
             utteranceSeq++
             val id = "$UTTERANCE_PREFIX$utteranceSeq"
@@ -87,10 +88,10 @@ class TranslationSpeaker(context: Context) : TextToSpeech.OnInitListener {
                 Bundle(),
                 id,
             )
-            result == TextToSpeech.SUCCESS
+            if (result == TextToSpeech.SUCCESS) id else null
         } catch (t: Throwable) {
             Log.w(TAG, "speak failed: ${t.message}")
-            false
+            null
         }
     }
 

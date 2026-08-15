@@ -74,6 +74,10 @@ pub const OP_PTT_STOP_V2: u8 = 0x16;
 /// `[epoch:u64][sender_ts_ms:u64]` (16 bytes fixed).
 pub const OP_WAKE: u8 = 0x17;
 
+/// AES-GCM authenticated wrapper for every v2 control frame. Inner opcode
+/// is bound in AAD; raw 0x10..=0x1f must not be acted on without opening.
+pub const OP_AUTHENTICATED: u8 = 0x18;
+
 /// Replayed audio frame from the relay's per-peer ring buffer (catch-up
 /// after a reconnect). Variable length. Wire layout:
 ///   [0x19] [peer_id_len:u16 LE] [peer_id bytes] [original_audio_frame]
@@ -112,6 +116,20 @@ pub const OP_MANDOWN: u8 = 0x1D;
 /// `emergency::EmergencyClear`.
 pub const OP_EMERGENCY_CLEAR: u8 = 0x1E;
 
+/// Hybrid PQC handshake confirmation. Initiator → responder after the
+/// responder message is verified; the responder must not install the
+/// proposed session until this authenticated confirm arrives.
+/// Payload: `[channel:u8][sha256(responder_message)]`.
+pub const OP_HYBRID_CONFIRM: u8 = 0x1F;
+
+/// Hybrid PQC handshake confirm-ack. Responder → initiator after installing
+/// on CONFIRM. The initiator must not install the proposed session until
+/// this authenticated ack arrives; a lost CONFIRM therefore cannot leave
+/// the initiator on a new key the responder never confirmed.
+/// Payload: `[channel:u8][sha256(responder_message)]` (same token as CONFIRM).
+/// Outer routing window is 0x10..=0x20 so this is not treated as audio.
+pub const OP_HYBRID_CONFIRM_ACK: u8 = 0x20;
+
 /// Every opcode this protocol defines, for uniqueness checking and for
 /// consumers that need to validate an inbound byte against the whole set.
 /// Keep in sync when adding an opcode — `all_opcodes_are_unique` fails loudly
@@ -130,12 +148,15 @@ pub const ALL_OPCODES: &[(&str, u8)] = &[
     ("PTT_START_V2", OP_PTT_START_V2),
     ("PTT_STOP_V2", OP_PTT_STOP_V2),
     ("WAKE", OP_WAKE),
+    ("AUTHENTICATED", OP_AUTHENTICATED),
     ("REPLAY_FRAME", OP_REPLAY_FRAME),
     ("EMERGENCY", OP_EMERGENCY),
     ("HYBRID_INIT", OP_HYBRID_INIT),
     ("HYBRID_RESP", OP_HYBRID_RESP),
     ("MANDOWN", OP_MANDOWN),
     ("EMERGENCY_CLEAR", OP_EMERGENCY_CLEAR),
+    ("HYBRID_CONFIRM", OP_HYBRID_CONFIRM),
+    ("HYBRID_CONFIRM_ACK", OP_HYBRID_CONFIRM_ACK),
 ];
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -221,6 +242,8 @@ mod tests {
         assert!(is_tlv_opcode(OP_WAKE));
         assert!(is_tlv_opcode(OP_PARTNER_OFFLINE));
         assert!(is_tlv_opcode(OP_REPLAY_FRAME));
+        assert!(is_tlv_opcode(OP_HYBRID_CONFIRM_ACK));
+        assert!((0x10..=0x20).contains(&OP_HYBRID_CONFIRM_ACK));
     }
 
     #[test]

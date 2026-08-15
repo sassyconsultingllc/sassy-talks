@@ -2,7 +2,6 @@
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-OGDQSAQFTU2T
 /// Discovery Service - Peer Discovery and Management
-
 use super::BEACON_INTERVAL_SECS;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -24,46 +23,46 @@ impl DiscoveryService {
             device_id,
         }
     }
-    
+
     /// Start discovery service
     pub async fn start(&self) {
         info!("Discovery service started");
-        
+
         let peers = Arc::clone(&self.peers);
-        
+
         tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(BEACON_INTERVAL_SECS));
-            
+
             loop {
                 interval.tick().await;
-                
+
                 // Clean up stale peers
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_secs();
-                
-                peers.write().unwrap().retain(|_, peer| {
-                    peer.is_active()
-                });
+
+                peers.write().unwrap().retain(|_, peer| peer.is_active());
             }
         });
     }
-    
+
     /// Add or update peer
     pub fn update_peer(&self, peer: super::PeerInfo) {
         self.peers.write().unwrap().insert(peer.device_id, peer);
     }
-    
+
     /// Get all active peers
     pub fn get_peers(&self) -> Vec<super::PeerInfo> {
-        self.peers.read().unwrap()
+        self.peers
+            .read()
+            .unwrap()
             .values()
             .filter(|p| p.is_active())
             .cloned()
             .collect()
     }
-    
+
     /// Get peer by device ID
     pub fn get_peer(&self, device_id: u32) -> Option<super::PeerInfo> {
         self.peers.read().unwrap().get(&device_id).cloned()

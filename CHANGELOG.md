@@ -9,6 +9,23 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.2] (76) - 2026-08-15
+
+### Fixed
+- **Jitter between two PTT radios.** The 400 ms “peer speaking” LED was being
+  used as the transmit lock, so a normal cellular gap looked like a free
+  channel, the second radio keyed up, and the live jitter buffer dumped both
+  streams. Floor occupancy is now a separate hold (1.5 s of audio silence,
+  300 ms after PTT_STOP). Incoming audio re-asserts the floor even if the LED
+  already blinked off. The cache no longer treats a gap between two peers as
+  network jitter, no longer drops the first talker's prebuffer on overlap, and
+  no longer plays a second peer's beacon into the live talker's speaker.
+
+### Added
+- Authenticated control plane, deterministic floor/emergency preemption, TLS
+  pin helpers, relay connection state, FCM wake policy, and technical-audit
+  export — the uncommitted audit remediations that this Play build ships.
+
 ## [3.1.23] (75) - 2026-08-10
 
 ### Changed

@@ -67,8 +67,9 @@ object DeviceQuirks {
             enableNs = false,
             enableAgc = true,
         ),
-        outputForceCommMode = false,
-        notes = "Samsung: NS too aggressive on quiet speakers; AGC works fine."
+        outputForceCommMode = true,
+        notes = "Samsung: NS too aggressive on quiet speakers; AGC works fine. " +
+                "Force comm-mode loudspeaker on RX (earpiece is not the default)."
     )
 
     private fun xiaomiProfile(): Profile = Profile(
@@ -83,7 +84,7 @@ object DeviceQuirks {
 
     val defaultProfile = Profile(
         effectsConfig = AudioEffectsManager.Config(),
-        outputForceCommMode = false,
-        notes = "Stock defaults."
+        outputForceCommMode = true,
+        notes = "Stock defaults. Force comm-mode loudspeaker on RX."
     )
 }

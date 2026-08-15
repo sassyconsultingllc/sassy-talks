@@ -82,12 +82,16 @@ class CellularWebSocketClient {
             .build()
     }
 
-    private val client: OkHttpClient = sharedClient
+    private val client: OkHttpClient =
+        RelayTlsPins.apply(sharedClient.newBuilder()).build()
 
     private var webSocket: WebSocket? = null
     private val isConnected = AtomicBoolean(false)
     private val isRunning = AtomicBoolean(false)
+    private val isConnecting = AtomicBoolean(false)
     private val reconnectAttempts = AtomicInteger(0)
+    /** Invalidates auth callbacks, sockets, pumps, and reconnect tasks together. */
+    private val generation = GenerationOwner()
     // Set by disconnect(), cleared by an explicit connect(). While true, every
     // reconnect path is inert. This replaces the old "poison the attempt
     // counter" trick, which stopped working when scheduleReconnect gained the
@@ -113,7 +117,7 @@ class CellularWebSocketClient {
         Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "cellular-reconnect").apply { isDaemon = true }
         }
-    private var pendingReconnect: ScheduledFuture<*>? = null
+    @Volatile private var pendingReconnect: ScheduledFuture<*>? = null
 
     // Relay keepalive — decouples socket liveness from Bluetooth. The real
     // heartbeat lives on PttCoordinator (only created when BT is initialised),
@@ -132,8 +136,8 @@ class CellularWebSocketClient {
     /**
      * Fired once when a previously-open relay socket transitions to down
      * (graceful close, failure, or user disconnect). AutoConnect uses this
-     * for local-first failover (stay on WiFi, or drop to Bluetooth) instead
-     * of waiting for a WiFi NetworkCallback.
+     * for sticky reconnect (keep the relay hub through brief blips) instead
+     * of immediately failing over to Bluetooth.
      */
     var onRelayLost: ((reason: String) -> Unit)? = null
 
@@ -159,14 +163,16 @@ class CellularWebSocketClient {
         if (closed.getAndSet(false)) {
             reconnectAttempts.set(0)
         }
-        if (isConnected.get()) {
-            Log.w(TAG, "Already connected")
+        if (isConnected.get() || !isConnecting.compareAndSet(false, true)) {
+            Log.d(TAG, "Already connected/connecting")
             return true
         }
+        val ownerGeneration = generation.next()
         // Respect build-time flag to disable cellular relay (opt-in at build)
         try {
             if (!BuildConfig.ENABLE_CELLULAR_RELAY) {
                 Log.w(TAG, "Cellular relay disabled by build config")
+                isConnecting.set(false)
                 return false
             }
         } catch (e: Throwable) {
@@ -176,6 +182,7 @@ class CellularWebSocketClient {
         val baseWsUrl = SassyTalkNative.cellularGetWsUrl()
         if (baseWsUrl.isBlank()) {
             Log.e(TAG, "No WS URL — set room first")
+            isConnecting.set(false)
             return false
         }
         // Room id (= QR session_id). Log a short fingerprint so split-room
@@ -192,25 +199,31 @@ class CellularWebSocketClient {
         // every reconnect cycle. enqueue() runs on the OkHttp dispatcher.
         Log.i(TAG, "Fetching relay auth token…")
         authorizeWsUrlAsync(baseWsUrl) { wsUrl, err ->
+            if (!generation.owns(ownerGeneration) || closed.get()) {
+                Log.d(TAG, "Ignoring stale auth result generation=$ownerGeneration")
+                return@authorizeWsUrlAsync
+            }
             if (err != null || wsUrl == null) {
+                isConnecting.set(false)
                 Log.e(TAG, "Auth fetch failed: ${err?.message}")
                 SassyTalkNative.cellularOnError("auth: ${err?.message ?: "unknown"}")
-                scheduleReconnect("auth failure: ${err?.message}")
+                if (isTerminalAuthError(err)) {
+                    closed.set(true)
+                    Log.e(TAG, "Terminal relay authentication failure; reconnect disabled until explicit connect")
+                } else {
+                    scheduleReconnect("auth failure: ${err?.message}")
+                }
                 return@authorizeWsUrlAsync
             }
             // disconnect() may have raced the auth round-trip — don't open a
             // socket for a client that was torn down while we were fetching.
-            if (closed.get()) {
-                Log.i(TAG, "Auth completed after disconnect — not opening socket")
-                return@authorizeWsUrlAsync
-            }
-            openWebSocketAuthenticated(wsUrl)
+            openWebSocketAuthenticated(wsUrl, ownerGeneration)
         }
 
         return true // Connection is async; status comes via onOpen
     }
 
-    private fun openWebSocketAuthenticated(wsUrl: String) {
+    private fun openWebSocketAuthenticated(wsUrl: String, ownerGeneration: Int) {
         Log.i(TAG, "Connecting to relay (authenticated)")
 
         val request = Request.Builder()
@@ -219,7 +232,13 @@ class CellularWebSocketClient {
 
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (!generation.owns(ownerGeneration) || closed.get()) {
+                    webSocket.close(1000, "stale generation")
+                    return
+                }
                 Log.i(TAG, "WebSocket opened")
+                this@CellularWebSocketClient.webSocket = webSocket
+                isConnecting.set(false)
                 isConnected.set(true)
                 reconnectAttempts.set(0)
                 SassyTalkNative.cellularOnConnected()
@@ -228,13 +247,14 @@ class CellularWebSocketClient {
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                if (!generation.owns(ownerGeneration)) return
                 val raw = bytes.toByteArray()
                 // Validate full TLV structure before routing to PttCoordinator:
-                // byte[0] opcode in 0x10..0x1F, bytes[1..2] payload length (u16 LE),
+                // byte[0] opcode in 0x10..0x20, bytes[1..2] payload length (u16 LE),
                 // total frame size must equal 3 + payloadLen.
                 if (raw.size >= 3) {
                     val op = raw[0].toInt() and 0xFF
-                    if (op in 0x10..0x1F) {
+                    if (op in 0x10..0x20) {
                         val payloadLen = (raw[1].toInt() and 0xFF) or ((raw[2].toInt() and 0xFF) shl 8)
                         if (raw.size == 3 + payloadLen) {
                             // Derive a per-peer routing key from the TLV payload
@@ -255,6 +275,7 @@ class CellularWebSocketClient {
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (!generation.owns(ownerGeneration)) return
                 if (BuildConfig.DEBUG) Log.d(TAG, "Control: $text")
                 try {
                     val obj = JSONObject(text)
@@ -286,13 +307,15 @@ class CellularWebSocketClient {
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                if (!generation.owns(ownerGeneration)) return
                 Log.i(TAG, "WebSocket closing: $code $reason")
                 webSocket.close(1000, null)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (!generation.owns(ownerGeneration)) return
                 Log.i(TAG, "WebSocket closed: $code $reason")
-                onDisconnected("closed: $code $reason")
+                onDisconnected("closed: $code $reason", ownerGeneration)
                 // Server-initiated close (e.g. DO restart) previously left us
                 // permanently disconnected. Retry via the same backoff as
                 // onFailure so the radio recovers automatically.
@@ -300,12 +323,15 @@ class CellularWebSocketClient {
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if (!generation.owns(ownerGeneration)) return
                 Log.e(TAG, "WebSocket failure: ${t.message}")
                 SassyTalkNative.cellularOnError(t.message ?: "unknown error")
-                onDisconnected("failure: ${t.message}")
+                onDisconnected("failure: ${t.message}", ownerGeneration)
                 scheduleReconnect("failure: ${t.message}")
             }
-        })
+        }).also {
+            if (generation.owns(ownerGeneration)) webSocket = it else it.cancel()
+        }
     }
 
     /** Disconnect from the relay */
@@ -315,11 +341,21 @@ class CellularWebSocketClient {
         // — including the one onClosed() fires when the close handshake for
         // THIS disconnect completes a moment from now.
         closed.set(true)
+        generation.invalidate()
+        isConnecting.set(false)
         cancelPendingReconnect()
         stopOutboundPump()
         webSocket?.close(1000, "user disconnect")
         webSocket = null
         onDisconnected("user disconnect")
+    }
+
+    /** Terminal close: stop reconnect and release scheduler threads. */
+    fun shutdown() {
+        disconnect()
+        stopKeepAlive()
+        try { reconnectScheduler.shutdownNow() } catch (_: Throwable) {}
+        try { keepAliveScheduler.shutdownNow() } catch (_: Throwable) {}
     }
 
     /**
@@ -345,9 +381,10 @@ class CellularWebSocketClient {
         } else {
             RECONNECT_FLOOR_MS
         }
+        val scheduledGeneration = generation.current()
         cancelPendingReconnect()
         pendingReconnect = reconnectScheduler.schedule({
-            if (!isConnected.get() && !closed.get()) {
+            if (generation.owns(scheduledGeneration) && !isConnected.get() && !closed.get()) {
                 Log.i(TAG, "Reconnecting ($cause, attempt $attempt, delay ${delayMs}ms)…")
                 try { connect() } catch (e: Exception) {
                     Log.w(TAG, "Reconnect attempt $attempt threw: ${e.message}")
@@ -360,6 +397,9 @@ class CellularWebSocketClient {
         pendingReconnect?.cancel(false)
         pendingReconnect = null
     }
+
+    fun isAttempting(): Boolean =
+        !closed.get() && (isConnected.get() || isConnecting.get() || pendingReconnect?.isDone == false)
 
     fun isConnected(): Boolean = isConnected.get()
 
@@ -463,7 +503,9 @@ class CellularWebSocketClient {
         outboundThread = null
     }
 
-    private fun onDisconnected(reason: String) {
+    private fun onDisconnected(reason: String, ownerGeneration: Int? = null) {
+        if (ownerGeneration != null && !generation.owns(ownerGeneration)) return
+        isConnecting.set(false)
         stopKeepAlive()
         if (isConnected.getAndSet(false)) {
             stopOutboundPump()
@@ -474,16 +516,27 @@ class CellularWebSocketClient {
                 Log.w(TAG, "onRelayLost callback threw: ${t.message}")
             }
         }
+        pttCoordinator?.onTransportAvailabilityChanged("relay-$reason")
     }
 
-    /** Send a raw binary frame via the WebSocket relay. */
-    fun sendBinary(bytes: ByteArray) {
-        val ws = webSocket ?: return
+    /** Send an authenticated binary control frame via the WebSocket relay. */
+    fun sendBinary(bytes: ByteArray): Boolean {
+        val ws = webSocket ?: return false
+        val protected = if (bytes.firstOrNull() == ControlFrame.OP_AUTHENTICATED) {
+            bytes
+        } else {
+            AuthenticatedControlPlane.seal(bytes) ?: run {
+                Log.e(TAG, "Control send blocked: no authenticated room context")
+                return false
+            }
+        }
         // Control frames (HB / PTT markers) are small and infrequent — still
         // honour backpressure so we don't silently drop a wake/PTT_START.
-        if (!sendWithRetry(ws, bytes) && BuildConfig.DEBUG) {
-            Log.w(TAG, "sendBinary dropped ${bytes.size}B control frame")
+        val sent = sendWithRetry(ws, protected)
+        if (!sent && BuildConfig.DEBUG) {
+            Log.w(TAG, "sendBinary dropped ${protected.size}B control frame")
         }
+        return sent
     }
 
     /** Send a heartbeat ping to the relay (JSON control message) */
@@ -540,7 +593,7 @@ class CellularWebSocketClient {
             0,
             SassyTalkNative.localCapabilities(),
         )
-        webSocket?.let { sendWithRetry(it, frame) }
+        sendBinary(frame)
     }
 
     /**
@@ -570,6 +623,9 @@ class CellularWebSocketClient {
             .build()
             .newBuilder()
             .setQueryParameter("room", room)
+            .apply {
+                peerId?.takeIf { it.isNotBlank() }?.let { setQueryParameter("peer", it) }
+            }
             .build()
 
         val req = Request.Builder().url(authUrl).get().build()
@@ -624,6 +680,13 @@ class CellularWebSocketClient {
         url.startsWith("https://") -> "wss://" + url.removePrefix("https://")
         url.startsWith("http://")  -> "ws://"  + url.removePrefix("http://")
         else -> url
+    }
+
+    private fun isTerminalAuthError(error: Throwable?): Boolean {
+        val message = error?.message ?: return false
+        return message.contains("auth http 400") ||
+            message.contains("auth http 401") ||
+            message.contains("auth http 403")
     }
 
     /**

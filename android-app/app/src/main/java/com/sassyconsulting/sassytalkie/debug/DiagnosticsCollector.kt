@@ -5,6 +5,7 @@ package com.sassyconsulting.sassytalkie.debug
 
 import android.content.Context
 import com.sassyconsulting.sassytalkie.CellularWebSocketClient
+import com.sassyconsulting.sassytalkie.RelayConnectionState
 import com.sassyconsulting.sassytalkie.SassyTalkNative
 import com.sassyconsulting.sassytalkie.WalkieService
 import org.json.JSONObject
@@ -49,7 +50,9 @@ object DiagnosticsCollector {
         try {
             val sessionRoom = SassyTalkNative.getSessionId().orEmpty()
             val cell = parseCellularStats(SassyTalkNative.cellularGetStats())
-            val wsOk = walkieService?.pttCoordinator?.cellularClient?.isConnected() == true
+            val kotlinWs = walkieService?.pttCoordinator?.cellularClient?.isConnected() == true
+            val nativeLive = try { SassyTalkNative.hasLiveAudioPath() } catch (_: Throwable) { false }
+            val wsOk = RelayConnectionState.isLive(kotlinWs, cell.state, nativeLive)
             val peers = walkieService?.pttCoordinator?.peerIds?.value?.size ?: 0
             val users = try { SassyTalkNative.getUsers().size } catch (_: Throwable) { 0 }
             val channel = try { SassyTalkNative.getChannel() } catch (_: Throwable) { 0 }
@@ -107,7 +110,9 @@ object DiagnosticsCollector {
         val cell = parseCellularStats(
             try { SassyTalkNative.cellularGetStats() } catch (_: Throwable) { "{}" },
         )
-        val wsOk = walkieService?.pttCoordinator?.cellularClient?.isConnected()
+        val kotlinWs = walkieService?.pttCoordinator?.cellularClient?.isConnected() == true
+        val nativeLive = try { SassyTalkNative.hasLiveAudioPath() } catch (_: Throwable) { false }
+        val wsOk = RelayConnectionState.isLive(kotlinWs, cell.state, nativeLive)
 
         line("App", "SassyTalkie")
         line("versionName", com.sassyconsulting.sassytalkie.BuildConfig.VERSION_NAME)
@@ -134,7 +139,7 @@ object DiagnosticsCollector {
             else -> "NO — audio may be on wrong room"
         })
         line("cellular state", cell.state.ifEmpty { "?" })
-        line("WS connected", wsOk ?: "(service not bound)")
+        line("WS connected", wsOk)
         line("sent / received", "${cell.sent} / ${cell.received}")
         line("in / out queue", "${cell.inboundQueue} / ${cell.outboundQueue}")
         line("dropped packets", cell.dropped)
