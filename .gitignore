@@ -89,3 +89,7 @@ ios-native.zip
 # immediately. build.rs discovers the opus sources from the registry and
 # cargo-ndk supplies the linkers, so no committed override is needed.
 android-native/.cargo/config.toml
+
+# Stray cargo target dir from a desktop remediation build — 1.3GB of build
+# output that is not source. Ignored rather than committed.
+tauri-desktop/src-tauri/target-remediation/

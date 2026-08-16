@@ -9,6 +9,37 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.2.2] (78) - 2026-08-16
+
+### Changed
+- **Custom deep-link scheme is now `sassy-talks://`.** Registered in the
+  manifest alongside the previous `sassytalk://`, which is still accepted on
+  the way in — invites get pasted into chats and left there, and a link shared
+  last week is live until it expires, so dropping the old scheme would turn
+  every one of them into a dead tap. New links are minted with the new scheme
+  only. The relay's `/v/` viewer page (the fallback for a click that does not
+  resolve via App Links) now fires the new scheme too; that half takes effect
+  on the next worker deploy.
+  - Verified on-device: `sassy-talks://`, legacy `sassytalk://`, and the
+    verified https App Link all open MainActivity rather than a browser.
+
+### Added
+- **Trial countdown before the paywall.** The trial worked but arrived
+  unannounced — five sessions of a working radio, then a wall with no lead-up.
+  The radio screen now shows a muted "2 free sessions left" / "Last free
+  session" card with an Upgrade shortcut, for the last two sessions only:
+  counting down from five nags someone who has barely started, and saying
+  nothing is how the wall becomes a surprise.
+- **The gate explains itself.** Both flavors distinguish "you used your 5 free
+  sessions" from "this build arrived locked". A bare paywall after five working
+  sessions reads as the app breaking rather than as a transaction.
+
+### Fixed
+- The gate is a dead end by design, but the new Upgrade shortcut made that a
+  trap: a user who tapped it with sessions still left could not get back to the
+  radio. Back now works from the gate while the trial is unspent, and only
+  then — once it is gone the gate is final again.
+
 ## [3.2.1] (77) - 2026-08-16
 
 ### Fixed
