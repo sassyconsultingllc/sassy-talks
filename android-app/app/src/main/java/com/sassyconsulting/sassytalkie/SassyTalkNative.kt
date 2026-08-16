@@ -983,8 +983,8 @@ object SassyTalkNative {
             } else {
                 true
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "setSpeakerphone failed: ${e.message}")
+        } catch (t: Throwable) {
+            Log.e(TAG, "setSpeakerphone failed: ${t.message}")
             false
         }
     }
@@ -992,7 +992,9 @@ object SassyTalkNative {
     /** Persist loudspeaker vs earpiece without entering MODE_IN_COMMUNICATION. */
     fun setSpeakerphonePreference(on: Boolean) {
         if (!initialized) return
-        try { nativeSetSpeakerPreference(on) } catch (_: Exception) {}
+        try { nativeSetSpeakerPreference(on) } catch (t: Throwable) {
+            Log.e(TAG, "setSpeakerphonePreference failed: ${t.message}")
+        }
     }
 
     /**
@@ -1002,8 +1004,8 @@ object SassyTalkNative {
      */
     fun reassertRxRoute(): Boolean {
         if (!initialized) return false
-        return try { nativeReassertRxRoute() } catch (e: Exception) {
-            Log.e(TAG, "reassertRxRoute failed: ${e.message}")
+        return try { nativeReassertRxRoute() } catch (t: Throwable) {
+            Log.e(TAG, "reassertRxRoute failed: ${t.message}")
             false
         }
     }

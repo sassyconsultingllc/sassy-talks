@@ -9,6 +9,19 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.2.1] (77) - 2026-08-16
+
+### Fixed
+- **Phones crashed on start after the 3.2 update.** `3.2` added JNI methods
+  (`nativeSetSpeakerPreference`, `nativeReassertRxRoute`,
+  `nativeHasLiveAudioPath`) and rebuilt only the x86_64 native library.
+  Physical devices load arm64, which was still the 3.1.20 binary, so
+  `setSpeakerphonePreference()` threw `UnsatisfiedLinkError` on the first
+  launch after permissions. Both ABIs are now rebuilt together, and the
+  JNI wrappers catch `Throwable` so a missing symbol logs instead of
+  taking the process down. CI now also checks those 3.2 symbols exist in
+  **both** `.so` files.
+
 ## [3.2] (76) - 2026-08-15
 
 ### Fixed

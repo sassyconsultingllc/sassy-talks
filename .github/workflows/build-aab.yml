@@ -152,7 +152,10 @@ jobs:
             echo "$abi: $(stat -c%s "$so") bytes"
             # Spot-check symbols from three independent subsystems so a
             # partial/misconfigured build fails here rather than at runtime.
-            for sym in nativeInit nativePttStart nativeEmergencyActivate; do
+            # nativeSetSpeakerPreference / nativeReassertRxRoute /
+            # nativeHasLiveAudioPath shipped in 3.2 Kotlin and were missing
+            # from the committed arm64 .so — phones crashed on start.
+            for sym in nativeInit nativePttStart nativeEmergencyActivate nativeSetSpeakerPreference nativeReassertRxRoute nativeHasLiveAudioPath; do
               if ! grep -aq "$sym" "$so"; then
                 echo "::error::$abi: missing exported symbol $sym"; fail=1
               fi
