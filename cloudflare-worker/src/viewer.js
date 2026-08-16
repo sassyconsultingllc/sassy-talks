@@ -233,10 +233,17 @@ const LANDING_HTML = `<!DOCTYPE html>
           var u = new URL(href);
           // u.pathname is already "/v/<id>"; the scheme host is "v", so append
           // only the "/<id>" part — strip the leading "/v" or we'd emit the
-          // doubled "sassytalk://v/v/<id>" that the app rejects. The #fragment
+          // doubled "sassy-talks://v/v/<id>" that the app rejects. The #fragment
           // (the AES key) MUST survive: the custom-scheme intent-filter delivers
           // the whole URL to MainActivity, which reads dataString incl. fragment.
-          return 'sassytalk://v' + u.pathname.replace(/^\/v/, '') + u.hash;
+          //
+          // Scheme is sassy-talks:// as of 3.1.24. Older installs registered
+          // sassytalk:// only, so a device that has not updated yet will not
+          // match this — that is why the page tries the https App Link first
+          // and falls back to intent:// with a Play link, rather than relying
+          // on the custom scheme alone. The app still ACCEPTS the old scheme
+          // inbound, so links minted before the change keep working.
+          return 'sassy-talks://v' + u.pathname.replace(/^\/v/, '') + u.hash;
         } catch (e) {
           return href;
         }
