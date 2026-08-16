@@ -174,7 +174,16 @@ object Entitlements {
                 )
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "Enter your license key from checkout,\nor a friends & family promo code.\nLicenses cover 3 devices.",
+                    // Say WHY this screen appeared. Arriving at a bare paywall
+                    // after five working sessions reads as the app breaking;
+                    // naming the trial makes it a transaction the user
+                    // recognises rather than a fault.
+                    text = if (TrialGate.trialExhausted(context)) {
+                        "You've used your ${TrialGate.FREE_SESSIONS} free sessions.\n" +
+                            "Enter your license key from checkout,\nor a friends & family promo code."
+                    } else {
+                        "Enter your license key from checkout,\nor a friends & family promo code.\nLicenses cover 3 devices."
+                    },
                     fontSize = 14.sp,
                     color = TextGray,
                     textAlign = TextAlign.Center,

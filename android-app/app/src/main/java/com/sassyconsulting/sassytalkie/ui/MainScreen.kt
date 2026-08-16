@@ -57,6 +57,7 @@ fun MainScreen(
     onShowActivity: () -> Unit = {},
     onShowAbout: () -> Unit = {},
     onShowSettings: () -> Unit = {},
+    onShowUpgrade: () -> Unit = {},
     onEndSession: () -> Unit = {},
     walkieService: WalkieService? = null,
     autoConnect: AutoConnectManager,
@@ -161,6 +162,18 @@ fun MainScreen(
                     SassyTalkNative.getSessionId(),
                 )
             }
+        }
+    }
+
+    // Trial countdown. Re-read whenever a peer appears, since that is the only
+    // moment the count can change — see TrialGate.noteQualifyingSession above.
+    var trialWarn by remember { mutableStateOf(false) }
+    var trialLeft by remember { mutableIntStateOf(0) }
+    LaunchedEffect(trialPeerIds.isNotEmpty()) {
+        withContext(Dispatchers.IO) {
+            val warn = com.sassyconsulting.sassytalkie.license.TrialGate.shouldWarn(context)
+            val left = com.sassyconsulting.sassytalkie.license.TrialGate.sessionsRemaining(context)
+            withContext(Dispatchers.Main) { trialWarn = warn; trialLeft = left }
         }
     }
 
@@ -425,6 +438,14 @@ fun MainScreen(
             SelfEmergencyBanner(
                 onClear = { walkieService?.pttCoordinator?.clearEmergency() }
             )
+            Spacer(modifier = Modifier.height(6.dp))
+        }
+
+        // Trial countdown. Shown only for the last two free sessions: the
+        // paywall used to arrive with no warning at all, and a countdown from
+        // five would nag someone who has barely started.
+        if (trialWarn) {
+            TrialCountdownBanner(sessionsLeft = trialLeft, onUpgrade = onShowUpgrade)
             Spacer(modifier = Modifier.height(6.dp))
         }
 
@@ -1581,5 +1602,54 @@ private fun PTTButton(
             }
         }
     }
+    }
+}
+
+/**
+ * Trial countdown shown on the radio screen for the last two free sessions.
+ *
+ * Deliberately understated — a muted card, not an interstitial. The user is
+ * mid-radio-session; the point is that the paywall does not arrive as a
+ * surprise, not to interrupt the thing they came here to do. "Upgrade" is
+ * offered so they can act on the warning immediately instead of having to
+ * remember it later, but ignoring it costs them nothing until the count runs
+ * out.
+ */
+@Composable
+private fun TrialCountdownBanner(sessionsLeft: Int, onUpgrade: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = SurfaceBg),
+        shape = RoundedCornerShape(10.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Default.Info,
+                contentDescription = null,
+                tint = Orange,
+                modifier = Modifier.size(16.dp),
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = if (sessionsLeft <= 1) {
+                    "Last free session"
+                } else {
+                    "$sessionsLeft free sessions left"
+                },
+                color = TextGray,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(
+                onClick = onUpgrade,
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+            ) {
+                Text("Upgrade", color = Cyan, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+        }
     }
 }

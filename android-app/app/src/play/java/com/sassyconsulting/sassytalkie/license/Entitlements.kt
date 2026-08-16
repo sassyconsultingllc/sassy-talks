@@ -355,7 +355,14 @@ object Entitlements {
                 Text(text = "🎙", fontSize = 64.sp)
                 Spacer(modifier = Modifier.height(24.dp))
                 Text(
-                    text = "Unlock Sassy-Talk",
+                    // Name the trial rather than showing a bare wall — after
+                    // five working sessions an unexplained paywall reads as the
+                    // app breaking.
+                    text = if (TrialGate.trialExhausted(context)) {
+                        "Free trial used"
+                    } else {
+                        "Unlock Sassy-Talk"
+                    },
                     fontSize = 24.sp,
                     fontWeight = FontWeight.Bold,
                     color = Teal,

@@ -108,6 +108,35 @@ object TrialGate {
         )
     }
 
+    /**
+     * Should the radio screen warn that the trial is running out?
+     *
+     * Pure so it can be tested without Android: the real inputs
+     * ([sessionsRemaining], [Entitlements.isUnlockedCached]) are both
+     * environment-dependent, and the second is unconditionally true in debug
+     * builds — testing through them would assert nothing.
+     *
+     * Warns only on the last two sessions. Counting down from five would be
+     * nagging a user who has barely started; saying nothing at all is how the
+     * paywall ends up arriving with no warning, which is the edge this closes.
+     * Never warns an entitled user — they have nothing left to run out of.
+     */
+    fun warnThreshold(remaining: Int, entitled: Boolean): Boolean =
+        !entitled && remaining in 1..2
+
+    /** [warnThreshold] applied to the live environment. */
+    fun shouldWarn(context: Context): Boolean =
+        warnThreshold(sessionsRemaining(context), Entitlements.isUnlockedCached(context))
+
+    /**
+     * True when the trial is spent AND unpurchased — i.e. the user is at the
+     * paywall *because they used it up*, not because they arrived locked. Lets
+     * the gate say which of those happened instead of showing one blank wall
+     * for both.
+     */
+    fun trialExhausted(context: Context): Boolean =
+        !Entitlements.isUnlockedCached(context) && qualifyingSessions(context) >= FREE_SESSIONS
+
     /** Test/support hook: restore a full trial. */
     fun reset(context: Context) {
         prefs(context).edit().remove(KEY_COUNTED_SESSIONS).apply()

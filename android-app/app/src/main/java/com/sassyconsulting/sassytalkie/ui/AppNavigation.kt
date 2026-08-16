@@ -415,12 +415,20 @@ fun AppNavigation(
     }
 
     // Hardware back button support
+    // The gate is normally a dead end — that is the point of a paywall. But the
+    // trial countdown offers an "Upgrade" shortcut, and a user who taps it out
+    // of curiosity with sessions still left must be able to get back to the
+    // radio. Escapable ONLY while the trial is unspent; once it is gone the
+    // gate is final again.
+    val gateIsVoluntary = currentScreen == Screen.Gate &&
+        com.sassyconsulting.sassytalkie.license.TrialGate.inTrial(context)
     BackHandler(
         enabled = currentScreen != Screen.Auth &&
             currentScreen != Screen.Profile &&
-            currentScreen != Screen.Gate,
+            (currentScreen != Screen.Gate || gateIsVoluntary),
     ) {
         when (currentScreen) {
+            Screen.Gate -> currentScreen = Screen.Main
             Screen.Main -> {
                 walkieService?.releaseMulticastLock()
                 currentScreen = Screen.Auth
@@ -474,6 +482,7 @@ fun AppNavigation(
             onShowActivity = { currentScreen = Screen.Activity },
             onShowAbout = { currentScreen = Screen.About },
             onShowSettings = { currentScreen = Screen.Settings },
+            onShowUpgrade = { currentScreen = Screen.Gate },
             onEndSession = {
                 walkieService?.pttCoordinator?.onPttReleased()
                 autoConnect.disconnect()
