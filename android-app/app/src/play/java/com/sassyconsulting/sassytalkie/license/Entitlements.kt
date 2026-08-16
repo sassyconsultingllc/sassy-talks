@@ -108,6 +108,7 @@ object Entitlements {
             .enablePendingPurchases(
                 PendingPurchasesParams.newBuilder().enableOneTimeProducts().build(),
             )
+            .enableAutoServiceReconnection()
             .build()
         val main = android.os.Handler(android.os.Looper.getMainLooper())
         fun finish(result: Boolean) {
@@ -220,6 +221,7 @@ object Entitlements {
                 .enablePendingPurchases(
                     PendingPurchasesParams.newBuilder().enableOneTimeProducts().build(),
                 )
+                .enableAutoServiceReconnection()
                 .build()
                 .also { clientHolder[0] = it }
         }
@@ -230,7 +232,10 @@ object Entitlements {
         ) {
             catalogLoading = false
             details = product
-            price = product?.oneTimePurchaseOfferDetails?.formattedPrice
+            price = product?.oneTimePurchaseOfferDetailsList
+                ?.firstOrNull()
+                ?.formattedPrice
+                ?: product?.oneTimePurchaseOfferDetails?.formattedPrice
             if (product == null && err != null) error = err
         }
 
@@ -291,7 +296,8 @@ object Entitlements {
                                                 .build(),
                                         ),
                                     ).build()
-                                client.queryProductDetailsAsync(params) { pr, list ->
+                                client.queryProductDetailsAsync(params) { pr, detailsResult ->
+                                    val list = detailsResult.productDetailsList.orEmpty()
                                     scope.launch(Dispatchers.Main.immediate) {
                                         when {
                                             pr.responseCode != BillingClient.BillingResponseCode.OK ->

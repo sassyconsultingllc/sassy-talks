@@ -9,6 +9,16 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.2.3] (79) - 2026-08-16
+
+### Changed
+- **Google Play Billing Library 7.1.1 → 9.1.0.** Play stops accepting updates
+  that still ship Billing Library 7 after 31 August 2026. The paywall already
+  used the ProductDetails / QueryPurchasesParams APIs, so the live change is
+  the 8.x listener (`QueryProductDetailsResult.productDetailsList`) plus
+  `enableAutoServiceReconnection()` so a dropped Play connection retries
+  instead of hanging Restore. Next publishing deadline moves to 31 August 2028.
+
 ## [3.2.2] (78) - 2026-08-16
 
 ### Changed

@@ -26,8 +26,8 @@ android {
         applicationId = "com.sassyconsulting.sassytalkie"
         minSdk = 24
         targetSdk = 35
-        versionCode = 78
-        versionName = "3.2.2"
+        versionCode = 79
+        versionName = "3.2.3"
         
         // Feature flag: enable or disable cellular (relay) transport at build time
         buildConfigField("boolean", "ENABLE_CELLULAR_RELAY", "true")
@@ -177,7 +177,7 @@ kotlin {
 dependencies {
     // Play flavor only: Google Play Billing for the one-time unlock purchase.
     // The direct flavor ships zero Google billing code.
-    "playImplementation"("com.android.billingclient:billing-ktx:7.1.1")
+    "playImplementation"("com.android.billingclient:billing-ktx:9.1.0")
 
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.core:core-splashscreen:1.0.1")
