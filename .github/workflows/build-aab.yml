@@ -92,7 +92,13 @@ jobs:
       - name: Install NDK ${{ env.NDK_VERSION }}
         run: |
           yes | sdkmanager --install "ndk;$NDK_VERSION" > /dev/null
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          ndk="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION"
+          # cargo-ndk prefers NDK_HOME over ANDROID_NDK_HOME. Set both to the
+          # Gradle-pinned NDK so a runner with a newer default cannot silently
+          # compile libs against the wrong sysroot.
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ndk" >> "$GITHUB_ENV"
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
