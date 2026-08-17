@@ -26,7 +26,7 @@ set(OPUS_SO    ${CMAKE_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}/libopus.so)
 
 find_library(log-lib log)
 
-# 16 KB page-size alignment (Google Play requirement for Android 15+ / targetSdk 35).
+# 16 KB page-size alignment (Google Play requirement for Android 15+ / targetSdk 35+).
 # NDK r25 links LOAD segments at 4 KB by default; force 16 KB so this .so loads
 # on 16 KB-page devices. Applies to every target defined below.
 add_link_options("-Wl,-z,max-page-size=16384")

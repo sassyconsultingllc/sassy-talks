@@ -17,7 +17,7 @@ if (file("google-services.json").exists()) {
 
 android {
     namespace = "com.sassyconsulting.sassytalkie"
-    compileSdk = 35
+    compileSdk = 36
     // Pin to an NDK that is actually installed. AGP's default for this version
     // is 27.0.12077973 (not present); 27.1.12297006 is installed.
     ndkVersion = "27.1.12297006"
@@ -25,9 +25,10 @@ android {
     defaultConfig {
         applicationId = "com.sassyconsulting.sassytalkie"
         minSdk = 24
-        targetSdk = 35
-        versionCode = 79
-        versionName = "3.2.3"
+        // Play requires targetSdk 36 for app updates from 31 August 2026.
+        targetSdk = 36
+        versionCode = 80
+        versionName = "3.2.4"
         
         // Feature flag: enable or disable cellular (relay) transport at build time
         buildConfigField("boolean", "ENABLE_CELLULAR_RELAY", "true")
@@ -218,7 +219,8 @@ dependencies {
     implementation("com.google.mlkit:translate:17.0.3")
 
     // CameraX for QR scanner — 1.4.0+ aligns libimage_processing_util_jni.so to 16 KB.
-    // Pinned to 1.4.2 (last 1.4.x): 1.6.x demands compileSdk 36 + AGP 8.9.1.
+    // Stay on 1.4.2: it already meets Play's 16 KB page-size rule; 1.6.x is a
+    // separate upgrade once compileSdk 36 is no longer the only gate.
     implementation("androidx.camera:camera-camera2:1.4.2")
     implementation("androidx.camera:camera-lifecycle:1.4.2")
     implementation("androidx.camera:camera-view:1.4.2")

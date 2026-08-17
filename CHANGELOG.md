@@ -9,6 +9,16 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [3.2.4] (80) - 2026-08-17
+
+### Changed
+- **Target / compile SDK 35 → 36 (Android 16).** Play stops accepting updates
+  that still target API 35 after 31 August 2026. Edge-to-edge, predictive back
+  (`enableOnBackInvokedCallback` + Compose `BackHandler`), and unrestricted
+  large-screen orientation were already in place from the Android 15 work —
+  this release is the version bump Play's policy requires so production
+  uploads can continue.
+
 ## [3.2.3] (79) - 2026-08-16
 
 ### Changed
