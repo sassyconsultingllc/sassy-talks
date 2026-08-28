@@ -55,12 +55,14 @@ ringbuf = "0.3"
 # Error handling
 thiserror = "1.0"
 
-# iOS FFI
+[target.'cfg(target_vendor = "apple")'.dependencies]
+# Apple-only FFI. These MUST stay behind the target gate: core-foundation 0.9
+# unconditionally does `use std::os::unix::io` and `libc::PATH_MAX`, so listing
+# it in plain [dependencies] made the crate un-checkable on a non-Apple host —
+# which meant no `cargo check` of the portable logic (floor control, protocol
+# framing, jitter buffer) without a Mac. Gating restores host-side verification.
 core-foundation = "0.9"
 core-foundation-sys = "0.8"
-
-[target.'cfg(target_os = "ios")'.dependencies]
-# iOS-specific dependencies
 objc = "0.2"
 block = "0.1"
 

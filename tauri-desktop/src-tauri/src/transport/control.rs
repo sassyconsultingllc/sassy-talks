@@ -113,6 +113,14 @@ pub fn decode(bytes: &[u8]) -> Option<Decoded> {
     })
 }
 
+// PTT/heartbeat/ack payload layouts now live in `sassytalkie_core::ptt_frames`,
+// the shared codec Android/iOS/desktop all build against — see that module's
+// docs for why (this file's hand-rolled `encode_ptt_start_v2` was the desktop
+// copy that lost the emergency-priority byte and could never request floor
+// preemption). These wrappers keep the desktop-facing types (`PresenceState`,
+// `Heartbeat`, `RecvAck`) but delegate the byte layout to core.
+use sassytalkie_core::ptt_frames as frames;
+
 pub fn encode_heartbeat(
     epoch: u64,
     seq: u32,
@@ -120,52 +128,35 @@ pub fn encode_heartbeat(
     state: PresenceState,
     rtt_ms: u16,
 ) -> Vec<u8> {
-    let mut p = Vec::with_capacity(23);
-    p.extend_from_slice(&epoch.to_le_bytes());
-    p.extend_from_slice(&seq.to_le_bytes());
-    p.extend_from_slice(&ts_ms.to_le_bytes());
-    p.push(state.as_byte());
-    p.extend_from_slice(&rtt_ms.to_le_bytes());
-    encode_tlv(OP_HEARTBEAT, &p)
+    frames::encode_heartbeat(epoch, seq, ts_ms, state.as_byte(), rtt_ms, 0)
 }
 
 pub fn parse_heartbeat(payload: &[u8]) -> Option<Heartbeat> {
-    if payload.len() < 23 {
-        return None;
-    }
+    let hb = frames::parse_heartbeat(payload)?;
     Some(Heartbeat {
-        epoch: u64::from_le_bytes(payload[0..8].try_into().ok()?),
-        seq: u32::from_le_bytes(payload[8..12].try_into().ok()?),
-        ts_ms: u64::from_le_bytes(payload[12..20].try_into().ok()?),
-        state: PresenceState::from_byte(payload[20]),
-        rtt_ms: u16::from_le_bytes(payload[21..23].try_into().ok()?),
+        epoch: hb.epoch,
+        seq: hb.seq,
+        ts_ms: hb.ts_ms,
+        state: PresenceState::from_byte(hb.state),
+        rtt_ms: hb.rtt_ms,
     })
 }
 
 pub fn encode_recv_ack(epoch: u64, last_seq: u32, ts_ms: u64) -> Vec<u8> {
-    let mut p = Vec::with_capacity(20);
-    p.extend_from_slice(&epoch.to_le_bytes());
-    p.extend_from_slice(&last_seq.to_le_bytes());
-    p.extend_from_slice(&ts_ms.to_le_bytes());
-    encode_tlv(OP_RECV_ACK, &p)
+    frames::encode_recv_ack(epoch, last_seq, ts_ms)
 }
 
 pub fn parse_recv_ack(payload: &[u8]) -> Option<RecvAck> {
-    if payload.len() < 20 {
-        return None;
-    }
+    let ra = frames::parse_recv_ack(payload)?;
     Some(RecvAck {
-        epoch: u64::from_le_bytes(payload[0..8].try_into().ok()?),
-        last_seq: u32::from_le_bytes(payload[8..12].try_into().ok()?),
-        ts_ms: u64::from_le_bytes(payload[12..20].try_into().ok()?),
+        epoch: ra.epoch,
+        last_seq: ra.last_seq,
+        ts_ms: ra.ts_ms,
     })
 }
 
 pub fn encode_eot_ack(epoch: u64, up_to_seq: u32) -> Vec<u8> {
-    let mut p = Vec::with_capacity(12);
-    p.extend_from_slice(&epoch.to_le_bytes());
-    p.extend_from_slice(&up_to_seq.to_le_bytes());
-    encode_tlv(OP_EOT_ACK, &p)
+    frames::encode_eot_ack(epoch, up_to_seq)
 }
 
 pub fn encode_partner_offline(peer_id: &str) -> Vec<u8> {
@@ -176,18 +167,15 @@ pub fn encode_partner_offline(peer_id: &str) -> Vec<u8> {
     encode_tlv(OP_PARTNER_OFFLINE, &p)
 }
 
-pub fn encode_ptt_start_v2(epoch: u64, start_seq: u32) -> Vec<u8> {
-    let mut p = Vec::with_capacity(12);
-    p.extend_from_slice(&epoch.to_le_bytes());
-    p.extend_from_slice(&start_seq.to_le_bytes());
-    encode_tlv(OP_PTT_START_V2, &p)
+/// Emits the 13-byte emergency-aware `OP_PTT_START_V2` payload — the desktop
+/// build previously emitted 12 bytes here and silently dropped the emergency
+/// flag. `emergency` requests floor preemption; see `core::floor::remote_wins`.
+pub fn encode_ptt_start_v2(epoch: u64, start_seq: u32, emergency: bool) -> Vec<u8> {
+    frames::encode_ptt_start_v2(epoch, start_seq, emergency)
 }
 
 pub fn encode_ptt_stop_v2(epoch: u64, end_seq: u32) -> Vec<u8> {
-    let mut p = Vec::with_capacity(12);
-    p.extend_from_slice(&epoch.to_le_bytes());
-    p.extend_from_slice(&end_seq.to_le_bytes());
-    encode_tlv(OP_PTT_STOP_V2, &p)
+    frames::encode_ptt_stop_v2(epoch, end_seq)
 }
 
 pub fn new_session_epoch() -> u64 {

@@ -55,3 +55,11 @@ pub mod wire;
 // `/v/<id>#<key>` invite-link import path is one audited AES-GCM call site
 // shared by Android, iOS, and desktop instead of three.
 pub mod share;
+// `ptt_frames` — TLV codecs for the PTT / liveness opcodes. The constants were
+// already centralised in `protocol`; the ENCODERS were not, and drifted (the
+// desktop copy of PTT_START_V2 lost the emergency-priority byte). One codec.
+pub mod ptt_frames;
+// `floor` — deterministic busy-channel + emergency-preemption policy. Must stay
+// byte-compatible with the Android `FloorArbitration.kt` that ships today, or
+// simultaneous key-ups resolve to two talkers / none.
+pub mod floor;

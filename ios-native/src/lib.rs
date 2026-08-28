@@ -17,6 +17,7 @@ pub mod state;
 pub mod transport;
 pub mod control;
 pub mod ffi;
+pub mod floor;
 
 pub use audio::{AudioEngine, AudioFrame};
 pub use codec::{OpusEncoder, OpusDecoder};

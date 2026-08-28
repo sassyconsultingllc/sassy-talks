@@ -622,7 +622,7 @@ mod tests {
         assert!(is_control_frame(&hb), "heartbeat must classify as control");
 
         // PTT_START_V2 TLV.
-        let ptt = control::encode_ptt_start_v2(0xABCD, 7);
+        let ptt = control::encode_ptt_start_v2(0xABCD, 7, false);
         assert!(is_control_frame(&ptt));
     }
 

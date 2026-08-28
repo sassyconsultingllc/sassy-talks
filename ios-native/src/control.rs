@@ -4,22 +4,17 @@
 //! control — iOS control-plane frames. Wire format is the shared core envelope.
 
 use sassytalkie_core::pqc;
-use sassytalkie_core::protocol::{encode_tlv, OP_HEARTBEAT};
+use sassytalkie_core::protocol::OP_HEARTBEAT;
+use sassytalkie_core::ptt_frames;
 
 pub const PRESENCE_IDLE: u8 = 0;
 pub const PRESENCE_SPEAKING: u8 = 2;
 
 /// Heartbeat with trailing capabilities byte (CAP_HYBRID_PQC advertised;
-/// auto-PQC initiation remains off).
+/// auto-PQC initiation remains off). Byte layout lives in the shared
+/// `sassytalkie_core::ptt_frames` codec so Android/iOS/desktop can't drift.
 pub fn encode_heartbeat(epoch: u64, seq: u32, ts_ms: u64, state: u8, rtt_ms: u16) -> Vec<u8> {
-    let mut p = Vec::with_capacity(24);
-    p.extend_from_slice(&epoch.to_le_bytes());
-    p.extend_from_slice(&seq.to_le_bytes());
-    p.extend_from_slice(&ts_ms.to_le_bytes());
-    p.push(state);
-    p.extend_from_slice(&rtt_ms.to_le_bytes());
-    p.push(pqc::local_capabilities());
-    encode_tlv(OP_HEARTBEAT, &p)
+    ptt_frames::encode_heartbeat(epoch, seq, ts_ms, state, rtt_ms, pqc::local_capabilities())
 }
 
 pub fn now_ms() -> u64 {
