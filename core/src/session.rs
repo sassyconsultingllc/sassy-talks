@@ -1,0 +1,629 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-WGSLS3ER3L6S
+/// Session Management - Per-channel QR-based key exchange with time-limited sessions
+///
+/// Each channel (1-8) can have its own independent AES-256-GCM encryption key
+/// and custom group name. This allows a user to be in multiple encrypted groups
+/// simultaneously — e.g., "Alpha Team" on channel 1, "Night Shift" on channel 3.
+///
+/// Flow:
+/// 1. Device A calls generate_session_qr(channel, duration, group_name)
+/// 2. QR JSON includes the channel number + group name
+/// 3. Device B scans QR → key stored in the same channel slot
+/// 4. Both devices share the same AES key for that channel
+/// 5. Switching channels switches which key is used for encrypt/decrypt
+
+use std::time::{SystemTime, UNIX_EPOCH};
+use log::info;
+use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
+
+use crate::crypto::CryptoSession;
+
+/// Maximum session duration: 3 days
+const MAX_SESSION_HOURS: u32 = 72;
+/// Default session duration: 1 day
+const DEFAULT_SESSION_HOURS: u32 = 24;
+/// Maximum number of channels (displayed as 1-8)
+pub const MAX_CHANNELS: usize = 8;
+
+/// Session key with metadata (now includes channel + group name)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionKey {
+    /// Base64-encoded 32-byte AES key
+    pub key: String,
+    /// Device name that generated this session
+    pub device: String,
+    /// Session creation timestamp (unix seconds)
+    pub created_at: u64,
+    /// Session expiry timestamp (unix seconds)
+    pub expires_at: u64,
+    /// Unique session ID
+    pub session_id: String,
+    /// Channel number (1-8). Legacy QR codes without this field default to 1.
+    #[serde(default = "default_channel")]
+    pub channel: u8,
+    /// User-facing group name. Defaults to "Channel N".
+    #[serde(default)]
+    pub group_name: String,
+    /// Stable cohort identifier across key rotations. Empty/missing in
+    /// legacy QRs — the importer mints one locally in that case.
+    #[serde(default)]
+    pub cohort_id: String,
+}
+
+fn default_channel() -> u8 { 1 }
+
+/// Wipe the base64-encoded AES key (and other sensitive strings) when the
+/// SessionKey is dropped — i.e. when a channel is cleared, a session expires,
+/// or the SessionManager itself goes away. This is defense-in-depth against
+/// post-process memory inspection; it does NOT replace the on-disk hardening
+/// in SassyTalkNative.kt.
+impl Drop for SessionKey {
+    fn drop(&mut self) {
+        self.key.zeroize();
+        self.device.zeroize();
+        self.session_id.zeroize();
+        self.group_name.zeroize();
+        self.cohort_id.zeroize();
+    }
+}
+
+/// Per-channel session slot
+#[derive(Debug, Clone)]
+pub struct ChannelSession {
+    pub key: SessionKey,
+    pub group_name: String,
+}
+
+impl Drop for ChannelSession {
+    fn drop(&mut self) {
+        // SessionKey drops itself; just wipe our duplicate copy of the name.
+        self.group_name.zeroize();
+    }
+}
+
+/// Per-channel session registry (replaces the old single-session SessionManager)
+pub struct SessionManager {
+    channels: [Option<ChannelSession>; MAX_CHANNELS],
+    device_name: String,
+}
+
+impl SessionManager {
+    pub fn new(device_name: &str) -> Self {
+        Self {
+            channels: Default::default(),
+            device_name: device_name.to_string(),
+        }
+    }
+
+    /// Generate a new session QR for a specific channel, minting a fresh cohort_id.
+    pub fn generate_session_qr(
+        &mut self,
+        channel: u8,
+        duration_hours: u32,
+        group_name: &str,
+    ) -> Result<String, String> {
+        self.generate_session_qr_with_cohort(channel, duration_hours, group_name, None)
+    }
+
+    /// Generate a session QR, optionally reusing a previously-known cohort_id
+    /// (used by the "Rejoin" flow so a regenerated session inherits cohort identity).
+    pub fn generate_session_qr_with_cohort(
+        &mut self,
+        channel: u8,
+        duration_hours: u32,
+        group_name: &str,
+        cohort_id: Option<&str>,
+    ) -> Result<String, String> {
+        let ch_idx = validate_channel(channel)?;
+        let hours = if duration_hours == 0 { DEFAULT_SESSION_HOURS } else { duration_hours };
+        let duration = hours.min(MAX_SESSION_HOURS).max(1);
+        let now = current_unix_time()?;
+        let expires = now + (duration as u64 * 3600);
+
+        let key_bytes: [u8; 32] = rand::random();
+        let key_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &key_bytes,
+        );
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let cohort = cohort_id
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        let name = if group_name.is_empty() {
+            format!("Channel {}", channel)
+        } else {
+            group_name.to_string()
+        };
+
+        let session = SessionKey {
+            key: key_b64,
+            device: self.device_name.clone(),
+            created_at: now,
+            expires_at: expires,
+            session_id: session_id.clone(),
+            channel,
+            group_name: name.clone(),
+            cohort_id: cohort.clone(),
+        };
+
+        let json = serde_json::to_string(&session)
+            .map_err(|e| format!("Failed to serialize session: {}", e))?;
+
+        self.channels[ch_idx] = Some(ChannelSession {
+            key: session,
+            group_name: name.clone(),
+        });
+
+        info!("Session generated for ch{} '{}' cohort {}: {} (expires in {}h)",
+            channel, name, cohort, session_id, duration);
+
+        Ok(json)
+    }
+
+    /// Import a session from a scanned QR code JSON payload.
+    /// Returns (channel, CryptoSession, cohort_id).
+    /// If the QR lacks a cohort_id (legacy), a fresh UUID is minted locally
+    /// and written into the stored ChannelSession so the joiner can match it
+    /// against later regenerations from the same host.
+    pub fn import_session(&mut self, qr_json: &str) -> Result<(u8, CryptoSession, String), String> {
+        let mut session: SessionKey = serde_json::from_str(qr_json)
+            .map_err(|e| format!("Invalid QR data: {}", e))?;
+
+        let channel = session.channel;
+        let ch_idx = validate_channel(channel)?;
+
+        let now = current_unix_time()?;
+        if now > session.expires_at {
+            return Err("Session has expired".to_string());
+        }
+
+        // checked_sub: a crafted QR can set created_at > expires_at while still
+        // having a future expires_at (so the expiry check above passes). Plain
+        // subtraction would panic in debug / wrap in release on that input.
+        let duration_secs = session.expires_at
+            .checked_sub(session.created_at)
+            .ok_or_else(|| "Invalid session: expires before creation".to_string())?;
+        if duration_secs > MAX_SESSION_HOURS as u64 * 3600 {
+            return Err("Session duration exceeds maximum".to_string());
+        }
+
+        let key_bytes = Zeroizing::new(base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &session.key,
+        ).map_err(|e| format!("Invalid key encoding: {}", e))?);
+
+        if key_bytes.len() != 32 {
+            return Err(format!("Invalid key length: {} (expected 32)", key_bytes.len()));
+        }
+
+        let mut key_array = Zeroizing::new([0u8; 32]);
+        key_array.copy_from_slice(&key_bytes);
+        let crypto = CryptoSession::from_psk(&key_array);
+
+        if session.cohort_id.is_empty() {
+            session.cohort_id = uuid::Uuid::new_v4().to_string();
+            info!("Legacy QR: minted local cohort_id {} for ch{}", session.cohort_id, channel);
+        }
+
+        let name = if session.group_name.is_empty() {
+            format!("Channel {}", channel)
+        } else {
+            session.group_name.clone()
+        };
+
+        let cohort_id = session.cohort_id.clone();
+
+        info!("Session imported for ch{} '{}' cohort {} from {}: {}",
+            channel, name, cohort_id, session.device, session.session_id);
+
+        self.channels[ch_idx] = Some(ChannelSession {
+            key: session,
+            group_name: name,
+        });
+
+        Ok((channel, crypto, cohort_id))
+    }
+
+    /// Get the CryptoSession for a specific channel (if it has a valid key).
+    ///
+    /// INVARIANT — call this ONCE per channel at session establishment and hold
+    /// the returned session for the channel's lifetime (as the transport does
+    /// via `set_crypto`). Each call mints a FRESH `CryptoSession` with an empty
+    /// `seen_nonces` set: the anti-replay window lives on the session instance,
+    /// so calling this per received frame would hand every frame a clean replay
+    /// set and silently defeat replay rejection. Never put this on a decrypt
+    /// hot path — decrypt through the one cached session instead.
+    pub fn get_crypto_for_channel(&self, channel: u8) -> Option<CryptoSession> {
+        let arr = self.get_psk_for_channel(channel)?;
+        Some(CryptoSession::from_psk(&arr))
+    }
+
+    /// Raw 32-byte PSK for a channel (the base64-decoded QR session key), if the
+    /// channel has a valid, non-expired session. Returned in a `Zeroizing`
+    /// wrapper so it wipes after use.
+    ///
+    /// This is the bootstrap secret for the path-(a) PSK-authenticated hybrid
+    /// handshake (`pqc::PskHybridInitiator` / `pqc::psk_hybrid_respond`): the QR
+    /// PSK authenticates the pairing while the ephemeral hybrid exchange adds
+    /// forward secrecy + post-quantum protection. Same expiry/validation rules as
+    /// `get_crypto_for_channel`.
+    pub fn get_psk_for_channel(&self, channel: u8) -> Option<Zeroizing<[u8; 32]>> {
+        let ch_idx = validate_channel(channel).ok()?;
+        let cs = self.channels[ch_idx].as_ref()?;
+        let now = current_unix_time().ok()?;
+        if now > cs.key.expires_at {
+            return None; // expired
+        }
+
+        let key_bytes = Zeroizing::new(base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &cs.key.key,
+        ).ok()?);
+
+        if key_bytes.len() != 32 { return None; }
+        let mut arr = Zeroizing::new([0u8; 32]);
+        arr.copy_from_slice(&key_bytes);
+        Some(arr)
+    }
+
+    /// Check if ANY channel has a valid (non-expired) session.
+    pub fn is_authenticated(&self) -> bool {
+        self.channels.iter().any(|slot| {
+            if let Some(cs) = slot {
+                current_unix_time().map(|now| now < cs.key.expires_at).unwrap_or(false)
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Check if a specific channel has a valid session.
+    pub fn channel_is_authenticated(&self, channel: u8) -> bool {
+        self.get_crypto_for_channel(channel).is_some()
+    }
+
+    /// Get the group name for a channel.
+    pub fn get_group_name(&self, channel: u8) -> String {
+        let ch_idx = match validate_channel(channel) {
+            Ok(i) => i,
+            Err(_) => return format!("Channel {}", channel),
+        };
+        self.channels[ch_idx].as_ref()
+            .map(|cs| cs.group_name.clone())
+            .unwrap_or_else(|| format!("Channel {}", channel))
+    }
+
+    /// Set a custom group name for a channel.
+    pub fn set_group_name(&mut self, channel: u8, name: &str) {
+        if let Ok(idx) = validate_channel(channel) {
+            if let Some(cs) = self.channels[idx].as_mut() {
+                cs.group_name = name.to_string();
+                cs.key.group_name = name.to_string();
+            }
+        }
+    }
+
+    /// Get the session_id for a channel (used as relay room ID).
+    pub fn get_session_id(&self, channel: u8) -> Option<String> {
+        let ch_idx = validate_channel(channel).ok()?;
+        self.channels[ch_idx].as_ref().map(|cs| cs.key.session_id.clone())
+    }
+
+    /// Get the first valid session_id across all channels (for relay room).
+    pub fn get_any_session_id(&self) -> Option<String> {
+        self.channels.iter().filter_map(|slot| {
+            slot.as_ref().map(|cs| cs.key.session_id.clone())
+        }).next()
+    }
+
+    /// Get the cohort_id of the currently active session on a channel, if any.
+    /// Returns None if the channel has no session or the session has expired.
+    pub fn get_active_cohort_id(&self, channel: u8) -> Option<String> {
+        let ch_idx = validate_channel(channel).ok()?;
+        let cs = self.channels[ch_idx].as_ref()?;
+        let now = current_unix_time().ok()?;
+        if now > cs.key.expires_at { return None; }
+        Some(cs.key.cohort_id.clone())
+    }
+
+    /// Get session status as JSON (for UI display).
+    pub fn get_session_status(&self) -> String {
+        let now = current_unix_time().unwrap_or(0);
+
+        let channels: Vec<serde_json::Value> = (0..MAX_CHANNELS).map(|i| {
+            let ch = (i + 1) as u8;
+            match &self.channels[i] {
+                Some(cs) => {
+                    let expired = now > cs.key.expires_at;
+                    let remaining = if expired { 0 } else { cs.key.expires_at - now };
+                    serde_json::json!({
+                        "channel": ch,
+                        "active": !expired,
+                        "group_name": cs.group_name,
+                        "session_id": cs.key.session_id,
+                        "peer_device": cs.key.device,
+                        "remaining_seconds": remaining,
+                        "fingerprint": cs.key.session_id.chars().take(8).collect::<String>(),
+                    })
+                }
+                None => serde_json::json!({
+                    "channel": ch,
+                    "active": false,
+                    "group_name": format!("Channel {}", ch),
+                }),
+            }
+        }).collect();
+
+        serde_json::json!({
+            "channels": channels,
+            "any_active": self.is_authenticated(),
+        }).to_string()
+    }
+
+    /// Get channel info as JSON array (lightweight, for channel picker).
+    pub fn get_channel_info(&self) -> String {
+        let now = current_unix_time().unwrap_or(0);
+        let info: Vec<serde_json::Value> = (0..MAX_CHANNELS).map(|i| {
+            let ch = (i + 1) as u8;
+            match &self.channels[i] {
+                Some(cs) => {
+                    let active = now < cs.key.expires_at;
+                    serde_json::json!({
+                        "channel": ch,
+                        "active": active,
+                        "name": cs.group_name,
+                        "fingerprint": cs.key.session_id.chars().take(8).collect::<String>(),
+                    })
+                }
+                None => serde_json::json!({
+                    "channel": ch,
+                    "active": false,
+                    "name": format!("Channel {}", ch),
+                }),
+            }
+        }).collect();
+        serde_json::to_string(&info).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// Clear a specific channel's session.
+    pub fn clear_channel(&mut self, channel: u8) {
+        if let Ok(idx) = validate_channel(channel) {
+            if let Some(cs) = self.channels[idx].take() {
+                info!("Session cleared for ch{}: {}", channel, cs.key.session_id);
+            }
+        }
+    }
+
+    /// Clear ALL channel sessions.
+    pub fn clear_session(&mut self) {
+        for i in 0..MAX_CHANNELS {
+            if let Some(cs) = self.channels[i].take() {
+                info!("Session cleared for ch{}: {}", i + 1, cs.key.session_id);
+            }
+        }
+    }
+
+    pub fn set_device_name(&mut self, name: &str) {
+        self.device_name = name.to_string();
+    }
+}
+
+fn validate_channel(channel: u8) -> Result<usize, String> {
+    if channel < 1 || channel > MAX_CHANNELS as u8 {
+        Err(format!("Invalid channel {} (must be 1-{})", channel, MAX_CHANNELS))
+    } else {
+        Ok((channel - 1) as usize)
+    }
+}
+
+fn current_unix_time() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|e| format!("System time error: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pull a string field out of a QR JSON payload, panicking with a clear
+    /// message if the field is missing or malformed. Tests use this instead
+    /// of stacked `.unwrap()`s so a regression in the QR schema produces a
+    /// readable failure rather than a generic "called `Option::unwrap()` on
+    /// a `None` value" message.
+    fn qr_field(qr_json: &str, field: &str) -> String {
+        let v: serde_json::Value = serde_json::from_str(qr_json)
+            .unwrap_or_else(|e| panic!("QR JSON failed to parse: {}\n{}", e, qr_json));
+        v.get(field)
+            .and_then(|x| x.as_str())
+            .unwrap_or_else(|| panic!("QR JSON missing string field '{}': {}", field, qr_json))
+            .to_string()
+    }
+
+    #[test]
+    fn test_session_generate_and_import() {
+        let mut host = SessionManager::new("Host");
+        let qr_json = host.generate_session_qr(1, 24, "Alpha Team").unwrap();
+
+        let mut joiner = SessionManager::new("Joiner");
+        let (ch, mut crypto, _cid) = joiner.import_session(&qr_json).unwrap();
+
+        assert_eq!(ch, 1);
+        assert!(host.is_authenticated());
+        assert!(joiner.is_authenticated());
+        assert!(joiner.channel_is_authenticated(1));
+        assert!(!joiner.channel_is_authenticated(2));
+
+        // Crypto should work
+        let plaintext = b"test audio data";
+        let encrypted = crypto.encrypt(plaintext).unwrap();
+        let host_crypto = host.get_crypto_for_channel(1).unwrap();
+        let decrypted = host_crypto.decrypt(&encrypted).unwrap();
+        assert_eq!(&decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_per_channel_isolation() {
+        let mut mgr = SessionManager::new("Test");
+        mgr.generate_session_qr(1, 24, "Team A").unwrap();
+        mgr.generate_session_qr(3, 24, "Team B").unwrap();
+
+        assert!(mgr.channel_is_authenticated(1));
+        assert!(!mgr.channel_is_authenticated(2));
+        assert!(mgr.channel_is_authenticated(3));
+
+        assert_eq!(mgr.get_group_name(1), "Team A");
+        assert_eq!(mgr.get_group_name(2), "Channel 2");
+        assert_eq!(mgr.get_group_name(3), "Team B");
+
+        // Different keys for different channels
+        let c1 = mgr.get_crypto_for_channel(1).unwrap();
+        let mut c3 = mgr.get_crypto_for_channel(3).unwrap();
+        let encrypted = c3.encrypt(b"secret").unwrap();
+        assert!(c1.decrypt(&encrypted).is_err()); // wrong key
+    }
+
+    #[test]
+    fn test_legacy_qr_defaults_to_channel_1() {
+        // Legacy QR without channel field
+        let mut host = SessionManager::new("Host");
+        let qr = host.generate_session_qr(1, 24, "").unwrap();
+
+        // Strip channel field to simulate legacy
+        let mut parsed: serde_json::Value = serde_json::from_str(&qr).unwrap();
+        parsed.as_object_mut().unwrap().remove("channel");
+        parsed.as_object_mut().unwrap().remove("group_name");
+        let legacy_json = serde_json::to_string(&parsed).unwrap();
+
+        let mut joiner = SessionManager::new("Joiner");
+        let (ch, _, _cid) = joiner.import_session(&legacy_json).unwrap();
+        assert_eq!(ch, 1); // defaults to channel 1
+    }
+
+    #[test]
+    fn test_session_expiry_validation() {
+        let mut mgr = SessionManager::new("Test");
+        let expired_json = serde_json::json!({
+            "key": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[0u8; 32]),
+            "device": "Old",
+            "created_at": 1000,
+            "expires_at": 1001,
+            "session_id": "expired-session",
+            "channel": 1,
+            "group_name": "Expired",
+        }).to_string();
+
+        let result = mgr.import_session(&expired_json);
+        assert!(result.is_err());
+        assert!(result.err().unwrap().contains("expired"));
+    }
+
+    #[test]
+    fn test_channel_info_json() {
+        let mut mgr = SessionManager::new("Test");
+        mgr.generate_session_qr(2, 24, "Ops").unwrap();
+        let info = mgr.get_channel_info();
+        assert!(info.contains("\"Ops\""));
+        assert!(info.contains("\"channel\":2"));
+    }
+
+    #[test]
+    fn test_session_includes_cohort_id_field() {
+        let mut host = SessionManager::new("Host");
+        let qr_json = host.generate_session_qr(1, 24, "Alpha Team").unwrap();
+        let cohort_id = qr_field(&qr_json, "cohort_id");
+        assert!(!cohort_id.is_empty(), "cohort_id must be present and non-empty");
+        assert!(uuid::Uuid::parse_str(&cohort_id).is_ok(), "cohort_id must be a valid UUID: {}", cohort_id);
+    }
+
+    #[test]
+    fn test_generate_with_reused_cohort_id_preserves_it() {
+        let mut host = SessionManager::new("Host");
+        let qr1 = host.generate_session_qr_with_cohort(1, 24, "Alpha", None).unwrap();
+        let cid = qr_field(&qr1, "cohort_id");
+        let qr2 = host.generate_session_qr_with_cohort(1, 24, "Alpha", Some(&cid)).unwrap();
+        let cid2 = qr_field(&qr2, "cohort_id");
+        assert_eq!(cid, cid2, "supplied cohort_id must round-trip");
+    }
+
+    #[test]
+    fn test_import_returns_cohort_id() {
+        let mut host = SessionManager::new("Host");
+        let qr = host.generate_session_qr(1, 24, "Alpha").unwrap();
+        let expected_cid = qr_field(&qr, "cohort_id");
+
+        let mut joiner = SessionManager::new("Joiner");
+        let (ch, _crypto, cid) = joiner.import_session(&qr).unwrap();
+        assert_eq!(ch, 1);
+        assert_eq!(cid, expected_cid);
+    }
+
+    #[test]
+    fn test_import_legacy_qr_mints_local_cohort_id() {
+        let mut host = SessionManager::new("Host");
+        let qr = host.generate_session_qr(1, 24, "Alpha").unwrap();
+        // Strip cohort_id to simulate a legacy QR
+        let mut parsed: serde_json::Value = serde_json::from_str(&qr).unwrap();
+        parsed.as_object_mut().unwrap().remove("cohort_id");
+        let legacy = serde_json::to_string(&parsed).unwrap();
+
+        let mut joiner = SessionManager::new("Joiner");
+        let (_ch, _crypto, cid) = joiner.import_session(&legacy).unwrap();
+        assert!(!cid.is_empty(), "legacy QR must yield a locally-minted cohort_id");
+        assert!(uuid::Uuid::parse_str(&cid).is_ok(), "minted cohort_id must be a valid UUID: {}", cid);
+    }
+
+    #[test]
+    fn hostile_session_id_does_not_panic_in_status() {
+        // A crafted QR with a short / non-ASCII session_id must NOT panic the
+        // status or channel-info paths. Previously `&session_id[..8]` panicked
+        // on byte-len < 8 or a non-char-boundary at byte 8, unwinding across the
+        // JNI boundary into the JVM = process abort from hostile input.
+        let now = current_unix_time().unwrap();
+        for sid in ["ab", "\u{1F600}\u{1F600}", ""] {
+            let crafted = serde_json::json!({
+                "key": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[7u8; 32]),
+                "device": "Hostile",
+                "created_at": now,
+                "expires_at": now + 3600,
+                "session_id": sid,
+                "channel": 1,
+                "group_name": "X",
+            }).to_string();
+
+            let mut mgr = SessionManager::new("Victim");
+            mgr.import_session(&crafted).expect("crafted-but-valid session should import");
+            // These two previously panicked on the slice; now they return cleanly.
+            let _ = mgr.get_session_status();
+            let _ = mgr.get_channel_info();
+        }
+    }
+
+    #[test]
+    fn import_rejects_expires_before_creation() {
+        // created_at > expires_at (with expires_at still in the future) passed
+        // the expiry check and then underflowed the duration subtraction.
+        let now = current_unix_time().unwrap();
+        let crafted = serde_json::json!({
+            "key": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[7u8; 32]),
+            "device": "Hostile",
+            "created_at": now + 10_000,
+            "expires_at": now + 3600,
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "channel": 1,
+            "group_name": "X",
+        }).to_string();
+        let mut mgr = SessionManager::new("Victim");
+        assert!(
+            mgr.import_session(&crafted).is_err(),
+            "expires-before-creation must be rejected, not panic"
+        );
+    }
+}

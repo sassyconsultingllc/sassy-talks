@@ -1,0 +1,147 @@
+# Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+# Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+# CodeMark: SCLLC1-sassytalkie-ONZZJRG4UONF
+[package]
+name = "sassy-talk"
+version = "1.0.0"
+description = "Cross-platform PTT walkie-talkie with retro vibes"
+authors = ["Sassy Consulting LLC"]
+license = "Proprietary"
+repository = "https://github.com/sassyconsulting/sassy-talk"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "sassy_talk_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+sha2 = "0.10"
+
+[dependencies]
+# v2.7.x: shared cross-platform core. Source of truth for protocol opcodes
+# (OP_PTT_START_V2, OP_HEARTBEAT, OP_WAKE, OP_REPLAY_FRAME, etc.), audio
+# cache (Live/Queue/Mix), cohort_history, and crypto. Wired here so the
+# desktop client stays in lockstep with the Android phone client — opcode
+# additions on either side propagate automatically.
+sassytalkie-core = { path = "../../core" }
+
+# Tauri framework
+tauri = { version = "2.0", features = [] }
+tauri-plugin-shell = "2.0"
+
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+
+# Audio I/O - Cross-platform
+cpal = "0.15"
+
+# Send wrapper for non-Send types (cpal::Stream on Windows)
+send_wrapper = "0.6"
+
+# Audio codec - Opus for low latency voice
+audiopus = "0.3.0-rc.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+
+# Cryptography - AES-256-GCM + X25519
+aes-gcm = "0.10"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+rand = "0.8"
+sha2 = "0.10"
+hkdf = "0.12"
+zeroize = "1.8"
+
+# Networking - UDP multicast for cross-platform audio
+socket2 = { version = "0.5", features = ["all"] }
+
+# Cellular relay transport — native WebSocket client to the Cloudflare relay
+# (wss://relay.sassyconsultingllc.com). Desktop owns the socket directly
+# (unlike Android, where Kotlin/OkHttp owns it and Rust is a queue bridge).
+# rustls + webpki roots: pure-Rust TLS, no OpenSSL/system-cert dependency,
+# identical behavior across Windows/macOS/Linux.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+# /auth HMAC token fetch before the WS upgrade. rustls to share TLS stack with
+# tokio-tungstenite and avoid a second (OpenSSL) backend.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots = "0.26"
+
+# Ring buffer for audio
+ringbuf = "0.4"
+
+# Checksum
+crc32fast = "1.4"
+
+# Logging
+tracing = "0.1"
+hostname = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+log = "0.4"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Unique IDs
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+# Base64
+base64 = "0.22"
+
+# Hex encoding for public keys
+hex = "0.4"
+
+# Platform-specific: Android
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+android_logger = "0.14"
+ndk = "0.9"
+ndk-context = "0.1"
+
+# Platform-specific: iOS/macOS
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+core-foundation = "0.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "2.11"
+
+# Platform-specific: Linux
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+secret-service = "3.1"
+
+# Platform-specific: Windows
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Threading",
+    "Win32_System_Com",
+    "Win32_Foundation",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+
+[profile.dev]
+opt-level = 0
+debug = true

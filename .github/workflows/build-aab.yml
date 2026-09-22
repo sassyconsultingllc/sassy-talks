@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+# Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+# CodeMark: SCLLC1-sassytalkie-WLDUFJ7BKHLX
 name: Build Release AAB
 
 on:
@@ -19,7 +22,19 @@ on:
     branches:
       - main
     paths:
-      - 'sassy-talk-clean/android-app/**'
+      - 'android-app/**'
+      # The Rust sources are part of the shipped artifact — this job compiles
+      # them into the AAB. Without these paths a change to the audio engine,
+      # transport or protocol produced no build at all, which is half of how
+      # x86_64 silently shipped three releases stale (v3.1.16 changelog).
+      - 'android-native/**'
+      - 'core/**'
+      - '.github/workflows/build-aab.yml'
+
+env:
+  # Must match android-app/app/build.gradle.kts `ndkVersion`, or the libs CI
+  # builds are compiled against a different sysroot than Gradle expects.
+  NDK_VERSION: 27.1.12297006
 
 jobs:
   build-aab:
@@ -44,12 +59,155 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('sassy-talk-clean/android-app/**/*.gradle.kts') }}
+          key: ${{ runner.os }}-gradle-${{ hashFiles('android-app/**/*.gradle.kts') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
 
+      # ── Native (Rust) ────────────────────────────────────────────────────
+      # Until now this workflow never compiled Rust: it packaged whatever
+      # libsassytalkie.so happened to be committed. That made the checked-in
+      # binary the real release artifact, and it drifted — x86_64 shipped
+      # 3.1.12-era audio code while the app reported 3.1.15, because only
+      # arm64 had been rebuilt by hand. CI now builds BOTH ABIs from source
+      # on every release build, so the committed .so can never decide what
+      # ships again.
+
+      - name: Set up Rust with Android targets
+        uses: dtolnay/rust-toolchain@1ff72ee08e3cb84d84adba594e0a297990fc1ed3 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            android-native/target
+          key: ${{ runner.os }}-cargo-ndk-${{ hashFiles('android-native/Cargo.toml', 'core/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ndk-
+
+      - name: Install NDK ${{ env.NDK_VERSION }}
+        run: |
+          yes | sdkmanager --install "ndk;$NDK_VERSION" > /dev/null
+          ndk="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION"
+          # cargo-ndk prefers NDK_HOME over ANDROID_NDK_HOME. Set both to the
+          # Gradle-pinned NDK so a runner with a newer default cannot silently
+          # compile libs against the wrong sysroot.
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ndk" >> "$GITHUB_ENV"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Fetch bundled libopus sources
+        # build.rs compiles libopus itself via the `cc` crate (bypassing
+        # audiopus_sys's cmake build, which is unreliable for Android
+        # cross-compilation) but it takes the C sources from audiopus_sys's
+        # bundled copy. audiopus_sys is an OPTIONAL dependency, so a clean
+        # machine never downloads it — it was only ever present because one
+        # developer's registry happened to hold it, the same root cause as the
+        # hardcoded OPUS_SRC_DIR.
+        #
+        # Cargo.toml suggests `cargo fetch --features _prefetch-opus-src`, but
+        # `cargo fetch` takes no --features flag (that comment is stale). And
+        # enabling the feature via `cargo build` would compile audiopus_sys,
+        # running the very cmake path build.rs exists to avoid. So fetch the
+        # published crate directly and hand build.rs its documented override.
+        run: |
+          set -euo pipefail
+          ver=0.2.2
+          curl -sSfL "https://static.crates.io/crates/audiopus_sys/audiopus_sys-${ver}.crate" \
+            -o /tmp/audiopus_sys.crate
+          mkdir -p /tmp/opus-src
+          tar -xzf /tmp/audiopus_sys.crate -C /tmp/opus-src
+          src="/tmp/opus-src/audiopus_sys-${ver}/opus"
+          # Fail loudly here rather than let build.rs die further along.
+          test -f "$src/include/opus.h"
+          echo "OPUS_SRC_DIR=$src" >> "$GITHUB_ENV"
+          echo "libopus sources at $src"
+
+      - name: Run core unit tests
+        working-directory: core
+        run: cargo test --lib
+
+      - name: Run Android native host tests
+        working-directory: android-native
+        run: cargo test --lib --locked
+
+      - name: Build native libs (arm64-v8a + x86_64)
+        working-directory: android-native
+        # ONE invocation for both ABIs. Building them separately is how they
+        # drifted apart in the first place — it makes it possible to forget
+        # one and impossible to notice.
+        run: |
+          cargo ndk -t arm64-v8a -t x86_64 \
+            -o ../android-app/app/src/main/jniLibs build --release
+
+      - name: Verify both ABIs were produced and export the JNI surface
+        run: |
+          fail=0
+          for abi in arm64-v8a x86_64; do
+            so="android-app/app/src/main/jniLibs/$abi/libsassytalkie.so"
+            if [ ! -s "$so" ]; then
+              echo "::error::$abi: libsassytalkie.so missing or empty"; fail=1; continue
+            fi
+            echo "$abi: $(stat -c%s "$so") bytes"
+            # Spot-check symbols from three independent subsystems so a
+            # partial/misconfigured build fails here rather than at runtime.
+            # nativeSetSpeakerPreference / nativeReassertRxRoute /
+            # nativeHasLiveAudioPath shipped in 3.2 Kotlin and were missing
+            # from the committed arm64 .so — phones crashed on start.
+            for sym in nativeInit nativePttStart nativeEmergencyActivate nativeSetSpeakerPreference nativeReassertRxRoute nativeHasLiveAudioPath; do
+              if ! grep -aq "$sym" "$so"; then
+                echo "::error::$abi: missing exported symbol $sym"; fail=1
+              fi
+            done
+          done
+          exit $fail
+
+      - name: Verify Android 16 KiB ELF page compatibility
+        run: python3 scripts/check-elf-alignment.py android-app/app/src/main/jniLibs
+
+      - name: Report drift from the committed prebuilt
+        # Informational only — CI's freshly built lib is authoritative now.
+        # A diff here means someone changed Rust without rebuilding locally,
+        # which is worth seeing in the log but is no longer a shipping risk.
+        run: |
+          if git diff --quiet -- android-app/app/src/main/jniLibs; then
+            echo "Committed .so matches the CI build."
+          else
+            echo "::notice::Committed .so differs from the CI build — CI's build is what ships."
+            git diff --stat -- android-app/app/src/main/jniLibs
+          fi
+
       - name: Make gradlew executable
-        run: chmod +x sassy-talk-clean/android-app/gradlew
+        run: chmod +x android-app/gradlew
+
+      - name: Materialize google-services.json for Play FCM
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          set -euo pipefail
+          # Gradle applies the Google Services plugin only if this file exists
+          # (local builds without FCM stay optional). Release CI must have it.
+          if [ -z "${GOOGLE_SERVICES_JSON:-}" ]; then
+            echo "::error::GOOGLE_SERVICES_JSON secret is not set — Play release needs google-services.json for FCM."
+            echo "::error::Add the Firebase google-services.json contents as repo secret GOOGLE_SERVICES_JSON."
+            exit 1
+          fi
+          printf '%s' "$GOOGLE_SERVICES_JSON" > android-app/app/google-services.json
+          test -s android-app/app/google-services.json || {
+            echo "::error::Wrote empty google-services.json"
+            exit 1
+          }
+
+      - name: Run Android JVM unit tests
+        working-directory: android-app
+        run: ./gradlew testPlayDebugUnitTest testDirectDebugUnitTest --stacktrace
 
       - name: Decode release keystore
         env:
@@ -59,9 +217,9 @@ jobs:
             echo "::error::RELEASE_KEYSTORE_BASE64 secret is not set — refusing to build a debug-signed AAB."
             exit 1
           fi
-          mkdir -p sassy-talk-clean/android-app/app/keystore
-          echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > sassy-talk-clean/android-app/app/keystore/release.keystore
-          test -s sassy-talk-clean/android-app/app/keystore/release.keystore || { echo "::error::Decoded keystore is empty"; exit 1; }
+          mkdir -p android-app/app/keystore
+          echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > android-app/app/keystore/release.keystore
+          test -s android-app/app/keystore/release.keystore || { echo "::error::Decoded keystore is empty"; exit 1; }
 
       - name: Verify release credentials are present
         env:
@@ -76,16 +234,18 @@ jobs:
           [ "$missing" -eq 0 ] || exit 1
 
       - name: Build Release AAB
-        working-directory: sassy-talk-clean/android-app
+        working-directory: android-app
         env:
           RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
           RELEASE_KEY_ALIAS:      ${{ secrets.RELEASE_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD:   ${{ secrets.RELEASE_KEY_PASSWORD }}
-        run: ./gradlew bundleRelease
+        # Play flavor only: the AAB that ships to Google Play carries the
+        # Billing paywall. The direct (license-key) flavor is built locally.
+        run: ./gradlew bundlePlayRelease
 
       - name: Verify AAB is signed with release keystore (not debug)
         run: |
-          AAB="sassy-talk-clean/android-app/app/build/outputs/bundle/release/app-release.aab"
+          AAB="android-app/app/build/outputs/bundle/playRelease/app-play-release.aab"
           test -s "$AAB" || { echo "::error::AAB not produced"; exit 1; }
           # Pull the signing cert subject and fail if it's the Android debug cert.
           tmpdir=$(mktemp -d)
@@ -103,8 +263,28 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sassy-talkie-release-aab
-          path: sassy-talk-clean/android-app/app/build/outputs/bundle/release/*.aab
+          path: android-app/app/build/outputs/bundle/playRelease/*.aab
           retention-days: 30
+
+      - name: Verify Play credentials are present
+        # The upload action reports a missing/empty service account as a bare
+        # "Unknown error occurred" and exits in ~100ms, which reads like a Play
+        # API rejection rather than an unset secret. The keystore secrets above
+        # already get an explicit preflight; this gives the Play credential the
+        # same treatment so the failure names itself.
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_to_play == 'true'
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [ -z "${PLAY_SERVICE_ACCOUNT_JSON:-}" ]; then
+            echo "::error::PLAY_SERVICE_ACCOUNT_JSON secret is not set — cannot publish to Google Play."
+            echo "::error::Create a Play Console service account, grant it release permissions, and add the JSON as that repo secret."
+            echo "::error::The signed AAB is still attached to this run as an artifact and can be uploaded via the Play Console manually."
+            exit 1
+          fi
+          # Fail on a malformed secret too — a truncated paste is otherwise
+          # indistinguishable from an API rejection at the upload step.
+          echo "$PLAY_SERVICE_ACCOUNT_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("type")=="service_account", "not a service_account JSON"; print("service account:", d.get("client_email","<no client_email>"))'
 
       - name: Publish to Google Play
         # Only on manual workflow_dispatch with publish_to_play=true.
@@ -117,7 +297,7 @@ jobs:
         with:
           serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
           packageName: com.sassyconsulting.sassytalkie
-          releaseFiles: sassy-talk-clean/android-app/app/build/outputs/bundle/release/app-release.aab
+          releaseFiles: android-app/app/build/outputs/bundle/playRelease/app-play-release.aab
           track: ${{ inputs.play_track }}
           status: completed
           changesNotSentForReview: false

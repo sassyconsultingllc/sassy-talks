@@ -1,0 +1,590 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-OCHBVFKEDGW5
+use log::{info, warn};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+/// State Machine - Central coordinator for all subsystems
+///
+/// Manages audio engine, transport, crypto, users, audio cache, and the
+/// TX/RX audio pipeline threads. Provides the API surface consumed by
+/// both the JNI exports (Kotlin app) and the legacy egui UI.
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+use crate::audio::AudioEngine;
+use crate::audio_cache::AudioCache;
+use crate::audio_pipeline;
+use crate::cellular_transport::CellularState;
+use crate::crypto::CryptoSession;
+use crate::transport::{ActiveTransport, TransportManager};
+use crate::users::UserRegistry;
+use crate::wifi_direct::{GroupRole, WifiDirectPeer, WifiDirectState};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AppState {
+    Initializing,
+    Ready,
+    Connecting,
+    Connected,
+    Transmitting,
+    Receiving,
+    Disconnecting,
+    Error,
+}
+
+pub struct StateMachine {
+    state: Arc<Mutex<AppState>>,
+    transport: Arc<Mutex<TransportManager>>,
+    audio: Arc<Mutex<AudioEngine>>,
+    audio_cache: Arc<Mutex<AudioCache>>,
+    user_registry: Arc<Mutex<UserRegistry>>,
+    ptt_pressed: Arc<AtomicBool>,
+    current_channel: Arc<AtomicU8>,
+    current_subchannel: Arc<AtomicU8>,
+    tx_running: Arc<AtomicBool>,
+    rx_running: Arc<AtomicBool>,
+    // Handles for the audio pipeline threads so we can join on shutdown instead
+    // of only signalling the flags (avoids races where threads outlive the
+    // resources they reference).
+    tx_handle: Mutex<Option<JoinHandle<()>>>,
+    rx_handle: Mutex<Option<JoinHandle<()>>>,
+    rx_shared: Arc<Mutex<audio_pipeline::RxSharedState>>,
+    device_name: String,
+    local_sender_id: String,
+    // Per-install unique salt mixed into local_sender_id. Without it the id was
+    // a pure hash of the DEVICE NAME, so two devices with the same name (both
+    // left on the default, or same model) derived IDENTICAL sender ids — the
+    // receiver then dropped every frame from the peer as its own echo
+    // (audio_pipeline process_frame: sender_id == local_sender_id) and never
+    // registered them: no audio, no roster entry, while epoch-keyed heartbeat
+    // toasts still fired. Set once at startup from Kotlin's InstallId.
+    install_salt: String,
+}
+
+impl StateMachine {
+    pub fn new(ptt: Arc<AtomicBool>, channel: Arc<AtomicU8>, subchannel: Arc<AtomicU8>) -> Self {
+        let device_name = "SassyTalkie-Android".to_string();
+        let local_sender_id = Self::derive_sender_id(&device_name, "");
+
+        Self {
+            state: Arc::new(Mutex::new(AppState::Initializing)),
+            transport: Arc::new(Mutex::new(TransportManager::new(&device_name).unwrap())),
+            audio: Arc::new(Mutex::new(AudioEngine::new().unwrap())),
+            audio_cache: Arc::new(Mutex::new(AudioCache::new())),
+            user_registry: Arc::new(Mutex::new(UserRegistry::new())),
+            ptt_pressed: ptt,
+            current_channel: channel,
+            current_subchannel: subchannel,
+            tx_running: Arc::new(AtomicBool::new(false)),
+            rx_running: Arc::new(AtomicBool::new(false)),
+            tx_handle: Mutex::new(None),
+            rx_handle: Mutex::new(None),
+            rx_shared: Arc::new(Mutex::new(audio_pipeline::RxSharedState::new())),
+            device_name,
+            local_sender_id,
+            install_salt: String::new(),
+        }
+    }
+
+    /// Sender-id derivation: device name + per-install salt. The id is opaque
+    /// to receivers (self-echo check, registry/cache key), so mixing the salt
+    /// is fully wire-compatible — it only has to be unique per device and
+    /// stable across restarts (favorites/mute are keyed on it).
+    fn derive_sender_id(name: &str, salt: &str) -> String {
+        let material = format!("{}|{}", name, salt);
+        crate::users::UserRegistry::derive_user_id(material.as_bytes())
+    }
+
+    /// Set the per-install unique id (Kotlin InstallId, stable across restarts,
+    /// unique per install). Re-derives local_sender_id so two devices sharing a
+    /// display name no longer collide. Call BEFORE transports connect.
+    pub fn set_install_id(&mut self, install_id: String) {
+        self.install_salt = install_id;
+        self.local_sender_id = Self::derive_sender_id(&self.device_name, &self.install_salt);
+        info!(
+            "StateMachine: install id set, local_sender_id re-derived to {}",
+            self.local_sender_id
+        );
+    }
+
+    pub fn initialize(&self) -> Result<(), String> {
+        info!("StateMachine: initializing");
+        let audio = self.audio.lock().unwrap();
+        audio.init_recorder()?;
+        audio.init_player()?;
+        *self.state.lock().unwrap() = AppState::Ready;
+        info!("StateMachine: ready");
+        Ok(())
+    }
+
+    pub fn shutdown(&self) -> Result<(), String> {
+        info!("StateMachine: shutting down");
+        self.stop_audio_threads();
+        self.disconnect()?;
+        let audio = self.audio.lock().unwrap();
+        let _ = audio.release();
+        Ok(())
+    }
+
+    // ── Audio Pipeline Threads ──
+
+    /// Start TX and RX threads. Called when transport is ready.
+    fn start_audio_pipeline(&self) {
+        if self.tx_running.load(Ordering::SeqCst) {
+            return; // Already running
+        }
+
+        self.tx_running.store(true, Ordering::SeqCst);
+        self.rx_running.store(true, Ordering::SeqCst);
+
+        // spawn_*_thread now returns io::Result. Thread-spawn failure
+        // (OOM, ulimit) shouldn't abort the entire process — log, leave
+        // the corresponding atomic in "running" state so a future
+        // start_pipeline() can try again, and let the upper layer cope
+        // with the degraded state.
+        match audio_pipeline::spawn_tx_thread(
+            Arc::clone(&self.tx_running),
+            Arc::clone(&self.ptt_pressed),
+            Arc::clone(&self.current_channel),
+            Arc::clone(&self.current_subchannel),
+            Arc::clone(&self.audio),
+            Arc::clone(&self.transport),
+            self.local_sender_id.clone(),
+            self.device_name.clone(),
+        ) {
+            Ok(tx) => {
+                *self.tx_handle.lock().unwrap() = Some(tx);
+            }
+            Err(e) => {
+                warn!("StateMachine: failed to spawn TX thread: {}", e);
+                self.tx_running.store(false, Ordering::SeqCst);
+            }
+        }
+
+        match audio_pipeline::spawn_rx_thread(
+            Arc::clone(&self.rx_running),
+            Arc::clone(&self.current_channel),
+            Arc::clone(&self.current_subchannel),
+            Arc::clone(&self.audio),
+            Arc::clone(&self.transport),
+            Arc::clone(&self.audio_cache),
+            Arc::clone(&self.user_registry),
+            Arc::clone(&self.rx_shared),
+            self.local_sender_id.clone(),
+        ) {
+            Ok(rx) => {
+                *self.rx_handle.lock().unwrap() = Some(rx);
+            }
+            Err(e) => {
+                warn!("StateMachine: failed to spawn RX thread: {}", e);
+                self.rx_running.store(false, Ordering::SeqCst);
+            }
+        }
+
+        info!("StateMachine: audio pipeline started");
+    }
+
+    /// Stop TX and RX threads and wait for them to exit so the audio /
+    /// transport resources they reference can be safely dropped or released.
+    fn stop_audio_threads(&self) {
+        self.tx_running.store(false, Ordering::SeqCst);
+        self.rx_running.store(false, Ordering::SeqCst);
+
+        let tx = self.tx_handle.lock().unwrap().take();
+        let rx = self.rx_handle.lock().unwrap().take();
+        if let Some(h) = tx {
+            if let Err(e) = h.join() {
+                warn!("TX thread join panicked: {:?}", e);
+            }
+        }
+        if let Some(h) = rx {
+            if let Err(e) = h.join() {
+                warn!("RX thread join panicked: {:?}", e);
+            }
+        }
+        self.rx_shared.lock().unwrap().reset();
+        info!("StateMachine: audio pipeline stopped");
+    }
+
+    // ── WiFi Direct Connection (Android-to-Android, no router) ──
+
+    /// Called by Kotlin JNI when WiFi Direct group is formed.
+    /// Starts multicast transport on the P2P network and begins audio pipeline.
+    pub fn on_wifi_direct_connected(&self) -> Result<(), String> {
+        info!("StateMachine: WiFi Direct group formed");
+
+        {
+            let mut transport = self.transport.lock().unwrap();
+            transport.on_wifi_direct_connected()?;
+        }
+
+        *self.state.lock().unwrap() = AppState::Connected;
+        self.start_audio_pipeline();
+        Ok(())
+    }
+
+    /// Called by Kotlin JNI when WiFi Direct group is dissolved.
+    pub fn on_wifi_direct_disconnected(&self) {
+        info!("StateMachine: WiFi Direct group dissolved");
+        self.stop_audio_threads();
+
+        {
+            let mut transport = self.transport.lock().unwrap();
+            transport.on_wifi_direct_disconnected();
+        }
+
+        let current = *self.state.lock().unwrap();
+        if current == AppState::Connected
+            || current == AppState::Transmitting
+            || current == AppState::Receiving
+        {
+            *self.state.lock().unwrap() = AppState::Ready;
+        }
+    }
+
+    // ── WiFi Multicast Connection (cross-platform, shared WiFi) ──
+
+    /// Start WiFi multicast transport directly (for cross-platform use).
+    /// Call this when devices are on the same WiFi network (no WiFi Direct needed).
+    pub fn connect_wifi_multicast(&self) -> Result<(), String> {
+        info!("StateMachine: connecting via WiFi multicast (cross-platform)");
+        *self.state.lock().unwrap() = AppState::Connecting;
+
+        {
+            let mut transport = self.transport.lock().unwrap();
+            transport.connect_wifi_multicast().map_err(|e| {
+                *self.state.lock().unwrap() = AppState::Error;
+                e
+            })?;
+        }
+
+        *self.state.lock().unwrap() = AppState::Connected;
+        self.start_audio_pipeline();
+        info!("StateMachine: WiFi multicast connected, audio pipeline started");
+        Ok(())
+    }
+
+    // ── Cellular Connection (WebSocket relay, works anywhere with internet) ──
+
+    /// Set the cellular relay room ID (from QR session_id)
+    pub fn set_cellular_room(&self, room_id: String) {
+        let mut transport = self.transport.lock().unwrap();
+        transport.set_cellular_room(room_id);
+    }
+
+    /// Get the WebSocket URL for Kotlin to connect to
+    pub fn get_cellular_ws_url(&self) -> String {
+        self.transport.lock().unwrap().get_cellular_ws_url()
+    }
+
+    /// Called by Kotlin JNI when the cellular WebSocket connects
+    pub fn on_cellular_connected(&self) -> Result<(), String> {
+        info!("StateMachine: cellular WebSocket connected");
+
+        {
+            let mut transport = self.transport.lock().unwrap();
+            transport.on_cellular_connected()?;
+        }
+
+        *self.state.lock().unwrap() = AppState::Connected;
+        self.start_audio_pipeline();
+        info!("StateMachine: cellular connected, audio pipeline started");
+        Ok(())
+    }
+
+    /// Called by Kotlin JNI when the cellular WebSocket disconnects
+    pub fn on_cellular_disconnected(&self, reason: &str) {
+        info!("StateMachine: cellular disconnected: {}", reason);
+
+        // Update transport state first, then decide whether the shared audio
+        // threads still have a live IP path to serve. Stopping them
+        // unconditionally here silenced WiFi multicast audio in BOTH
+        // directions on every relay flap until the next reconnect event —
+        // start_audio_pipeline only runs from connect handlers, and WiFi
+        // never re-fires one because its socket never went down.
+        // (Transport lock is dropped before stop_audio_threads: the audio
+        // threads take that lock, so joining them while holding it would
+        // deadlock.)
+        let audio_still_live = {
+            let mut transport = self.transport.lock().unwrap();
+            transport.on_cellular_disconnected(reason);
+            // Keep TX/RX threads when WiFi OR Bluetooth still carries audio —
+            // stopping here after a relay flap with RFCOMM up caused silent PTT
+            // until the next connect event (BT re-promotion alone is not enough
+            // if the pipeline was torn down).
+            transport.has_live_audio_path()
+        };
+
+        if audio_still_live {
+            info!("StateMachine: cellular down but local path still live — audio pipeline kept running");
+            return;
+        }
+
+        self.stop_audio_threads();
+
+        let current = *self.state.lock().unwrap();
+        if current == AppState::Connected
+            || current == AppState::Transmitting
+            || current == AppState::Receiving
+        {
+            *self.state.lock().unwrap() = AppState::Ready;
+        }
+    }
+
+    /// Called by Kotlin JNI when a binary message arrives from the relay
+    pub fn on_cellular_message(&self, data: Vec<u8>) {
+        let mut transport = self.transport.lock().unwrap();
+        transport.on_cellular_message(data);
+    }
+
+    /// Called by Kotlin JNI when the WebSocket has an error
+    pub fn on_cellular_error(&self, error: &str) {
+        let mut transport = self.transport.lock().unwrap();
+        transport.on_cellular_error(error);
+    }
+
+    /// Poll outbound cellular queue (called by Kotlin timer)
+    pub fn poll_cellular_outbound(&self) -> Option<Vec<u8>> {
+        self.transport.lock().unwrap().poll_cellular_outbound()
+    }
+
+    pub fn report_cellular_send_result(&self, success: bool) {
+        self.transport
+            .lock()
+            .unwrap()
+            .report_cellular_send_result(success);
+    }
+
+    pub fn poll_bluetooth_outbound(&self) -> Option<Vec<u8>> {
+        self.transport.lock().unwrap().poll_bluetooth_outbound()
+    }
+
+    pub fn report_bluetooth_send_result(&self, success: bool) {
+        self.transport
+            .lock()
+            .unwrap()
+            .report_bluetooth_send_result(success);
+    }
+
+    /// Get cellular transport state
+    pub fn get_cellular_state(&self) -> CellularState {
+        self.transport.lock().unwrap().cellular_state()
+    }
+
+    /// Get cellular stats JSON
+    pub fn get_cellular_stats(&self) -> String {
+        self.transport.lock().unwrap().get_cellular_stats()
+    }
+
+    // ── Bluetooth Connection ──
+
+    /// Called by Kotlin JNI when Bluetooth RFCOMM connects to a peer.
+    /// Starts audio pipeline just like WiFi Direct and Cellular do.
+    pub fn on_bluetooth_connected(&self) {
+        info!("StateMachine: Bluetooth RFCOMM connected");
+
+        {
+            let mut transport = self.transport.lock().unwrap();
+            transport.on_bluetooth_connected();
+        }
+
+        *self.state.lock().unwrap() = AppState::Connected;
+        self.start_audio_pipeline();
+        info!("StateMachine: Bluetooth connected, audio pipeline started");
+    }
+
+    /// Called by Kotlin JNI when Bluetooth RFCOMM disconnects.
+    pub fn on_bluetooth_disconnected(&self) {
+        info!("StateMachine: Bluetooth disconnected");
+
+        // Same guard as on_cellular_disconnected: BT is a parallel fallback
+        // plane (its audio runs through the Kotlin RFCOMM pump), so a BT peer
+        // dropping must not kill the shared TX/RX threads that carry WiFi and
+        // relay audio.
+        let ip_still_live = {
+            let mut transport = self.transport.lock().unwrap();
+            transport.on_bluetooth_disconnected();
+            transport.has_live_ip_transport()
+        };
+
+        if ip_still_live {
+            info!(
+                "StateMachine: Bluetooth down but an IP path is live — audio pipeline kept running"
+            );
+            return;
+        }
+
+        self.stop_audio_threads();
+
+        let current = *self.state.lock().unwrap();
+        if current == AppState::Connected
+            || current == AppState::Transmitting
+            || current == AppState::Receiving
+        {
+            *self.state.lock().unwrap() = AppState::Ready;
+        }
+    }
+
+    // ── Disconnect ──
+
+    pub fn disconnect(&self) -> Result<(), String> {
+        info!("StateMachine: disconnecting");
+        *self.state.lock().unwrap() = AppState::Disconnecting;
+
+        self.stop_audio_threads();
+        // Preserve history so the timeline's replay button still works after
+        // a disconnect. `clear()` wipes history too — use it only for hard
+        // resets (logout, etc.). See AudioCache::clear vs clear_active.
+        self.audio_cache.lock().unwrap().clear_active();
+
+        let mut transport = self.transport.lock().unwrap();
+        transport.disconnect()?;
+        *self.state.lock().unwrap() = AppState::Ready;
+        Ok(())
+    }
+
+    // ── WiFi ──
+
+    pub fn init_wifi(&self) -> Result<(), String> {
+        self.transport.lock().unwrap().init_wifi()
+    }
+
+    pub fn get_wifi_state(&self) -> crate::wifi_transport::WifiState {
+        self.transport.lock().unwrap().wifi_state()
+    }
+
+    pub fn get_wifi_peers(&self) -> Vec<crate::wifi_transport::WifiPeer> {
+        self.transport.lock().unwrap().get_wifi_peers().to_vec()
+    }
+
+    pub fn has_wifi_peers(&self) -> bool {
+        self.transport.lock().unwrap().has_wifi_peers()
+    }
+
+    // ── WiFi Direct ──
+
+    pub fn get_wifi_direct_state(&self) -> WifiDirectState {
+        self.transport.lock().unwrap().wifi_direct_state()
+    }
+
+    pub fn get_wifi_direct_peers(&self) -> Vec<WifiDirectPeer> {
+        self.transport
+            .lock()
+            .unwrap()
+            .get_wifi_direct_peers()
+            .to_vec()
+    }
+
+    pub fn has_wifi_direct_peers(&self) -> bool {
+        self.transport.lock().unwrap().has_wifi_direct_peers()
+    }
+
+    pub fn get_wifi_direct_role(&self) -> GroupRole {
+        self.transport.lock().unwrap().wifi_direct_role()
+    }
+
+    // ── Transport ──
+
+    pub fn get_active_transport(&self) -> ActiveTransport {
+        self.transport.lock().unwrap().active_transport()
+    }
+
+    pub fn get_preferred_transport(&self) -> ActiveTransport {
+        self.transport.lock().unwrap().preferred_transport()
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        self.transport.lock().unwrap().is_encrypted()
+    }
+
+    pub fn set_crypto_session(&self, session: CryptoSession) {
+        self.transport.lock().unwrap().set_crypto(session);
+        info!("StateMachine: crypto session set");
+    }
+
+    pub fn arm_pending_rx(&self, session: CryptoSession) {
+        self.transport.lock().unwrap().arm_pending_rx(session);
+        info!("StateMachine: staged hybrid RX armed");
+    }
+
+    pub fn discard_pending_rx(&self) {
+        self.transport.lock().unwrap().discard_pending_rx();
+    }
+
+    pub fn set_psk(&self, key: &[u8; 32]) {
+        self.transport.lock().unwrap().set_psk(key);
+    }
+
+    pub fn get_transport(&self) -> &Arc<Mutex<TransportManager>> {
+        &self.transport
+    }
+
+    pub fn get_device_name(&self) -> String {
+        self.device_name.clone()
+    }
+
+    pub fn get_local_sender_id(&self) -> String {
+        self.local_sender_id.clone()
+    }
+
+    pub fn get_audio(&self) -> &Arc<Mutex<AudioEngine>> {
+        &self.audio
+    }
+
+    /// Set the device display name (called from Kotlin with the actual Android device model)
+    pub fn set_device_name(&mut self, name: String) {
+        info!("StateMachine: device name set to '{}'", name);
+        self.device_name = name.clone();
+        self.local_sender_id = Self::derive_sender_id(&name, &self.install_salt);
+        // Update transport too
+        let mut transport = self.transport.lock().unwrap();
+        transport.set_device_name(&name);
+    }
+
+    // ── PTT ──
+
+    pub fn on_ptt_press(&self) -> Result<(), String> {
+        self.ptt_pressed.store(true, Ordering::SeqCst);
+        *self.state.lock().unwrap() = AppState::Transmitting;
+        info!("PTT pressed");
+        Ok(())
+    }
+
+    pub fn on_ptt_release(&self) -> Result<(), String> {
+        self.ptt_pressed.store(false, Ordering::SeqCst);
+        *self.state.lock().unwrap() = AppState::Connected;
+        info!("PTT released");
+        Ok(())
+    }
+
+    pub fn is_ptt_active(&self) -> bool {
+        self.ptt_pressed.load(Ordering::SeqCst)
+    }
+
+    // ── State / Accessors ──
+
+    pub fn get_state(&self) -> AppState {
+        *self.state.lock().unwrap()
+    }
+
+    pub fn get_audio_cache(&self) -> &Arc<Mutex<AudioCache>> {
+        &self.audio_cache
+    }
+
+    pub fn get_user_registry(&self) -> &Arc<Mutex<UserRegistry>> {
+        &self.user_registry
+    }
+
+    pub fn get_rx_shared(&self) -> &Arc<Mutex<audio_pipeline::RxSharedState>> {
+        &self.rx_shared
+    }
+}
+
+impl Drop for StateMachine {
+    fn drop(&mut self) {
+        self.stop_audio_threads();
+        // disconnect from transport
+        let mut transport = self.transport.lock().unwrap();
+        let _ = transport.disconnect();
+    }
+}

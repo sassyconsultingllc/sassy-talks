@@ -1,0 +1,861 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-R75DJW7J6RNN
+package com.sassyconsulting.sassytalkie.ui
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.sassyconsulting.sassytalkie.translate.LiveCaptionTranslator
+import com.sassyconsulting.sassytalkie.translate.LiveTranslationBridge
+import com.sassyconsulting.sassytalkie.translate.LiveTranslationText
+import com.sassyconsulting.sassytalkie.translate.TranslationManager
+import com.sassyconsulting.sassytalkie.ui.theme.*
+
+/**
+ * Settings panel for offline live-caption + translation of the LOCAL speaker.
+ *
+ * Configures the app-scoped [LiveTranslationBridge] (enable, source/target
+ * languages, Wi-Fi-only model downloads). Recognition keeps running on the
+ * main radio screen after leaving Settings so captions stay available in use.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TranslationPanel(
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    // Ensure bridge is ready even if Activity init raced composition.
+    LaunchedEffect(Unit) { LiveTranslationBridge.init(context) }
+    DisposableEffect(Unit) {
+        LiveTranslationBridge.acquireUi()
+        onDispose { LiveTranslationBridge.releaseUi() }
+    }
+
+    val enabled by LiveTranslationBridge.enabled.collectAsState()
+    val sourceLang by LiveTranslationBridge.sourceLang.collectAsState()
+    val targetLang by LiveTranslationBridge.targetLang.collectAsState()
+    val wifiOnly by LiveTranslationBridge.wifiOnlyModels.collectAsState()
+    val ttsEnabled by LiveTranslationBridge.ttsEnabled.collectAsState()
+    val timelineEnabled by LiveTranslationBridge.timelineEnabled.collectAsState()
+    val pausedForPtt by LiveTranslationBridge.pausedForPtt.collectAsState()
+    val caption by LiveTranslationBridge.caption.collectAsState()
+    val translation by LiveTranslationBridge.translation.collectAsState()
+    val status by LiveTranslationBridge.status.collectAsState()
+    val errorMessage by LiveTranslationBridge.errorMessage.collectAsState()
+    val modelState by LiveTranslationBridge.modelState.collectAsState()
+    val downloadedModels by LiveTranslationBridge.downloadedModels.collectAsState()
+
+    var sourceMenuExpanded by remember { mutableStateOf(false) }
+    var targetMenuExpanded by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        LiveTranslationBridge.refreshDownloadedModels()
+    }
+    LaunchedEffect(enabled) {
+        if (enabled) LiveTranslationBridge.refreshDownloadedModels()
+    }
+
+    val sourceLabel = remember(sourceLang) {
+        TranslationManager.COMMON_LANGUAGES.firstOrNull { it.code == sourceLang }?.label ?: sourceLang
+    }
+    val targetLabel = remember(targetLang) {
+        TranslationManager.COMMON_LANGUAGES.firstOrNull { it.code == targetLang }?.label ?: targetLang
+    }
+
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = CardBg),
+        shape = RoundedCornerShape(12.dp),
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.Default.Translate,
+                    contentDescription = null,
+                    tint = Cyan,
+                    modifier = Modifier.size(20.dp),
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Live Translation",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Cyan,
+                    letterSpacing = 1.sp,
+                    modifier = Modifier.weight(1f),
+                )
+                Switch(
+                    checked = enabled,
+                    onCheckedChange = { LiveTranslationBridge.setEnabled(it) },
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Orange,
+                        checkedTrackColor = Orange.copy(alpha = 0.3f),
+                        uncheckedThumbColor = TextMuted,
+                        uncheckedTrackColor = SurfaceBg,
+                    ),
+                )
+            }
+
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "Captions your speech on-device and translates it on the radio screen. Pauses while you transmit (mic is for PTT). Speak while idle to build a caption; with Speak translation on, the translation is read back after you release PTT.",
+                fontSize = 11.sp,
+                color = TextMuted,
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            LanguagePicker(
+                label = "I speak",
+                selectedLabel = sourceLabel,
+                expanded = sourceMenuExpanded,
+                onExpandedChange = { sourceMenuExpanded = it },
+                downloadedModels = downloadedModels,
+                onSelect = { code ->
+                    LiveTranslationBridge.setSourceLang(code)
+                    // Keep source ≠ target so captions actually translate.
+                    if (code == targetLang) {
+                        val fallback = TranslationManager.COMMON_LANGUAGES
+                            .firstOrNull { it.code != code }?.code
+                        if (fallback != null) LiveTranslationBridge.setTargetLang(fallback)
+                    }
+                    sourceMenuExpanded = false
+                },
+            )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(
+                    onClick = { LiveTranslationBridge.swapLanguages() },
+                    enabled = sourceLang != targetLang,
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                ) {
+                    Text(
+                        text = "⇅ Swap languages",
+                        fontSize = 12.sp,
+                        color = if (sourceLang != targetLang) TealLight else TextMuted,
+                    )
+                }
+            }
+
+            LanguagePicker(
+                label = "Translate to",
+                selectedLabel = targetLabel,
+                expanded = targetMenuExpanded,
+                onExpandedChange = { targetMenuExpanded = it },
+                excludeCode = sourceLang,
+                downloadedModels = downloadedModels,
+                onSelect = { code ->
+                    LiveTranslationBridge.setTargetLang(code)
+                    targetMenuExpanded = false
+                },
+            )
+
+            if (sourceLang == targetLang) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "Pick a different target language to translate — source and target match.",
+                    fontSize = 11.sp,
+                    color = StatusWarning,
+                )
+            }
+
+            if (enabled) {
+                Spacer(modifier = Modifier.height(12.dp))
+                TranslationSetupCard(
+                    sourceLang = sourceLang,
+                    targetLang = targetLang,
+                    sourceLabel = sourceLabel,
+                    targetLabel = targetLabel,
+                    downloadedModels = downloadedModels,
+                    modelState = modelState,
+                    status = status,
+                    errorMessage = errorMessage,
+                    wifiOnly = wifiOnly,
+                    onOpenSpeechSettings = {
+                        LiveTranslationBridge.openOfflineSpeechSettings(context)
+                    },
+                    onRetryModels = { LiveTranslationBridge.retryModelDownload() },
+                    onAllowCellular = { LiveTranslationBridge.setWifiOnlyModels(false) },
+                )
+            }
+
+            if (modelState == TranslationManager.ModelState.DOWNLOADING) {
+                Spacer(modifier = Modifier.height(10.dp))
+                ModelDownloadBanner(
+                    sourceLabel = sourceLabel,
+                    targetLabel = targetLabel,
+                )
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            PrefToggle(
+                title = "Wi-Fi only downloads",
+                description = "Language models (~30 MB each) download only on unmetered networks",
+                checked = wifiOnly,
+                onCheckedChange = { LiveTranslationBridge.setWifiOnlyModels(it) },
+                accent = Cyan,
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            PrefToggle(
+                title = "Save to Timeline",
+                description = "Append captions to this session's Activity (cleared when the session ends)",
+                checked = timelineEnabled,
+                onCheckedChange = { LiveTranslationBridge.setTimelineEnabled(it) },
+                accent = Cyan,
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            PrefToggle(
+                title = "Speak translation",
+                description = "Read back the translation after PTT release (and on idle finals). Muted while transmitting or while a peer is speaking.",
+                checked = ttsEnabled,
+                onCheckedChange = { LiveTranslationBridge.setTtsEnabled(it) },
+                accent = Orange,
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            StatusLine(
+                enabled = enabled,
+                pausedForPtt = pausedForPtt,
+                status = status,
+                modelState = modelState,
+                errorMessage = errorMessage,
+                wifiOnly = wifiOnly,
+                sourceLabel = sourceLabel,
+                targetLabel = targetLabel,
+            )
+
+            val needsOfflineSpeechPack = enabled &&
+                LiveTranslationText.needsOfflineSpeechPack(errorMessage)
+
+            if (needsOfflineSpeechPack) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(
+                    onClick = { LiveTranslationBridge.openOfflineSpeechSettings(context) },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = TealDark,
+                        contentColor = TextWhite,
+                    ),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                ) {
+                    Text("Open system speech settings", fontSize = 12.sp)
+                }
+            }
+
+            if (enabled && modelState == TranslationManager.ModelState.FAILED) {
+                Spacer(modifier = Modifier.height(8.dp))
+                TextButton(onClick = { LiveTranslationBridge.retryModelDownload() }) {
+                    Text("Retry model download", color = Orange, fontSize = 12.sp)
+                }
+            }
+
+            if (enabled && downloadedModels.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Text("Downloaded models", fontSize = 12.sp, color = TextMuted)
+                Spacer(modifier = Modifier.height(4.dp))
+                downloadedModels.forEach { code ->
+                    val label = TranslationManager.COMMON_LANGUAGES
+                        .firstOrNull { it.code == code }?.label ?: code
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = label,
+                            fontSize = 13.sp,
+                            color = TextWhite,
+                            modifier = Modifier.weight(1f),
+                        )
+                        IconButton(
+                            onClick = { LiveTranslationBridge.deleteLanguageModel(code) },
+                            modifier = Modifier.size(32.dp),
+                        ) {
+                            Icon(
+                                Icons.Default.Delete,
+                                contentDescription = "Delete $label model",
+                                tint = TextMuted,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            CaptionBlock(
+                label = "Heard ($sourceLabel)",
+                text = when {
+                    !enabled -> "—"
+                    pausedForPtt -> "Paused while transmitting"
+                    caption.isNotBlank() -> caption
+                    else -> "Listening…"
+                },
+                accent = TextGray,
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            CaptionBlock(
+                label = targetLabel,
+                text = translation.ifBlank { "—" },
+                accent = Orange,
+            )
+        }
+    }
+}
+
+@Composable
+private fun PrefToggle(
+    title: String,
+    description: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    accent: androidx.compose.ui.graphics.Color,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, fontSize = 13.sp, color = TextWhite)
+            Text(text = description, fontSize = 11.sp, color = TextMuted)
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = accent,
+                checkedTrackColor = accent.copy(alpha = 0.3f),
+                uncheckedThumbColor = TextMuted,
+                uncheckedTrackColor = SurfaceBg,
+            ),
+        )
+    }
+}
+
+/**
+ * First-run checklist: ML Kit translation models (in-app) + offline speech pack
+ * (system Settings). Keeps CTAs visible until both sides look ready.
+ */
+@Composable
+private fun TranslationSetupCard(
+    sourceLang: String,
+    targetLang: String,
+    sourceLabel: String,
+    targetLabel: String,
+    downloadedModels: List<String>,
+    modelState: TranslationManager.ModelState,
+    status: LiveCaptionTranslator.Status,
+    errorMessage: String?,
+    wifiOnly: Boolean,
+    onOpenSpeechSettings: () -> Unit,
+    onRetryModels: () -> Unit,
+    onAllowCellular: () -> Unit,
+) {
+    val modelsReady = sourceLang in downloadedModels &&
+        targetLang in downloadedModels &&
+        modelState == TranslationManager.ModelState.READY
+    val modelDownloading = modelState == TranslationManager.ModelState.DOWNLOADING
+    val modelFailed = modelState == TranslationManager.ModelState.FAILED
+    val needsSpeechPack = LiveTranslationText.needsOfflineSpeechPack(errorMessage)
+    val speechOk = status != LiveCaptionTranslator.Status.UNAVAILABLE && !needsSpeechPack
+    val hint = LiveTranslationText.setupHint(
+        modelsReady = modelsReady,
+        modelDownloading = modelDownloading,
+        modelFailed = modelFailed,
+        speechOk = speechOk,
+        wifiOnly = wifiOnly,
+    )
+    val allReady = modelsReady && speechOk &&
+        status != LiveCaptionTranslator.Status.ERROR
+
+    Surface(
+        color = if (allReady) StatusConnected.copy(alpha = 0.10f) else TealDark.copy(alpha = 0.22f),
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(
+                text = if (allReady) "Setup complete" else "First-run setup",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = if (allReady) StatusConnected else TealLight,
+                letterSpacing = 0.5.sp,
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(text = hint, fontSize = 11.sp, color = TextGray)
+
+            Spacer(modifier = Modifier.height(10.dp))
+            SetupStepRow(
+                step = "1",
+                title = "Translation models ($sourceLabel → $targetLabel)",
+                detail = when {
+                    modelDownloading -> "Downloading ~30 MB…"
+                    modelFailed -> if (wifiOnly) "Failed — need Wi-Fi or allow cellular" else "Failed — tap retry"
+                    modelsReady -> "On device"
+                    else -> "Will download when you enable / change languages"
+                },
+                ready = modelsReady,
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            SetupStepRow(
+                step = "2",
+                title = "Offline speech pack (system)",
+                detail = when {
+                    needsSpeechPack -> "Required for on-device captions — open Voice / Languages settings"
+                    status == LiveCaptionTranslator.Status.UNAVAILABLE ->
+                        errorMessage ?: "Speech recognition unavailable"
+                    status == LiveCaptionTranslator.Status.LISTENING -> "Recognizer listening"
+                    else -> "Installed (or not yet tested)"
+                },
+                ready = speechOk,
+            )
+
+            if (!modelsReady || needsSpeechPack || modelFailed) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    if (needsSpeechPack) {
+                        Button(
+                            onClick = onOpenSpeechSettings,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = TealDark,
+                                contentColor = TextWhite,
+                            ),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text("Speech settings", fontSize = 11.sp, maxLines = 1)
+                        }
+                    }
+                    if (modelFailed) {
+                        TextButton(
+                            onClick = onRetryModels,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                        ) {
+                            Text("Retry models", color = Orange, fontSize = 11.sp)
+                        }
+                        if (wifiOnly) {
+                            TextButton(
+                                onClick = onAllowCellular,
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                            ) {
+                                Text("Allow cellular", color = Cyan, fontSize = 11.sp)
+                            }
+                        }
+                    } else if (!modelsReady && !modelDownloading) {
+                        TextButton(
+                            onClick = onRetryModels,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                        ) {
+                            Text("Download models", color = Cyan, fontSize = 11.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SetupStepRow(
+    step: String,
+    title: String,
+    detail: String,
+    ready: Boolean,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.Top,
+    ) {
+        Text(
+            text = if (ready) "✓" else step,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            color = if (ready) StatusConnected else StatusWarning,
+            modifier = Modifier.width(18.dp),
+        )
+        Column(modifier = Modifier.weight(1f)) {
+            Text(text = title, fontSize = 12.sp, color = TextWhite)
+            Text(text = detail, fontSize = 10.sp, color = TextMuted)
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LanguagePicker(
+    label: String,
+    selectedLabel: String,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    onSelect: (String) -> Unit,
+    excludeCode: String? = null,
+    downloadedModels: List<String> = emptyList(),
+) {
+    val options = remember(excludeCode) {
+        TranslationManager.COMMON_LANGUAGES.filter { it.code != excludeCode }
+    }
+    Text(label, fontSize = 12.sp, color = TextMuted)
+    Spacer(modifier = Modifier.height(4.dp))
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = onExpandedChange,
+    ) {
+        OutlinedTextField(
+            value = selectedLabel,
+            onValueChange = {},
+            readOnly = true,
+            trailingIcon = {
+                Icon(Icons.Default.ArrowDropDown, contentDescription = null, tint = TextGray)
+            },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = Cyan,
+                unfocusedBorderColor = SurfaceBg,
+                focusedTextColor = TextWhite,
+                unfocusedTextColor = TextWhite,
+                focusedContainerColor = SurfaceBg,
+                unfocusedContainerColor = SurfaceBg,
+            ),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .menuAnchor(),
+        )
+        ExposedDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { onExpandedChange(false) },
+        ) {
+            options.forEach { lang ->
+                val onDevice = downloadedModels.contains(lang.code)
+                DropdownMenuItem(
+                    text = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = lang.label,
+                                modifier = Modifier.weight(1f),
+                            )
+                            if (!onDevice) {
+                                Text(
+                                    text = "download",
+                                    fontSize = 10.sp,
+                                    color = StatusWarning,
+                                )
+                            }
+                        }
+                    },
+                    onClick = { onSelect(lang.code) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ModelDownloadBanner(
+    sourceLabel: String,
+    targetLabel: String,
+) {
+    Surface(
+        color = StatusWarning.copy(alpha = 0.12f),
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            CircularProgressIndicator(
+                color = StatusWarning,
+                strokeWidth = 2.dp,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Downloading language model",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = StatusWarning,
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = "$sourceLabel → $targetLabel · ~30 MB on this device",
+                    fontSize = 11.sp,
+                    color = TextGray,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusLine(
+    enabled: Boolean,
+    pausedForPtt: Boolean,
+    status: LiveCaptionTranslator.Status,
+    modelState: TranslationManager.ModelState,
+    errorMessage: String?,
+    wifiOnly: Boolean = true,
+    sourceLabel: String = "",
+    targetLabel: String = "",
+) {
+    val downloadLine = if (sourceLabel.isNotEmpty() && targetLabel.isNotEmpty()) {
+        "Downloading $sourceLabel → $targetLabel model (~30 MB)…"
+    } else {
+        "Downloading language model…"
+    }
+    val needsSpeechPack = LiveTranslationText.needsOfflineSpeechPack(errorMessage) ||
+        status == LiveCaptionTranslator.Status.UNAVAILABLE
+    val (text, color) = when {
+        // Speech-pack / UNAVAILABLE wins over an in-flight model download so
+        // error 12 cannot look like a download that never finishes.
+        needsSpeechPack ->
+            "Install offline speech pack — use Speech settings below" to StatusDisconnected
+        status == LiveCaptionTranslator.Status.ERROR &&
+            LiveTranslationText.needsOfflineSpeechPack(errorMessage) ->
+            "Install offline speech pack — use Speech settings below" to StatusDisconnected
+        modelState == TranslationManager.ModelState.DOWNLOADING ->
+            downloadLine to StatusWarning
+        !enabled -> "Off" to TextMuted
+        pausedForPtt -> "Paused for PTT" to StatusWarning
+        status == LiveCaptionTranslator.Status.ERROR ->
+            (errorMessage ?: "Error") to StatusDisconnected
+        modelState == TranslationManager.ModelState.FAILED ->
+            if (wifiOnly) {
+                "Model download failed — connect to Wi-Fi or disable Wi-Fi-only" to StatusDisconnected
+            } else {
+                "Model download failed — check network and retry" to StatusDisconnected
+            }
+        status == LiveCaptionTranslator.Status.LISTENING ->
+            "Listening (offline) — captions also show on the radio screen" to StatusConnected
+        status == LiveCaptionTranslator.Status.IDLE && enabled && !pausedForPtt ->
+            if (sourceLabel.isNotEmpty() && targetLabel.isNotEmpty()) {
+                "Quiet · $sourceLabel → $targetLabel" to TextGray
+            } else {
+                "Quiet — will resume listening shortly" to TextGray
+            }
+        modelState == TranslationManager.ModelState.READY &&
+            sourceLabel.isNotEmpty() && targetLabel.isNotEmpty() ->
+            "Ready · $sourceLabel → $targetLabel" to StatusConnected
+        else -> "Ready" to TextGray
+    }
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        if (modelState == TranslationManager.ModelState.DOWNLOADING && !needsSpeechPack) {
+            CircularProgressIndicator(
+                color = StatusWarning,
+                strokeWidth = 2.dp,
+                modifier = Modifier.size(14.dp),
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+        }
+        Text(text = text, fontSize = 11.sp, color = color, fontWeight = FontWeight.Medium)
+    }
+}
+
+@Composable
+private fun CaptionBlock(
+    label: String,
+    text: String,
+    accent: androidx.compose.ui.graphics.Color,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(SurfaceBg)
+            .padding(12.dp),
+    ) {
+        Text(text = label, fontSize = 10.sp, color = TextMuted, letterSpacing = 1.sp)
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(text = text, fontSize = 15.sp, color = accent)
+    }
+}
+
+/**
+ * Slim full-width caption strip above PTT — translated text first,
+ * edge-to-edge rectangle (not a tall card / pill).
+ */
+@Composable
+fun LiveTranslationOverlay(
+    modifier: Modifier = Modifier,
+) {
+    val enabled by LiveTranslationBridge.enabled.collectAsState()
+    if (!enabled) return
+
+    val context = LocalContext.current
+    val caption by LiveTranslationBridge.caption.collectAsState()
+    val translation by LiveTranslationBridge.translation.collectAsState()
+    val pausedForPtt by LiveTranslationBridge.pausedForPtt.collectAsState()
+    val sourceLang by LiveTranslationBridge.sourceLang.collectAsState()
+    val targetLang by LiveTranslationBridge.targetLang.collectAsState()
+    val status by LiveTranslationBridge.status.collectAsState()
+    val modelState by LiveTranslationBridge.modelState.collectAsState()
+    val errorMessage by LiveTranslationBridge.errorMessage.collectAsState()
+    val ttsEnabled by LiveTranslationBridge.ttsEnabled.collectAsState()
+
+    val sourceLabel = remember(sourceLang) {
+        TranslationManager.COMMON_LANGUAGES.firstOrNull { it.code == sourceLang }?.label ?: sourceLang
+    }
+    val targetLabel = remember(targetLang) {
+        TranslationManager.COMMON_LANGUAGES.firstOrNull { it.code == targetLang }?.label ?: targetLang
+    }
+
+    val needsSpeechPack = LiveTranslationText.needsOfflineSpeechPack(errorMessage) ||
+        status == LiveCaptionTranslator.Status.UNAVAILABLE
+
+    val primaryText = LiveTranslationText.radioOverlayPrimary(
+        pausedForPtt = pausedForPtt,
+        ttsEnabled = ttsEnabled,
+        modelDownloading = modelState == TranslationManager.ModelState.DOWNLOADING,
+        needsSpeechPack = needsSpeechPack,
+        statusError = status == LiveCaptionTranslator.Status.ERROR,
+        translation = translation,
+        caption = caption,
+        listening = status == LiveCaptionTranslator.Status.LISTENING,
+        sourceCode = sourceLang,
+        targetCode = targetLang,
+    )
+    val primaryColor = when {
+        pausedForPtt -> StatusWarning
+        needsSpeechPack ||
+            status == LiveCaptionTranslator.Status.ERROR ||
+            status == LiveCaptionTranslator.Status.UNAVAILABLE -> StatusDisconnected
+        modelState == TranslationManager.ModelState.DOWNLOADING -> StatusWarning
+        translation.isNotBlank() -> Coral
+        else -> TextPrimary
+    }
+
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .then(
+                if (needsSpeechPack) {
+                    Modifier.clickable {
+                        LiveTranslationBridge.openOfflineSpeechSettings(context)
+                    }
+                } else {
+                    Modifier
+                },
+            ),
+        color = CardBg.copy(alpha = 0.94f),
+        shape = RoundedCornerShape(0.dp),
+        tonalElevation = 0.dp,
+        shadowElevation = 0.dp,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 36.dp, max = 52.dp)
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Default.Translate,
+                contentDescription = null,
+                tint = TealLight,
+                modifier = Modifier.size(14.dp),
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = primaryText,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = primaryColor,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (translation.isNotBlank() &&
+                    caption.isNotBlank() &&
+                    !pausedForPtt &&
+                    modelState != TranslationManager.ModelState.DOWNLOADING &&
+                    !needsSpeechPack
+                ) {
+                    Text(
+                        text = caption,
+                        fontSize = 10.sp,
+                        color = TextMuted,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                } else {
+                    Text(
+                        text = when {
+                            needsSpeechPack -> "Tap to open system speech settings"
+                            else -> "$sourceLabel → $targetLabel"
+                        },
+                        fontSize = 10.sp,
+                        color = TextMuted,
+                        maxLines = 1,
+                    )
+                }
+            }
+            if (modelState == TranslationManager.ModelState.DOWNLOADING && !needsSpeechPack) {
+                CircularProgressIndicator(
+                    color = StatusWarning,
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(12.dp),
+                )
+            } else {
+                Text(
+                    text = when {
+                        pausedForPtt -> "PTT"
+                        needsSpeechPack -> "!"
+                        status == LiveCaptionTranslator.Status.LISTENING -> "●"
+                        status == LiveCaptionTranslator.Status.ERROR ||
+                            status == LiveCaptionTranslator.Status.UNAVAILABLE -> "!"
+                        else -> "○"
+                    },
+                    fontSize = 11.sp,
+                    color = when {
+                        pausedForPtt -> StatusWarning
+                        needsSpeechPack -> StatusDisconnected
+                        status == LiveCaptionTranslator.Status.LISTENING -> StatusConnected
+                        status == LiveCaptionTranslator.Status.ERROR ||
+                            status == LiveCaptionTranslator.Status.UNAVAILABLE -> StatusDisconnected
+                        else -> TextMuted
+                    },
+                )
+            }
+        }
+    }
+}
