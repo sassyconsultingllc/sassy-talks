@@ -149,6 +149,8 @@ fn main() {
             commands::leave_cellular_session,
             commands::wipe_session,
             commands::get_cellular_status,
+            commands::get_cohort_history,
+            commands::clear_cohort_history,
         ])
         .setup(|_app| {
             info!("Sassy-Talk setup complete");

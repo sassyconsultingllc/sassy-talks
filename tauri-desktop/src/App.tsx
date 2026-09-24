@@ -34,6 +34,7 @@ import type {
   AudioDevices,
   NetworkInfo,
   CellularStatus,
+  CohortRecord,
   View,
 } from './types';
 
@@ -76,6 +77,9 @@ export default function App() {
   const [cellularRoom, setCellularRoom] = useState<string | null>(null);
   const [cellularStatus, setCellularStatus] = useState<CellularStatus | null>(null);
   const [cellularJoining, setCellularJoining] = useState(false);
+  // Recent sessions (cohort history). Display-only — no key material is stored,
+  // so re-joining still requires pasting the QR again.
+  const [recentCohorts, setRecentCohorts] = useState<CohortRecord[]>([]);
 
   // Audio visualization
   const [audioLevel, setAudioLevel] = useState(0);
@@ -197,6 +201,19 @@ export default function App() {
     // Run ONCE on mount: setup + polling interval live for the component's
     // lifetime. isSearching is read via isSearchingRef inside the interval.
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Load the recent-sessions (cohort) list once on mount.
+  useEffect(() => {
+    (async () => {
+      try {
+        const json = await invoke<string>('get_cohort_history');
+        const parsed = JSON.parse(json || '[]') as CohortRecord[];
+        setRecentCohorts(Array.isArray(parsed) ? parsed : []);
+      } catch (e) {
+        console.error('Failed to load cohort history:', e);
+      }
+    })();
   }, []);
 
   // ==========================================================================
@@ -402,6 +419,25 @@ export default function App() {
   // Cellular Relay (Internet) Handlers
   // ==========================================================================
 
+  const loadCohorts = async () => {
+    try {
+      const json = await invoke<string>('get_cohort_history');
+      const parsed = JSON.parse(json || '[]') as CohortRecord[];
+      setRecentCohorts(Array.isArray(parsed) ? parsed : []);
+    } catch (e) {
+      console.error('Failed to load cohort history:', e);
+    }
+  };
+
+  const clearCohorts = async () => {
+    try {
+      await invoke('clear_cohort_history');
+    } catch (e) {
+      console.error('Failed to clear cohort history:', e);
+    }
+    setRecentCohorts([]);
+  };
+
   const joinCellular = async () => {
     const input = cellularQr.trim();
     if (!input || cellularJoining) return;
@@ -417,6 +453,7 @@ export default function App() {
         ? await invoke<string>('import_share_link', { url: input })
         : await invoke<string>('join_cellular_session', { qrJson: input });
       setCellularRoom(room);
+      void loadCohorts();
       Sounds.connectionSuccess();
       // Jump to the Talk view so the user can immediately push-to-talk.
       setCurrentView('walkie');
@@ -496,7 +533,7 @@ export default function App() {
       <header className="lobby-header">
         <h1>Sassy-Talk</h1>
         <div className="lobby-header-actions">
-          <p className="subtitle">Bluetooth Walkie-Talkie</p>
+          <p className="subtitle">LAN &amp; Internet Walkie-Talkie</p>
           <button className="settings-gear-btn" onClick={() => setShowSettingsModal(true)} title="Quick Settings">
             <IconSettings size={20} />
           </button>
@@ -817,6 +854,29 @@ export default function App() {
               >
                 {cellularJoining ? 'Connecting…' : 'Join over Internet'}
               </button>
+              {recentCohorts.length > 0 && (
+                <div className="cohort-history">
+                  <div className="cohort-history-header">
+                    <span className="setting-label">Recent sessions</span>
+                    <button className="cohort-clear-btn" onClick={clearCohorts}>Clear</button>
+                  </div>
+                  <ul className="cohort-list">
+                    {recentCohorts.map((c) => (
+                      <li key={c.cohort_id} className="cohort-item">
+                        <span className="cohort-name">{c.group_name || `Channel ${c.channel}`}</span>
+                        <span className="cohort-meta">
+                          {c.host_device ? `${c.host_device} · ` : ''}
+                          {new Date(c.last_joined_at * 1000).toLocaleDateString()}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="cohort-hint">
+                    Re-joining still needs the QR/invite — sessions are listed for reference only
+                    (no keys are stored on disk).
+                  </p>
+                </div>
+              )}
             </>
           ) : (
             <>

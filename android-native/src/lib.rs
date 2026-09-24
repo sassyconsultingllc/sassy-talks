@@ -14,6 +14,9 @@ use log::{error, info, warn};
 pub mod audio;
 pub mod audio_effects;
 pub mod audio_route_policy;
+// Canonical mutex acquisition order + debug-only regression guard (see the
+// module docs and docs/deferred-hardening.md item 2).
+pub mod lock_order;
 pub mod audio_routing;
 pub mod device_quirks;
 pub mod jni_bridge;

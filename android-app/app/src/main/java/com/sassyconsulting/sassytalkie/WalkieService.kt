@@ -168,6 +168,7 @@ class WalkieService : Service() {
         // available when the adapter is off or permissions are denied.
         pttCoordinator = PttCoordinator().also {
             it.maxTxMs = ManagedConfig.maxTxMs(this)
+            it.presenceSensor = PresenceSensor(applicationContext)
             wireCoordinatorCallbacks(it)
             it.restoreLocalEmergencyIndicator(emergencyAuditStore.selfActive)
         }
@@ -519,6 +520,7 @@ class WalkieService : Service() {
         val bt = BluetoothTransport(this)
         val coord = pttCoordinator ?: PttCoordinator().also {
             pttCoordinator = it
+            it.presenceSensor = PresenceSensor(applicationContext)
             wireCoordinatorCallbacks(it)
         }
 

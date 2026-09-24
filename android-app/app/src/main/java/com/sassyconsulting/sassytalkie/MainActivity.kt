@@ -379,9 +379,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // Full shutdown: stop native + stop service
-        SassyTalkNative.shutdown()
-        stopService(Intent(this, WalkieService::class.java))
+        // Only tear down the backend when the user is actually leaving the app.
+        // Config changes also destroy/recreate the Activity; shutting down on
+        // every such change caused audio/BT glitches and needless service restarts.
+        if (isFinishing && !isChangingConfigurations) {
+            SassyTalkNative.shutdown()
+            stopService(Intent(this, WalkieService::class.java))
+        }
     }
 
     // ── Permission helpers ──

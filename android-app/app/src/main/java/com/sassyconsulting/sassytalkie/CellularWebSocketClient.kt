@@ -252,6 +252,21 @@ class CellularWebSocketClient {
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 if (!generation.owns(ownerGeneration)) return
                 val raw = bytes.toByteArray()
+                // OP_REPLAY_FRAME (0x19) is a catch-up wrapper the relay emits
+                // when a woken peer reconnects with ?catchup=1. It is NOT standard
+                // TLV — strip the header and hand the inner audio to the normal RX path.
+                if (raw.size >= 3 && (raw[0].toInt() and 0xFF) == 0x19) {
+                    val peerIdLen = (raw[1].toInt() and 0xFF) or ((raw[2].toInt() and 0xFF) shl 8)
+                    val audioOffset = 3 + peerIdLen
+                    if (audioOffset in 0..raw.size) {
+                        val audio = raw.copyOfRange(audioOffset, raw.size)
+                        if (audio.isNotEmpty()) {
+                            com.sassyconsulting.sassytalkie.debug.AudioTelemetry.onPacketReceived(audio.size)
+                            SassyTalkNative.cellularOnMessage(audio)
+                        }
+                    }
+                    return
+                }
                 // Validate full TLV structure before routing to PttCoordinator:
                 // byte[0] opcode in 0x10..0x20, bytes[1..2] payload length (u16 LE),
                 // total frame size must equal 3 + payloadLen.

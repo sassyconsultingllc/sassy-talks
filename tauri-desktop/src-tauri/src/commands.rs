@@ -397,6 +397,21 @@ pub async fn get_cellular_status(state: State<'_, Arc<AppState>>) -> Result<Stri
     Ok(state.cellular_status().await.unwrap_or_default())
 }
 
+
+/// Recent-sessions (cohort) history as a JSON array. Holds no key material —
+/// it's a display list of past sessions (group name, host, last joined).
+#[tauri::command]
+pub async fn get_cohort_history(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    Ok(state.cohort_history_json())
+}
+
+/// Clear the recent-sessions history.
+#[tauri::command]
+pub async fn clear_cohort_history(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.clear_cohort_history();
+    Ok(())
+}
+
 /// Host of the Cloudflare relay. The invite link and the blob fetch are both
 /// pinned to this host so a hostile link can't redirect the fetch elsewhere.
 const RELAY_HOST: &str = "relay.sassyconsultingllc.com";

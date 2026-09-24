@@ -403,8 +403,18 @@ impl CellularTransport {
         }
     }
 
-    /// Route an inbound binary frame: authenticated control first, else audio.
+    /// Route an inbound binary frame: unwrap catch-up replay, then authenticated
+    /// control, else audio.
     fn handle_inbound(&self, bytes: Vec<u8>) {
+        // OP_REPLAY_FRAME (0x19) is a catch-up wrapper the relay emits when we
+        // reconnect with ?catchup=1. It is NOT standard TLV — strip the header
+        // and decrypt the inner encrypted audio frame.
+        if let Some(audio) = unwrap_replay_frame(&bytes) {
+            if !audio.is_empty() {
+                self.decrypt_and_deliver_audio(audio.to_vec());
+            }
+            return;
+        }
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -467,6 +477,69 @@ impl CellularTransport {
                 );
             }
         }
+    }
+
+
+    /// Decrypt an encrypted audio frame and forward Opus to the inbound queue.
+    fn decrypt_and_deliver_audio(&self, bytes: Vec<u8>) {
+        let plain = {
+            let live = self.crypto.lock().unwrap().decrypt(&bytes);
+            match live {
+                Ok(pt) => pt,
+                Err(_) => match self.control.try_decrypt_staged(&bytes) {
+                    Some(pt) => {
+                        if let Some(session) = self.control.promote_staged() {
+                            *self.crypto.lock().unwrap() = session;
+                        }
+                        pt
+                    }
+                    None => {
+                        debug!("Cellular: decrypt failed ({} bytes)", bytes.len());
+                        return;
+                    }
+                },
+            }
+        };
+        match wire::unpack_wire_frame(&plain) {
+            Ok((_ch, _sub, sender, _name, ts, opus)) => {
+                if sender == self.config.peer_id {
+                    return;
+                }
+                self.packets_received.fetch_add(1, Ordering::Relaxed);
+                let _ = self.inbound_tx.try_send(super::AudioFrame {
+                    sender,
+                    timestamp: ts,
+                    opus,
+                });
+            }
+            Err(e) => {
+                debug!(
+                    "Cellular: wire unpack failed ({} bytes): {}",
+                    plain.len(),
+                    e
+                );
+            }
+        }
+    }
+
+    /// Announce PTT start over the relay (OP_PTT_START_V2).
+    pub fn notify_ptt_start(&self) {
+        if self.state() != CellularState::Connected {
+            return;
+        }
+        let seq = self.heartbeat_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = control::encode_ptt_start_v2(self.session_epoch, seq, false);
+        let _ = self.outbound_tx.try_send(frame);
+    }
+
+    /// Announce PTT stop over the relay (OP_PTT_STOP_V2).
+    pub fn notify_ptt_stop(&self) {
+        if self.state() != CellularState::Connected {
+            return;
+        }
+        let seq = self.heartbeat_seq.load(Ordering::Relaxed);
+        let frame = control::encode_ptt_stop_v2(self.session_epoch, seq);
+        let _ = self.outbound_tx.try_send(frame);
     }
 
     /// Update the channel stamped into outbound wire frames (kept in sync with
@@ -558,6 +631,21 @@ impl CellularTransport {
     fn set_state(&self, s: CellularState) {
         self.state.store(s as u8, Ordering::Relaxed);
     }
+}
+
+
+/// OP_REPLAY_FRAME (0x19) catch-up wrapper: [0]=0x19, [1..2]=peer_id_len LE,
+/// then peer_id bytes, then the original encrypted audio frame.
+fn unwrap_replay_frame(b: &[u8]) -> Option<&[u8]> {
+    if b.len() < 3 || b[0] != 0x19 {
+        return None;
+    }
+    let peer_id_len = (b[1] as usize) | ((b[2] as usize) << 8);
+    let audio_offset = 3 + peer_id_len;
+    if audio_offset > b.len() {
+        return None;
+    }
+    Some(&b[audio_offset..])
 }
 
 type WsStream =

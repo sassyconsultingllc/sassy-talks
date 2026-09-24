@@ -892,7 +892,28 @@ class PttCoordinator(
         Log.i(TAG, "\u2190 PTT_STOP from $deviceAddress")
         stopRecvAckJob(deviceAddress)
         releaseFloorAfterDrain(deviceAddress)
-        // TODO: Play roger beep
+        playRogerBeep()
+    }
+
+    /**
+     * Short roger acknowledgement tone when a peer finishes speaking.
+     * Best-effort — failures are logged and swallowed.
+     */
+    private val rogerToneGen: android.media.ToneGenerator? by lazy {
+        try {
+            android.media.ToneGenerator(android.media.AudioManager.STREAM_VOICE_CALL, 70)
+        } catch (t: Throwable) {
+            Log.w(TAG, "ToneGenerator init failed: ${t.message}")
+            null
+        }
+    }
+
+    private fun playRogerBeep() {
+        try {
+            rogerToneGen?.startTone(android.media.ToneGenerator.TONE_PROP_ACK, 150)
+        } catch (t: Throwable) {
+            Log.w(TAG, "roger beep failed: ${t.message}")
+        }
     }
 
     /** Set peerSpeaking = true and arm the UI LED timeout. Not the TX floor. */
