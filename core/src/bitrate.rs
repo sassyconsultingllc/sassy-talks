@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-OVXPJBHYYIFV
 //! bitrate — receiver-side Opus bitrate guard (design: `docs/bitrate-guard-design.md`).
 //!
 //! Every stock SassyTalkie client encodes Opus at ~24 kbps VBR, but nothing on

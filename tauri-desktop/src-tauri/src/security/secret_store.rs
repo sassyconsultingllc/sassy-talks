@@ -1,5 +1,8 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-UIUFB2RODWTW
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 //! AES-256-GCM file secret store plus an OS vault (Windows Credential Manager,
 //! macOS Keychain, Linux libsecret/secret-service). Persist prefers the OS
 //! vault and migrates any existing file blob into it. Fallback is the AES file
