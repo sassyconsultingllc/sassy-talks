@@ -41,7 +41,8 @@ final class RelayClient: NSObject {
     /// After the first successful dial, reconnects request ?catchup=1.
     private var hasCompletedHandshake = false
 
-    private let peerId = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
+    /// Same stable peer id PresenceClient uses so /presence and WS identity match.
+    private var peerId: String { PresenceClient.peerId }
     private let deviceName = UIDevice.current.name
 
     /// Connect to the relay for the current paired session. No-op if unpaired.
@@ -57,8 +58,18 @@ final class RelayClient: NSObject {
                 self?.running = false
                 return
             }
-            DispatchQueue.main.async { self.openSocket(room: room, token: token) }
+            DispatchQueue.main.async {
+                self.openSocket(room: room, token: token)
+                // Register APNs token when one exists (no-op if registration pending).
+                PresenceClient.uploadCurrentToken(roomId: room)
+            }
         }
+    }
+
+    /// Warm reconnect after a wake push — tear down and dial again with catchup.
+    func reconnectForWake() {
+        disconnect()
+        connect()
     }
 
     func disconnect() {

@@ -3,11 +3,8 @@
 // CodeMark: SCLLC1-sassytalkie-IOS2STOREKIT24
 //
 //  StoreKitEntitlements.swift
-//  SassyTalkie — StoreKit 2 equivalent of Android Play Billing `sassytalkie_unlock`.
-//
-//  StoreKit 2 requires iOS 15. The XcodeGen target still deploys to iOS 14, so
-//  purchase/restore are gated with `@available`. On iOS 14 the trial still
-//  runs; the paywall explains that buying needs iOS 15+.
+//  SassyTalkie — StoreKit 2 equivalent of Android Play Billing `sassytalkie_unlock`,
+//  plus relay promo receipts (LicensePromo) matching Play Entitlements.kt.
 
 import Foundation
 import StoreKit
@@ -21,7 +18,8 @@ enum StoreKitEntitlements {
         #if DEBUG
         return true
         #else
-        return UserDefaults.standard.bool(forKey: unlockedKey)
+        if UserDefaults.standard.bool(forKey: unlockedKey) { return true }
+        return LicensePromo.hasValidReceipt()
         #endif
     }
 
@@ -29,8 +27,23 @@ enum StoreKitEntitlements {
         UserDefaults.standard.set(value, forKey: unlockedKey)
     }
 
-    /// Silent reconcile against the App Store (reinstall / refund).
+    /// Silent reconcile: promo receipts refresh against the relay; otherwise
+    /// App Store (reinstall / refund).
     static func refresh(completion: @escaping (Bool) -> Void) {
+        #if DEBUG
+        completion(true)
+        return
+        #endif
+        if LicensePromo.isPromoCredential {
+            if !LicensePromo.hasValidReceipt() {
+                completion(false)
+                return
+            }
+            LicensePromo.refreshIfNeeded { ok in
+                completion(ok || LicensePromo.hasValidReceipt())
+            }
+            return
+        }
         if #available(iOS 15.0, *) {
             Task {
                 let ok = await refreshStoreKit2()
@@ -54,6 +67,8 @@ enum StoreKitEntitlements {
                     return true
                 }
             }
+            // Keep a still-valid promo receipt even if StoreKit has no purchase.
+            if LicensePromo.hasValidReceipt() { return true }
             persistUnlocked(false)
             return false
         }

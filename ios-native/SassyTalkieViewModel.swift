@@ -240,6 +240,7 @@ class SassyTalkieViewModel: ObservableObject {
     /// Android's AutoConnectManager bringing the relay up alongside WiFi).
     private let relayClient = RelayClient()
     private var stateTimer: Timer?
+    private var wakeObserver: NSObjectProtocol?
     
     // MARK: - Initialization
     
@@ -260,10 +261,13 @@ class SassyTalkieViewModel: ObservableObject {
             // Start state polling
             startStatePolling()
             SassyBluetoothManager.shared.start()
+            observeWakePushes()
             StoreKitEntitlements.refresh { [weak self] ok in
                 DispatchQueue.main.async { self?.isEntitled = ok }
             }
-            if let stored = KeychainStore.loadSessionQR(), importSessionQR(stored) > 0 {
+            if ManagedConfig.forceSessionWipe {
+                wipeSession(source: "managed_restriction")
+            } else if let stored = KeychainStore.loadSessionQR(), importSessionQR(stored) > 0 {
                 print("Restored session from Keychain")
             }
         } else {
@@ -271,15 +275,37 @@ class SassyTalkieViewModel: ObservableObject {
             statusText = "Error"
         }
     }
+
+    private func observeWakePushes() {
+        wakeObserver = NotificationCenter.default.addObserver(
+            forName: .sassyTalkieWake,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            // Warm path: reconnect relay (catchup=1 after first handshake).
+            // Cold path still requires the user to have opened the app via the
+            // notification — mic cannot start from a silent push.
+            self.statusText = "Wake — reconnecting…"
+            self.relayClient.reconnectForWake()
+        }
+    }
     
-    func wipeSession() {
+    func wipeSession(source: String = "user") {
+        if let room = Self.currentRoomId() {
+            DispatchQueue.global(qos: .utility).async {
+                _ = PresenceClient.remove(roomId: room)
+            }
+        }
         sassytalkie_wipe_session()
         KeychainStore.deleteSession()
         relayClient.disconnect()
         DispatchQueue.main.async {
             self.isPaired = false
             self.hostQRJSON = nil
-            self.statusText = "Session cleared"
+            self.statusText = source == "managed_restriction"
+                ? "Session cleared (MDM)"
+                : "Session cleared"
         }
     }
 
@@ -291,6 +317,9 @@ class SassyTalkieViewModel: ObservableObject {
     }
 
     deinit {
+        if let wakeObserver {
+            NotificationCenter.default.removeObserver(wakeObserver)
+        }
         stateTimer?.invalidate()
         relayClient.disconnect()
         SassyBluetoothManager.shared.stop()

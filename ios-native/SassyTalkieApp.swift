@@ -13,18 +13,18 @@ import AVFoundation
 
 @main
 struct SassyTalkieApp: App {
-    
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     init() {
-        // Request microphone permission
         requestMicrophonePermission()
     }
-    
+
     var body: some Scene {
         WindowGroup {
             ContentView()
         }
     }
-    
+
     private func requestMicrophonePermission() {
         #if !targetEnvironment(simulator)
         AVAudioSession.sharedInstance().requestRecordPermission { granted in

@@ -7,6 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A11F01E5EACE01BF00000001 /* PresenceClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A11F01E5EACE01FR00000001 /* PresenceClient.swift */; };
+		A12F01E5EACE01BF00000002 /* LicensePromo.swift in Sources */ = {isa = PBXBuildFile; fileRef = A12F01E5EACE01FR00000002 /* LicensePromo.swift */; };
+		A13F01E5EACE01BF00000003 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A13F01E5EACE01FR00000003 /* AppDelegate.swift */; };
 		313F89DF014924763E835821 /* AudioManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 216125E3676DAE2830B5BE83 /* AudioManager.swift */; };
 		4EE4C2B39A7FE1B432E27047 /* BluetoothManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F813C56B76B916D0060C327 /* BluetoothManager.swift */; };
 		C125BEEBEC5FC348E17311BF /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71BF2EB6D1957112A62EEEF9 /* ContentView.swift */; };
@@ -31,6 +34,9 @@
 /* Begin PBXFileReference section */
 		C66780D7416288CE808B3D19 /* SassyTalkie.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = SassyTalkie.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A5FC72A23754CDAE8402BA1D /* SassyTalkie-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "SassyTalkie-Bridging-Header.h"; sourceTree = "<group>"; };
+		A11F01E5EACE01FR00000001 /* PresenceClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PresenceClient.swift; sourceTree = "<group>"; };
+		A12F01E5EACE01FR00000002 /* LicensePromo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LicensePromo.swift; sourceTree = "<group>"; };
+		A13F01E5EACE01FR00000003 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		216125E3676DAE2830B5BE83 /* AudioManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioManager.swift; sourceTree = "<group>"; };
 		0F813C56B76B916D0060C327 /* BluetoothManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BluetoothManager.swift; sourceTree = "<group>"; };
 		71BF2EB6D1957112A62EEEF9 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -65,13 +71,16 @@
 		9D953DD836F9EF8263BD821D /* ios-native */ = {
 			isa = PBXGroup;
 			children = (
+				A13F01E5EACE01FR00000003 /* AppDelegate.swift */,
 				216125E3676DAE2830B5BE83 /* AudioManager.swift */,
 				0F813C56B76B916D0060C327 /* BluetoothManager.swift */,
 				71BF2EB6D1957112A62EEEF9 /* ContentView.swift */,
 				4927B55BF821BEBFDB976F37 /* HostQRView.swift */,
 				92553FDA01D898D5D21E0202 /* KeychainStore.swift */,
+				A12F01E5EACE01FR00000002 /* LicensePromo.swift */,
 				EE634ABA3EBBE07FF4271655 /* ManagedConfig.swift */,
 				76CE9922865C32AE7A572D76 /* PaywallView.swift */,
+				A11F01E5EACE01FR00000001 /* PresenceClient.swift */,
 				37233C04DF67564670A9848E /* PushWakePolicy.swift */,
 				ABDF4AFF8F8E4B7DFDAD6230 /* QRScannerView.swift */,
 				23A1446C488072FFF1B11EDC /* RelayClient.swift */,
@@ -155,13 +164,16 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A13F01E5EACE01BF00000003 /* AppDelegate.swift in Sources */,
 				313F89DF014924763E835821 /* AudioManager.swift in Sources */,
 				4EE4C2B39A7FE1B432E27047 /* BluetoothManager.swift in Sources */,
 				C125BEEBEC5FC348E17311BF /* ContentView.swift in Sources */,
 				549F5E30E73695DD1C5E275C /* HostQRView.swift in Sources */,
 				B210EF54F7192A2962BF7B8D /* KeychainStore.swift in Sources */,
+				A12F01E5EACE01BF00000002 /* LicensePromo.swift in Sources */,
 				89E740345408FCF4CAB801C2 /* ManagedConfig.swift in Sources */,
 				4631C777DA2567DCE7ED9AEF /* PaywallView.swift in Sources */,
+				A11F01E5EACE01BF00000001 /* PresenceClient.swift in Sources */,
 				7EB7E2198B4668E545DE0AEF /* PushWakePolicy.swift in Sources */,
 				2619EA23DD2D42053F0E71E3 /* QRScannerView.swift in Sources */,
 				B6AFFB16A86292BBB47EE7E9 /* RelayClient.swift in Sources */,
@@ -251,7 +263,7 @@
 				CODE_SIGN_ENTITLEMENTS = SassyTalkie.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 83;
+				CURRENT_PROJECT_VERSION = 84;
 				INFOPLIST_FILE = Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -271,7 +283,7 @@
 				CODE_SIGN_ENTITLEMENTS = SassyTalkie.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 83;
+				CURRENT_PROJECT_VERSION = 84;
 				INFOPLIST_FILE = Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

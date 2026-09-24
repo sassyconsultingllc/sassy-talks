@@ -2,9 +2,9 @@
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-35XE4SKEPRHR
 /// Bluetooth Module for iOS
-/// 
-/// Placeholder for CoreBluetooth integration
-/// Actual implementation happens in Swift using CoreBluetooth framework
+///
+/// Rust-side peer roster only. CoreBluetooth scan/advertise lives in
+/// `BluetoothManager.swift` and reports peers via `sassytalkie_bt_*` FFI.
 
 use std::collections::HashMap;
 use thiserror::Error;

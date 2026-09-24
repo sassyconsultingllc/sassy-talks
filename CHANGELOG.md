@@ -9,7 +9,16 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
-## [3.2.7] (83) - 2026-09-24
+## [3.2.7] (83 Android / 84 iOS) - 2026-09-24
+
+### Added
+- **iOS promo unlock:** paywall promo-code field redeems relay `/license/promo`
+  into a local time-limited receipt (parity with Play Entitlements + LicensePromo);
+  StoreKit purchase/restore unchanged; promo stays visible if StoreKit fails.
+- **iOS presence registration:** request notification permission, register for
+  remote notifications, and POST `/presence` with Authorization Bearer and a
+  real APNs device token when one exists (peer-bound capability). No empty or
+  invented tokens. Wake `kind|type=wake` warm-reconnects the relay.
 
 ### Fixed
 - **Play paywall promo fallback:** restore friends & family promo-code entry on
@@ -27,10 +36,11 @@ All notable changes to SassyTalkie. Format loosely follows
 
 ### Changed
 - **iOS product tree:** merge the audited iPhone Xcode project into
-  `ios-native/` (aligned to marketing 3.2.7 / build 83). Kept live iOS
-  relay/auth (peer + catchup), TLS pins, StoreKit paywall, share links, and
-  floor FFI — the zip snapshot was older on those surfaces and was not
-  copied over Android/core.
+  `ios-native/` (aligned to marketing 3.2.7). Android versionCode stays 83;
+  iOS `CURRENT_PROJECT_VERSION` is 84 for the presence + promo parity work.
+  Kept live iOS relay/auth (peer + catchup), TLS pins, StoreKit paywall, share
+  links, and floor FFI — the zip snapshot was older on those surfaces and was
+  not copied over Android/core.
 
 ## [3.2.6] (82) - 2026-09-22
 
