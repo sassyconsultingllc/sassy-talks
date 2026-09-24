@@ -20,5 +20,14 @@
          fails and LAN discovery is dead. See remaining ship work. -->
     <key>com.apple.developer.networking.multicast</key>
     <true/>
+    <!--
+      Push Notifications (APNs). `development` is the honest default for local /
+      TestFlight-bound debug builds. For App Store / production distribution,
+      switch this value to `production` (or let Xcode's automatic signing
+      rewrite it for the distribution profile). Never invent Team ID / key id /
+      .p8 contents here — those live as worker secrets (APNS_*).
+    -->
+    <key>aps-environment</key>
+    <string>development</string>
 </dict>
 </plist>

@@ -9,7 +9,7 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
-## [3.2.7] (83 Android / 84 iOS) - 2026-09-24
+## [3.2.7] (83 Android / 85 iOS) - 2026-09-24
 
 ### Added
 - **iOS promo unlock:** paywall promo-code field redeems relay `/license/promo`
@@ -19,6 +19,8 @@ All notable changes to SassyTalkie. Format loosely follows
   remote notifications, and POST `/presence` with Authorization Bearer and a
   real APNs device token when one exists (peer-bound capability). No empty or
   invented tokens. Wake `kind|type=wake` warm-reconnects the relay.
+- **iOS APNs wake path:** presence `platform=apns` routes wakes through Apple
+  HTTP/2 (FCM unchanged for Android); enable remote-notification + aps-environment.
 
 ### Fixed
 - **Play paywall promo fallback:** restore friends & family promo-code entry on

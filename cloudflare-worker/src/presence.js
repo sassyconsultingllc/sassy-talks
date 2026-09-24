@@ -2,22 +2,24 @@
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-NQVZ3ZHQVPBR
 /**
- * presence.js — FCM presence registry for the SassyTalk relay.
+ * presence.js — Push presence registry for the SassyTalk relay.
  *
- * Maps (room, peer) → FCM token in the SHARES KV namespace so the Durable
- * Object can wake offline peers with a push when a transmission starts.
+ * Maps (room, peer) → device token (+ platform) in the SHARES KV namespace so
+ * the Durable Object can wake offline peers with FCM (Android) or APNs (iOS)
+ * when a transmission starts.
  *
  * Consumed by:
  *   ptt-relay-worker.js → handlePresenceRoute (HTTP register/unregister)
  *   ptt-relay.js (DO)   → listPresence / dropPresence / getPresenceVersion
  *
- * Privacy: a presence row holds only a random per-install peer ID and an FCM
- * token. No audio, no content, no real identity. The token lets Google wake the
- * device; the push payload (see fcm.js) carries only a room id. Rows self-expire
- * (FCM tokens rotate), so an abandoned install leaves nothing behind for long.
+ * Privacy: a presence row holds only a random per-install peer ID and a push
+ * token. No audio, no content, no real identity. platform is "fcm" (default)
+ * or "apns". Rows self-expire (tokens rotate), so an abandoned install leaves
+ * nothing behind for long.
  *
  * KV layout (all under the SHARES binding):
- *   presence:<roomId>:<peerId>   value = fcmToken   metadata = { peer, token }
+ *   presence:<roomId>:<peerId>   value = token
+ *     metadata = { peer, token, platform }
  *   presence-ver:<roomId>        value = monotonically-increasing version int
  */
 
@@ -48,8 +50,10 @@ const isValidToken = (t) => typeof t === "string" && t.length > 0 && t.length <=
  * HTTP entry point. Returns a Response for /presence, or null so the worker
  * can keep routing other paths.
  *
- * POST   /presence  { room, peer, fcm_token }  (Authorization: Bearer <capToken>)
- * DELETE /presence  { room, peer }             (Authorization: Bearer <capToken>)
+ * POST   /presence  { room, peer, token|fcm_token, platform? }
+ *                   platform: "fcm" (default) | "apns"
+ *                   Authorization: Bearer <capToken>
+ * DELETE /presence  { room, peer }  Authorization: Bearer <capToken>
  */
 export async function handlePresenceRoute(request, env, url) {
   if (url.pathname !== "/presence") return null;
@@ -71,6 +75,8 @@ async function registerPresence(request, env) {
   const room = body.room;
   const peer = body.peer;
   const token = body.fcm_token ?? body.token;
+  // Default fcm so Android clients that omit platform keep working.
+  const platform = body.platform === "apns" ? "apns" : "fcm";
   if (!isValidRoomId(room)) return json({ error: "Missing or invalid room" }, 400);
   if (!isValidPeer(peer)) return json({ error: "Missing or invalid peer" }, 400);
   if (!isValidToken(token)) return json({ error: "Missing or invalid fcm_token" }, 400);
@@ -85,7 +91,7 @@ async function registerPresence(request, env) {
 
   await env.SHARES.put(presenceKey(room, peer), token, {
     expirationTtl: PRESENCE_TTL_SEC,
-    metadata: { peer, token },
+    metadata: { peer, token, platform },
   });
   await bumpVersion(env, room);
   return json({ ok: true });
@@ -113,9 +119,9 @@ async function unregisterPresence(request, env) {
 }
 
 /**
- * List all registered (peer, token) pairs for a room. Used by the DO's FCM
- * fan-out. Reads tokens straight from KV list metadata so a 16-peer room costs
- * a single list() call rather than 16 gets.
+ * List all registered (peer, token, platform) rows for a room. Used by the
+ * DO's wake fan-out. Reads from KV list metadata so a 16-peer room costs a
+ * single list() call rather than 16 gets. platform defaults to "fcm".
  */
 export async function listPresence(env, roomId) {
   if (!env || !env.SHARES || !roomId) return [];
@@ -126,12 +132,16 @@ export async function listPresence(env, roomId) {
     for (const k of res.keys) {
       const md = k.metadata;
       if (md && md.peer && md.token) {
-        out.push({ peer: md.peer, token: md.token });
+        out.push({
+          peer: md.peer,
+          token: md.token,
+          platform: md.platform === "apns" ? "apns" : "fcm",
+        });
       } else {
         // Older row written without metadata — fall back to a value read.
         const peer = k.name.slice(presencePrefix(roomId).length);
         const token = await env.SHARES.get(k.name);
-        if (peer && token) out.push({ peer, token });
+        if (peer && token) out.push({ peer, token, platform: "fcm" });
       }
     }
     cursor = res.list_complete ? undefined : res.cursor;

@@ -68,6 +68,7 @@ enum PresenceClient {
             "room": roomId,
             "peer": peer,
             "token": deviceToken,
+            "platform": "apns",
         ]
         guard let url = URL(string: "\(relayBase)/presence"),
               let data = try? JSONSerialization.data(withJSONObject: body) else { return false }

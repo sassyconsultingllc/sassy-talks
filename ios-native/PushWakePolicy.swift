@@ -8,15 +8,22 @@
 //  What the app does in code (PresenceClient + AppDelegate):
 //    • Request notification permission and registerForRemoteNotifications.
 //    • When a real APNs device token arrives, POST /presence with
-//      Authorization: Bearer <peer-bound capability> (never invent/empty token).
+//      Authorization: Bearer <peer-bound capability>, platform=apns
+//      (never invent/empty token).
 //    • On kind|type=wake, warm-reconnect the relay; cold path is a user-visible
 //      notification the operator taps (mic cannot start from a silent push).
 //
+//  Worker path (cloudflare-worker apns.js / wake-push.js): presence rows with
+//  platform=apns are woken via Apple HTTP/2, not FCM. Requires owner-set
+//  APNS_* secrets on the worker (see cloudflare-worker/.env.example).
+//
 //  Still requires an Apple Developer account (owner work, not inventable here):
-//    • APNs Auth Key (.p8) configured on the relay worker (APNs dispatch, not FCM).
-//    • Push Notifications capability on the App ID / provisioning profile.
-//    • Info.plist `remote-notification` background mode — omit until the worker
-//      actually sends wakes (unused background modes are an App Store review risk).
+//    • APNs Auth Key (.p8) configured on the relay worker.
+//    • Push Notifications capability on the App ID / provisioning profile
+//      (aps-environment in SassyTalkie.entitlements; SystemCapabilities in
+//      the Xcode project).
+//    • Info.plist `remote-notification` background mode (enabled now that
+//      the worker can send APNs wakes).
 //
 //  iOS cannot start microphone capture from a silent push (same class of
 //  restriction as Android API 34+ FGS+mic from FCM).

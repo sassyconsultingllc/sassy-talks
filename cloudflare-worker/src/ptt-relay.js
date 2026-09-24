@@ -23,7 +23,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { listPresence, dropPresence, getPresenceVersion } from "./presence.js";
-import { sendWakePush } from "./fcm.js";
+import { routeWakePush, anyWakeTransportConfigured } from "./wake-push.js";
 
 const MAX_PEERS_PER_ROOM = 16;
 const MAX_DEVICE_NAME_LEN = 100;
@@ -633,9 +633,10 @@ export class PttRoom extends DurableObject {
   }
 
   /**
-   * Fire FCM wake pushes to peers registered for /presence that are NOT
-   * currently attached as a WebSocket. Triggered from the binary fan-out
-   * path on OP_WAKE or OP_PTT_START_V2 frames. Per-peer 10s cooldown.
+   * Fire wake pushes (FCM or APNs by presence.platform) to peers registered
+   * for /presence that are NOT currently attached as a WebSocket. Triggered
+   * from the binary fan-out path on OP_WAKE or OP_PTT_START_V2 frames.
+   * Per-peer 10s cooldown.
    *
    * Best-effort: runs inside waitUntil(), so failures are logged but never
    * stall audio delivery to peers that ARE connected.
@@ -643,11 +644,11 @@ export class PttRoom extends DurableObject {
   async firePushesForOfflinePeers(activeSockets) {
     if (!this.env || !this.env.SHARES) return;
     if (!this.roomId) return;
-    if (!this.env.FCM_SERVICE_ACCOUNT_JSON) return; // FCM not configured — silent skip
+    if (!anyWakeTransportConfigured(this.env)) return; // neither FCM nor APNs ready
 
     // Per-room budget: cap total pushes this room can emit per window, on top of
     // the per-peer cooldown. Stops a peer cycling triggers across many offline
-    // peers from turning the relay into an FCM/KV pump.
+    // peers from turning the relay into an FCM/APNs/KV pump.
     const winNow = Date.now();
     if (winNow - this.fcmRoomWindowStartMs > FCM_ROOM_PUSH_WINDOW_MS) {
       this.fcmRoomWindowStartMs = winNow;
@@ -683,7 +684,8 @@ export class PttRoom extends DurableObject {
       }
     }
 
-    for (const { peer, token } of this.presenceCache.list) {
+    for (const row of this.presenceCache.list) {
+      const { peer, token, platform } = row;
       if (attached.has(peer)) continue; // peer is online — no push needed
       if (this.fcmRoomPushCount >= FCM_ROOM_PUSH_BUDGET) break; // room budget hit
       const lastMs = this.lastFcmPushMs.get(peer) || 0;
@@ -695,19 +697,19 @@ export class PttRoom extends DurableObject {
       this.bufferUntilMs = now + BUFFER_TTL_MS;
 
       try {
-        const r = await sendWakePush(this.env, token, this.roomId);
+        const r = await routeWakePush(this.env, { token, platform }, this.roomId);
         if (!r.ok && r.stale) {
-          // FCM said the token is dead; drop the presence row so we don't
+          // Provider said the token is dead; drop the presence row so we don't
           // keep trying. The app re-registers on next launch / token refresh.
           await dropPresence(this.env, this.roomId, peer);
           // Also drop from cache so this iteration doesn't try again.
           this.presenceCache.list = this.presenceCache.list.filter((p) => p.peer !== peer);
-          console.warn(`FCM token stale, dropped presence: room=${this.roomId} peer=${peer}`);
+          console.warn(`wake token stale (${platform || "fcm"}), dropped presence: room=${this.roomId} peer=${peer}`);
         } else if (!r.ok) {
-          console.warn(`FCM push failed status=${r.status} room=${this.roomId} peer=${peer}: ${r.error}`);
+          console.warn(`wake push failed (${platform || "fcm"}) status=${r.status} room=${this.roomId} peer=${peer}: ${r.error}`);
         }
       } catch (e) {
-        console.error(`FCM push exception room=${this.roomId} peer=${peer}: ${e.message}`);
+        console.error(`wake push exception room=${this.roomId} peer=${peer}: ${e.message}`);
       }
     }
   }

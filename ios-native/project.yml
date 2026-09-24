@@ -42,11 +42,16 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.sassyconsulting.sassytalkie
         MARKETING_VERSION: "3.2.7"
-        CURRENT_PROJECT_VERSION: "84"
+        CURRENT_PROJECT_VERSION: "85"
         CODE_SIGN_STYLE: Automatic
         # Associated Domains (Universal Links for /v/ invite links). The file is
         # hand-maintained like Info.plist; see SassyTalkie.entitlements.
         CODE_SIGN_ENTITLEMENTS: SassyTalkie.entitlements
+    # Push Notifications: declared via aps-environment in SassyTalkie.entitlements
+    # (and SystemCapabilities.com.apple.Push in project.pbxproj). Do NOT use
+    # xcodegen `entitlements:` / nested `attributes.SystemCapabilities` here —
+    # entitlements: would overwrite the hand-maintained file, and nested
+    # SystemCapabilities can serialize as a quoted string on current xcodegen.
     # NOTE: Do NOT add an `info:` block here. `info.path` makes XcodeGen GENERATE
     # (overwrite) the file on every `xcodegen generate`, and with no `properties`
     # it strips every NS*UsageDescription key — shipping a build that hits

@@ -66,10 +66,20 @@ database_id = "be46952d-2e07-4c25-b0db-f1bc6d43c50d"
 #   AUTH_SECRET_PREV           — optional outgoing key during bounded rotation.
 #   AUTH_SECRET_PREV_UNTIL     — required Unix-second deadline for PREV acceptance.
 #   FCM_SERVICE_ACCOUNT_JSON   — Firebase service-account JSON (project_id,
-#                                client_email, private_key) for wake pushes via
-#                                presence.js/fcm.js. Optional: if unset, the relay
-#                                still forwards audio; it just skips offline-peer
-#                                wake notifications.
+#                                client_email, private_key) for Android wake
+#                                pushes via presence.js/fcm.js. Optional: if
+#                                unset, FCM wakes are skipped.
+#   APNS_KEY_ID                — Apple Push Auth Key ID (10-char) from the
+#                                developer portal. Optional with the other
+#                                APNS_*; if any required APNS_* is unset, iOS
+#                                wakes are skipped (see apns.js).
+#   APNS_TEAM_ID               — Apple Developer Team ID (10-char).
+#   APNS_PRIVATE_KEY           — Contents of the .p8 Auth Key (PEM text).
+#   APNS_BUNDLE_ID             — App bundle id (apns-topic), e.g.
+#                                com.sassyconsulting.sassytalkie.
+#   APNS_USE_SANDBOX           — If "true"/"1"/"yes", use
+#                                api.sandbox.push.apple.com; otherwise
+#                                api.push.apple.com.
 #   LICENSE_SALT               — HMAC key for license-key/device hashing and
 #                                receipt tokens (/license/*). Fail-closed: unset =
 #                                license endpoints refuse. `openssl rand -hex 32`.

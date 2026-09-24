@@ -8,9 +8,9 @@
 //  wake) post Notification.Name.sassyTalkieWake for a warm relay reconnect.
 //
 //  Push delivery still needs an Apple Developer APNs key on the relay worker
-//  and the Push Notifications capability on the App ID — this file does not
-//  invent those. remote-notification background mode is intentionally omitted
-//  until the worker actually sends APNs wakes (App Store review risk).
+//  (APNS_* secrets) and a provisioning profile that includes Push Notifications.
+//  remote-notification background mode is enabled so silent wakes can run the
+//  warm-reconnect handler while the process is suspended.
 
 import UIKit
 import UserNotifications
@@ -55,7 +55,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 
     func application(_ application: UIApplication,
                      didFailToRegisterForRemoteNotificationsWithError error: Error) {
-        // Expected without Push Notifications capability / APNs entitlement.
+        // Expected if provisioning lacks Push Notifications / APNs entitlement.
         NSLog("SassyTalkie push: APNs registration failed — %@", error.localizedDescription)
     }
 
