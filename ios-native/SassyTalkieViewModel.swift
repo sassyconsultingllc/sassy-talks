@@ -283,6 +283,9 @@ class SassyTalkieViewModel: ObservableObject {
             startStatePolling()
             SassyBluetoothManager.shared.start()
             observeWakePushes()
+            StoreKitEntitlements.startObservingTransactions { [weak self] ok in
+                self?.isEntitled = ok
+            }
             StoreKitEntitlements.refresh { [weak self] ok in
                 DispatchQueue.main.async { self?.isEntitled = ok }
             }

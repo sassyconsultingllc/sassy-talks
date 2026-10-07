@@ -58,6 +58,29 @@ final class RelayClient {
     private var lastAliveMs: UInt64 = 0
     private var networkSatisfied = true
 
+    // Wake pushes can arrive before any RelayClient exists (cold launch) — kept
+    // static so the first dial after the push still asks for the transmission
+    // that triggered it.
+    private static let wakeLock = NSLock()
+    private static var pendingWakeMs: UInt64 = 0
+
+    /// Record that a wake push arrived (AppDelegate, any thread). The relay
+    /// opens its store-and-forward window when it sends the push; the next
+    /// dial asks for audio from just before it.
+    static func noteWakePush() {
+        wakeLock.lock()
+        pendingWakeMs = nowMs()
+        wakeLock.unlock()
+    }
+
+    private static func takePendingWake() -> UInt64 {
+        wakeLock.lock()
+        defer { wakeLock.unlock() }
+        let ms = pendingWakeMs
+        pendingWakeMs = 0
+        return ms
+    }
+
     /// Same stable peer id PresenceClient uses so /presence and WS identity match.
     private var peerId: String { PresenceClient.peerId }
     private let deviceName = UIDevice.current.name
@@ -173,8 +196,18 @@ final class RelayClient {
         var urlStr = "\(Self.wssBase)/ws?room=\(Self.enc(room))"
             + "&device=\(Self.enc(deviceName))&peer=\(Self.enc(peerId))"
             + "&client_id=\(Self.enc(UUID().uuidString))"
-        if hasCompletedHandshake {
-            let since = sassytalkie_relay_catchup_since(lastAliveMs, Self.nowMs())
+        // Catch-up cursor: after a short drop, everything since our last live
+        // frame; after a wake push, the transmission that triggered it (the
+        // push fires on PTT_START, so start 2 s before it arrived). The core
+        // policy caps both at 15 s so nothing replays as a late burst.
+        let now = Self.nowMs()
+        let wakeMs = Self.takePendingWake()
+        let anchors = [
+            hasCompletedHandshake ? lastAliveMs : 0,
+            wakeMs > 2_000 ? wakeMs - 2_000 : 0,
+        ].filter { $0 > 0 }
+        if let anchor = anchors.min() {
+            let since = sassytalkie_relay_catchup_since(anchor, now)
             if since > 0 { urlStr += "&since=\(since)" }
         }
         guard let url = URL(string: urlStr) else {

@@ -102,6 +102,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         guard isWake(userInfo) else { return false }
         let room = (userInfo["room"] as? String) ?? ""
         NSLog("SassyTalkie push: WAKE source=%@ room=%@", source, room)
+        // Before the post: on a cold launch nobody observes it yet, but the
+        // first relay dial still picks the wake time up for catch-up.
+        RelayClient.noteWakePush()
         NotificationCenter.default.post(
             name: .sassyTalkieWake,
             object: nil,

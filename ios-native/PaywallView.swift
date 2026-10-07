@@ -19,7 +19,7 @@ struct PaywallView: View {
 
     var body: some View {
         NavigationView {
-            ScrollView {
+            ScrollView(.vertical, showsIndicators: true) {
                 VStack(spacing: 20) {
                     Image(systemName: "lock.fill")
                         .font(.system(size: 44))
@@ -99,8 +99,11 @@ struct PaywallView: View {
             .background(Color.stBgDark.ignoresSafeArea())
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                if TrialStore.mayUseRadio(entitled: viewModel.isEntitled) {
-                    ToolbarItem(placement: .navigationBarLeading) {
+                // The condition lives inside the item: `if` directly in a
+                // ToolbarContentBuilder needs iOS 16, and this target is 14
+                // (it surfaced as "ambiguous use of 'init'" on the ScrollView).
+                ToolbarItem(placement: .navigationBarLeading) {
+                    if TrialStore.mayUseRadio(entitled: viewModel.isEntitled) {
                         Button("Back") { presentationMode.wrappedValue.dismiss() }
                             .foregroundColor(.stTeal)
                     }
@@ -152,7 +155,7 @@ struct PaywallView: View {
     private func restore() {
         busy = true
         status = ""
-        StoreKitEntitlements.refresh { ok in
+        StoreKitEntitlements.restore { ok in
             busy = false
             viewModel.isEntitled = ok
             status = ok ? "Restored" : "No purchase found"

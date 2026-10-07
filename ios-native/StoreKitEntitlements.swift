@@ -27,30 +27,73 @@ enum StoreKitEntitlements {
         UserDefaults.standard.set(value, forKey: unlockedKey)
     }
 
-    /// Silent reconcile: promo receipts refresh against the relay; otherwise
-    /// App Store (reinstall / refund).
+    private static var updatesTask: Task<Void, Never>?
+
+    /// Listen to `Transaction.updates` for the life of the app. Start once at
+    /// launch, before any purchase. Without it, an Ask-to-Buy purchase that a
+    /// parent approves later, an offer-code redemption, a purchase interrupted
+    /// mid-flow, or a refund never reached the app: `purchase()` returned
+    /// `.pending` and the unlock never happened, and unfinished transactions
+    /// are redelivered forever (an App Review rejection reason).
+    /// `onChange` runs on the main actor with the current entitlement.
+    static func startObservingTransactions(onChange: @escaping (Bool) -> Void) {
+        guard updatesTask == nil else { return }
+        guard #available(iOS 15.0, *) else { return }
+        updatesTask = Task.detached(priority: .background) {
+            for await result in Transaction.updates {
+                guard case .verified(let tx) = result, tx.productID == productId else { continue }
+                let owned = tx.revocationDate == nil
+                persistUnlocked(owned)
+                await tx.finish()
+                let entitled = owned || LicensePromo.hasValidReceipt()
+                await MainActor.run { onChange(entitled) }
+            }
+        }
+    }
+
+    /// Silent reconcile. A live promo receipt refreshes against the relay;
+    /// anything else (no promo, or a promo that lapsed) asks the App Store, so a
+    /// promo user who later bought the app is not locked out when the promo
+    /// expires. Always completes on the main thread (callers mutate UI state).
     static func refresh(completion: @escaping (Bool) -> Void) {
+        let finish: (Bool) -> Void = { ok in DispatchQueue.main.async { completion(ok) } }
         #if DEBUG
-        completion(true)
+        finish(true)
         return
         #endif
-        if LicensePromo.isPromoCredential {
-            if !LicensePromo.hasValidReceipt() {
-                completion(false)
-                return
-            }
+        if LicensePromo.hasValidReceipt() {
             LicensePromo.refreshIfNeeded { ok in
-                completion(ok || LicensePromo.hasValidReceipt())
+                if ok || LicensePromo.hasValidReceipt() {
+                    finish(true)
+                } else {
+                    checkAppStore(finish)
+                }
             }
             return
         }
+        checkAppStore(finish)
+    }
+
+    /// The "Restore Purchase" button: force an App Store sync first (Apple's
+    /// restore on StoreKit 2; it may ask the user to sign in), then reconcile.
+    /// `currentEntitlements` alone can miss a purchase on a new device until
+    /// the store syncs. Completes on the main thread.
+    static func restore(completion: @escaping (Bool) -> Void) {
         if #available(iOS 15.0, *) {
             Task {
-                let ok = await refreshStoreKit2()
-                await MainActor.run { completion(ok) }
+                try? await AppStore.sync()
+                refresh(completion: completion)
             }
         } else {
-            completion(isUnlockedCached)
+            refresh(completion: completion)
+        }
+    }
+
+    private static func checkAppStore(_ finish: @escaping (Bool) -> Void) {
+        if #available(iOS 15.0, *) {
+            Task { finish(await refreshStoreKit2()) }
+        } else {
+            finish(UserDefaults.standard.bool(forKey: unlockedKey) || LicensePromo.hasValidReceipt())
         }
     }
 
