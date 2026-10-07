@@ -48,6 +48,16 @@ pub enum ControlAction {
         opcode: u8,
     },
     Heartbeat,
+    /// Authenticated OP_PTT_START_V2: `sender` requests the floor.
+    FloorStart {
+        sender: String,
+        start: sassytalkie_core::ptt_frames::PttStart,
+    },
+    /// Authenticated OP_PTT_STOP_V2: `sender` released the floor.
+    FloorStop {
+        sender: String,
+        stop: sassytalkie_core::ptt_frames::PttStop,
+    },
     HybridOutbound(Vec<u8>),
     Emergency,
     InstalledPq,
@@ -148,9 +158,27 @@ impl ControlPlane {
             | sassytalkie_core::protocol::OP_RECV_ACK
             | sassytalkie_core::protocol::OP_EOT_ACK
             | sassytalkie_core::protocol::OP_WAKE
-            | sassytalkie_core::protocol::OP_PTT_START_V2
-            | sassytalkie_core::protocol::OP_PTT_STOP_V2
             | sassytalkie_core::protocol::OP_PARTNER_OFFLINE => ControlAction::Heartbeat,
+            // Floor control used to be swallowed here as a "heartbeat": the
+            // desktop never yielded to, or blocked on, anyone's transmission.
+            sassytalkie_core::protocol::OP_PTT_START_V2 => {
+                match sassytalkie_core::ptt_frames::parse_ptt_start_v2(decoded.payload) {
+                    Some(start) => ControlAction::FloorStart {
+                        sender: verified.sender_id.clone(),
+                        start,
+                    },
+                    None => ControlAction::Ignore,
+                }
+            }
+            sassytalkie_core::protocol::OP_PTT_STOP_V2 => {
+                match sassytalkie_core::ptt_frames::parse_ptt_stop_v2(decoded.payload) {
+                    Some(stop) => ControlAction::FloorStop {
+                        sender: verified.sender_id.clone(),
+                        stop,
+                    },
+                    None => ControlAction::Ignore,
+                }
+            }
             OP_EMERGENCY | OP_MANDOWN | OP_EMERGENCY_CLEAR => ControlAction::Emergency,
             OP_HYBRID_INIT => self.on_hybrid_init(decoded.payload, now_ms),
             OP_HYBRID_RESP => self.on_hybrid_resp(decoded.payload, now_ms),

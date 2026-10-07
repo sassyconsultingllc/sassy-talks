@@ -156,6 +156,11 @@ export default function App() {
         setStatus(s);
         setIsTransmitting(s.is_transmitting);
         setIsReceiving(s.is_receiving);
+        if (s.tx_notice) {
+          // Floor taken by another radio, or the 60 s safety limit.
+          setError(s.tx_notice);
+          Sounds.error();
+        }
         // No meter on the backend — approximate the bar from TX/RX state.
         setAudioLevel(s.is_transmitting || s.is_receiving ? 70 : 0);
         if (s.is_receiving && !wasReceiving) {
