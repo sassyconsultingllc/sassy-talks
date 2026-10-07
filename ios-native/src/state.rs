@@ -7,7 +7,9 @@
 /// Similar to Android version but adapted for iOS
 use crate::audio::{AudioEngine, AudioFrame, PlayoutHandle};
 use crate::codec::{OpusDecoder, OpusEncoder};
-use crate::floor::{FloorState, REJECT_CHANNEL_BUSY, REJECT_MAX_TX, REJECT_NOT_ENCRYPTED};
+use crate::floor::{
+    FloorState, REJECT_CHANNEL_BUSY, REJECT_MAX_TX, REJECT_NOT_ENCRYPTED, REJECT_PREEMPTED,
+};
 use crate::transport::TransportManager;
 use log::{error, info, warn};
 use sassytalkie_core::floor as floor_policy;
@@ -55,9 +57,6 @@ const MAX_RELAY_DECODERS: usize = 16;
 
 /// How often the RX thread retries the LAN multicast socket while it is down.
 const LAN_RETRY_MS: u64 = 5_000;
-
-/// Reason surfaced when another radio wins floor arbitration mid-transmission.
-pub const REJECT_PREEMPTED: &str = "Channel taken by another radio";
 
 /// Wire-frame sender id derived from the stable per-install id. Capped at the
 /// wire limit (`wire::MAX_SENDER_ID_LEN`, 32): `pack_wire_frame` truncates a
