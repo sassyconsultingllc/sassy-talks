@@ -29,6 +29,12 @@ class AudioManager: NSObject {
     private let sampleRate: Double = 48000
     private let channelCount: UInt32 = 1
     private let frameSize: UInt32 = 960 // 20ms at 48kHz
+
+    /// Render-thread scratch for Rust's int16 output, allocated once. The render
+    /// block used to build a fresh Swift array every callback — a heap
+    /// allocation on the real-time thread, a classic source of glitches.
+    private static let renderScratchCapacity = 4096
+    private let renderScratch = UnsafeMutablePointer<Int16>.allocate(capacity: AudioManager.renderScratchCapacity)
     
     // MARK: - Initialization
     
@@ -54,6 +60,35 @@ class AudioManager: NSObject {
             name: AVAudioSession.routeChangeNotification,
             object: AVAudioSession.sharedInstance()
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleEngineConfigurationChange),
+            name: .AVAudioEngineConfigurationChange,
+            object: audioEngine
+        )
+    }
+
+    /// AirPods / headset / CarPlay connecting changes the hardware format, and
+    /// AVAudioEngine STOPS itself and posts this. Nothing restarted it, so
+    /// after pairing earbuds the app went silent until relaunch. Restart the
+    /// engine and, if transmitting, reinstall the mic tap for the new format.
+    @objc private func handleEngineConfigurationChange(_ note: Notification) {
+        DispatchQueue.main.async {
+            let wasRecording = self.isRecording
+            if wasRecording {
+                self.inputNode.removeTap(onBus: 0)
+                self.isRecording = false
+            }
+            do {
+                if wasRecording {
+                    try self.startRecording()
+                } else if self.isPlaying && !self.audioEngine.isRunning {
+                    try self.audioEngine.start()
+                }
+            } catch {
+                print("❌ Audio engine restart after route change failed: \(error)")
+            }
+        }
     }
 
     @objc private func handleInterruption(_ note: Notification) {
@@ -81,6 +116,10 @@ class AudioManager: NSObject {
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+            // One Opus frame per IO cycle keeps mic-to-wire latency near 20 ms
+            // (the default can be ~100 ms of buffered input on some devices).
+            try? session.setPreferredSampleRate(sampleRate)
+            try? session.setPreferredIOBufferDuration(0.02)
             try session.setActive(true)
             print("✅ Audio session configured")
         } catch {
@@ -202,36 +241,39 @@ class AudioManager: NSObject {
         print("🔊 Playback stopped")
     }
     
+    /// Real-time render callback: no allocation, no blocking (Rust's playout
+    /// read is try-lock only). Mono source, so every channel buffer gets the
+    /// same samples.
     private func fillOutputBuffer(_ bufferList: UnsafeMutablePointer<AudioBufferList>, frameCount: UInt32) -> OSStatus {
         let ablPointer = UnsafeMutableAudioBufferListPointer(bufferList)
-        let count = Int(frameCount)
-        var int16 = [Int16](repeating: 0, count: count)
-        let written = int16.withUnsafeMutableBufferPointer { buf -> Int in
-            guard let base = buf.baseAddress else { return 0 }
-            return Int(sassytalkie_get_audio_output(base, count))
-        }
-
-        for buffer in ablPointer {
-            guard let ptr = buffer.mData else { continue }
-            let floats = ptr.assumingMemoryBound(to: Float.self)
-            let n = min(count, Int(buffer.mDataByteSize) / MemoryLayout<Float>.size)
-            for i in 0..<n {
-                if i < written {
-                    floats[i] = Float(int16[i]) / 32768.0
-                } else {
-                    floats[i] = 0
+        let total = Int(frameCount)
+        var offset = 0
+        while offset < total {
+            let chunk = min(total - offset, Self.renderScratchCapacity)
+            let written = Int(sassytalkie_get_audio_output(renderScratch, chunk))
+            for buffer in ablPointer {
+                guard let ptr = buffer.mData else { continue }
+                let floats = ptr.assumingMemoryBound(to: Float.self)
+                let capacity = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
+                let end = min(offset + chunk, capacity)
+                guard offset < end else { continue }
+                for i in offset..<end {
+                    let j = i - offset
+                    floats[i] = j < written ? Float(renderScratch[j]) / 32768.0 : 0
                 }
             }
+            offset += chunk
         }
-
         return noErr
     }
     
     // MARK: - Cleanup
     
     deinit {
+        NotificationCenter.default.removeObserver(self)
         stopRecording()
         stopPlayback()
         audioEngine.stop()
+        renderScratch.deallocate()
     }
 }

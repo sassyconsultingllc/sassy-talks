@@ -15,8 +15,13 @@
 
 // Rust library FFI functions
 
-/// Initialize the SassyTalkie library
+/// Initialize the SassyTalkie library with a throwaway identity (prefer the
+/// _with_identity variant).
 bool sassytalkie_init(void);
+
+/// Initialize with this install's stable id (the same value sent as the relay /
+/// presence peer=) and the user-visible device name. Safe to call again.
+bool sassytalkie_init_with_identity(const char* _Nullable install_id, const char* _Nullable device_name);
 
 /// Shutdown the library
 void sassytalkie_shutdown(void);
@@ -27,7 +32,10 @@ const char* _Nonnull sassytalkie_get_version(void);
 /// Free string allocated by library
 void sassytalkie_free_string(char* _Nullable s);
 
-/// Set current channel (1-99)
+/// Highest channel a session supports (stepper bound).
+uint8_t sassytalkie_max_channel(void);
+
+/// Set current channel (clamped to 1...sassytalkie_max_channel())
 bool sassytalkie_set_channel(uint8_t channel);
 
 /// Get current channel
@@ -171,6 +179,10 @@ uint8_t* _Nullable sassytalkie_relay_heartbeat_frame(size_t* _Nonnull out_len);
 /// Process a binary frame received from the relay WS. Returns true if it was
 /// playable audio for our channel.
 bool sassytalkie_relay_on_message(const uint8_t* _Nullable ptr, size_t len);
+
+/// since= cursor (Unix ms) for a relay reconnect, from when the last socket was
+/// last alive. 0 = do not request catch-up.
+uint64_t sassytalkie_relay_catchup_since(uint64_t last_alive_ms, uint64_t now_ms);
 
 /// Free a buffer returned by sassytalkie_relay_poll_outbound / _heartbeat_frame.
 void sassytalkie_free_bytes(uint8_t* _Nullable ptr, size_t len);

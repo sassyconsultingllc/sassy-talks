@@ -6,6 +6,7 @@
 /// Interfaces with Swift's AVAudioEngine for recording and playback
 /// Handles PCM audio frames for transmission
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use ringbuf::{HeapRb, HeapProducer, HeapConsumer};
 use thiserror::Error;
@@ -18,6 +19,50 @@ pub const FRAME_SIZE: usize = 960;
 
 /// Ring buffer size (1 second)
 const BUFFER_SIZE: usize = SAMPLE_RATE as usize;
+
+/// After an underrun, hold playout until this much audio is queued (60 ms).
+/// Relay frames arrive with 20-100 ms jitter; playing each frame the instant it
+/// lands made every late frame a click of silence.
+pub const PLAYOUT_PREBUFFER_SAMPLES: usize = FRAME_SIZE * 3;
+
+/// Playout latency ceiling (300 ms). A burst (reconnect, relay catch-up, a
+/// Wi-Fi stall releasing) used to sit in the 1 s ring and delay everything
+/// after it for the rest of the transmission. Past this, the oldest queued
+/// audio is dropped so the listener stays near real time.
+pub const PLAYOUT_MAX_SAMPLES: usize = FRAME_SIZE * 15;
+
+/// The speaker side of the output ring, safe to call from the Core Audio render
+/// thread: it never blocks (a contended lock yields silence for one callback)
+/// and never allocates. Holds only the consumer end, so it does not contend
+/// with the global FFI state lock or the RX writer's producer lock.
+#[derive(Clone)]
+pub struct PlayoutHandle {
+    consumer: Arc<Mutex<HeapConsumer<i16>>>,
+    primed: Arc<AtomicBool>,
+}
+
+impl PlayoutHandle {
+    /// Fill `out` from the ring. Returns samples written; the caller zero-fills
+    /// the remainder.
+    pub fn read(&self, out: &mut [i16]) -> usize {
+        let Ok(mut consumer) = self.consumer.try_lock() else {
+            return 0;
+        };
+        if !self.primed.load(Ordering::Acquire) {
+            if consumer.len() < PLAYOUT_PREBUFFER_SAMPLES {
+                return 0;
+            }
+            self.primed.store(true, Ordering::Release);
+        }
+        let n = consumer.pop_slice(out);
+        if n < out.len() {
+            // Ran dry: re-prime before resuming so the next late frame does not
+            // produce another click.
+            self.primed.store(false, Ordering::Release);
+        }
+        n
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum AudioError {
@@ -102,6 +147,7 @@ pub struct AudioEngine {
     // Output ring buffer (reception → speaker)
     output_producer: Arc<Mutex<HeapProducer<i16>>>,
     output_consumer: Arc<Mutex<HeapConsumer<i16>>>,
+    output_primed: Arc<AtomicBool>,
 }
 
 impl AudioEngine {
@@ -120,7 +166,23 @@ impl AudioEngine {
             input_consumer: Arc::new(Mutex::new(input_consumer)),
             output_producer: Arc::new(Mutex::new(output_producer)),
             output_consumer: Arc::new(Mutex::new(output_consumer)),
+            output_primed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Handle for the render callback (see [`PlayoutHandle`]).
+    pub fn playout_handle(&self) -> PlayoutHandle {
+        PlayoutHandle {
+            consumer: Arc::clone(&self.output_consumer),
+            primed: Arc::clone(&self.output_primed),
+        }
+    }
+
+    /// Drop any mic audio still queued from the previous press. Without this the
+    /// tail of the last transmission (up to 1 s the TX thread never consumed)
+    /// went out at the start of the next one.
+    pub fn clear_input(&self) {
+        self.input_consumer.lock().unwrap().clear();
     }
     
     /// Start recording
@@ -196,9 +258,17 @@ impl AudioEngine {
         Ok(AudioFrame::new(samples))
     }
     
-    /// Write received audio frame to output buffer
+    /// Write received audio frame to output buffer, dropping the oldest queued
+    /// audio first if this frame would push latency past [`PLAYOUT_MAX_SAMPLES`].
     pub fn write_output_frame(&self, frame: &AudioFrame) -> Result<(), AudioError> {
         let mut producer = self.output_producer.lock().unwrap();
+        let queued = producer.len();
+        if queued + frame.samples.len() > PLAYOUT_MAX_SAMPLES {
+            let excess = queued + frame.samples.len() - PLAYOUT_MAX_SAMPLES;
+            // Lock order is always producer then consumer; the render thread
+            // only ever try_locks the consumer, so this cannot deadlock it.
+            self.output_consumer.lock().unwrap().skip(excess);
+        }
         let written = producer.push_slice(&frame.samples);
         if written < frame.samples.len() {
             return Err(AudioError::BufferOverflow);
@@ -206,11 +276,9 @@ impl AudioEngine {
         Ok(())
     }
     
-    /// Read audio for Swift playback
-    /// Called by Swift's AVAudioEngine callback
+    /// Read audio for Swift playback (prebuffered, non-blocking).
     pub fn read_output(&self, buffer: &mut [i16]) -> Result<usize, AudioError> {
-        let mut consumer = self.output_consumer.lock().unwrap();
-        Ok(consumer.pop_slice(buffer))
+        Ok(self.playout_handle().read(buffer))
     }
     
     /// Get current state
@@ -233,5 +301,74 @@ impl AudioEngine {
 impl Default for AudioEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(v: i16) -> AudioFrame {
+        AudioFrame::new(vec![v; FRAME_SIZE])
+    }
+
+    #[test]
+    fn playout_waits_for_the_prebuffer_then_plays_in_order() {
+        let engine = AudioEngine::new();
+        let play = engine.playout_handle();
+        let mut out = vec![0i16; FRAME_SIZE];
+
+        engine.write_output_frame(&frame(1)).unwrap();
+        engine.write_output_frame(&frame(2)).unwrap();
+        assert_eq!(play.read(&mut out), 0, "two frames is under the 60 ms prebuffer");
+
+        engine.write_output_frame(&frame(3)).unwrap();
+        assert_eq!(play.read(&mut out), FRAME_SIZE);
+        assert!(out.iter().all(|&s| s == 1));
+        assert_eq!(play.read(&mut out), FRAME_SIZE);
+        assert!(out.iter().all(|&s| s == 2));
+    }
+
+    #[test]
+    fn underrun_reprimes_instead_of_clicking_frame_by_frame() {
+        let engine = AudioEngine::new();
+        let play = engine.playout_handle();
+        let mut out = vec![0i16; FRAME_SIZE];
+        for v in 1..=3 {
+            engine.write_output_frame(&frame(v)).unwrap();
+        }
+        for _ in 0..3 {
+            assert_eq!(play.read(&mut out), FRAME_SIZE);
+        }
+        assert_eq!(play.read(&mut out), 0, "ran dry");
+        // One late frame alone does not restart playout.
+        engine.write_output_frame(&frame(9)).unwrap();
+        assert_eq!(play.read(&mut out), 0);
+    }
+
+    #[test]
+    fn a_burst_is_capped_to_the_latency_ceiling_keeping_the_newest_audio() {
+        let engine = AudioEngine::new();
+        let play = engine.playout_handle();
+        for v in 0..40 {
+            engine.write_output_frame(&frame(v)).unwrap();
+        }
+        let mut out = vec![0i16; FRAME_SIZE];
+        let mut frames = Vec::new();
+        while play.read(&mut out) == FRAME_SIZE {
+            frames.push(out[0]);
+        }
+        let cap = PLAYOUT_MAX_SAMPLES / FRAME_SIZE;
+        assert_eq!(frames.len(), cap);
+        assert_eq!(*frames.last().unwrap(), 39, "newest audio survives");
+        assert_eq!(frames[0], 40 - cap as i16);
+    }
+
+    #[test]
+    fn clear_input_drops_the_previous_press_tail() {
+        let engine = AudioEngine::new();
+        engine.write_input(&vec![7i16; FRAME_SIZE * 2]).unwrap();
+        engine.clear_input();
+        assert!(engine.read_input_frame().is_err(), "nothing stale left to transmit");
     }
 }

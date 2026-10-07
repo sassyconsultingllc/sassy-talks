@@ -6,11 +6,12 @@
 /// Coordinates audio, codec, and transport
 /// Similar to Android version but adapted for iOS
 
-use crate::audio::{AudioEngine, AudioFrame};
+use crate::audio::{AudioEngine, AudioFrame, PlayoutHandle};
 use crate::codec::{OpusEncoder, OpusDecoder};
 use crate::floor::{FloorState, REJECT_CHANNEL_BUSY, REJECT_MAX_TX, REJECT_NOT_ENCRYPTED};
 use crate::transport::TransportManager;
 use sassytalkie_core::floor as floor_policy;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::thread;
@@ -22,19 +23,19 @@ use log::{error, info, warn};
 pub enum StateError {
     #[error("Audio error: {0}")]
     AudioError(String),
-    
+
     #[error("Codec error: {0}")]
     CodecError(String),
-    
+
     #[error("Transport error: {0}")]
     TransportError(String),
-    
+
     #[error("Invalid state transition")]
     InvalidStateTransition,
-    
+
     #[error("Not connected")]
     NotConnected,
-    
+
     #[error("Already transmitting")]
     AlreadyTransmitting,
 
@@ -43,6 +44,52 @@ pub enum StateError {
 
     #[error("Authenticate via QR first")]
     NotEncrypted,
+}
+
+/// Channels a session QR can carry (core `session::MAX_CHANNELS`). iOS used to
+/// let the UI dial up to 99; frames on 9+ were dropped by every Android peer.
+pub const MAX_CHANNEL: u8 = sassytalkie_core::session::MAX_CHANNELS as u8;
+
+/// Most relay senders we keep an Opus decoder for at once. Opus decoders are
+/// stateful per stream; sharing one across talkers garbled both.
+const MAX_RELAY_DECODERS: usize = 16;
+
+/// How often the RX thread retries the LAN multicast socket while it is down.
+const LAN_RETRY_MS: u64 = 5_000;
+
+/// Reason surfaced when another radio wins floor arbitration mid-transmission.
+pub const REJECT_PREEMPTED: &str = "Channel taken by another radio";
+
+/// Wire-frame sender id derived from the stable per-install id. Capped at the
+/// wire limit (`wire::MAX_SENDER_ID_LEN`, 32): `pack_wire_frame` truncates a
+/// longer id, and a truncated id no longer equals ours, so our own relay echo
+/// would sail past the loopback check and play back to us.
+pub fn sender_id_for_install(install_id: &str) -> String {
+    let cleaned: String = install_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(sassytalkie_core::wire::MAX_SENDER_ID_LEN - 4)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if cleaned.is_empty() {
+        format!("ios-{:08x}", rand::random::<u32>())
+    } else {
+        format!("ios-{cleaned}")
+    }
+}
+
+/// Display name for wire frames: trimmed, non-empty, within the wire limit on a
+/// UTF-8 boundary.
+fn clamp_device_name(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return "iPhone".to_string();
+    }
+    let mut end = name.len().min(sassytalkie_core::wire::MAX_DEVICE_NAME_LEN);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_string()
 }
 
 /// Application state
@@ -66,24 +113,25 @@ struct StagedHybridResponder {
 pub struct StateMachine {
     // Current state
     state: Arc<Mutex<AppState>>,
-    
+
     // Device info
-    device_id: u32,
     device_name: String,
     // Stable per-install sender id placed in every wire frame (<= 32 bytes).
     // Matches the role of android-native's sender_id; only needs to be a stable
     // UTF-8 string for receiver-side attribution/mixing.
     sender_id: String,
-    
+
     // Current channel
     current_channel: Arc<AtomicU8>,
-    
+
     // Core components
     audio: Arc<Mutex<AudioEngine>>,
+    playout: PlayoutHandle,
     encoder: Arc<Mutex<OpusEncoder>>,
-    decoder: Arc<Mutex<OpusDecoder>>,
+    /// One Opus decoder per relay sender (the LAN RX thread keeps its own map).
+    relay_decoders: Arc<Mutex<HashMap<String, OpusDecoder>>>,
     transport: Arc<Mutex<TransportManager>>,
-    
+
     // Control flags
     is_transmitting: Arc<AtomicBool>,
     should_stop_tx: Arc<AtomicBool>,
@@ -124,33 +172,44 @@ pub struct StateMachine {
 }
 
 impl StateMachine {
-    /// Create new state machine
+    /// Create a state machine with a throwaway identity (tests, legacy init).
     pub fn new() -> Result<Self, StateError> {
-        let device_id = rand::random();
-        let device_name = format!("iPhone-{}", device_id % 10000);
-        let sender_id = format!("ios-{:08x}", device_id);
-        
+        let device_id: u32 = rand::random();
+        Self::with_identity(&format!("{device_id:08x}"), &format!("iPhone-{}", device_id % 10000))
+    }
+
+    /// Create a state machine for this install. `install_id` is the stable
+    /// per-install id Swift also sends as the relay/presence `peer=`; it used
+    /// to be a fresh random value every launch, so Android saw a new radio
+    /// after each relaunch and floor tie-breaks used a moving id.
+    pub fn with_identity(install_id: &str, device_name: &str) -> Result<Self, StateError> {
+        let device_name = clamp_device_name(device_name);
+        let sender_id = sender_id_for_install(install_id);
+
         let audio = AudioEngine::new();
+        let playout = audio.playout_handle();
         let encoder = OpusEncoder::new()
-            .map_err(|e| StateError::CodecError(e.to_string()))?;
-        let decoder = OpusDecoder::new()
             .map_err(|e| StateError::CodecError(e.to_string()))?;
         let transport = TransportManager::new()
             .map_err(|e| StateError::TransportError(e.to_string()))?;
-        
-        // Start transport
-        transport.start()
-            .map_err(|e| StateError::TransportError(e.to_string()))?;
-        
+
+        // LAN multicast is optional. With no Wi-Fi, no Local Network permission
+        // yet, or no multicast entitlement, the join fails — and that used to
+        // fail init outright, leaving a relay-capable phone stuck on "Error".
+        // The RX thread retries the socket every LAN_RETRY_MS.
+        if let Err(e) = transport.start() {
+            warn!("LAN multicast unavailable ({e}); relay-only until it comes up");
+        }
+
         Ok(Self {
             state: Arc::new(Mutex::new(AppState::Idle)),
-            device_id,
             device_name,
             sender_id,
             current_channel: Arc::new(AtomicU8::new(1)),
             audio: Arc::new(Mutex::new(audio)),
+            playout,
             encoder: Arc::new(Mutex::new(encoder)),
-            decoder: Arc::new(Mutex::new(decoder)),
+            relay_decoders: Arc::new(Mutex::new(HashMap::new())),
             transport: Arc::new(Mutex::new(transport)),
             is_transmitting: Arc::new(AtomicBool::new(false)),
             should_stop_tx: Arc::new(AtomicBool::new(false)),
@@ -245,6 +304,16 @@ impl StateMachine {
         &self.floor
     }
 
+    /// Render-thread handle for the speaker ring (never blocks).
+    pub fn playout_handle(&self) -> PlayoutHandle {
+        self.playout.clone()
+    }
+
+    /// Wire sender id (stable per install).
+    pub fn sender_id(&self) -> &str {
+        &self.sender_id
+    }
+
     /// Seal `inner` with the authenticated control plane and send it on both
     /// LAN multicast (raw datagram) and the relay queue.
     fn send_control_inner(&self, inner: Vec<u8>) {
@@ -268,6 +337,16 @@ impl StateMachine {
         self.is_transmitting.store(false, Ordering::SeqCst);
         self.tx_started_ms.store(0, Ordering::SeqCst);
         let _ = self.audio.lock().unwrap().stop_recording();
+        self.floor.set_reject_reason(REJECT_PREEMPTED);
+        // Close our floor claim the way a release does (Android calls
+        // onPttReleased here), so peers EOT cleanly instead of waiting out the
+        // stale hold.
+        send_ptt_stop(
+            &self.control,
+            &self.transport,
+            self.session_epoch,
+            self.tx_seq.load(Ordering::SeqCst),
+        );
     }
 
     /// Replace the active AEAD session (e.g. with a key-exchange / hybrid result).
@@ -362,10 +441,18 @@ impl StateMachine {
         }
     }
 
-    /// Process a binary frame from the relay. Authenticated control is handled
-    /// fail-closed; remaining bytes are treated as sealed audio.
+    /// Process a binary frame from the relay. Catch-up frames are unwrapped,
+    /// authenticated control is handled fail-closed, the rest is sealed audio.
     pub fn process_relay_frame(&self, sealed: &[u8]) -> bool {
         let now = crate::control::now_ms();
+        // OP_REPLAY_FRAME (relay catch-up) is not a TLV; unwrap before the AEAD.
+        // Replayed control is dropped: a stale PTT_START must not take the floor.
+        if let Some(inner) = sassytalkie_core::protocol::replay_inner(sealed) {
+            if sassytalkie_core::protocol::is_control_frame_shape(inner) {
+                return false;
+            }
+            return self.process_relay_audio(inner, now);
+        }
         let classified = {
             let codec = self.control.lock().unwrap();
             sassytalkie_core::control_auth::classify_inbound(codec.as_ref(), sealed, now)
@@ -390,6 +477,11 @@ impl StateMachine {
                 return false;
             }
         }
+        self.process_relay_audio(sealed, now)
+    }
+
+    /// Open, attribute and play one sealed relay audio frame.
+    fn process_relay_audio(&self, sealed: &[u8], now: u64) -> bool {
         let plain = match self.transport.lock().unwrap().open_sealed(sealed) {
             Some(p) => p,
             None => return false,
@@ -407,14 +499,35 @@ impl StateMachine {
         if frame_channel != self.current_channel.load(Ordering::SeqCst) {
             return false;
         }
+        // Never play over our own transmission (half-duplex, like Android/desktop).
+        if self.is_transmitting.load(Ordering::SeqCst) {
+            return false;
+        }
         self.floor.hold(&sender, floor_policy::STALE_HOLD_MS, now);
-        let samples = match self.decoder.lock().unwrap().decode(&compressed) {
-            Ok(s) => s,
-            Err(_) => return false,
+        let samples = {
+            let mut decoders = self.relay_decoders.lock().unwrap();
+            if !decoders.contains_key(&sender) && decoders.len() >= MAX_RELAY_DECODERS {
+                decoders.clear();
+            }
+            let decoder = match decoders.entry(sender.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(v) => match OpusDecoder::new() {
+                    Ok(d) => v.insert(d),
+                    Err(e) => {
+                        error!("Opus decoder for {sender}: {e}");
+                        return false;
+                    }
+                },
+            };
+            match decoder.decode(&compressed) {
+                Ok(s) => s,
+                Err(_) => return false,
+            }
         };
         let frame = AudioFrame::new(samples);
         let _ = self.audio.lock().unwrap().write_output_frame(&frame);
-        *self.state.lock().unwrap() = AppState::Receiving;
+        // "Receiving" is derived from floor/LED state in current_state(); storing
+        // it here left the UI on "Receiving" forever after the first frame.
         true
     }
 
@@ -671,18 +784,19 @@ impl StateMachine {
         };
         self.hybrid_on_confirm(&payload, crate::control::now_ms())
     }
-    
+
     /// Set channel
     pub fn set_channel(&self, channel: u8) {
+        let channel = channel.clamp(1, MAX_CHANNEL);
         self.current_channel.store(channel, Ordering::SeqCst);
         info!("Channel set to {}", channel);
     }
-    
+
     /// Get channel
     pub fn get_channel(&self) -> u8 {
         self.current_channel.load(Ordering::SeqCst)
     }
-    
+
     /// Get current state. Floor occupancy (not the 400 ms LED) drives Receiving
     /// so the UI stays honest after the LED blinks off during a cellular gap.
     pub fn current_state(&self) -> AppState {
@@ -695,7 +809,7 @@ impl StateMachine {
         }
         *self.state.lock().unwrap()
     }
-    
+
     /// PTT press - start transmission. Refuses when unpaired or the floor is
     /// held (unless a local emergency overrides). Emits authenticated
     /// `OP_PTT_START_V2` so Android/iOS/desktop run the same arbitration.
@@ -724,8 +838,12 @@ impl StateMachine {
         );
         self.send_control_inner(inner);
 
-        self.audio.lock().unwrap().start_recording()
-            .map_err(|e| StateError::AudioError(e.to_string()))?;
+        {
+            let mut audio = self.audio.lock().unwrap();
+            audio.clear_input();
+            audio.start_recording()
+                .map_err(|e| StateError::AudioError(e.to_string()))?;
+        }
 
         *self.state.lock().unwrap() = AppState::Transmitting;
         self.is_transmitting.store(true, Ordering::SeqCst);
@@ -736,20 +854,20 @@ impl StateMachine {
 
         Ok(())
     }
-    
+
     /// PTT release - stop transmission and emit `OP_PTT_STOP_V2`.
     pub fn on_ptt_release(&mut self) -> Result<(), StateError> {
         if !self.is_transmitting.load(Ordering::SeqCst) {
             return Ok(());
         }
-        
+
         info!("PTT released - stopping transmission");
-        
+
         self.should_stop_tx.store(true, Ordering::SeqCst);
-        
+
         self.audio.lock().unwrap().stop_recording()
             .map_err(|e| StateError::AudioError(e.to_string()))?;
-        
+
         let end_seq = self.tx_seq.load(Ordering::SeqCst);
         let inner = sassytalkie_core::ptt_frames::encode_ptt_stop_v2(self.session_epoch, end_seq);
         self.send_control_inner(inner);
@@ -757,10 +875,10 @@ impl StateMachine {
         *self.state.lock().unwrap() = AppState::Connected;
         self.is_transmitting.store(false, Ordering::SeqCst);
         self.tx_started_ms.store(0, Ordering::SeqCst);
-        
+
         Ok(())
     }
-    
+
     /// Start TX thread
     fn start_tx_thread(&self) {
         let audio = Arc::clone(&self.audio);
@@ -774,6 +892,8 @@ impl StateMachine {
         let channel = self.current_channel.load(Ordering::SeqCst);
         let device_name = self.device_name.clone();
         let sender_id = self.sender_id.clone();
+        let control = Arc::clone(&self.control);
+        let session_epoch = self.session_epoch;
 
         thread::spawn(move || {
             info!("TX thread started");
@@ -787,6 +907,7 @@ impl StateMachine {
                     is_transmitting.store(false, Ordering::SeqCst);
                     tx_started_ms.store(0, Ordering::SeqCst);
                     let _ = audio.lock().unwrap().stop_recording();
+                    send_ptt_stop(&control, &transport, session_epoch, tx_seq.load(Ordering::SeqCst));
                     info!("TX safety ceiling reached ({} ms)", floor_policy::DEFAULT_MAX_TX_MS);
                     break;
                 }
@@ -828,27 +949,26 @@ impl StateMachine {
             info!("TX thread stopped");
         });
     }
-    
+
     /// Start listening for audio
     pub fn start_listening(&mut self) -> Result<(), StateError> {
         info!("Starting RX listener");
-        
+
         self.audio.lock().unwrap().start_playing()
             .map_err(|e| StateError::AudioError(e.to_string()))?;
-        
+
         self.should_stop_rx.store(false, Ordering::SeqCst);
         *self.state.lock().unwrap() = AppState::Connected;
         self.start_rx_thread();
-        
+
         Ok(())
     }
-    
+
     /// Start RX thread
     fn start_rx_thread(&self) {
         let audio = Arc::clone(&self.audio);
         let transport = Arc::clone(&self.transport);
         let should_stop = Arc::clone(&self.should_stop_rx);
-        let state = Arc::clone(&self.state);
         let current_channel = Arc::clone(&self.current_channel);
         let self_sender_id = self.sender_id.clone();
         let floor = Arc::clone(&self.floor);
@@ -859,15 +979,33 @@ impl StateMachine {
         let tx_started_ms = Arc::clone(&self.tx_started_ms);
         let session_epoch = self.session_epoch;
         let local_peer = self.sender_id.clone();
+        let tx_seq = Arc::clone(&self.tx_seq);
 
         thread::spawn(move || {
             info!("RX thread started");
             let mut decoders: std::collections::HashMap<String, OpusDecoder> =
                 std::collections::HashMap::new();
-            
+            let mut last_lan_retry = 0u64;
+
             while !should_stop.load(Ordering::SeqCst) {
-                let raw = match transport.lock().unwrap().recv_datagram() {
+                let received = transport.lock().unwrap().recv_datagram();
+                let raw = match received {
                     Ok(r) => r,
+                    Err(crate::transport::TransportError::IoError(e))
+                        if e.kind() == std::io::ErrorKind::NotConnected =>
+                    {
+                        // No LAN socket (init found no Wi-Fi / permission). Retry
+                        // periodically so LAN comes back without a relaunch.
+                        let now = crate::control::now_ms();
+                        if now.saturating_sub(last_lan_retry) >= LAN_RETRY_MS {
+                            last_lan_retry = now;
+                            if transport.lock().unwrap().start().is_ok() {
+                                info!("LAN multicast socket is up");
+                            }
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
                     Err(_) => {
                         thread::sleep(Duration::from_millis(5));
                         continue;
@@ -903,6 +1041,7 @@ impl StateMachine {
                             &tx_started_ms,
                             &audio,
                             session_epoch,
+                            &tx_seq,
                             &local_peer,
                             &transport,
                             &control,
@@ -928,14 +1067,26 @@ impl StateMachine {
                     continue;
                 }
 
-                if frame_channel == current_channel.load(Ordering::SeqCst) {
+                if frame_channel == current_channel.load(Ordering::SeqCst)
+                    && !is_transmitting.load(Ordering::SeqCst)
+                {
                     // Inbound audio re-asserts the floor even if the 400 ms LED
                     // already blinked off (changelog 3.2).
                     floor.hold(&sender, floor_policy::STALE_HOLD_MS, now);
 
-                    let decoder = decoders
-                        .entry(sender.clone())
-                        .or_insert_with(|| OpusDecoder::new().expect("create Opus decoder"));
+                    if !decoders.contains_key(&sender) && decoders.len() >= MAX_RELAY_DECODERS {
+                        decoders.clear();
+                    }
+                    let decoder = match decoders.entry(sender.clone()) {
+                        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(v) => match OpusDecoder::new() {
+                            Ok(d) => v.insert(d),
+                            Err(e) => {
+                                error!("Opus decoder for {}: {}", sender, e);
+                                continue;
+                            }
+                        },
+                    };
                     let samples = match decoder.decode(&compressed) {
                         Ok(s) => s,
                         Err(e) => {
@@ -946,14 +1097,13 @@ impl StateMachine {
 
                     let frame = AudioFrame::new(samples);
                     let _ = audio.lock().unwrap().write_output_frame(&frame);
-                    *state.lock().unwrap() = AppState::Receiving;
                 }
             }
-            
+
             info!("RX thread stopped");
         });
     }
-    
+
     /// Connect to device
     pub fn connect_to_device(&mut self, _device_id: u32) -> Result<(), StateError> {
         info!("Connecting to device...");
@@ -961,7 +1111,7 @@ impl StateMachine {
         self.start_listening()?;
         Ok(())
     }
-    
+
     /// Disconnect
     pub fn disconnect(&mut self) -> Result<(), StateError> {
         info!("Disconnecting...");
@@ -971,19 +1121,19 @@ impl StateMachine {
         *self.state.lock().unwrap() = AppState::Idle;
         Ok(())
     }
-    
+
     /// Process audio input (called from Swift)
     pub fn process_audio_input(&mut self, samples: &[i16]) -> Result<(), StateError> {
         self.audio.lock().unwrap().write_input(samples)
             .map_err(|e| StateError::AudioError(e.to_string()))
     }
-    
+
     /// Get audio output (called from Swift)
     pub fn get_audio_output(&mut self, buffer: &mut [i16]) -> Result<usize, StateError> {
         self.audio.lock().unwrap().read_output(buffer)
             .map_err(|e| StateError::AudioError(e.to_string()))
     }
-    
+
     /// Shutdown
     pub fn shutdown(&mut self) -> Result<(), StateError> {
         info!("Shutting down state machine");
@@ -992,6 +1142,26 @@ impl StateMachine {
         self.transport.lock().unwrap().stop();
         Ok(())
     }
+}
+
+/// Seal and send `OP_PTT_STOP_V2` on both LAN and relay. Shared by release,
+/// floor preemption and the max-TX ceiling so every way a transmission ends
+/// looks the same to peers.
+fn send_ptt_stop(
+    control: &Arc<Mutex<Option<sassytalkie_core::control_auth::ControlAuthCodec>>>,
+    transport: &Arc<Mutex<TransportManager>>,
+    session_epoch: u64,
+    end_seq: u32,
+) {
+    let inner = sassytalkie_core::ptt_frames::encode_ptt_stop_v2(session_epoch, end_seq);
+    let now = crate::control::now_ms();
+    let Some(sealed) = control.lock().unwrap().as_ref().and_then(|c| c.seal(&inner, now).ok()) else {
+        warn!("PTT_STOP not sent: no authenticated room context");
+        return;
+    };
+    let transport = transport.lock().unwrap();
+    let _ = transport.send_control_datagram(&sealed);
+    transport.enqueue_relay_control(sealed);
 }
 
 /// LAN multicast control: PTT floor only. Hybrid rekey stays on the relay
@@ -1006,6 +1176,7 @@ fn lan_handle_ptt_control(
     tx_started_ms: &std::sync::atomic::AtomicU64,
     audio: &Mutex<AudioEngine>,
     session_epoch: u64,
+    tx_seq: &AtomicU32,
     local_peer: &str,
     transport: &Arc<Mutex<TransportManager>>,
     control: &Arc<Mutex<Option<sassytalkie_core::control_auth::ControlAuthCodec>>>,
@@ -1033,6 +1204,8 @@ fn lan_handle_ptt_control(
                     is_transmitting.store(false, Ordering::SeqCst);
                     tx_started_ms.store(0, Ordering::SeqCst);
                     let _ = audio.lock().unwrap().stop_recording();
+                    floor.set_reject_reason(REJECT_PREEMPTED);
+                    send_ptt_stop(control, transport, session_epoch, tx_seq.load(Ordering::SeqCst));
                 } else {
                     return;
                 }
@@ -1057,5 +1230,102 @@ fn lan_handle_ptt_control(
             });
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sassytalkie_core::crypto::CryptoSession;
+
+    const KEY: [u8; 32] = [0x5a; 32];
+
+    fn paired() -> StateMachine {
+        let sm = StateMachine::with_identity("6F1C2A5E-0D3B-4C7A-9E21-ABCDEF012345", "Test iPhone")
+            .expect("state machine");
+        sm.set_psk(&KEY);
+        sm
+    }
+
+    /// A sealed relay audio frame from `sender`, as Android would send it.
+    fn sealed_from(sender: &str, channel: u8) -> Vec<u8> {
+        let mut enc = OpusEncoder::new().unwrap();
+        let opus = enc.encode(&vec![0i16; crate::audio::FRAME_SIZE]).unwrap();
+        let wire = sassytalkie_core::wire::pack_wire_frame(
+            channel,
+            sassytalkie_core::wire::SUBCH_MAIN,
+            sender,
+            "Pixel",
+            sassytalkie_core::wire::now_ms(),
+            &opus,
+        );
+        CryptoSession::from_psk(&KEY).encrypt(&wire).unwrap()
+    }
+
+    fn replay_wrap(frame: &[u8]) -> Vec<u8> {
+        let mut out = vec![sassytalkie_core::protocol::OP_REPLAY_FRAME, 0, 0];
+        out.extend_from_slice(frame);
+        out
+    }
+
+    #[test]
+    fn sender_id_fits_the_wire_so_loopback_check_holds() {
+        let id = sender_id_for_install("6F1C2A5E-0D3B-4C7A-9E21-ABCDEF012345");
+        assert!(id.len() <= sassytalkie_core::wire::MAX_SENDER_ID_LEN);
+        assert!(id.starts_with("ios-6f1c2a5e"));
+        // Stable: the same install id always maps to the same sender id.
+        assert_eq!(id, sender_id_for_install("6F1C2A5E-0D3B-4C7A-9E21-ABCDEF012345"));
+        assert!(sender_id_for_install("").starts_with("ios-"));
+    }
+
+    #[test]
+    fn device_name_is_clamped_on_a_char_boundary() {
+        assert_eq!(clamp_device_name("   "), "iPhone");
+        let long = "é".repeat(60); // 120 bytes
+        let clamped = clamp_device_name(&long);
+        assert!(clamped.len() <= sassytalkie_core::wire::MAX_DEVICE_NAME_LEN);
+        assert!(clamped.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn channel_is_clamped_to_what_sessions_support() {
+        let sm = paired();
+        sm.set_channel(42);
+        assert_eq!(sm.get_channel(), MAX_CHANNEL);
+        sm.set_channel(0);
+        assert_eq!(sm.get_channel(), 1);
+    }
+
+    #[test]
+    fn relay_audio_plays_and_does_not_latch_receiving() {
+        let sm = paired();
+        assert!(sm.process_relay_frame(&sealed_from("android-peer", 1)));
+        assert!(sm.floor().is_held(crate::control::now_ms()));
+        // The stored state used to be set to Receiving here and never cleared,
+        // so the UI said "Receiving" for the rest of the session.
+        assert_ne!(*sm.state.lock().unwrap(), AppState::Receiving);
+    }
+
+    #[test]
+    fn catch_up_frames_are_unwrapped_and_deduplicated() {
+        let sm = paired();
+        let frame = sealed_from("android-peer", 1);
+        assert!(sm.process_relay_frame(&replay_wrap(&frame)), "missed frame plays");
+        assert!(!sm.process_relay_frame(&frame), "same frame live again is a replay");
+        assert!(!sm.process_relay_frame(&replay_wrap(&frame)));
+    }
+
+    #[test]
+    fn own_echo_wrong_channel_and_replayed_control_never_play() {
+        let sm = paired();
+        let own = sealed_from(&sm.sender_id().to_string(), 1);
+        assert!(!sm.process_relay_frame(&own));
+        assert!(!sm.process_relay_frame(&sealed_from("android-peer", 2)));
+        let ctrl = sassytalkie_core::protocol::encode_tlv(
+            sassytalkie_core::protocol::OP_AUTHENTICATED,
+            &[1u8; 40],
+        );
+        assert!(!sm.process_relay_frame(&replay_wrap(&ctrl)));
+        assert!(!sm.floor().is_held(crate::control::now_ms()));
     }
 }

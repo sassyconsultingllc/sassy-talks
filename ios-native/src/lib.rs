@@ -70,24 +70,67 @@ fn app_state() -> &'static Mutex<Option<StateMachine>> {
     APP_STATE.get_or_init(|| Mutex::new(None))
 }
 
+/// The speaker ring's consumer, kept OUTSIDE `APP_STATE` so the Core Audio
+/// render callback never waits on the global lock (which relay decrypt, QR
+/// import and PTT all hold). Only touched with `try_lock` on the render thread.
+static PLAYOUT: Mutex<Option<audio::PlayoutHandle>> = Mutex::new(None);
+
+fn install_state(state: StateMachine) -> bool {
+    let handle = state.playout_handle();
+    match app_state().lock() {
+        Ok(mut g) => {
+            if let Some(mut old) = g.take() {
+                let _ = old.shutdown();
+            }
+            *g = Some(state);
+        }
+        Err(_) => return false,
+    }
+    if let Ok(mut p) = PLAYOUT.lock() {
+        *p = Some(handle);
+    }
+    true
+}
+
 /// Initialize the library
 /// 
 /// # Safety
 /// This function must be called before any other library functions
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_init() -> bool {
-    // Initialize logger
-    env_logger::init();
+    init_with(StateMachine::new())
+}
+
+/// Initialize with this install's stable identity. Prefer this over
+/// `sassytalkie_init`: `install_id` must be the same per-install id Swift sends
+/// as the relay/presence `peer=`, so the wire sender id, floor tie-breaks and
+/// presence all name one radio across relaunches. `device_name` is what peers
+/// see in their timeline. Calling it again replaces the running state.
+///
+/// # Safety
+/// Both arguments must be NUL-terminated UTF-8 C strings (or null).
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_init_with_identity(
+    install_id: *const c_char,
+    device_name: *const c_char,
+) -> bool {
+    let id = ffi::helpers::c_string_to_rust(install_id).unwrap_or_default();
+    let name = ffi::helpers::c_string_to_rust(device_name).unwrap_or_default();
+    init_with(StateMachine::with_identity(&id, &name))
+}
+
+fn init_with(state: Result<StateMachine, state::StateError>) -> bool {
+    // try_init: env_logger::init() panics on a second call, and a panic out of
+    // an extern "C" fn aborts the app.
+    let _ = env_logger::try_init();
     info!("SassyTalkie iOS v{} initializing...", VERSION);
-    
-    // Create state machine
-    match StateMachine::new() {
+    match state {
         Ok(state) => {
-            if let Ok(mut g) = app_state().lock() {
-                *g = Some(state);
+            let ok = install_state(state);
+            if ok {
+                info!("SassyTalkie initialized successfully");
             }
-            info!("SassyTalkie initialized successfully");
-            true
+            ok
         }
         Err(e) => {
             eprintln!("Failed to initialize SassyTalkie: {}", e);
@@ -100,6 +143,9 @@ pub unsafe extern "C" fn sassytalkie_init() -> bool {
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_shutdown() {
     info!("SassyTalkie shutting down...");
+    if let Ok(mut p) = PLAYOUT.lock() {
+        *p = None;
+    }
     if let Ok(mut g) = app_state().lock() {
         if let Some(mut s) = g.take() {
             let _ = s.shutdown();
@@ -448,7 +494,21 @@ pub unsafe extern "C" fn sassytalkie_relay_on_message(ptr: *const u8, len: usize
     false
 }
 
-/// Set current channel
+/// Highest channel a session can use (core MAX_CHANNELS); the UI's stepper bound.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_max_channel() -> u8 {
+    state::MAX_CHANNEL
+}
+
+/// `since=` cursor for a relay reconnect given when the last socket was last
+/// alive (Unix ms). 0 means "do not ask for catch-up" (never connected, or the
+/// gap is too long to replay usefully). Same policy as Android and desktop.
+#[no_mangle]
+pub unsafe extern "C" fn sassytalkie_relay_catchup_since(last_alive_ms: u64, now_ms: u64) -> u64 {
+    sassytalkie_core::protocol::catchup_since_ms(last_alive_ms, now_ms).unwrap_or(0)
+}
+
+/// Set current channel (clamped to 1..=sassytalkie_max_channel()).
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_set_channel(channel: u8) -> bool {
     if let Ok(mut g) = app_state().lock() {
@@ -642,9 +702,9 @@ pub unsafe extern "C" fn sassytalkie_process_audio_input(
     if audio_data.is_null() || sample_count == 0 {
         return false;
     }
-    
+
     let samples = std::slice::from_raw_parts(audio_data, sample_count);
-    
+
     if let Ok(mut g) = app_state().lock() {
         if let Some(s) = g.as_mut() {
             return s.process_audio_input(samples).is_ok();
@@ -666,15 +726,19 @@ pub unsafe extern "C" fn sassytalkie_get_audio_output(
     if buffer.is_null() || buffer_size == 0 {
         return 0;
     }
-    
+
     let out_buffer = std::slice::from_raw_parts_mut(buffer, buffer_size);
-    
-    if let Ok(mut g) = app_state().lock() {
-        if let Some(s) = g.as_mut() {
-            return s.get_audio_output(out_buffer).unwrap_or(0);
-        }
-    }
-    0
+
+    // Render thread: never block. A contended lock is one buffer of silence,
+    // which is far better than a priority-inverted glitch on every PTT press.
+    let handle = match PLAYOUT.try_lock() {
+        Ok(g) => match g.as_ref() {
+            Some(h) => h.clone(),
+            None => return 0,
+        },
+        Err(_) => return 0,
+    };
+    handle.read(out_buffer)
 }
 
 // ───────────────────────── Bluetooth peer-finding (CoreBluetooth bridge) ─────────────────────────
@@ -795,5 +859,35 @@ pub unsafe extern "C" fn sassytalkie_bt_set_connected(id: *const c_char) -> bool
 pub unsafe extern "C" fn sassytalkie_bt_clear_connected() {
     if let Ok(mut mgr) = bt_manager().lock() {
         mgr.clear_connected();
+    }
+}
+
+#[cfg(test)]
+mod ffi_tests {
+    use super::*;
+
+    #[test]
+    fn init_twice_does_not_panic_and_keeps_one_state() {
+        // env_logger::init() used to abort the process on the second call.
+        let id = CString::new("6F1C2A5E-0D3B-4C7A-9E21-ABCDEF012345").unwrap();
+        let name = CString::new("Shane's iPhone").unwrap();
+        unsafe {
+            assert!(sassytalkie_init_with_identity(id.as_ptr(), name.as_ptr()));
+            assert!(sassytalkie_init_with_identity(id.as_ptr(), name.as_ptr()));
+            assert!(app_state().lock().unwrap().is_some());
+            sassytalkie_shutdown();
+            assert!(app_state().lock().unwrap().is_none());
+            assert!(PLAYOUT.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn catchup_cursor_matches_core() {
+        let t = 1_700_000_000_000u64;
+        unsafe {
+            assert_eq!(sassytalkie_relay_catchup_since(0, t), 0);
+            assert_eq!(sassytalkie_relay_catchup_since(t - 1_000, t), t - 1_250);
+            assert_eq!(sassytalkie_relay_catchup_since(t - 60_000, t), 0);
+        }
     }
 }

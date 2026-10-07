@@ -4,7 +4,6 @@
 //! control — iOS control-plane frames. Wire format is the shared core envelope.
 
 use sassytalkie_core::pqc;
-use sassytalkie_core::protocol::OP_HEARTBEAT;
 use sassytalkie_core::ptt_frames;
 
 pub const PRESENCE_IDLE: u8 = 0;
@@ -28,7 +27,7 @@ pub fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use sassytalkie_core::control_auth::{classify_inbound, ControlAuthCodec, InboundControl};
-    use sassytalkie_core::protocol::OP_AUTHENTICATED;
+    use sassytalkie_core::protocol::{OP_AUTHENTICATED, OP_HEARTBEAT};
 
     #[test]
     fn heartbeat_is_tlv_with_caps_byte() {
