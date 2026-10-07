@@ -9,6 +9,40 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [Unreleased]
+
+### Fixed
+- **Senders silently inaudible on desktop and iPhone (since 3.2):** the
+  authenticated control plane treated any frame starting below 0x10 as a
+  legacy hint. Sealed audio starts with a per-session random nonce prefix,
+  so in 1 session in 16 a sender was dropped entirely by desktop and iOS
+  listeners until it restarted. Legacy hints are now single-byte only.
+- **Reconnect catch-up (since 3.2.6):** every reconnect asked the relay for
+  `catchup=1`, and no client unwrapped OP_REPLAY_FRAME, so up to 30 s of
+  replay went into the AEAD as garbage (diagnostics read it as a key
+  mismatch). Clients now unwrap replays, drop replayed control, and ask only
+  for the gap they missed (`since=`, 15 s cap). Relay: no self-echo or stale
+  control in replays; 13-byte PTT_START_V2 wakes offline peers again.
+- **Desktop:** receiving indicator and incoming chime never fired (3.2.7);
+  Linux build (stylesheet case, libsecret vault that never compiled);
+  invite links pasted inside chat text.
+- **iOS:** relay stayed offline after one failed /auth; app stuck on
+  "Receiving"; status messages overwritten every 100 ms; init failed without
+  Wi-Fi multicast; one Opus decoder shared by every relay talker; AirPods /
+  route changes silenced audio; render thread took the global lock; stale mic
+  audio at the start of each press; random per-launch identity; channel
+  stepper past the 8 sessions support; mic left hot after preemption or the
+  60 s limit; PaywallView did not compile for iOS 14; no StoreKit
+  `Transaction.updates` listener; restore without `AppStore.sync()`; promo
+  users who later bought were locked out when the promo lapsed.
+
+### Added
+- **Desktop floor control:** claims and releases the floor with
+  PTT_START_V2/STOP_V2, refuses "Channel busy", yields to emergency / lower
+  epoch, EOT_ACKs peers, 60 s safety limit (Android/iOS parity).
+- **CI:** first green run. iOS simulator build (Rust + Swift) with a bridging
+  header vs Rust FFI drift check; Android SDK and CMake 4 fixes.
+
 ## [3.2.7] (83 Android / 85 iOS) - 2026-09-24
 
 ### Added
