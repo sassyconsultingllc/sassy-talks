@@ -37,7 +37,7 @@
 /// existing TX/RX threads in `lib.rs` drive either transport with one branch.
 ///
 /// Copyright 2025 Sassy Consulting LLC. All rights reserved.
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -146,8 +146,11 @@ pub struct CellularTransport {
     packets_sent: AtomicU32,
     packets_received: AtomicU32,
 
-    /// After the first successful dial, reconnects request ?catchup=1.
+    /// After the first successful dial, reconnects ask the relay to replay the
+    /// gap they missed (`since=`, see `core::protocol::catchup_since_ms`).
     has_completed_handshake: AtomicBool,
+    /// Wall-clock ms the socket was last known alive (dial or inbound frame).
+    last_alive_ms: AtomicU64,
 
     control: ControlPlane,
 }
@@ -178,6 +181,7 @@ impl CellularTransport {
             packets_sent: AtomicU32::new(0),
             packets_received: AtomicU32::new(0),
             has_completed_handshake: AtomicBool::new(false),
+            last_alive_ms: AtomicU64::new(0),
             control,
         })
     }
@@ -269,7 +273,14 @@ impl CellularTransport {
             uuid::Uuid::new_v4(),
         );
         if self.has_completed_handshake.load(Ordering::Relaxed) {
-            url.push_str("&catchup=1");
+            // Only the gap we missed; catchup=1 replayed the whole ~30 s window
+            // (already-heard audio + stale control) on every reconnect.
+            if let Some(since) = sassytalkie_core::protocol::catchup_since_ms(
+                self.last_alive_ms.load(Ordering::Relaxed),
+                unix_now_ms(),
+            ) {
+                url.push_str(&format!("&since={since}"));
+            }
         }
         let mut request = url
             .into_client_request()
@@ -297,6 +308,7 @@ impl CellularTransport {
             _ => DialError::Retryable(format!("ws connect failed: {}", e)),
         })?;
         self.has_completed_handshake.store(true, Ordering::Relaxed);
+        self.last_alive_ms.store(unix_now_ms(), Ordering::Relaxed);
         Ok(stream)
     }
 
@@ -403,12 +415,21 @@ impl CellularTransport {
         }
     }
 
-    /// Route an inbound binary frame: authenticated control first, else audio.
+    /// Route an inbound binary frame: relay catch-up unwrapped first, then
+    /// authenticated control, else audio.
     fn handle_inbound(&self, bytes: Vec<u8>) {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_ms = unix_now_ms();
+        self.last_alive_ms.store(now_ms, Ordering::Relaxed);
+        // OP_REPLAY_FRAME is not a TLV and must be unwrapped before the AEAD
+        // sees it. Only audio is caught up; replayed control is dropped.
+        if let Some(inner) = sassytalkie_core::protocol::replay_inner(&bytes) {
+            if sassytalkie_core::protocol::is_control_frame_shape(inner) {
+                return;
+            }
+            let inner = inner.to_vec();
+            self.handle_audio(inner);
+            return;
+        }
         match self.control.handle_inbound(&bytes, now_ms, |session| {
             *self.crypto.lock().unwrap() = session;
         }) {
@@ -429,6 +450,11 @@ impl CellularTransport {
                 return;
             }
         }
+        self.handle_audio(bytes);
+    }
+
+    /// Decrypt a sealed audio frame (live or unwrapped catch-up) and queue it.
+    fn handle_audio(&self, bytes: Vec<u8>) {
         let plain = {
             let live = self.crypto.lock().unwrap().decrypt(&bytes);
             match live {
@@ -601,20 +627,18 @@ fn https_base() -> String {
         .replacen("ws://", "http://", 1)
 }
 
-/// Is this a non-audio control frame? Matches the relay/Kotlin classifier:
-/// opcode in 0x10..=0x1F AND a TLV payload length that exactly accounts for the
-/// frame size. Encrypted audio frames begin with a 12-byte random nonce, so the
-/// joint opcode + exact-length check makes a false positive astronomically rare.
+/// Is this a non-audio control frame? Shared with every other client via
+/// `core::protocol::is_control_frame_shape` (opcode in 0x10..=0x20 AND a TLV
+/// length that exactly accounts for the frame).
 fn is_control_frame(b: &[u8]) -> bool {
-    if b.len() < 3 {
-        return false;
-    }
-    let op = b[0];
-    if !(0x10..=0x20).contains(&op) {
-        return false;
-    }
-    let payload_len = u16::from_le_bytes([b[1], b[2]]) as usize;
-    b.len() == 3 + payload_len
+    sassytalkie_core::protocol::is_control_frame_shape(b)
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Minimal percent-encoding for query values (RFC 3986 unreserved set passes
@@ -685,6 +709,69 @@ mod tests {
         assert!(!is_control_frame(&frame));
         let recovered = rx.decrypt(&frame).unwrap();
         assert_eq!(&recovered, opus);
+    }
+
+    fn replay_wrap(original: &[u8]) -> Vec<u8> {
+        let mut out = vec![sassytalkie_core::protocol::OP_REPLAY_FRAME, 0, 0];
+        out.extend_from_slice(original);
+        out
+    }
+
+    fn test_transport(key: [u8; 32]) -> Arc<CellularTransport> {
+        CellularTransport::new(
+            CellularConfig {
+                room_id: "room-test-0001".into(),
+                device_name: "desk".into(),
+                peer_id: "desk-peer".into(),
+            },
+            CryptoSession::from_psk(&key),
+            key,
+        )
+    }
+
+    /// The 3.2.6 regression: reconnects asked for catch-up but the replay
+    /// header went straight into the AEAD, so nothing replayed ever played.
+    #[tokio::test]
+    async fn replayed_audio_from_a_peer_decrypts_and_plays_once() {
+        let key = generate_psk();
+        let t = test_transport(key);
+        let mut rx = t.take_audio_receiver().unwrap();
+
+        let mut phone = CryptoSession::from_psk(&key);
+        let wire = wire::pack_wire_frame(1, wire::SUBCH_MAIN, "phone", "Phone", 42, b"opus-bytes");
+        let sealed = phone.encrypt(&wire).unwrap();
+
+        t.handle_inbound(replay_wrap(&sealed));
+        let frame = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("replayed frame must reach the decoder")
+            .unwrap();
+        assert_eq!(frame.sender, "phone");
+        assert_eq!(frame.opus, b"opus-bytes");
+
+        // Heard live already → the same sealed frame replayed is rejected by
+        // the AEAD replay window, not played twice.
+        t.handle_inbound(replay_wrap(&sealed));
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn replayed_control_and_own_audio_never_play() {
+        let key = generate_psk();
+        let t = test_transport(key);
+        let mut rx = t.take_audio_receiver().unwrap();
+
+        let ctrl = sassytalkie_core::protocol::encode_tlv(
+            sassytalkie_core::protocol::OP_AUTHENTICATED,
+            &[5u8; 40],
+        );
+        t.handle_inbound(replay_wrap(&ctrl));
+
+        let mut me = CryptoSession::from_psk(&key);
+        let own = wire::pack_wire_frame(1, wire::SUBCH_MAIN, "desk-peer", "desk", 7, b"mine");
+        t.handle_inbound(replay_wrap(&me.encrypt(&own).unwrap()));
+
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
     }
 
     #[test]

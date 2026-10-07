@@ -229,6 +229,10 @@ pub struct CellularTransport {
     /// Inbound frames dropped for exceeding MAX_PACKET_SIZE (distinct from
     /// queue-overflow drops, which live on each PacketQueue).
     packets_dropped_oversize: u64,
+    /// Relay catch-up (OP_REPLAY_FRAME) frames unwrapped and queued as audio.
+    replayed_audio: u64,
+    /// Relay catch-up frames whose payload was control — dropped by design.
+    replayed_control_dropped: u64,
     /// Kotlin reports the result of the actual WebSocket.send call. A failed
     /// bearer is excluded from live TX gating until reconnect or a success.
     tx_send_allowed: bool,
@@ -248,6 +252,8 @@ impl CellularTransport {
             packets_queued: 0,
             packets_received: 0,
             packets_dropped_oversize: 0,
+            replayed_audio: 0,
+            replayed_control_dropped: 0,
             tx_send_allowed: false,
             last_send_success: None,
         }
@@ -361,6 +367,21 @@ impl CellularTransport {
             return;
         }
         self.packets_received += 1;
+        // Catch-up frames from the relay arrive wrapped as OP_REPLAY_FRAME.
+        // Unwrap so the original sealed audio reaches the AEAD intact (as-is,
+        // the 3-byte header shifted the nonce and every replayed frame failed
+        // to decrypt). Frames already heard live are rejected by the replay
+        // window; replayed control is dropped — a stale PTT_START must never
+        // take the floor seconds after the fact.
+        if let Some(inner) = sassytalkie_core::protocol::replay_inner(&data) {
+            if sassytalkie_core::protocol::is_control_frame_shape(inner) {
+                self.replayed_control_dropped += 1;
+                return;
+            }
+            self.replayed_audio += 1;
+            self.inbound.push(inner.to_vec());
+            return;
+        }
         self.inbound.push(data);
     }
 
@@ -469,7 +490,7 @@ impl CellularTransport {
     /// Get stats as JSON string
     pub fn get_stats(&self) -> String {
         format!(
-            r#"{{"state":"{}","room":"{}","queued":{},"sent":{},"send_failed":{},"tx_live":{},"last_send_success_age_ms":{},"received":{},"inbound_queue":{},"outbound_queue":{},"inbound_oldest_age_ms":{},"outbound_oldest_age_ms":{},"dropped_inbound_overflow":{},"dropped_outbound_overflow":{},"dropped_inbound_stale":{},"dropped_outbound_stale":{},"dropped_oversize":{}}}"#,
+            r#"{{"state":"{}","room":"{}","queued":{},"sent":{},"send_failed":{},"tx_live":{},"last_send_success_age_ms":{},"received":{},"inbound_queue":{},"outbound_queue":{},"inbound_oldest_age_ms":{},"outbound_oldest_age_ms":{},"dropped_inbound_overflow":{},"dropped_outbound_overflow":{},"dropped_inbound_stale":{},"dropped_outbound_stale":{},"dropped_oversize":{},"replayed_audio":{},"replayed_control_dropped":{}}}"#,
             match self.state {
                 CellularState::Disconnected => "disconnected",
                 CellularState::Connecting => "connecting",
@@ -493,7 +514,9 @@ impl CellularTransport {
             self.outbound.dropped(),
             self.inbound.dropped_stale(),
             self.outbound.dropped_stale(),
-            self.packets_dropped_oversize
+            self.packets_dropped_oversize,
+            self.replayed_audio,
+            self.replayed_control_dropped
         )
     }
 }
@@ -519,6 +542,35 @@ fn urlencoded(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn relay_replay(original: &[u8]) -> Vec<u8> {
+        let mut out = vec![sassytalkie_core::protocol::OP_REPLAY_FRAME, 0, 0];
+        out.extend_from_slice(original);
+        out
+    }
+
+    #[test]
+    fn replayed_audio_is_unwrapped_before_it_reaches_the_aead() {
+        let mut t = CellularTransport::new("test");
+        let sealed: Vec<u8> = (0u8..80).collect();
+        t.on_message_received(relay_replay(&sealed));
+        assert_eq!(t.inbound_queue().pop(), Some(sealed), "header stripped, frame intact");
+        assert!(t.get_stats().contains("\"replayed_audio\":1"));
+    }
+
+    #[test]
+    fn replayed_control_is_dropped_live_frames_pass_through() {
+        let mut t = CellularTransport::new("test");
+        let sealed_control =
+            sassytalkie_core::protocol::encode_tlv(sassytalkie_core::protocol::OP_AUTHENTICATED, &[9u8; 40]);
+        t.on_message_received(relay_replay(&sealed_control));
+        assert_eq!(t.inbound_queue().len(), 0, "stale control must not be replayed");
+
+        let live: Vec<u8> = (100u8..180).collect();
+        t.on_message_received(live.clone());
+        assert_eq!(t.inbound_queue().pop(), Some(live));
+        assert!(t.get_stats().contains("\"replayed_control_dropped\":1"));
+    }
 
     #[test]
     fn queue_drops_expired_packets_before_delivery() {
