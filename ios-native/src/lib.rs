@@ -5,24 +5,24 @@
 // Copyright 2025 Sassy Consulting LLC. All rights reserved.
 
 //! iOS Core Library for SassyTalkie PTT Walkie-Talkie
-//! 
+//!
 //! This library provides the core Rust functionality for iOS,
 //! with FFI bindings for Swift to call into.
 
 pub mod audio;
 pub mod bluetooth;
 pub mod codec;
-pub mod protocol;
-pub mod state;
-pub mod transport;
 pub mod control;
 pub mod ffi;
 pub mod floor;
+pub mod protocol;
+pub mod state;
+pub mod transport;
 
 pub use audio::{AudioEngine, AudioFrame};
-pub use codec::{OpusEncoder, OpusDecoder};
+pub use codec::{OpusDecoder, OpusEncoder};
 pub use protocol::{Packet, PacketType};
-pub use state::{StateMachine, AppState};
+pub use state::{AppState, StateMachine};
 
 // Shared cross-platform crypto/session/PQC from the core crate — the SAME engine
 // Android (android-native re-exports these) and desktop use. iOS previously had
@@ -35,15 +35,17 @@ pub use sassytalkie_core::session;
 // AES-GCM path Android and desktop use (parity for link-import).
 pub use sassytalkie_core::share;
 
-use std::os::raw::c_char;
-use std::ffi::{CStr, CString};
-use std::sync::{Mutex, OnceLock};
-use log::info;
 use base64::Engine as _;
+use log::info;
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
+use std::sync::{Mutex, OnceLock};
 
 /// Base64-decode a C string argument to bytes, or None on null/invalid input.
 unsafe fn decode_b64_arg(p: *const c_char) -> Option<Vec<u8>> {
-    if p.is_null() { return None; }
+    if p.is_null() {
+        return None;
+    }
     let s = CStr::from_ptr(p).to_str().ok()?;
     base64::engine::general_purpose::STANDARD.decode(s).ok()
 }
@@ -93,7 +95,7 @@ fn install_state(state: StateMachine) -> bool {
 }
 
 /// Initialize the library
-/// 
+///
 /// # Safety
 /// This function must be called before any other library functions
 #[no_mangle]
@@ -154,7 +156,7 @@ pub unsafe extern "C" fn sassytalkie_shutdown() {
 }
 
 /// Get version string
-/// 
+///
 /// # Safety
 /// Caller must free the returned string with `sassytalkie_free_string`
 #[no_mangle]
@@ -163,7 +165,7 @@ pub unsafe extern "C" fn sassytalkie_get_version() -> *const c_char {
 }
 
 /// Free a string allocated by the library
-/// 
+///
 /// # Safety
 /// Pointer must have been returned by a library function
 #[no_mangle]
@@ -180,12 +182,20 @@ pub unsafe extern "C" fn sassytalkie_free_string(s: *mut c_char) {
 /// decrypted (+ replay-checked).
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_set_psk(key_b64: *const c_char) -> bool {
-    let bytes = match decode_b64_arg(key_b64) { Some(b) => b, None => return false };
-    if bytes.len() != 32 { return false; }
+    let bytes = match decode_b64_arg(key_b64) {
+        Some(b) => b,
+        None => return false,
+    };
+    if bytes.len() != 32 {
+        return false;
+    }
     let mut key = [0u8; 32];
     key.copy_from_slice(&bytes);
     if let Ok(g) = app_state().lock() {
-        if let Some(s) = g.as_ref() { s.set_psk(&key); return true; }
+        if let Some(s) = g.as_ref() {
+            s.set_psk(&key);
+            return true;
+        }
     }
     false
 }
@@ -202,7 +212,9 @@ pub unsafe extern "C" fn sassytalkie_import_session_qr(qr_json: *const c_char) -
         _ => return 0,
     };
     if let Ok(g) = app_state().lock() {
-        if let Some(s) = g.as_ref() { return s.import_session_qr(&json).unwrap_or(0); }
+        if let Some(s) = g.as_ref() {
+            return s.import_session_qr(&json).unwrap_or(0);
+        }
     }
     0
 }
@@ -252,8 +264,14 @@ pub unsafe extern "C" fn sassytalkie_generate_session_qr(
 ) -> *mut c_char {
     let group = ffi::helpers::c_string_to_rust(group_name).unwrap_or_default();
     let json = {
-        let g = match app_state().lock() { Ok(g) => g, Err(_) => return std::ptr::null_mut() };
-        match g.as_ref().and_then(|s| s.generate_session_qr(channel, duration_hours, &group)) {
+        let g = match app_state().lock() {
+            Ok(g) => g,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        match g
+            .as_ref()
+            .and_then(|s| s.generate_session_qr(channel, duration_hours, &group))
+        {
             Some(j) => j,
             None => return std::ptr::null_mut(),
         }
@@ -270,7 +288,10 @@ pub unsafe extern "C" fn sassytalkie_generate_session_qr(
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_key_exchange_init() -> *mut c_char {
     let pubkey = {
-        let g = match app_state().lock() { Ok(g) => g, Err(_) => return std::ptr::null_mut() };
+        let g = match app_state().lock() {
+            Ok(g) => g,
+            Err(_) => return std::ptr::null_mut(),
+        };
         match g.as_ref() {
             Some(s) => s.key_exchange_init(),
             None => return std::ptr::null_mut(),
@@ -283,12 +304,19 @@ pub unsafe extern "C" fn sassytalkie_key_exchange_init() -> *mut c_char {
 /// installing the AEAD session. Returns true on success.
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_key_exchange_complete(remote_b64: *const c_char) -> bool {
-    let bytes = match decode_b64_arg(remote_b64) { Some(b) => b, None => return false };
-    if bytes.len() != 32 { return false; }
+    let bytes = match decode_b64_arg(remote_b64) {
+        Some(b) => b,
+        None => return false,
+    };
+    if bytes.len() != 32 {
+        return false;
+    }
     let mut remote = [0u8; 32];
     remote.copy_from_slice(&bytes);
     if let Ok(g) = app_state().lock() {
-        if let Some(s) = g.as_ref() { return s.key_exchange_complete(&remote); }
+        if let Some(s) = g.as_ref() {
+            return s.key_exchange_complete(&remote);
+        }
     }
     false
 }
@@ -298,7 +326,9 @@ pub unsafe extern "C" fn sassytalkie_key_exchange_complete(remote_b64: *const c_
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_wipe_session() {
     if let Ok(g) = app_state().lock() {
-        if let Some(s) = g.as_ref() { s.wipe_session(); }
+        if let Some(s) = g.as_ref() {
+            s.wipe_session();
+        }
     }
 }
 
@@ -331,7 +361,9 @@ pub unsafe extern "C" fn sassytalkie_set_enrollment_token(token: *const c_char) 
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_hybrid_handshake_confirm() -> bool {
     if let Ok(g) = app_state().lock() {
-        if let Some(s) = g.as_ref() { return s.hybrid_confirm(); }
+        if let Some(s) = g.as_ref() {
+            return s.hybrid_confirm();
+        }
     }
     false
 }
@@ -341,7 +373,9 @@ pub unsafe extern "C" fn sassytalkie_hybrid_handshake_confirm() -> bool {
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_local_capabilities() -> u8 {
     if let Ok(g) = app_state().lock() {
-        if let Some(s) = g.as_ref() { return s.local_capabilities(); }
+        if let Some(s) = g.as_ref() {
+            return s.local_capabilities();
+        }
     }
     0
 }
@@ -352,7 +386,10 @@ pub unsafe extern "C" fn sassytalkie_local_capabilities() -> u8 {
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_hybrid_handshake_init() -> *mut c_char {
     let msg = {
-        let g = match app_state().lock() { Ok(g) => g, Err(_) => return std::ptr::null_mut() };
+        let g = match app_state().lock() {
+            Ok(g) => g,
+            Err(_) => return std::ptr::null_mut(),
+        };
         match g.as_ref().and_then(|s| s.hybrid_init()) {
             Some(m) => m,
             None => return std::ptr::null_mut(),
@@ -365,10 +402,18 @@ pub unsafe extern "C" fn sassytalkie_hybrid_handshake_init() -> *mut c_char {
 /// return the base64 responder message (free with sassytalkie_free_string), or
 /// null on failure.
 #[no_mangle]
-pub unsafe extern "C" fn sassytalkie_hybrid_handshake_respond(init_b64: *const c_char) -> *mut c_char {
-    let init_bytes = match decode_b64_arg(init_b64) { Some(b) => b, None => return std::ptr::null_mut() };
+pub unsafe extern "C" fn sassytalkie_hybrid_handshake_respond(
+    init_b64: *const c_char,
+) -> *mut c_char {
+    let init_bytes = match decode_b64_arg(init_b64) {
+        Some(b) => b,
+        None => return std::ptr::null_mut(),
+    };
     let resp = {
-        let g = match app_state().lock() { Ok(g) => g, Err(_) => return std::ptr::null_mut() };
+        let g = match app_state().lock() {
+            Ok(g) => g,
+            Err(_) => return std::ptr::null_mut(),
+        };
         match g.as_ref().and_then(|s| s.hybrid_respond(&init_bytes)) {
             Some(r) => r,
             None => return std::ptr::null_mut(),
@@ -382,9 +427,14 @@ pub unsafe extern "C" fn sassytalkie_hybrid_handshake_respond(init_b64: *const c
 /// sassytalkie_hybrid_handshake_init on this device.
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_hybrid_handshake_complete(resp_b64: *const c_char) -> bool {
-    let resp_bytes = match decode_b64_arg(resp_b64) { Some(b) => b, None => return false };
+    let resp_bytes = match decode_b64_arg(resp_b64) {
+        Some(b) => b,
+        None => return false,
+    };
     if let Ok(g) = app_state().lock() {
-        if let Some(s) = g.as_ref() { return s.hybrid_complete(&resp_bytes); }
+        if let Some(s) = g.as_ref() {
+            return s.hybrid_complete(&resp_bytes);
+        }
     }
     false
 }
@@ -400,7 +450,9 @@ fn bytes_into_raw(v: Vec<u8>, out_len: *mut usize) -> *mut u8 {
     let boxed = v.into_boxed_slice();
     let len = boxed.len();
     let ptr = Box::into_raw(boxed) as *mut u8;
-    unsafe { *out_len = len; }
+    unsafe {
+        *out_len = len;
+    }
     ptr
 }
 
@@ -411,7 +463,9 @@ fn bytes_into_raw(v: Vec<u8>, out_len: *mut usize) -> *mut u8 {
 /// `ptr`/`len` must be exactly a pair previously returned by those functions.
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_free_bytes(ptr: *mut u8, len: usize) {
-    if ptr.is_null() { return; }
+    if ptr.is_null() {
+        return;
+    }
     let slice = std::slice::from_raw_parts_mut(ptr, len);
     let _ = Box::from_raw(slice as *mut [u8]);
 }
@@ -421,13 +475,18 @@ pub unsafe extern "C" fn sassytalkie_free_bytes(ptr: *mut u8, len: usize) {
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_relay_room_id() -> *mut c_char {
     let id = {
-        let g = match app_state().lock() { Ok(g) => g, Err(_) => return std::ptr::null_mut() };
+        let g = match app_state().lock() {
+            Ok(g) => g,
+            Err(_) => return std::ptr::null_mut(),
+        };
         match g.as_ref().and_then(|s| s.relay_room_id()) {
             Some(r) => r,
             None => return std::ptr::null_mut(),
         }
     };
-    CString::new(id).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(id)
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// Mark the relay connected (true) / disconnected (false). While connected, TX
@@ -435,7 +494,9 @@ pub unsafe extern "C" fn sassytalkie_relay_room_id() -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_relay_set_active(active: bool) {
     if let Ok(g) = app_state().lock() {
-        if let Some(s) = g.as_ref() { s.set_relay_active(active); }
+        if let Some(s) = g.as_ref() {
+            s.set_relay_active(active);
+        }
     }
 }
 
@@ -447,10 +508,15 @@ pub unsafe extern "C" fn sassytalkie_relay_set_active(active: bool) {
 /// `out_len` must be a valid pointer to a usize.
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_relay_poll_outbound(out_len: *mut usize) -> *mut u8 {
-    if out_len.is_null() { return std::ptr::null_mut(); }
+    if out_len.is_null() {
+        return std::ptr::null_mut();
+    }
     *out_len = 0;
     let frame = {
-        let g = match app_state().lock() { Ok(g) => g, Err(_) => return std::ptr::null_mut() };
+        let g = match app_state().lock() {
+            Ok(g) => g,
+            Err(_) => return std::ptr::null_mut(),
+        };
         match g.as_ref().and_then(|s| s.poll_relay_outbound()) {
             Some(f) => f,
             None => return std::ptr::null_mut(),
@@ -466,10 +532,15 @@ pub unsafe extern "C" fn sassytalkie_relay_poll_outbound(out_len: *mut usize) ->
 /// `out_len` must be a valid pointer to a usize.
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_relay_heartbeat_frame(out_len: *mut usize) -> *mut u8 {
-    if out_len.is_null() { return std::ptr::null_mut(); }
+    if out_len.is_null() {
+        return std::ptr::null_mut();
+    }
     *out_len = 0;
     let frame = {
-        let g = match app_state().lock() { Ok(g) => g, Err(_) => return std::ptr::null_mut() };
+        let g = match app_state().lock() {
+            Ok(g) => g,
+            Err(_) => return std::ptr::null_mut(),
+        };
         match g.as_ref() {
             Some(s) => s.relay_heartbeat_frame(),
             None => return std::ptr::null_mut(),
@@ -486,10 +557,14 @@ pub unsafe extern "C" fn sassytalkie_relay_heartbeat_frame(out_len: *mut usize) 
 /// `ptr` must point to `len` valid bytes.
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_relay_on_message(ptr: *const u8, len: usize) -> bool {
-    if ptr.is_null() || len == 0 { return false; }
+    if ptr.is_null() || len == 0 {
+        return false;
+    }
     let bytes = std::slice::from_raw_parts(ptr, len);
     if let Ok(g) = app_state().lock() {
-        if let Some(s) = g.as_ref() { return s.process_relay_frame(bytes); }
+        if let Some(s) = g.as_ref() {
+            return s.process_relay_frame(bytes);
+        }
     }
     false
 }
@@ -626,7 +701,9 @@ pub unsafe extern "C" fn sassytalkie_take_ptt_reject() -> *mut c_char {
     if let Ok(g) = app_state().lock() {
         if let Some(s) = g.as_ref() {
             if let Some(reason) = s.floor().take_reject_reason() {
-                return CString::new(reason).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut());
+                return CString::new(reason)
+                    .map(|c| c.into_raw())
+                    .unwrap_or(std::ptr::null_mut());
             }
         }
     }
@@ -664,7 +741,9 @@ pub unsafe extern "C" fn sassytalkie_encrypt_share_blob(json: *const c_char) -> 
 pub unsafe extern "C" fn sassytalkie_tls_pins_json() -> *mut c_char {
     let json = serde_json::to_string(sassytalkie_core::tls_pins::SPKI_PINS_SHA256_B64)
         .unwrap_or_else(|_| "[]".into());
-    CString::new(json).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut())
+    CString::new(json)
+        .map(|c| c.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
@@ -691,7 +770,7 @@ pub unsafe extern "C" fn sassytalkie_get_state() -> u8 {
 }
 
 /// Process audio input from Swift (AVAudioEngine)
-/// 
+///
 /// # Safety
 /// `audio_data` must point to valid PCM samples
 #[no_mangle]
@@ -715,7 +794,7 @@ pub unsafe extern "C" fn sassytalkie_process_audio_input(
 
 /// Get audio output for Swift (AVAudioEngine)
 /// Returns number of samples written
-/// 
+///
 /// # Safety
 /// `buffer` must have space for at least `buffer_size` samples
 #[no_mangle]
@@ -752,7 +831,7 @@ pub unsafe extern "C" fn sassytalkie_get_audio_output(
 // The advertised + scanned GATT service UUID MUST match the Android app so iOS↔Android
 // peers discover each other.
 
-use crate::bluetooth::{BluetoothManager, BluetoothDevice};
+use crate::bluetooth::{BluetoothDevice, BluetoothManager};
 
 /// SassyTalkie BLE service UUID — identical to Android `BleSignalingService.SERVICE_UUID`.
 pub const SASSYTALKIE_BLE_SERVICE_UUID: &str = "b1a2e5d4-d5ab-7890-bede-fa12345678f0";
@@ -771,7 +850,9 @@ fn bt_manager() -> &'static Mutex<BluetoothManager> {
 /// Caller must free the returned string with `sassytalkie_free_string`.
 #[no_mangle]
 pub unsafe extern "C" fn sassytalkie_bt_service_uuid() -> *const c_char {
-    CString::new(SASSYTALKIE_BLE_SERVICE_UUID).unwrap().into_raw()
+    CString::new(SASSYTALKIE_BLE_SERVICE_UUID)
+        .unwrap()
+        .into_raw()
 }
 
 /// Register a peer discovered by the Swift CoreBluetooth central.

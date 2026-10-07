@@ -16,8 +16,8 @@ mod android;
 pub use android::*;
 
 mod crypto;
-pub mod secret_store;
 mod os_vault;
+pub mod secret_store;
 pub use crypto::CryptoEngine;
 
 use thiserror::Error;

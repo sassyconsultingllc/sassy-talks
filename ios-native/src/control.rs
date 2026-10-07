@@ -31,7 +31,13 @@ mod tests {
 
     #[test]
     fn heartbeat_is_tlv_with_caps_byte() {
-        let hb = encode_heartbeat(0xDEAD_BEEF_CAFE_F00D, 7, 1_700_000_000_000, PRESENCE_IDLE, 0);
+        let hb = encode_heartbeat(
+            0xDEAD_BEEF_CAFE_F00D,
+            7,
+            1_700_000_000_000,
+            PRESENCE_IDLE,
+            0,
+        );
         assert_eq!(hb[0], OP_HEARTBEAT);
         let len = u16::from_le_bytes([hb[1], hb[2]]) as usize;
         assert_eq!(len, 24);

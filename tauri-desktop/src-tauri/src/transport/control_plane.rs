@@ -43,7 +43,10 @@ pub enum ControlAction {
     /// Not a control TLV — caller should treat as audio.
     NotControl,
     Ignore,
-    Rejected { reason: &'static str, opcode: u8 },
+    Rejected {
+        reason: &'static str,
+        opcode: u8,
+    },
     Heartbeat,
     HybridOutbound(Vec<u8>),
     Emergency,
@@ -65,8 +68,7 @@ impl ControlPlane {
 
     pub fn install_psk(&self, key: [u8; 32], room_id: &str, sender_id: &str, epoch: u64) {
         *self.psk.lock().unwrap() = Some(key);
-        *self.codec.lock().unwrap() =
-            ControlAuthCodec::new(key, room_id, sender_id, epoch).ok();
+        *self.codec.lock().unwrap() = ControlAuthCodec::new(key, room_id, sender_id, epoch).ok();
     }
 
     pub fn clear(&self) {
@@ -79,7 +81,12 @@ impl ControlPlane {
     }
 
     pub fn seal(&self, inner: &[u8], now_ms: u64) -> Option<Vec<u8>> {
-        self.codec.lock().unwrap().as_ref()?.seal(inner, now_ms).ok()
+        self.codec
+            .lock()
+            .unwrap()
+            .as_ref()?
+            .seal(inner, now_ms)
+            .ok()
     }
 
     pub fn encode_heartbeat_sealed(
@@ -257,7 +264,12 @@ impl ControlPlane {
                 opcode: OP_HYBRID_CONFIRM,
             };
         };
-        if !confirm_acceptable(Some(&staged.token), Some(token), now_ms, staged.staged_at_ms) {
+        if !confirm_acceptable(
+            Some(&staged.token),
+            Some(token),
+            now_ms,
+            staged.staged_at_ms,
+        ) {
             return ControlAction::Rejected {
                 reason: "hybrid_confirm",
                 opcode: OP_HYBRID_CONFIRM,

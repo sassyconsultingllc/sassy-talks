@@ -64,8 +64,8 @@ mod win {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::FILETIME;
     use windows::Win32::Security::Credentials::{
-        CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_FLAGS, CRED_PERSIST_LOCAL_MACHINE,
-        CRED_TYPE_GENERIC,
+        CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_FLAGS,
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
     };
 
     fn wide(s: &str) -> Vec<u16> {
@@ -265,7 +265,9 @@ mod linux {
         // No secret service on this session (headless, no keyring daemon) is
         // "nothing stored", so the caller falls back to the AES file store.
         let Ok(ss) = connect() else { return Ok(None) };
-        let Ok(items) = find(&ss, target) else { return Ok(None) };
+        let Ok(items) = find(&ss, target) else {
+            return Ok(None);
+        };
         let Some(item) = items.into_iter().next() else {
             return Ok(None);
         };
@@ -276,7 +278,9 @@ mod linux {
 
     pub fn delete(target: &str) -> Result<(), String> {
         let Ok(ss) = connect() else { return Ok(()) };
-        let Ok(items) = find(&ss, target) else { return Ok(()) };
+        let Ok(items) = find(&ss, target) else {
+            return Ok(());
+        };
         for item in items {
             let _ = item.delete();
         }
@@ -408,7 +412,12 @@ impl SecretVault for MemoryVault {
         Ok(())
     }
     fn get(&self, target: &str) -> Result<Option<Vec<u8>>, String> {
-        Ok(self.inner.lock().map_err(|e| e.to_string())?.get(target).cloned())
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|e| e.to_string())?
+            .get(target)
+            .cloned())
     }
     fn delete(&self, target: &str) -> Result<(), String> {
         self.inner.lock().map_err(|e| e.to_string())?.remove(target);

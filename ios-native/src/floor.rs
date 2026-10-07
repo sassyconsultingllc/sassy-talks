@@ -94,17 +94,15 @@ impl FloorState {
         let drain_deadline = now_ms.saturating_add(policy::DRAIN_HOLD_MS);
         // fetch_update rather than a bare store: an inbound audio frame may have
         // extended the hold between the caller's `now_ms` and here.
-        let _ = self.hold_until_ms.fetch_update(
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-            |current| {
+        let _ = self
+            .hold_until_ms
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 if current > drain_deadline {
                     Some(drain_deadline)
                 } else {
                     None
                 }
-            },
-        );
+            });
     }
 
     /// Drop the floor immediately (local release, or session wipe).

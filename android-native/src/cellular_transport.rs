@@ -554,17 +554,27 @@ mod tests {
         let mut t = CellularTransport::new("test");
         let sealed: Vec<u8> = (0u8..80).collect();
         t.on_message_received(relay_replay(&sealed));
-        assert_eq!(t.inbound_queue().pop(), Some(sealed), "header stripped, frame intact");
+        assert_eq!(
+            t.inbound_queue().pop(),
+            Some(sealed),
+            "header stripped, frame intact"
+        );
         assert!(t.get_stats().contains("\"replayed_audio\":1"));
     }
 
     #[test]
     fn replayed_control_is_dropped_live_frames_pass_through() {
         let mut t = CellularTransport::new("test");
-        let sealed_control =
-            sassytalkie_core::protocol::encode_tlv(sassytalkie_core::protocol::OP_AUTHENTICATED, &[9u8; 40]);
+        let sealed_control = sassytalkie_core::protocol::encode_tlv(
+            sassytalkie_core::protocol::OP_AUTHENTICATED,
+            &[9u8; 40],
+        );
         t.on_message_received(relay_replay(&sealed_control));
-        assert_eq!(t.inbound_queue().len(), 0, "stale control must not be replayed");
+        assert_eq!(
+            t.inbound_queue().len(),
+            0,
+            "stale control must not be replayed"
+        );
 
         let live: Vec<u8> = (100u8..180).collect();
         t.on_message_received(live.clone());

@@ -2,15 +2,14 @@
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-RMF4M6XSR2QP
 /// Transport Module for iOS
-/// 
+///
 /// UDP multicast for WiFi-based communication
 /// Same approach as desktop version
-
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 
@@ -32,13 +31,13 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum TransportError {
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
-    
+
     #[error("Failed to bind socket: {0}")]
     BindError(String),
-    
+
     #[error("Failed to join multicast: {0}")]
     MulticastError(String),
-    
+
     #[error("Serialization error: {0}")]
     SerializationError(String),
 
@@ -89,11 +88,9 @@ const RELAY_OUTBOUND_CAP: usize = 256;
 impl TransportManager {
     /// Create new transport manager
     pub fn new() -> Result<Self, TransportError> {
-        let multicast_addr = SocketAddr::new(
-            IpAddr::V4(MULTICAST_ADDR.parse().unwrap()),
-            MULTICAST_PORT,
-        );
-        
+        let multicast_addr =
+            SocketAddr::new(IpAddr::V4(MULTICAST_ADDR.parse().unwrap()), MULTICAST_PORT);
+
         Ok(Self {
             socket: Arc::new(Mutex::new(None)),
             multicast_addr,
@@ -132,7 +129,13 @@ impl TransportManager {
     /// received over the WebSocket. `None` if there is no session or the frame
     /// fails authentication. (The caller then `unpack_wire_frame`s it.)
     pub fn open_sealed(&self, sealed: &[u8]) -> Option<Vec<u8>> {
-        if let Some(pt) = self.crypto.lock().unwrap().as_ref().and_then(|c| c.decrypt(sealed).ok()) {
+        if let Some(pt) = self
+            .crypto
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|c| c.decrypt(sealed).ok())
+        {
             return Some(pt);
         }
         let mut pending = self.pending_rx.lock().unwrap();
@@ -178,7 +181,7 @@ impl TransportManager {
     pub fn clear_crypto(&self) {
         *self.crypto.lock().unwrap() = None;
     }
-    
+
     /// Send a control envelope that is ALREADY sealed by `ControlAuthCodec`.
     /// Must not wrap it in the audio AEAD — that would double-encrypt and make
     /// `classify_inbound` miss `OP_AUTHENTICATED`. Used for PTT_START/STOP and
@@ -208,17 +211,19 @@ impl TransportManager {
                 )))
             }
         };
-        let buf_uninit: &mut [std::mem::MaybeUninit<u8>] = unsafe {
-            &mut *(raw.as_mut_slice() as *mut [u8] as *mut [std::mem::MaybeUninit<u8>])
-        };
+        let buf_uninit: &mut [std::mem::MaybeUninit<u8>] =
+            unsafe { &mut *(raw.as_mut_slice() as *mut [u8] as *mut [std::mem::MaybeUninit<u8>]) };
         match sock.recv_from(buf_uninit) {
             Ok((size, _)) => {
                 raw.truncate(size);
                 Ok(raw)
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(TransportError::IoError(
-                std::io::Error::new(std::io::ErrorKind::WouldBlock, "No data"),
-            )),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(TransportError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "No data",
+                )))
+            }
             Err(e) => Err(TransportError::IoError(e)),
         }
     }
@@ -226,28 +231,28 @@ impl TransportManager {
     /// Start transport
     pub fn start(&self) -> Result<(), TransportError> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        
+
         socket.set_reuse_address(true)?;
         socket.set_nonblocking(true)?;
-        
+
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), MULTICAST_PORT);
         socket.bind(&bind_addr.into())?;
-        
+
         // Join multicast group
         let multicast_ip: Ipv4Addr = MULTICAST_ADDR.parse().unwrap();
         socket
             .join_multicast_v4(&multicast_ip, &Ipv4Addr::UNSPECIFIED)
             .map_err(|e| TransportError::MulticastError(e.to_string()))?;
-        
+
         *self.socket.lock().unwrap() = Some(socket);
         Ok(())
     }
-    
+
     /// Stop transport
     pub fn stop(&self) {
         *self.socket.lock().unwrap() = None;
     }
-    
+
     /// Send packet. SECURITY: refuses to transmit cleartext — the whole
     /// serialized packet is sealed (`nonce||ct||tag`) with the active channel's
     /// `CryptoSession`, byte-for-byte the same framing android-native produces,
@@ -297,9 +302,12 @@ impl TransportManager {
             let socket = self.socket.lock().unwrap();
             let sock = match socket.as_ref() {
                 Some(s) => s,
-                None => return Err(TransportError::IoError(
-                    std::io::Error::new(std::io::ErrorKind::NotConnected, "Socket not initialized")
-                )),
+                None => {
+                    return Err(TransportError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "Socket not initialized",
+                    )))
+                }
             };
             // socket2 0.5 takes &mut [MaybeUninit<u8>]; `raw` is already
             // initialized so the cast is sound, and recv_from writes `size`
@@ -311,16 +319,20 @@ impl TransportManager {
                 Ok((size, addr)) => {
                     let socket_addr = match addr.as_socket() {
                         Some(sa) => sa,
-                        None => return Err(TransportError::IoError(
-                            std::io::Error::new(std::io::ErrorKind::Other, "Invalid address")
-                        )),
+                        None => {
+                            return Err(TransportError::IoError(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "Invalid address",
+                            )))
+                        }
                     };
                     (size, socket_addr)
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Err(TransportError::IoError(
-                        std::io::Error::new(std::io::ErrorKind::WouldBlock, "No data")
-                    ));
+                    return Err(TransportError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "No data",
+                    )));
                 }
                 Err(e) => return Err(TransportError::IoError(e)),
             }
@@ -345,43 +357,45 @@ impl TransportManager {
                             pt
                         }
                         None => {
-                            return Err(TransportError::IoError(
-                                std::io::Error::new(std::io::ErrorKind::WouldBlock, "Decrypt failed — dropped")
-                            ));
+                            return Err(TransportError::IoError(std::io::Error::new(
+                                std::io::ErrorKind::WouldBlock,
+                                "Decrypt failed — dropped",
+                            )));
                         }
                     }
                 }
             } else {
                 drop(live);
-                return Err(TransportError::IoError(
-                    std::io::Error::new(std::io::ErrorKind::WouldBlock, "No session — dropped")
-                ));
+                return Err(TransportError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "No session — dropped",
+                )));
             }
         };
         let copy_len = plaintext.len().min(buffer.len());
         buffer[..copy_len].copy_from_slice(&plaintext[..copy_len]);
         Ok((copy_len, addr))
     }
-    
+
     /// Add or update peer
     pub fn update_peer(&self, peer: PeerInfo) {
         let mut peers = self.peers.lock().unwrap();
         peers.insert(peer.device_id, peer);
     }
-    
+
     /// Get active peers
     pub fn get_peers(&self) -> Vec<PeerInfo> {
         let mut peers = self.peers.lock().unwrap();
-        
+
         // Remove stale peers
         let now = SystemTime::now();
         peers.retain(|_, peer| {
             now.duration_since(peer.last_seen).unwrap_or(Duration::MAX) < PEER_TIMEOUT
         });
-        
+
         peers.values().cloned().collect()
     }
-    
+
     /// Remove peer
     pub fn remove_peer(&self, device_id: u32) {
         let mut peers = self.peers.lock().unwrap();
