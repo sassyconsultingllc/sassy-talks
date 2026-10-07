@@ -24,7 +24,7 @@
 /// Legacy PTT-start (no epoch / seq). Superseded by [OP_PTT_START_V2].
 pub const OP_PTT_START: u8 = 0x01;
 /// Legacy PTT-stop. Superseded by [OP_PTT_STOP_V2].
-pub const OP_PTT_STOP:  u8 = 0x02;
+pub const OP_PTT_STOP: u8 = 0x02;
 /// Receiver acknowledges a PTT-start (BLE signalling handshake).
 pub const OP_READY_ACK: u8 = 0x03;
 /// Liveness ping (legacy; superseded by [OP_HEARTBEAT]).
@@ -164,7 +164,9 @@ pub const ALL_OPCODES: &[(&str, u8)] = &[
 /// Returns true when an opcode byte is in the TLV-framed v2 range (>= 0x10).
 /// Below that, callers should treat the byte as a legacy single-byte frame.
 #[inline]
-pub fn is_tlv_opcode(op: u8) -> bool { op >= 0x10 }
+pub fn is_tlv_opcode(op: u8) -> bool {
+    op >= 0x10
+}
 
 /// Encode a payload as `[op][len:u16 LE][payload...]`.
 ///
@@ -190,11 +192,20 @@ pub struct Tlv<'a> {
 /// too short, advertises a length past its own end, or the opcode is < 0x10
 /// (use the legacy path for those).
 pub fn parse_tlv(bytes: &[u8]) -> Option<Tlv<'_>> {
-    if bytes.len() < 3 { return None; }
-    if !is_tlv_opcode(bytes[0]) { return None; }
+    if bytes.len() < 3 {
+        return None;
+    }
+    if !is_tlv_opcode(bytes[0]) {
+        return None;
+    }
     let payload_len = (bytes[1] as usize) | ((bytes[2] as usize) << 8);
-    if bytes.len() < 3 + payload_len { return None; }
-    Some(Tlv { opcode: bytes[0], payload: &bytes[3..3 + payload_len] })
+    if bytes.len() < 3 + payload_len {
+        return None;
+    }
+    Some(Tlv {
+        opcode: bytes[0],
+        payload: &bytes[3..3 + payload_len],
+    })
 }
 
 /// The classifier every relay client uses to route a binary WebSocket message:
@@ -222,9 +233,12 @@ pub const MAX_REPLAY_PEER_ID_LEN: usize = 64;
 /// decrypting: handed to the AEAD as-is, the 3-byte header shifts the nonce and
 /// every replayed frame fails authentication.
 ///
-/// A live sealed-audio frame can begin with 0x19 (random nonce byte), so the
-/// header must also carry a plausible peer-id length and leave a frame at least
-/// as long as an AES-GCM nonce + tag; the residual collision rate is ~4e-6.
+/// A live sealed-audio frame can begin with 0x19, and because the nonce's first
+/// 8 bytes are a per-session random prefix that holds for the sender's whole
+/// session. So the header must also carry a plausible id-charset peer id and
+/// leave at least an AES-GCM nonce + tag; the residual misread rate is ~6e-8
+/// per session. Callers that decrypt inline should still fall back to the raw
+/// frame when the unwrapped one fails to open.
 ///
 /// Callers should drop a replayed frame that [`is_control_frame_shape`]: control
 /// is time-sensitive (a stale `PTT_START` would grab the floor) and only audio
@@ -236,6 +250,16 @@ pub fn replay_inner(bytes: &[u8]) -> Option<&[u8]> {
     }
     let id_len = (bytes[1] as usize) | ((bytes[2] as usize) << 8);
     if id_len > MAX_REPLAY_PEER_ID_LEN {
+        return None;
+    }
+    // Relay peer ids are `[A-Za-z0-9_-]` (the relay currently sends none).
+    // Requiring that keeps a live frame whose per-session nonce prefix happens
+    // to start 0x19 from being misread as replay for the whole session.
+    let id = bytes.get(3..3 + id_len)?;
+    if !id
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
+    {
         return None;
     }
     let inner = bytes.get(3 + id_len..)?;
@@ -331,7 +355,10 @@ mod tests {
     #[test]
     fn replay_inner_unwraps_relay_frames() {
         let sealed_audio: Vec<u8> = (0u8..60).collect();
-        assert_eq!(replay_inner(&relay_replay("", &sealed_audio)), Some(&sealed_audio[..]));
+        assert_eq!(
+            replay_inner(&relay_replay("", &sealed_audio)),
+            Some(&sealed_audio[..])
+        );
         assert_eq!(
             replay_inner(&relay_replay("peer-1234", &sealed_audio)),
             Some(&sealed_audio[..])
@@ -342,7 +369,11 @@ mod tests {
     fn replay_inner_rejects_non_replay_bytes() {
         let sealed_audio: Vec<u8> = (0u8..60).collect();
         assert_eq!(replay_inner(&sealed_audio), None, "first byte is not 0x19");
-        assert_eq!(replay_inner(&[OP_REPLAY_FRAME, 0]), None, "truncated header");
+        assert_eq!(
+            replay_inner(&[OP_REPLAY_FRAME, 0]),
+            None,
+            "truncated header"
+        );
         // A live frame whose random nonce happens to start 0x19 and whose next
         // two bytes read as a huge "peer id length" is not a replay frame.
         let mut live = sealed_audio.clone();
@@ -352,15 +383,24 @@ mod tests {
         assert_eq!(replay_inner(&live), None);
         // Header present but nothing worth decrypting after it.
         assert_eq!(replay_inner(&relay_replay("", &[1, 2, 3])), None);
+        // Peer-id bytes outside the relay's id charset: random nonce, not a header.
+        let mut odd_id = vec![OP_REPLAY_FRAME, 2, 0, 0xFF, 0x01];
+        odd_id.extend_from_slice(&sealed_audio);
+        assert_eq!(replay_inner(&odd_id), None);
         let too_long_id = "x".repeat(MAX_REPLAY_PEER_ID_LEN + 1);
-        assert_eq!(replay_inner(&relay_replay(&too_long_id, &sealed_audio)), None);
+        assert_eq!(
+            replay_inner(&relay_replay(&too_long_id, &sealed_audio)),
+            None
+        );
     }
 
     #[test]
     fn replayed_control_is_recognisable_so_clients_can_drop_it() {
         let sealed_control = encode_tlv(OP_AUTHENTICATED, &[7u8; 40]);
         let wrapped_control = relay_replay("", &sealed_control);
-        assert!(is_control_frame_shape(replay_inner(&wrapped_control).unwrap()));
+        assert!(is_control_frame_shape(
+            replay_inner(&wrapped_control).unwrap()
+        ));
         let audio: Vec<u8> = (0u8..60).collect();
         let wrapped = relay_replay("", &audio);
         assert!(!is_control_frame_shape(replay_inner(&wrapped).unwrap()));
@@ -382,8 +422,15 @@ mod tests {
         let t = 1_700_000_000_000u64;
         assert_eq!(catchup_since_ms(0, t), None, "never connected");
         assert_eq!(catchup_since_ms(t - 2_000, t), Some(t - 2_250));
-        assert_eq!(catchup_since_ms(t - MAX_CATCHUP_GAP_MS, t), Some(t - MAX_CATCHUP_GAP_MS - 250));
-        assert_eq!(catchup_since_ms(t - MAX_CATCHUP_GAP_MS - 1, t), None, "gap too long");
+        assert_eq!(
+            catchup_since_ms(t - MAX_CATCHUP_GAP_MS, t),
+            Some(t - MAX_CATCHUP_GAP_MS - 250)
+        );
+        assert_eq!(
+            catchup_since_ms(t - MAX_CATCHUP_GAP_MS - 1, t),
+            None,
+            "gap too long"
+        );
         // Clock stepped backwards: still a short gap, still a usable cursor.
         assert_eq!(catchup_since_ms(t + 500, t), Some(t + 250));
     }

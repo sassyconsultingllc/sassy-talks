@@ -42,10 +42,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::{connect_async_tls_with_config, Connector};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, HeaderValue};
+use tokio_tungstenite::tungstenite::http::header::{HeaderValue, AUTHORIZATION};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tokio_tungstenite::{connect_async_tls_with_config, Connector};
 use tracing::{debug, info, warn};
 
 use sassytalkie_core::crypto::CryptoSession;
@@ -294,19 +294,14 @@ impl CellularTransport {
         let tls = super::tls_pinning::client_config()
             .map_err(|e| DialError::TerminalAuth(format!("tls config: {e}")))?;
         let connector = Connector::Rustls(std::sync::Arc::new(tls));
-        let (stream, _resp) = connect_async_tls_with_config(
-            request,
-            None,
-            false,
-            Some(connector),
-        )
-        .await
-        .map_err(|e| match &e {
-            WsError::Http(response) if is_terminal_http_status(response.status().as_u16()) => {
-                DialError::TerminalAuth(format!("ws upgrade http {}", response.status()))
-            }
-            _ => DialError::Retryable(format!("ws connect failed: {}", e)),
-        })?;
+        let (stream, _resp) = connect_async_tls_with_config(request, None, false, Some(connector))
+            .await
+            .map_err(|e| match &e {
+                WsError::Http(response) if is_terminal_http_status(response.status().as_u16()) => {
+                    DialError::TerminalAuth(format!("ws upgrade http {}", response.status()))
+                }
+                _ => DialError::Retryable(format!("ws connect failed: {}", e)),
+            })?;
         self.has_completed_handshake.store(true, Ordering::Relaxed);
         self.last_alive_ms.store(unix_now_ms(), Ordering::Relaxed);
         Ok(stream)
@@ -426,9 +421,11 @@ impl CellularTransport {
             if sassytalkie_core::protocol::is_control_frame_shape(inner) {
                 return;
             }
-            let inner = inner.to_vec();
-            self.handle_audio(inner);
-            return;
+            if self.handle_audio(inner.to_vec()) {
+                return;
+            }
+            // Did not open as catch-up: a live frame whose per-session nonce
+            // prefix merely looks like a replay header. Fall through.
         }
         match self.control.handle_inbound(&bytes, now_ms, |session| {
             *self.crypto.lock().unwrap() = session;
@@ -454,7 +451,8 @@ impl CellularTransport {
     }
 
     /// Decrypt a sealed audio frame (live or unwrapped catch-up) and queue it.
-    fn handle_audio(&self, bytes: Vec<u8>) {
+    /// Returns whether the frame authenticated under a session we hold.
+    fn handle_audio(&self, bytes: Vec<u8>) -> bool {
         let plain = {
             let live = self.crypto.lock().unwrap().decrypt(&bytes);
             match live {
@@ -468,7 +466,7 @@ impl CellularTransport {
                     }
                     None => {
                         debug!("Cellular: decrypt failed ({} bytes)", bytes.len());
-                        return;
+                        return false;
                     }
                 },
             }
@@ -476,7 +474,7 @@ impl CellularTransport {
         match wire::unpack_wire_frame(&plain) {
             Ok((_ch, _sub, sender, _name, ts, opus)) => {
                 if sender == self.config.peer_id {
-                    return;
+                    return true;
                 }
                 self.packets_received.fetch_add(1, Ordering::Relaxed);
                 let _ = self.inbound_tx.try_send(super::AudioFrame {
@@ -493,6 +491,7 @@ impl CellularTransport {
                 );
             }
         }
+        true
     }
 
     /// Update the channel stamped into outbound wire frames (kept in sync with
@@ -752,7 +751,9 @@ mod tests {
         // Heard live already → the same sealed frame replayed is rejected by
         // the AEAD replay window, not played twice.
         t.handle_inbound(replay_wrap(&sealed));
-        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -771,7 +772,9 @@ mod tests {
         let own = wire::pack_wire_frame(1, wire::SUBCH_MAIN, "desk-peer", "desk", 7, b"mine");
         t.handle_inbound(replay_wrap(&me.encrypt(&own).unwrap()));
 
-        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_err());
     }
 
     #[test]

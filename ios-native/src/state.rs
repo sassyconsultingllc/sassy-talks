@@ -2,22 +2,21 @@
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-SCNETVIZP24V
 /// State Machine for iOS
-/// 
+///
 /// Coordinates audio, codec, and transport
 /// Similar to Android version but adapted for iOS
-
 use crate::audio::{AudioEngine, AudioFrame, PlayoutHandle};
-use crate::codec::{OpusEncoder, OpusDecoder};
+use crate::codec::{OpusDecoder, OpusEncoder};
 use crate::floor::{FloorState, REJECT_CHANNEL_BUSY, REJECT_MAX_TX, REJECT_NOT_ENCRYPTED};
 use crate::transport::TransportManager;
+use log::{error, info, warn};
 use sassytalkie_core::floor as floor_policy;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
-use log::{error, info, warn};
 
 #[derive(Error, Debug)]
 pub enum StateError {
@@ -175,7 +174,10 @@ impl StateMachine {
     /// Create a state machine with a throwaway identity (tests, legacy init).
     pub fn new() -> Result<Self, StateError> {
         let device_id: u32 = rand::random();
-        Self::with_identity(&format!("{device_id:08x}"), &format!("iPhone-{}", device_id % 10000))
+        Self::with_identity(
+            &format!("{device_id:08x}"),
+            &format!("iPhone-{}", device_id % 10000),
+        )
     }
 
     /// Create a state machine for this install. `install_id` is the stable
@@ -188,10 +190,9 @@ impl StateMachine {
 
         let audio = AudioEngine::new();
         let playout = audio.playout_handle();
-        let encoder = OpusEncoder::new()
-            .map_err(|e| StateError::CodecError(e.to_string()))?;
-        let transport = TransportManager::new()
-            .map_err(|e| StateError::TransportError(e.to_string()))?;
+        let encoder = OpusEncoder::new().map_err(|e| StateError::CodecError(e.to_string()))?;
+        let transport =
+            TransportManager::new().map_err(|e| StateError::TransportError(e.to_string()))?;
 
         // LAN multicast is optional. With no Wi-Fi, no Local Network permission
         // yet, or no multicast entitlement, the join fails — and that used to
@@ -226,7 +227,11 @@ impl StateMachine {
             session_epoch: {
                 // Non-zero random epoch for this process (heartbeat identity).
                 let v: u64 = rand::random();
-                if v == 0 { 1 } else { v }
+                if v == 0 {
+                    1
+                } else {
+                    v
+                }
             },
             heartbeat_seq: Arc::new(AtomicU32::new(0)),
             tx_seq: Arc::new(AtomicU32::new(0)),
@@ -269,9 +274,19 @@ impl StateMachine {
     pub fn set_psk(&self, key: &[u8; 32]) {
         *self.psk.lock().unwrap() = Some(*key);
         self.transport.lock().unwrap().set_psk(key);
-        let room = self.room_id.lock().unwrap().clone().unwrap_or_else(|| "unpaired".into());
-        *self.control.lock().unwrap() =
-            sassytalkie_core::control_auth::ControlAuthCodec::new(*key, &room, &self.sender_id, self.session_epoch).ok();
+        let room = self
+            .room_id
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "unpaired".into());
+        *self.control.lock().unwrap() = sassytalkie_core::control_auth::ControlAuthCodec::new(
+            *key,
+            &room,
+            &self.sender_id,
+            self.session_epoch,
+        )
+        .ok();
         info!("Crypto: PSK session installed");
     }
 
@@ -281,7 +296,10 @@ impl StateMachine {
 
     /// Clear keys, control plane, staged hybrid, and room. In-app wipe hook.
     pub fn wipe_session(&self) {
-        self.audit.lock().unwrap().append(crate::control::now_ms(), "wipe", "source=in_app");
+        self.audit
+            .lock()
+            .unwrap()
+            .append(crate::control::now_ms(), "wipe", "source=in_app");
         *self.psk.lock().unwrap() = None;
         *self.pending_hybrid.lock().unwrap() = None;
         *self.staged_hybrid.lock().unwrap() = None;
@@ -318,14 +336,25 @@ impl StateMachine {
     /// LAN multicast (raw datagram) and the relay queue.
     fn send_control_inner(&self, inner: Vec<u8>) {
         let now = crate::control::now_ms();
-        let sealed = match self.control.lock().unwrap().as_ref().and_then(|c| c.seal(&inner, now).ok()) {
+        let sealed = match self
+            .control
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|c| c.seal(&inner, now).ok())
+        {
             Some(s) => s,
             None => {
                 warn!("Control send blocked: no authenticated room context");
                 return;
             }
         };
-        if let Err(e) = self.transport.lock().unwrap().send_control_datagram(&sealed) {
+        if let Err(e) = self
+            .transport
+            .lock()
+            .unwrap()
+            .send_control_datagram(&sealed)
+        {
             warn!("Control multicast send failed: {}", e);
         }
         self.transport.lock().unwrap().enqueue_relay_control(sealed);
@@ -389,7 +418,10 @@ impl StateMachine {
         *self.room_id.lock().unwrap() = Some(room);
         self.set_channel(channel);
         self.set_psk(&*psk);
-        self.audit.lock().unwrap().append(crate::control::now_ms(), "enrollment", "ok");
+        self.audit
+            .lock()
+            .unwrap()
+            .append(crate::control::now_ms(), "enrollment", "ok");
         info!("Crypto: session imported from QR on channel {}", channel);
         Some(channel)
     }
@@ -418,7 +450,9 @@ impl StateMachine {
     /// (keeps us off the relay's idle-staleness sweeper + surfaces us in peer
     /// liveness). 23-byte TLV payload, caps=0 (no PQC handshake on iOS yet).
     pub fn relay_heartbeat_frame(&self) -> Vec<u8> {
-        let seq = self.heartbeat_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seq = self
+            .heartbeat_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let state = if self.is_transmitting.load(Ordering::SeqCst) {
             crate::control::PRESENCE_SPEAKING
         } else {
@@ -432,7 +466,13 @@ impl StateMachine {
             0,
         );
         let now = crate::control::now_ms();
-        match self.control.lock().unwrap().as_ref().and_then(|c| c.seal(&inner, now).ok()) {
+        match self
+            .control
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|c| c.seal(&inner, now).ok())
+        {
             Some(sealed) => sealed,
             None => {
                 warn!("Control send blocked: no authenticated room context");
@@ -451,7 +491,11 @@ impl StateMachine {
             if sassytalkie_core::protocol::is_control_frame_shape(inner) {
                 return false;
             }
-            return self.process_relay_audio(inner, now);
+            if self.process_relay_audio(inner, now) {
+                return true;
+            }
+            // Not playable as catch-up: may be a live frame whose per-session
+            // nonce prefix merely looks like a replay header. Fall through.
         }
         let classified = {
             let codec = self.control.lock().unwrap();
@@ -469,7 +513,10 @@ impl StateMachine {
                 return false;
             }
             sassytalkie_core::control_auth::InboundControl::AuthFailed => {
-                self.audit.lock().unwrap().append(now, "control_rejected", "reason=auth_or_replay");
+                self.audit
+                    .lock()
+                    .unwrap()
+                    .append(now, "control_rejected", "reason=auth_or_replay");
                 return false;
             }
             sassytalkie_core::control_auth::InboundControl::Verified(verified) => {
@@ -536,9 +583,16 @@ impl StateMachine {
     /// to the core's 1..=72 window; `group_name` may be empty ("Channel N"). The
     /// returned JSON is rendered as a QR for an Android/iOS joiner. Same shared
     /// `SessionManager` Android uses, so the QR is cross-platform by construction.
-    pub fn generate_session_qr(&self, channel: u8, duration_hours: u32, group_name: &str) -> Option<String> {
+    pub fn generate_session_qr(
+        &self,
+        channel: u8,
+        duration_hours: u32,
+        group_name: &str,
+    ) -> Option<String> {
         let mut mgr = crate::session::SessionManager::new(&self.device_name);
-        let json = mgr.generate_session_qr(channel, duration_hours, group_name).ok()?;
+        let json = mgr
+            .generate_session_qr(channel, duration_hours, group_name)
+            .ok()?;
         // Install our own key so the host can also TX/RX on this channel.
         self.import_session_qr(&json);
         Some(json)
@@ -549,7 +603,9 @@ impl StateMachine {
         verified: sassytalkie_core::control_auth::VerifiedControl,
         now: u64,
     ) {
-        let Some(decoded) = sassytalkie_core::control_auth::decode_control_frame(&verified.inner_frame) else {
+        let Some(decoded) =
+            sassytalkie_core::control_auth::decode_control_frame(&verified.inner_frame)
+        else {
             return;
         };
         use sassytalkie_core::protocol::*;
@@ -560,25 +616,45 @@ impl StateMachine {
                 }
             }
             OP_HYBRID_RESP => {
-                if let Some((channel, msg)) = sassytalkie_core::hybrid_rekey::parse_hybrid_frame(decoded.payload) {
+                if let Some((channel, msg)) =
+                    sassytalkie_core::hybrid_rekey::parse_hybrid_frame(decoded.payload)
+                {
                     if self.hybrid_complete(msg) {
                         let token = sassytalkie_core::hybrid_rekey::token_for(msg);
-                        let inner = sassytalkie_core::hybrid_rekey::encode_hybrid_frame(OP_HYBRID_CONFIRM, channel, &token);
-                        if let Some(sealed) = self.control.lock().unwrap().as_ref().and_then(|c| c.seal(&inner, now).ok()) {
+                        let inner = sassytalkie_core::hybrid_rekey::encode_hybrid_frame(
+                            OP_HYBRID_CONFIRM,
+                            channel,
+                            &token,
+                        );
+                        if let Some(sealed) = self
+                            .control
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(|c| c.seal(&inner, now).ok())
+                        {
                             self.transport.lock().unwrap().enqueue_relay_control(sealed);
                         }
                     }
                 }
             }
             OP_HYBRID_CONFIRM => {
-                if let Some((channel, token)) = sassytalkie_core::hybrid_rekey::parse_hybrid_frame(decoded.payload) {
+                if let Some((channel, token)) =
+                    sassytalkie_core::hybrid_rekey::parse_hybrid_frame(decoded.payload)
+                {
                     if self.hybrid_on_confirm(decoded.payload, now) {
                         let inner = sassytalkie_core::hybrid_rekey::encode_hybrid_frame(
                             OP_HYBRID_CONFIRM_ACK,
                             channel,
                             token,
                         );
-                        if let Some(sealed) = self.control.lock().unwrap().as_ref().and_then(|c| c.seal(&inner, now).ok()) {
+                        if let Some(sealed) = self
+                            .control
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(|c| c.seal(&inner, now).ok())
+                        {
                             self.transport.lock().unwrap().enqueue_relay_control(sealed);
                         }
                     }
@@ -594,7 +670,10 @@ impl StateMachine {
                 self.on_remote_ptt_stop(&verified.sender_id, decoded.payload, now);
             }
             OP_EMERGENCY | OP_MANDOWN | OP_EMERGENCY_CLEAR => {
-                self.audit.lock().unwrap().append(now, "emergency_control", "authenticated");
+                self.audit
+                    .lock()
+                    .unwrap()
+                    .append(now, "emergency_control", "authenticated");
             }
             _ => {}
         }
@@ -617,7 +696,9 @@ impl StateMachine {
             if remote_wins {
                 self.yield_local_tx("floor preempted");
             } else {
-                info!("Concurrent floor request from {peer_id} denied by deterministic arbitration");
+                info!(
+                    "Concurrent floor request from {peer_id} denied by deterministic arbitration"
+                );
                 return;
             }
         }
@@ -637,7 +718,12 @@ impl StateMachine {
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(floor_policy::DRAIN_HOLD_MS));
             let t = crate::control::now_ms();
-            if let Some(sealed) = control.lock().unwrap().as_ref().and_then(|c| c.seal(&ack_inner, t).ok()) {
+            if let Some(sealed) = control
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|c| c.seal(&ack_inner, t).ok())
+            {
                 let _ = transport.lock().unwrap().send_control_datagram(&sealed);
                 transport.lock().unwrap().enqueue_relay_control(sealed);
             }
@@ -661,13 +747,20 @@ impl StateMachine {
             channel,
             &resp_bytes,
         );
-        self.control.lock().unwrap().as_ref()?.seal(&inner, now).ok()
+        self.control
+            .lock()
+            .unwrap()
+            .as_ref()?
+            .seal(&inner, now)
+            .ok()
     }
 
     fn hybrid_on_confirm(&self, payload: &[u8], now: u64) -> bool {
         let token = sassytalkie_core::hybrid_rekey::parse_hybrid_frame(payload).map(|(_, m)| m);
         let staged_guard = self.staged_hybrid.lock().unwrap();
-        let Some(staged) = staged_guard.as_ref() else { return false };
+        let Some(staged) = staged_guard.as_ref() else {
+            return false;
+        };
         if !sassytalkie_core::hybrid_rekey::confirm_acceptable(
             Some(&staged.token),
             token,
@@ -675,15 +768,27 @@ impl StateMachine {
             staged.staged_at_ms,
         ) {
             drop(staged_guard);
-            self.audit.lock().unwrap().append(now, "control_rejected", "reason=hybrid_confirm");
+            self.audit
+                .lock()
+                .unwrap()
+                .append(now, "control_rejected", "reason=hybrid_confirm");
             return false;
         }
         drop(staged_guard);
-        if let Some(session) = self.staged_hybrid.lock().unwrap().as_mut().and_then(|s| s.session.take()) {
+        if let Some(session) = self
+            .staged_hybrid
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|s| s.session.take())
+        {
             self.transport.lock().unwrap().arm_pending_rx(session);
         }
         // ACK only — TX stays on the live key until peer ciphertext promotes.
-        self.audit.lock().unwrap().append(now, "rekey", "kind=hybrid_confirm_ack_sent");
+        self.audit
+            .lock()
+            .unwrap()
+            .append(now, "rekey", "kind=hybrid_confirm_ack_sent");
         info!("Crypto: hybrid PQC RX staged after confirm (TX still old key)");
         true
     }
@@ -698,12 +803,20 @@ impl StateMachine {
             now,
             staged.staged_at_ms,
         ) {
-            self.audit.lock().unwrap().append(now, "control_rejected", "reason=hybrid_confirm_ack");
+            self.audit
+                .lock()
+                .unwrap()
+                .append(now, "control_rejected", "reason=hybrid_confirm_ack");
             return false;
         }
-        let Some(session) = staged.session else { return false };
+        let Some(session) = staged.session else {
+            return false;
+        };
         self.install_session(session);
-        self.audit.lock().unwrap().append(now, "rekey", "kind=hybrid_confirm_ack");
+        self.audit
+            .lock()
+            .unwrap()
+            .append(now, "rekey", "kind=hybrid_confirm_ack");
         info!("Crypto: hybrid PQC session installed after confirm-ack");
         true
     }
@@ -777,7 +890,9 @@ impl StateMachine {
     pub fn hybrid_confirm(&self) -> bool {
         let payload = {
             let staged = self.staged_hybrid.lock().unwrap();
-            let Some(staged) = staged.as_ref() else { return false };
+            let Some(staged) = staged.as_ref() else {
+                return false;
+            };
             let mut p = vec![1u8];
             p.extend_from_slice(&staged.token);
             p
@@ -841,7 +956,8 @@ impl StateMachine {
         {
             let mut audio = self.audio.lock().unwrap();
             audio.clear_input();
-            audio.start_recording()
+            audio
+                .start_recording()
                 .map_err(|e| StateError::AudioError(e.to_string()))?;
         }
 
@@ -865,7 +981,10 @@ impl StateMachine {
 
         self.should_stop_tx.store(true, Ordering::SeqCst);
 
-        self.audio.lock().unwrap().stop_recording()
+        self.audio
+            .lock()
+            .unwrap()
+            .stop_recording()
             .map_err(|e| StateError::AudioError(e.to_string()))?;
 
         let end_seq = self.tx_seq.load(Ordering::SeqCst);
@@ -907,8 +1026,16 @@ impl StateMachine {
                     is_transmitting.store(false, Ordering::SeqCst);
                     tx_started_ms.store(0, Ordering::SeqCst);
                     let _ = audio.lock().unwrap().stop_recording();
-                    send_ptt_stop(&control, &transport, session_epoch, tx_seq.load(Ordering::SeqCst));
-                    info!("TX safety ceiling reached ({} ms)", floor_policy::DEFAULT_MAX_TX_MS);
+                    send_ptt_stop(
+                        &control,
+                        &transport,
+                        session_epoch,
+                        tx_seq.load(Ordering::SeqCst),
+                    );
+                    info!(
+                        "TX safety ceiling reached ({} ms)",
+                        floor_policy::DEFAULT_MAX_TX_MS
+                    );
                     break;
                 }
 
@@ -954,7 +1081,10 @@ impl StateMachine {
     pub fn start_listening(&mut self) -> Result<(), StateError> {
         info!("Starting RX listener");
 
-        self.audio.lock().unwrap().start_playing()
+        self.audio
+            .lock()
+            .unwrap()
+            .start_playing()
             .map_err(|e| StateError::AudioError(e.to_string()))?;
 
         self.should_stop_rx.store(false, Ordering::SeqCst);
@@ -1019,7 +1149,9 @@ impl StateMachine {
                 match classified {
                     sassytalkie_core::control_auth::InboundControl::NotControl => {}
                     sassytalkie_core::control_auth::InboundControl::LegacyHint { .. } => continue,
-                    sassytalkie_core::control_auth::InboundControl::RejectedUnauthenticated { opcode } => {
+                    sassytalkie_core::control_auth::InboundControl::RejectedUnauthenticated {
+                        opcode,
+                    } => {
                         audit.lock().unwrap().append(
                             now,
                             "control_rejected",
@@ -1028,7 +1160,11 @@ impl StateMachine {
                         continue;
                     }
                     sassytalkie_core::control_auth::InboundControl::AuthFailed => {
-                        audit.lock().unwrap().append(now, "control_rejected", "reason=auth_or_replay");
+                        audit.lock().unwrap().append(
+                            now,
+                            "control_rejected",
+                            "reason=auth_or_replay",
+                        );
                         continue;
                     }
                     sassytalkie_core::control_auth::InboundControl::Verified(verified) => {
@@ -1116,7 +1252,10 @@ impl StateMachine {
     pub fn disconnect(&mut self) -> Result<(), StateError> {
         info!("Disconnecting...");
         self.should_stop_rx.store(true, Ordering::SeqCst);
-        self.audio.lock().unwrap().stop_playing()
+        self.audio
+            .lock()
+            .unwrap()
+            .stop_playing()
             .map_err(|e| StateError::AudioError(e.to_string()))?;
         *self.state.lock().unwrap() = AppState::Idle;
         Ok(())
@@ -1124,13 +1263,19 @@ impl StateMachine {
 
     /// Process audio input (called from Swift)
     pub fn process_audio_input(&mut self, samples: &[i16]) -> Result<(), StateError> {
-        self.audio.lock().unwrap().write_input(samples)
+        self.audio
+            .lock()
+            .unwrap()
+            .write_input(samples)
             .map_err(|e| StateError::AudioError(e.to_string()))
     }
 
     /// Get audio output (called from Swift)
     pub fn get_audio_output(&mut self, buffer: &mut [i16]) -> Result<usize, StateError> {
-        self.audio.lock().unwrap().read_output(buffer)
+        self.audio
+            .lock()
+            .unwrap()
+            .read_output(buffer)
             .map_err(|e| StateError::AudioError(e.to_string()))
     }
 
@@ -1155,7 +1300,12 @@ fn send_ptt_stop(
 ) {
     let inner = sassytalkie_core::ptt_frames::encode_ptt_stop_v2(session_epoch, end_seq);
     let now = crate::control::now_ms();
-    let Some(sealed) = control.lock().unwrap().as_ref().and_then(|c| c.seal(&inner, now).ok()) else {
+    let Some(sealed) = control
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|c| c.seal(&inner, now).ok())
+    else {
         warn!("PTT_STOP not sent: no authenticated room context");
         return;
     };
@@ -1181,13 +1331,15 @@ fn lan_handle_ptt_control(
     transport: &Arc<Mutex<TransportManager>>,
     control: &Arc<Mutex<Option<sassytalkie_core::control_auth::ControlAuthCodec>>>,
 ) {
-    let Some(decoded) = sassytalkie_core::control_auth::decode_control_frame(&verified.inner_frame) else {
+    let Some(decoded) = sassytalkie_core::control_auth::decode_control_frame(&verified.inner_frame)
+    else {
         return;
     };
     use sassytalkie_core::protocol::*;
     match decoded.opcode {
         OP_PTT_START_V2 => {
-            let Some(start) = sassytalkie_core::ptt_frames::parse_ptt_start_v2(decoded.payload) else {
+            let Some(start) = sassytalkie_core::ptt_frames::parse_ptt_start_v2(decoded.payload)
+            else {
                 return;
             };
             if is_transmitting.load(Ordering::SeqCst) {
@@ -1205,7 +1357,12 @@ fn lan_handle_ptt_control(
                     tx_started_ms.store(0, Ordering::SeqCst);
                     let _ = audio.lock().unwrap().stop_recording();
                     floor.set_reject_reason(REJECT_PREEMPTED);
-                    send_ptt_stop(control, transport, session_epoch, tx_seq.load(Ordering::SeqCst));
+                    send_ptt_stop(
+                        control,
+                        transport,
+                        session_epoch,
+                        tx_seq.load(Ordering::SeqCst),
+                    );
                 } else {
                     return;
                 }
@@ -1213,7 +1370,8 @@ fn lan_handle_ptt_control(
             floor.hold(&verified.sender_id, floor_policy::STALE_HOLD_MS, now);
         }
         OP_PTT_STOP_V2 => {
-            let Some(stop) = sassytalkie_core::ptt_frames::parse_ptt_stop_v2(decoded.payload) else {
+            let Some(stop) = sassytalkie_core::ptt_frames::parse_ptt_stop_v2(decoded.payload)
+            else {
                 return;
             };
             floor.release_after_drain(&verified.sender_id, now);
@@ -1223,7 +1381,12 @@ fn lan_handle_ptt_control(
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(floor_policy::DRAIN_HOLD_MS));
                 let t = crate::control::now_ms();
-                if let Some(sealed) = control.lock().unwrap().as_ref().and_then(|c| c.seal(&ack_inner, t).ok()) {
+                if let Some(sealed) = control
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|c| c.seal(&ack_inner, t).ok())
+                {
                     let _ = transport.lock().unwrap().send_control_datagram(&sealed);
                     transport.lock().unwrap().enqueue_relay_control(sealed);
                 }
@@ -1274,7 +1437,10 @@ mod tests {
         assert!(id.len() <= sassytalkie_core::wire::MAX_SENDER_ID_LEN);
         assert!(id.starts_with("ios-6f1c2a5e"));
         // Stable: the same install id always maps to the same sender id.
-        assert_eq!(id, sender_id_for_install("6F1C2A5E-0D3B-4C7A-9E21-ABCDEF012345"));
+        assert_eq!(
+            id,
+            sender_id_for_install("6F1C2A5E-0D3B-4C7A-9E21-ABCDEF012345")
+        );
         assert!(sender_id_for_install("").starts_with("ios-"));
     }
 
@@ -1310,8 +1476,14 @@ mod tests {
     fn catch_up_frames_are_unwrapped_and_deduplicated() {
         let sm = paired();
         let frame = sealed_from("android-peer", 1);
-        assert!(sm.process_relay_frame(&replay_wrap(&frame)), "missed frame plays");
-        assert!(!sm.process_relay_frame(&frame), "same frame live again is a replay");
+        assert!(
+            sm.process_relay_frame(&replay_wrap(&frame)),
+            "missed frame plays"
+        );
+        assert!(
+            !sm.process_relay_frame(&frame),
+            "same frame live again is a replay"
+        );
         assert!(!sm.process_relay_frame(&replay_wrap(&frame)));
     }
 
