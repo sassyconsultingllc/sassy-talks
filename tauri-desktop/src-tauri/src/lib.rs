@@ -41,7 +41,7 @@ pub use tones::{ToneError, TonePlayer, ToneType};
 pub use transport::{PeerInfo, TransportConfig, TransportManager};
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -127,6 +127,11 @@ pub struct AppState {
     connection_status: Arc<RwLock<ConnectionStatus>>,
     is_transmitting: Arc<AtomicBool>,
     is_receiving: Arc<AtomicBool>,
+    /// Wall-clock ms of the last inbound frame handed to the speaker. The RX
+    /// loop's `is_receiving` flag is only true for the microseconds a frame is
+    /// in flight, so a 250 ms UI poll almost never saw it; the UI reads this
+    /// instead (see [`AppState::is_receiving`]).
+    last_rx_ms: Arc<AtomicU64>,
 
     // PTT threads
     tx_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -177,6 +182,7 @@ impl AppState {
             connection_status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
             is_transmitting: Arc::new(AtomicBool::new(false)),
             is_receiving: Arc::new(AtomicBool::new(false)),
+            last_rx_ms: Arc::new(AtomicU64::new(0)),
             tx_thread: Arc::new(Mutex::new(None)),
             rx_thread: Arc::new(Mutex::new(None)),
             cellular: Arc::new(Mutex::new(None)),
@@ -292,6 +298,7 @@ impl AppState {
             Arc::clone(&self.audio),
             audio_rx,
             Arc::clone(&self.is_receiving),
+            Arc::clone(&self.last_rx_ms),
             Arc::clone(&self.is_transmitting),
             Arc::clone(&self.audio_cache),
         );
@@ -469,6 +476,7 @@ impl AppState {
             Arc::clone(&self.audio),
             audio_rx,
             Arc::clone(&self.is_receiving),
+            Arc::clone(&self.last_rx_ms),
             Arc::clone(&self.is_transmitting),
             Arc::clone(&self.audio_cache),
         );
@@ -501,9 +509,13 @@ impl AppState {
         self.current_channel.load(Ordering::Relaxed)
     }
 
-    /// True while the RX loop is decoding inbound audio.
+    /// True while inbound audio is playing: a frame reached the speaker within
+    /// the last [`RX_ACTIVE_HOLD_MS`]. Covers 20 ms frame spacing plus relay
+    /// jitter so a 250 ms UI poll sees one continuous "receiving" span per
+    /// transmission (and the incoming chime fires once, not never).
     pub fn is_receiving(&self) -> bool {
-        self.is_receiving.load(Ordering::Relaxed)
+        rx_recent(self.last_rx_ms.load(Ordering::Relaxed), unix_ms())
+            || self.is_receiving.load(Ordering::Relaxed)
     }
 
     /// Set channel (clamped to valid range 1-16)
@@ -683,6 +695,7 @@ fn spawn_audio_rx_loop(
     audio: Arc<Mutex<AudioEngine>>,
     mut audio_rx: transport::RealtimeReceiver<transport::AudioFrame>,
     is_receiving: Arc<AtomicBool>,
+    last_rx_ms: Arc<AtomicU64>,
     is_transmitting: Arc<AtomicBool>,
     cache: Arc<Mutex<sassytalkie_core::audio_cache::AudioCache>>,
 ) -> JoinHandle<()> {
@@ -737,6 +750,8 @@ fn spawn_audio_rx_loop(
                 peer.synth_ts
             };
 
+            last_rx_ms.store(unix_ms(), Ordering::Relaxed);
+
             // Live mode → Some(pcm) for immediate playback. Queue/Mix mode →
             // None; frames drain via the loop below on tick(). Hold the shared
             // cache lock across ingest+tick+drain so two RX loops can't
@@ -768,6 +783,21 @@ fn spawn_audio_rx_loop(
 
         info!("RX thread stopped");
     })
+}
+
+/// How long after the last played frame the UI still shows "receiving".
+const RX_ACTIVE_HOLD_MS: u64 = 400;
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Pure so the hold window is unit-testable without a clock.
+fn rx_recent(last_rx_ms: u64, now_ms: u64) -> bool {
+    last_rx_ms != 0 && now_ms.saturating_sub(last_rx_ms) < RX_ACTIVE_HOLD_MS
 }
 
 const MAX_RX_DECODERS: usize = 32;
@@ -825,6 +855,23 @@ impl RxPeerPool {
             });
         peer.last_used = now;
         peer
+    }
+}
+
+#[cfg(test)]
+mod rx_indicator_tests {
+    use super::*;
+
+    #[test]
+    fn receiving_spans_frame_gaps_then_clears() {
+        let t0 = 1_700_000_000_000;
+        assert!(!rx_recent(0, t0), "never received");
+        assert!(rx_recent(t0, t0));
+        // 20 ms frames plus a jittery 250 ms relay gap stay one "receiving" span.
+        assert!(rx_recent(t0, t0 + 250));
+        assert!(!rx_recent(t0, t0 + RX_ACTIVE_HOLD_MS));
+        // Clock stepping backwards must not wedge the indicator on.
+        assert!(rx_recent(t0, t0 - 5));
     }
 }
 

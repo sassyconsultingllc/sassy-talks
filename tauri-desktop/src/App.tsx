@@ -7,7 +7,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import './styles/app.css';
+import './styles/App.css';
 import './styles/lobby.css';
 import PeerList from './components/lobby/PeerList';
 import DeviceList from './components/DeviceList';
@@ -413,11 +413,11 @@ export default function App() {
       // A link is fetched and decrypted natively (import_share_link → shared
       // core); pasted JSON joins directly. Tauri v2 camelCases params:
       // Rust `qr_json` -> `qrJson`.
-      const trimmed = input.trim();
+      // Unanchored: a link pasted inside a chat message ("Join me: <link>")
+      // is still a link. The Rust side picks the link token out of the text.
       const isLink =
-        /^https:\/\/relay\.sassyconsultingllc\.com\/v\//i.test(trimmed) ||
-        /^sassy-talks:\/\/v\//i.test(trimmed) ||
-        /^sassytalk:\/\/v\//i.test(trimmed);
+        /https:\/\/relay\.sassyconsultingllc\.com\/v\//i.test(input) ||
+        /(^|\s)sassy-?talks?:\/\/v\//i.test(input);
       const room = isLink
         ? await invoke<string>('import_share_link', { url: input })
         : await invoke<string>('join_cellular_session', { qrJson: input });

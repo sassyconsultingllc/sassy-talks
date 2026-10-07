@@ -205,7 +205,11 @@ fn os_delete(target: &str) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use secret_service::{EncryptionType, SecretService};
+    //! libsecret over D-Bus via secret-service's BLOCKING API. The crate's
+    //! top-level types are async; calling them without `.await` (as this module
+    //! originally did) never compiled, so Linux desktop builds had no vault.
+    use secret_service::blocking::{Item, SecretService};
+    use secret_service::EncryptionType;
     use std::collections::HashMap;
 
     fn attrs(target: &str) -> HashMap<&str, &str> {
@@ -215,15 +219,36 @@ mod linux {
         m
     }
 
+    fn connect() -> Result<SecretService<'static>, String> {
+        SecretService::connect(EncryptionType::Dh).map_err(|e| format!("libsecret: {e}"))
+    }
+
+    /// Unlocked matches first; locked ones are unlocked on demand (may prompt).
+    fn find<'a>(ss: &'a SecretService<'a>, target: &str) -> Result<Vec<Item<'a>>, String> {
+        let found = ss
+            .search_items(attrs(target))
+            .map_err(|e| format!("libsecret search: {e}"))?;
+        let mut items = found.unlocked;
+        for item in found.locked {
+            if item.unlock().is_ok() {
+                items.push(item);
+            }
+        }
+        Ok(items)
+    }
+
     pub fn available() -> bool {
-        SecretService::new(EncryptionType::Dh).is_ok()
+        connect().is_ok()
     }
 
     pub fn put(target: &str, blob: &[u8]) -> Result<(), String> {
-        let ss = SecretService::new(EncryptionType::Dh).map_err(|e| format!("libsecret: {e}"))?;
+        let ss = connect()?;
         let collection = ss
             .get_default_collection()
             .map_err(|e| format!("libsecret collection: {e}"))?;
+        collection
+            .ensure_unlocked()
+            .map_err(|e| format!("libsecret unlock: {e}"))?;
         collection
             .create_item(
                 &format!("SassyTalkie:{target}"),
@@ -237,32 +262,21 @@ mod linux {
     }
 
     pub fn get(target: &str) -> Result<Option<Vec<u8>>, String> {
-        let ss = match SecretService::new(EncryptionType::Dh) {
-            Ok(s) => s,
-            Err(_) => return Ok(None),
-        };
-        let items = match ss.search_items(attrs(target)) {
-            Ok(i) => i,
-            Err(_) => return Ok(None),
-        };
+        // No secret service on this session (headless, no keyring daemon) is
+        // "nothing stored", so the caller falls back to the AES file store.
+        let Ok(ss) = connect() else { return Ok(None) };
+        let Ok(items) = find(&ss, target) else { return Ok(None) };
         let Some(item) = items.into_iter().next() else {
             return Ok(None);
         };
-        match item.get_secret() {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) => Err(format!("libsecret get: {e}")),
-        }
+        item.get_secret()
+            .map(Some)
+            .map_err(|e| format!("libsecret get: {e}"))
     }
 
     pub fn delete(target: &str) -> Result<(), String> {
-        let ss = match SecretService::new(EncryptionType::Dh) {
-            Ok(s) => s,
-            Err(_) => return Ok(()),
-        };
-        let items = match ss.search_items(attrs(target)) {
-            Ok(i) => i,
-            Err(_) => return Ok(()),
-        };
+        let Ok(ss) = connect() else { return Ok(()) };
+        let Ok(items) = find(&ss, target) else { return Ok(()) };
         for item in items {
             let _ = item.delete();
         }

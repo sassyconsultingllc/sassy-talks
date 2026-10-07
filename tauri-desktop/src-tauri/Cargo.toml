@@ -117,7 +117,11 @@ security-framework = "2.11"
 # Platform-specific: Linux
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
-secret-service = "3.1"
+# secret-service 3 ships no async runtime by default (zbus then fails to
+# compile: no async_io/async_fs). async-io, not tokio: zbus's tokio feature
+# block_on()s a private runtime and panics when called from inside Tauri's
+# tokio runtime, which is exactly where the vault is used.
+secret-service = { version = "3.1", default-features = false, features = ["rt-async-io-crypto-rust"] }
 
 # Platform-specific: Windows
 [target.'cfg(target_os = "windows")'.dependencies]
