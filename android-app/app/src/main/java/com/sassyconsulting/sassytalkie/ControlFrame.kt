@@ -46,6 +46,14 @@ data class HeartbeatPayload(
     val caps: Int = 0,
 )
 
+/** Cohort pong payload decoded from an authenticated OP_COHORT_PONG frame. */
+data class CohortPongPayload(
+    val epoch: Long,
+    val seq: Int,
+    val tsMs: Long,
+    val rttMs: Int,
+)
+
 object ControlFrame {
     const val OP_PTT_START: Byte     = 0x01
     const val OP_PTT_STOP: Byte      = 0x02
@@ -90,6 +98,22 @@ object ControlFrame {
      */
     const val OP_HYBRID_CONFIRM_ACK: Byte = 0x20
     const val OP_REPLAY_FRAME: Byte = 0x19
+
+    /**
+     * Active cohort ping — an explicit round-trip liveness probe from one
+     * peer to its cohort, distinct from the passive periodic heartbeat. The
+     * receiver must first pass authenticated-control-plane verification; on
+     * receipt it answers with OP_COHORT_PONG. Payload matches
+     * `core::ptt_frames::CohortPing`: `[epoch:u64][seq:u32][ts_ms:u64]`.
+     */
+    const val OP_COHORT_PING: Byte = 0x21
+
+    /**
+     * Cohort pong — authenticated reply to OP_COHORT_PING. Payload matches
+     * `core::ptt_frames::CohortPong`:
+     * `[epoch:u64][seq:u32][ts_ms:u64][rtt_ms:u16]`.
+     */
+    const val OP_COHORT_PONG: Byte = 0x22
 
     /**
      * Life-safety beacons. Payload bodies are built and parsed natively
@@ -138,6 +162,8 @@ object ControlFrame {
         "EMERGENCY" to OP_EMERGENCY,
         "MANDOWN" to OP_MANDOWN,
         "EMERGENCY_CLEAR" to OP_EMERGENCY_CLEAR,
+        "COHORT_PING" to OP_COHORT_PING,
+        "COHORT_PONG" to OP_COHORT_PONG,
     )
 
     fun encodeLegacy(op: Byte): ByteArray = byteArrayOf(op)
@@ -259,5 +285,34 @@ object ControlFrame {
     fun parseWake(payload: ByteArray): Pair<Long, Long> {
         val b = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
         return b.long to b.long
+    }
+
+    /** Cohort ping payload: [epoch:u64][seq:u32][tsMs:u64]. 20 bytes. */
+    fun encodeCohortPing(epoch: Long, seq: Int, tsMs: Long): ByteArray {
+        val p = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN)
+        p.putLong(epoch); p.putInt(seq); p.putLong(tsMs)
+        return encodeTlv(OP_COHORT_PING, p.array())
+    }
+
+    /** Returns Triple(epoch, seq, tsMs). */
+    fun parseCohortPing(payload: ByteArray): Triple<Long, Int, Long>? {
+        if (payload.size < 20) return null
+        val b = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+        return Triple(b.long, b.int, b.long)
+    }
+
+    /** Cohort pong payload: [epoch:u64][seq:u32][tsMs:u64][rttMs:u16]. 22 bytes. */
+    fun encodeCohortPong(epoch: Long, seq: Int, tsMs: Long, rttMs: Int): ByteArray {
+        val p = ByteBuffer.allocate(22).order(ByteOrder.LITTLE_ENDIAN)
+        p.putLong(epoch); p.putInt(seq); p.putLong(tsMs); p.putShort(rttMs.toShort())
+        return encodeTlv(OP_COHORT_PONG, p.array())
+    }
+
+    /** Returns (epoch, seq, tsMs, rttMs). */
+    fun parseCohortPong(payload: ByteArray): CohortPongPayload? {
+        if (payload.size < 22) return null
+        val b = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+        val epoch = b.long; val seq = b.int; val tsMs = b.long; val rttMs = b.short.toInt() and 0xFFFF
+        return CohortPongPayload(epoch, seq, tsMs, rttMs)
     }
 }

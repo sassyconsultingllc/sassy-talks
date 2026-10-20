@@ -253,11 +253,11 @@ class CellularWebSocketClient {
                 if (!generation.owns(ownerGeneration)) return
                 val raw = bytes.toByteArray()
                 // Validate full TLV structure before routing to PttCoordinator:
-                // byte[0] opcode in 0x10..0x20, bytes[1..2] payload length (u16 LE),
+                // byte[0] opcode in 0x10..0x22, bytes[1..2] payload length (u16 LE),
                 // total frame size must equal 3 + payloadLen.
                 if (raw.size >= 3) {
                     val op = raw[0].toInt() and 0xFF
-                    if (op in 0x10..0x20) {
+                    if (op in 0x10..0x22) {
                         val payloadLen = (raw[1].toInt() and 0xFF) or ((raw[2].toInt() and 0xFF) shl 8)
                         if (raw.size == 3 + payloadLen) {
                             // Derive a per-peer routing key from the TLV payload

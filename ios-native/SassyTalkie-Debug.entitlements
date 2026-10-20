@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Debug/local-dev entitlements.
+
+      This is a REDUCED entitlements file used ONLY for the Debug configuration
+      (free Apple ID "Personal Team" device testing). It intentionally omits
+      the paid-program capabilities that would otherwise block codesigning:
+
+        * com.apple.developer.networking.multicast — requires a paid Apple
+          Developer account; without it, LAN multicast (WiFi transport)
+          discovery is disabled on iOS debug builds. Internet-relay audio and
+          BLE peer-finding still work.
+        * com.apple.developer.associated-domains — also paid-program; debug
+          builds rely on the sassy-talks:// custom-scheme deep link instead.
+
+      Release builds use SassyTalkie.entitlements (full capabilities).
+    -->
+</dict>
+</plist>

@@ -284,6 +284,10 @@ fun AppNavigation(
                         // toast left them guessing.
                         val ctx = describeImportedSession(result.json)
                         Toast.makeText(context, ctx, Toast.LENGTH_LONG).show()
+                        // Also surface a system notification so the join is
+                        // visible even if the app is backgrounded / the toast
+                        // is transient. This is the explicit "you joined" ack.
+                        walkieService?.notifyPeerJoined(ctx)
                         // Go straight onto the radio. Tapping an invite link is
                         // the join gesture; parking on Auth so the user could
                         // press Continue made every invite a two-step join and

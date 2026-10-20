@@ -130,6 +130,19 @@ pub const OP_HYBRID_CONFIRM: u8 = 0x1F;
 /// Outer routing window is 0x10..=0x20 so this is not treated as audio.
 pub const OP_HYBRID_CONFIRM_ACK: u8 = 0x20;
 
+/// Cohort ping — an active round-trip liveness probe from one peer to its
+/// cohort, distinct from the passive periodic [OP_HEARTBEAT]. Payload:
+/// `[epoch:u64][seq:u32][ts_ms:u64]` (20 B). A peer that both decrypts it
+/// and is on the same channel answers with [OP_COHORT_PONG].
+pub const OP_COHORT_PING: u8 = 0x21;
+
+/// Cohort pong — the authenticated reply to [OP_COHORT_PING]. Payload:
+/// `[epoch:u64][seq:u32][ts_ms:u64][rtt_ms:u16]` (22 B). The `rtt_ms`
+/// field holds the responder's measured round-trip time in radians/sample
+/// units is NOT used — it is a placeholder reserved for future latency
+/// telemetry so the wire shape is stable.
+pub const OP_COHORT_PONG: u8 = 0x22;
+
 /// Every opcode this protocol defines, for uniqueness checking and for
 /// consumers that need to validate an inbound byte against the whole set.
 /// Keep in sync when adding an opcode — `all_opcodes_are_unique` fails loudly
@@ -157,6 +170,8 @@ pub const ALL_OPCODES: &[(&str, u8)] = &[
     ("EMERGENCY_CLEAR", OP_EMERGENCY_CLEAR),
     ("HYBRID_CONFIRM", OP_HYBRID_CONFIRM),
     ("HYBRID_CONFIRM_ACK", OP_HYBRID_CONFIRM_ACK),
+    ("COHORT_PING", OP_COHORT_PING),
+    ("COHORT_PONG", OP_COHORT_PONG),
 ];
 
 // ── Helpers ───────────────────────────────────────────────────────────────

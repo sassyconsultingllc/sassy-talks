@@ -58,6 +58,18 @@ static TX_QUEUED: AtomicU64 = AtomicU64::new(0);
 static TX_SUCCEEDED: AtomicU64 = AtomicU64::new(0);
 static TX_FAILED: AtomicU64 = AtomicU64::new(0);
 
+/// TX frames abandoned because the AudioRecord HAL never filled a full 20 ms
+/// frame even after the read-loop backoff budget. A rising rate here means the
+/// device's capture path is starved (bad HAL profile, absurd CPU contention) —
+/// the far end hears gaps, which present as the "drunk"/"mosquito" artifacts.
+static TX_PARTIAL_FRAME_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// Inbound Opus frames that reached the RX path but failed to decode (bad/
+/// truncated packet despite passing AEAD, or an unexpected codec reset).
+/// This is the receiver-side "real-time compression check": a non-zero rate
+/// indicates bytes arriving that are not valid speech frames.
+static RX_DECODE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
 /// Debug-only crypto tracing. When on, the first bytes of each audio frame are
 /// logged BEFORE and AFTER encryption so an operator can confirm with their own
 /// eyes that what leaves the device is not the plaintext.
@@ -160,6 +172,20 @@ pub fn note_tx_failure() {
     TX_FAILED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// A TX frame was dropped because capture never produced a full frame within
+/// the read-loop budget. See [TX_PARTIAL_FRAME_DROPS].
+#[inline]
+pub fn note_tx_partial_frame_drop() {
+    TX_PARTIAL_FRAME_DROPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// An inbound Opus frame failed to decode after authentication. See
+/// [RX_DECODE_FAILURES].
+#[inline]
+pub fn note_rx_decode_failure() {
+    RX_DECODE_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Inbound frame decrypted and authenticated.
 #[inline]
 pub fn note_decrypt_ok() {
@@ -218,14 +244,15 @@ pub fn snapshot_json() -> String {
 
     format!(
         concat!(
-            r#"{{"capture":{{"frames":{},"last_dbfs":{:.1}}},"#,
-            r#""codec":{{"frames_encoded":{},"encoded_bytes":{},"avg_frame_bytes":{}}},"#,
+            r#"{{"capture":{{"frames":{},"last_dbfs":{:.1},"partial_frame_drops":{}}},"#,
+            r#""codec":{{"frames_encoded":{},"encoded_bytes":{},"avg_frame_bytes":{},"rx_decode_failures":{}}},"#,
             r#""crypto_rx":{{"ok":{},"fail":{},"no_session":{},"replay":{},"attempted":{},"ok_pct":{:.1}}},"#,
             r#""tx":{{"queued":{},"succeeded":{},"failed":{}}},"#,
             r#""activity":{{"last_tx_success_age_ms":{},"last_tx_age_ms":{},"last_rx_ok_age_ms":{}}}}}"#
         ),
         FRAMES_CAPTURED.load(Ordering::Relaxed),
         LAST_CAPTURE_DBFS_CENTI.load(Ordering::Relaxed) as f32 / 100.0,
+        TX_PARTIAL_FRAME_DROPS.load(Ordering::Relaxed),
         FRAMES_ENCODED.load(Ordering::Relaxed),
         ENCODED_BYTES.load(Ordering::Relaxed),
         {
@@ -236,6 +263,7 @@ pub fn snapshot_json() -> String {
                 ENCODED_BYTES.load(Ordering::Relaxed) / f
             }
         },
+        RX_DECODE_FAILURES.load(Ordering::Relaxed),
         ok,
         fail,
         no_sess,
