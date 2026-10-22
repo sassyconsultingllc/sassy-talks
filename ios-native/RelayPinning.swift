@@ -92,25 +92,42 @@ final class RelayPinningDelegate: NSObject, URLSessionDelegate {
         return Data(hash).base64EncodedString()
     }
 
-    /// Reconstruct SPKI DER from SecKey's raw export. GTS WE* are P-256 ECDSA;
-    /// WR* are RSA-2048. Anything else is skipped (fail-closed if no pin hits).
+    /// Reconstruct SPKI DER from SecKey's raw export (EC: uncompressed point
+    /// 0x04 ‖ X ‖ Y; RSA: PKCS#1 RSAPublicKey). The pin-set holds P-256 and
+    /// RSA-2048 intermediates and P-384 and RSA-4096 roots. Each header below
+    /// was checked byte-for-byte against the SPKI of every pinned certificate.
+    /// Until 2026-10-22 every EC key got the P-256 header, so the P-384 GTS
+    /// Root R4 anchor hashed to garbage, and RSA-4096 roots were skipped: only
+    /// the WE1 intermediate could ever match. The raw length is checked so an
+    /// unexpected key is skipped rather than mis-hashed (fail-closed if no pin hits).
     private func wrapSPKI(rawKey: Data, type: String?, bits: Int) -> Data? {
-        if type == (kSecAttrKeyTypeECSECPrimeRandom as String) {
-            // P-256 SubjectPublicKeyInfo header + uncompressed point (0x04 ‖ X ‖ Y).
-            let header = Data([
+        let isEC = type == (kSecAttrKeyTypeECSECPrimeRandom as String)
+        let isRSA = type == (kSecAttrKeyTypeRSA as String)
+        let header: [UInt8]
+        if isEC && bits == 256 && rawKey.count == 65 {
+            header = [
                 0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
                 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
-            ])
-            return header + rawKey
-        }
-        if type == (kSecAttrKeyTypeRSA as String) && bits == 2048 {
-            let header = Data([
+            ]
+        } else if isEC && bits == 384 && rawKey.count == 97 {
+            header = [
+                0x30, 0x76, 0x30, 0x10, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+                0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22, 0x03, 0x62, 0x00,
+            ]
+        } else if isRSA && bits == 2048 && rawKey.count == 270 {
+            header = [
                 0x30, 0x82, 0x01, 0x22, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
                 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00, 0x03, 0x82, 0x01, 0x0f, 0x00,
-            ])
-            return header + rawKey
+            ]
+        } else if isRSA && bits == 4096 && rawKey.count == 526 {
+            header = [
+                0x30, 0x82, 0x02, 0x22, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86,
+                0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00, 0x03, 0x82, 0x02, 0x0f, 0x00,
+            ]
+        } else {
+            return nil
         }
-        return nil
+        return Data(header) + rawKey
     }
 }
 
