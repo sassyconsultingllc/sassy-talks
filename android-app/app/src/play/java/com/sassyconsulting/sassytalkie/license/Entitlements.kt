@@ -179,12 +179,15 @@ object Entitlements {
         var catalogLoading by remember { mutableStateOf(true) }
         var catalogAttempt by remember { mutableIntStateOf(0) }
 
-        // One BillingClient per gate visit; listener handles the purchase result.
-        val clientHolder = remember { arrayOfNulls<BillingClient>(1) }
-        val client = remember {
+        // One BillingClient per connection attempt (first load and every Retry).
+        // endConnection() is terminal, so a client is never restarted; see
+        // BillingClientSlot. The listener acknowledges on whichever client is
+        // current, which is the one that launched the purchase flow.
+        val slot = remember { BillingClientSlot<BillingClient> { it.endConnection() } }
+        fun newGateClient(): BillingClient =
             BillingClient.newBuilder(appContext)
                 .setListener { result, purchases ->
-                    val billingClient = clientHolder[0] ?: return@setListener
+                    val billingClient = slot.current ?: return@setListener
                     scope.launch(Dispatchers.Main.immediate) {
                         when (result.responseCode) {
                             BillingClient.BillingResponseCode.OK -> {
@@ -223,8 +226,6 @@ object Entitlements {
                 )
                 .enableAutoServiceReconnection()
                 .build()
-                .also { clientHolder[0] = it }
-        }
 
         fun applyCatalogResult(
             product: ProductDetails?,
@@ -267,11 +268,12 @@ object Entitlements {
             error = null
             details = null
             price = null
-            // Reset before each attempt (including Retry) so startConnection is
-            // a clean bind. Play's enableAutoServiceReconnection() may also
-            // re-fire onBillingSetupFinished after a transient disconnect —
-            // do NOT treat onBillingServiceDisconnected as a fatal catalog miss.
-            try { client.endConnection() } catch (_: Exception) {}
+            // A new client for each attempt (including Retry): endConnection()
+            // is terminal, and restarting the old client failed every attempt.
+            // Play's enableAutoServiceReconnection() may also re-fire
+            // onBillingSetupFinished after a transient disconnect, so do NOT
+            // treat onBillingServiceDisconnected as a fatal catalog miss.
+            val client = slot.fresh { newGateClient() }
 
             val timedOut = withTimeoutOrNull(15_000L) {
                 suspendCancellableCoroutine { cont ->
@@ -358,7 +360,7 @@ object Entitlements {
                 )
             }
         }
-        DisposableEffect(Unit) { onDispose { client.endConnection() } }
+        DisposableEffect(Unit) { onDispose { slot.close() } }
 
         Box(
             modifier = Modifier.fillMaxSize().background(DarkBg),
@@ -414,6 +416,7 @@ object Entitlements {
                             onClick = {
                                 val activity = context as? Activity ?: return@Button
                                 val pd = details ?: return@Button
+                                val client = slot.current ?: return@Button
                                 busy = true
                                 error = null
                                 val flowParams = BillingFlowParams.newBuilder()
