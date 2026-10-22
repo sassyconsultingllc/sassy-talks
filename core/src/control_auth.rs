@@ -222,8 +222,10 @@ impl ControlAuthCodec {
         {
             return None;
         }
-        let age = now_ms as i64 - issued_at_ms as i64;
-        if age > MAX_AGE_MS || age < -MAX_FUTURE_SKEW_MS {
+        // i128: a key holder can put any u64 in issued_at, and the i64
+        // subtraction overflowed (a panic in debug builds) at 2^63 and above.
+        let age = now_ms as i128 - issued_at_ms as i128;
+        if age > MAX_AGE_MS as i128 || age < -(MAX_FUTURE_SKEW_MS as i128) {
             return None;
         }
         {
@@ -536,6 +538,18 @@ mod tests {
         for _ in 0..5 {
             let opened = receiver.open(&rebuilt.seal(&recv_ack(), now).unwrap(), now);
             assert!(opened.is_some(), "rebuilt codec's control must not be replay-rejected");
+        }
+    }
+
+    #[test]
+    fn extreme_issued_at_is_rejected_without_overflow() {
+        // Regression: issued_at >= 2^63 overflowed the i64 age subtraction.
+        let sender = ControlAuthCodec::new(key(), "room-1", "device-a", 11).unwrap();
+        let receiver = ControlAuthCodec::new(key(), "room-1", "device-b", 22).unwrap();
+        let now = 1_700_000_000_000u64;
+        for issued in [1u64 << 63, u64::MAX, 0] {
+            let envelope = sender.seal(&recv_ack(), issued).unwrap();
+            assert!(receiver.open(&envelope, now).is_none(), "issued_at {issued:#x}");
         }
     }
 
