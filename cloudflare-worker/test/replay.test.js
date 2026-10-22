@@ -8,6 +8,7 @@ import {
   selectReplayFrames,
   selectSubprotocol,
   replayCutoff,
+  appendToRing,
 } from "../src/ptt-relay.js";
 
 const tlv = (op, len) => {
@@ -57,6 +58,47 @@ describe("selectReplayFrames", () => {
   it("honours a since= cursor and clamps catchup=1 to the TTL", () => {
     expect(selectReplayFrames(buf, now - 2_000, now, "me").map((e) => e.frame)).toEqual([audio(4)]);
     expect(selectReplayFrames(buf, 0, now, "").length).toBe(3);
+  });
+});
+
+describe("appendToRing", () => {
+  const t0 = 1_700_000_000_000;
+  const fill = (retainAt) => {
+    // 20 s of 20 ms frames, retention decided per append.
+    const ring = [];
+    let held = 0;
+    for (let i = 0; i < 1000; i++) {
+      const now = t0 + i * 20;
+      held = appendToRing(ring, held, { ts: now, frame: audio(i), from: "a" }, now, retainAt(now));
+    }
+    return { ring, held, end: t0 + 999 * 20 };
+  };
+
+  it("keeps the last 15 s with no catch-up window open (silent drop)", () => {
+    // Regression: with no close or wake, nothing was buffered, so a peer that
+    // dropped silently and reconnected with since= got an empty replay.
+    const { ring, end } = fill(() => 15_000);
+    expect(ring.length).toBe(750); // ts in (end - 15 s, end]
+    expect(ring[0].ts).toBeGreaterThan(end - 15_000);
+    const missed = selectReplayFrames(ring, end - 3_000, end, "me");
+    expect(missed.length).toBe(150);
+  });
+
+  it("keeps up to the 30 s TTL while a window is open", () => {
+    const { ring } = fill(() => 30_000);
+    expect(ring.length).toBe(1000);
+  });
+
+  it("tracks bytes and enforces the byte cap", () => {
+    const ring = [];
+    let held = 0;
+    const big = new Uint8Array(900 * 1024);
+    for (let i = 0; i < 4; i++) {
+      held = appendToRing(ring, held, { ts: t0 + i, frame: big, from: "a" }, t0 + i, 15_000);
+    }
+    expect(held).toBe(ring.reduce((n, e) => n + e.frame.length, 0));
+    expect(held).toBeLessThanOrEqual(2 * 1024 * 1024);
+    expect(ring.length).toBe(2);
   });
 });
 

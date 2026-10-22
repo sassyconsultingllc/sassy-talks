@@ -117,6 +117,25 @@ export function selectReplayFrames(buffer, cutoff, nowMs, requesterPeer) {
 }
 
 /**
+ * Append one frame to the store-and-forward ring and trim it to the caps and
+ * to `retainMs`. Pure so the retention policy is testable without a Durable
+ * Object. Oldest entry is at index 0. Returns the new byte total.
+ */
+export function appendToRing(buffer, bytesHeld, entry, nowMs, retainMs) {
+  buffer.push(entry);
+  let held = bytesHeld + entry.frame.length;
+  while (
+    buffer.length > 0 &&
+    (buffer.length > BUFFER_MAX_FRAMES ||
+      held > BUFFER_MAX_BYTES ||
+      buffer[0].ts <= nowMs - retainMs)
+  ) {
+    held -= buffer.shift().frame.length;
+  }
+  return held;
+}
+
+/**
  * Catch-up request to replay cutoff (epoch ms), or null for no replay.
  *
  * Only `?since=<ms>` replays. A bare `?catchup=1` is what every 3.2.7 client
@@ -182,6 +201,10 @@ const SEND_FAIL_CLOSE_THRESHOLD = 3;
 const BUFFER_MAX_FRAMES = 1500;        // ~30 s of audio at 50 fps (20 ms Opus)
 const BUFFER_MAX_BYTES  = 2 * 1024 * 1024; // ~2 MB hard cap regardless of count
 const BUFFER_TTL_MS     = 30_000;      // drop frames older than this on replay
+// Always retained, even with no catch-up window open. Clients ask for at most
+// a 15 s gap with `since=`, and a silent drop (no close frame) gives the relay
+// nothing to open a window on, so this part has to be unconditional.
+const ALWAYS_RETAIN_MS  = 15_000;
 
 /**
  * Build a PARTNER_OFFLINE TLV binary frame for the given peerId.
@@ -267,12 +290,9 @@ export class PttRoom extends DurableObject {
     // stays O(1) (no re-summing the array on the hot path).
     this.audioBuffer = [];
     this.audioBufferBytes = 0;
-    // Store-and-forward is only useful when a peer might reconnect and ask to
-    // catch up. We open a buffering window (this.bufferUntilMs) after any peer
-    // disconnect or FCM wake — the only moments a catch-up reconnect can follow.
-    // In the steady state (all peers live-connected, nobody dropping) we skip
-    // the per-frame copy entirely instead of buffering ~800 frames/sec/room
-    // that no one will ever replay.
+    // The ring always holds the last ALWAYS_RETAIN_MS. After a peer disconnect,
+    // stale reap or FCM wake we also open a window (this.bufferUntilMs) during
+    // which it keeps up to BUFFER_TTL_MS, for peers that come back later.
     this.bufferUntilMs = 0;
     // Per-peer consecutive send-failure counters (WebSocket → count). Cleared
     // on a successful send. Not persisted — hibernation resets to zero which
@@ -492,44 +512,32 @@ export class PttRoom extends DurableObject {
         }
       }
 
-      // Store-and-forward append — ONLY while a catch-up reconnect is plausible
-      // (this.bufferUntilMs, opened on peer disconnect / FCM wake). In the
-      // steady state (everyone live, nobody dropping) catch-up is never
-      // requested, so we skip the per-frame Uint8Array copy + push + trim
-      // entirely — that's ~800 copies/sec saved in a full 16-peer room.
+      // Store-and-forward append, always. A phone whose link dies without a
+      // close frame (handoff, tunnel, NAT rebind) reconnects about 3 s later
+      // with `since=`, before the relay has seen any close or reaped the
+      // zombie socket (8-10 s). When buffering waited for those events, that
+      // replay was empty, which is the case catch-up exists for. A wake push
+      // also opened the window only after two KV reads, clipping the start of
+      // the utterance. PTT has one talker at a time, so this is about 50
+      // copies/s per active room, and 15 s of Opus is well under 200 KB.
+      // While a catch-up window is open the ring keeps up to BUFFER_TTL_MS.
       //
-      // Hot-path cost when active: one Uint8Array copy + array push, plus an
-      // occasional O(1) front-shift when over cap. NO storage write, NO await.
-      // We copy because `bytes` may alias a transient runtime buffer reused
-      // after this turn; the copy is also exactly what gets re-emitted later.
-      //
-      // Control frames (PTT_START/STOP/WAKE/etc.) are tiny and harmless to keep
-      // — replaying them is a no-op for receivers — so we buffer every binary
-      // frame uniformly rather than branch on opcode in the hot path.
-      if (Date.now() <= this.bufferUntilMs) {
+      // Hot-path cost: one Uint8Array copy + array push, plus an amortized
+      // front-shift. NO storage write, NO await. We copy because `bytes` may
+      // alias a transient runtime buffer reused after this turn; the copy is
+      // also exactly what gets re-emitted later. Control frames are buffered
+      // too (no opcode branch here); selectReplayFrames drops them on replay.
+      {
+        const now = Date.now();
         const framed = new Uint8Array(bytes.length);
         framed.set(bytes);
         // `from` lets replay skip a peer's own frames. The relay still never
         // parses audio; this is the sender's socket identity, not content.
         const from = (sessRefresh && (sessRefresh.peer || sessRefresh.id)) || "";
-        this.audioBuffer.push({ ts: Date.now(), frame: framed, from });
-        this.audioBufferBytes += framed.length;
-        // O(1) trim: shift the oldest until both caps are satisfied. `shift()`
-        // on a JS array is amortized cheap and we only ever drop a handful per
-        // append at steady state (one in, one out once the window is full).
-        while (
-          this.audioBuffer.length > BUFFER_MAX_FRAMES ||
-          this.audioBufferBytes > BUFFER_MAX_BYTES
-        ) {
-          const evicted = this.audioBuffer.shift();
-          if (!evicted) break;
-          this.audioBufferBytes -= evicted.frame.length;
-        }
-      } else if (this.audioBuffer.length > 0) {
-        // Window lapsed and no one is around to catch up — release the retained
-        // frames so a quiet room doesn't hold ~2 MB until hibernation.
-        this.audioBuffer.length = 0;
-        this.audioBufferBytes = 0;
+        const retainMs = now <= this.bufferUntilMs ? BUFFER_TTL_MS : ALWAYS_RETAIN_MS;
+        this.audioBufferBytes = appendToRing(
+          this.audioBuffer, this.audioBufferBytes, { ts: now, frame: framed, from }, now, retainMs,
+        );
       }
 
       // FCM wake-push fan-out for offline peers. Only fires for OP_WAKE (0x17)
