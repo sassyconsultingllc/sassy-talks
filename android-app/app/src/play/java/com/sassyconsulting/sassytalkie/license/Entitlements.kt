@@ -89,16 +89,22 @@ object Entitlements {
         // bypass, or the post-startup reconciliation re-locks a dev install
         // onto the paywall (no Play purchase on emulators).
         if (BuildConfig.DEBUG) return onResult(true)
-        if (LicenseStore.prefs(appContext)?.getString(LicenseStore.KEY_KIND, null) == "promo") {
-            if (!LicensePromo.hasValidReceipt(appContext)) {
-                onResult(false)
-                return
-            }
+        val kind = LicenseStore.prefs(appContext)?.getString(LicenseStore.KEY_KIND, null)
+        if (PlayRefreshPolicy.startWithPromo(kind, LicensePromo.hasValidReceipt(appContext))) {
             LicensePromo.refreshIfNeeded(appContext) { ok ->
-                onResult(ok || LicensePromo.hasValidReceipt(appContext))
+                if (PlayRefreshPolicy.askPlayAfterPromo(ok, LicensePromo.hasValidReceipt(appContext))) {
+                    refreshFromPlay(appContext, onResult)
+                } else {
+                    onResult(true)
+                }
             }
             return
         }
+        // A lapsed promo falls through to Play: the user may have bought since.
+        refreshFromPlay(appContext, onResult)
+    }
+
+    private fun refreshFromPlay(appContext: Context, onResult: (Boolean) -> Unit) {
         // Guarantee onResult fires EXACTLY once. Play Billing may drop the
         // connection (onBillingServiceDisconnected) or never call back at all;
         // a missed callback would hang the Restore button's coroutine forever.
@@ -567,7 +573,14 @@ object Entitlements {
     }
 
     private fun setUnlocked(context: Context, value: Boolean) {
-        LicenseStore.prefs(context)?.edit()?.putBoolean(LicenseStore.KEY_UNLOCKED, value)?.apply()
+        val p = LicenseStore.prefs(context) ?: return
+        val edit = p.edit().putBoolean(LicenseStore.KEY_UNLOCKED, value)
+        // A Play purchase supersedes a promo: drop the promo kind so later
+        // refreshes reconcile against Play rather than the relay.
+        if (value && p.getString(LicenseStore.KEY_KIND, null) == "promo") {
+            edit.remove(LicenseStore.KEY_KIND)
+        }
+        edit.apply()
     }
 
     // A refund shows up as Play reporting the one-time product unowned. Because

@@ -76,11 +76,13 @@ object LicensePromo {
                 }
                 is ApiResult.Rejected -> {
                     Log.w(TAG, "Promo rejected on refresh: ${res.message}")
+                    // Leave KEY_UNLOCKED alone: a promo never sets it, and on
+                    // Play it is the permanent purchase flag, so clearing it
+                    // here deleted a real purchase.
                     p.edit()
                         .remove(LicenseStore.KEY_RECEIPT_EXP)
                         .remove(LicenseStore.KEY_KIND)
                         .remove(LicenseStore.KEY_LICENSE)
-                        .putBoolean(LicenseStore.KEY_UNLOCKED, false)
                         .apply()
                     onResult(false)
                 }
