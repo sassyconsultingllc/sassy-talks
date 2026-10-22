@@ -139,11 +139,15 @@ object Entitlements {
                             it.purchaseState == Purchase.PurchaseState.PURCHASED
                     }
                     if (owned) {
-                        purchases.filter { it.products.contains(PRODUCT_ID) && !it.isAcknowledged }
-                            .forEach { acknowledge(client, it) }
                         setUnlocked(appContext, true)
                         clearUnownedSince(appContext)
-                        finish(true)
+                        // finish() ends the connection, which drops queued acks,
+                        // so it waits for Play to answer every one (the hard
+                        // timeout above still backstops a missing callback).
+                        val acks = PendingAcks { finish(true) }
+                        purchases.filter { it.products.contains(PRODUCT_ID) && !it.isAcknowledged }
+                            .forEach { acknowledge(client, it, acks.begin()) }
+                        acks.seal()
                     } else {
                         // Do NOT revoke on a single unowned result — Play can
                         // transiently return an empty list. Only drop entitlement
@@ -184,6 +188,9 @@ object Entitlements {
         // BillingClientSlot. The listener acknowledges on whichever client is
         // current, which is the one that launched the purchase flow.
         val slot = remember { BillingClientSlot<BillingClient> { it.endConnection() } }
+        // Leaving the gate ends the client only after its acks have called
+        // back; ending it first drops them and Play refunds after 3 days.
+        val gateAcks = remember { PendingAcks { slot.close() } }
         fun newGateClient(): BillingClient =
             BillingClient.newBuilder(appContext)
                 .setListener { result, purchases ->
@@ -196,7 +203,7 @@ object Entitlements {
                                         it.purchaseState == Purchase.PurchaseState.PURCHASED
                                 }
                                 if (p != null) {
-                                    acknowledge(billingClient, p)
+                                    acknowledge(billingClient, p, gateAcks.begin())
                                     setUnlocked(appContext, true)
                                     busy = false
                                     onUnlocked()
@@ -301,7 +308,7 @@ object Entitlements {
                                     }
                                 if (owned) {
                                     purchases.filter { !it.isAcknowledged }
-                                        .forEach { acknowledge(client, it) }
+                                        .forEach { acknowledge(client, it, gateAcks.begin()) }
                                     scope.launch(Dispatchers.Main.immediate) {
                                         catalogLoading = false
                                         setUnlocked(appContext, true)
@@ -360,7 +367,14 @@ object Entitlements {
                 )
             }
         }
-        DisposableEffect(Unit) { onDispose { slot.close() } }
+        DisposableEffect(Unit) {
+            onDispose {
+                gateAcks.seal()
+                // Backstop: end the client even if an ack never calls back.
+                android.os.Handler(android.os.Looper.getMainLooper())
+                    .postDelayed({ gateAcks.forceDone() }, 15_000L)
+            }
+        }
 
         Box(
             modifier = Modifier.fillMaxSize().background(DarkBg),
@@ -591,7 +605,8 @@ object Entitlements {
         return false
     }
 
-    private fun acknowledge(client: BillingClient, purchase: Purchase) {
+    /** [onDone] runs from Play's callback, whatever the result (see [PendingAcks]). */
+    private fun acknowledge(client: BillingClient, purchase: Purchase, onDone: () -> Unit) {
         client.acknowledgePurchase(
             AcknowledgePurchaseParams.newBuilder()
                 .setPurchaseToken(purchase.purchaseToken).build(),
@@ -599,6 +614,7 @@ object Entitlements {
             if (r.responseCode != BillingClient.BillingResponseCode.OK) {
                 Log.w(TAG, "acknowledge failed: ${r.debugMessage}")
             }
+            onDone()
         }
     }
 }
