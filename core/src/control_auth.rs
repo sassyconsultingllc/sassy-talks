@@ -77,7 +77,7 @@ impl ControlAuthCodec {
             room_binding,
             sender_id: sender_id.to_string(),
             epoch,
-            tx_sequence: AtomicU64::new(0),
+            tx_sequence: AtomicU64::new(next_sequence_base(wall_clock_ms())),
             replay: std::sync::Mutex::new(ReplayWindow::default()),
         })
     }
@@ -353,6 +353,43 @@ fn outer_aad(opcode: u8) -> Vec<u8> {
     aad
 }
 
+/// Sequences reserved per elapsed millisecond, and the minimum gap between
+/// the bases of two codecs built in the same process.
+const SEQUENCE_STRIDE: u64 = 1 << 16;
+
+static LAST_SEQUENCE_BASE: AtomicU64 = AtomicU64::new(0);
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Value a new codec's sequence counts up from.
+///
+/// Receivers key their replay window on (sender, epoch). A codec rebuilt
+/// under the same epoch (iOS re-importing the same QR or invite, desktop
+/// rejoining) used to restart at 1, so every peer rejected all of its control
+/// (PTT_START_V2, STOP, EOT_ACK, heartbeats) until the new count passed the
+/// old one, for as long as the app had already been running. Starting from
+/// the wall clock in ms times [`SEQUENCE_STRIDE`] puts a rebuilt codec above
+/// anything sent before it, unless the clock went backwards. The in-process
+/// high-water mark also separates two codecs built in the same millisecond.
+/// The clock is masked to 47 bits so the result stays below 2^63, which
+/// Android's signed `Long` sequence needs (it rejects values <= 0).
+fn next_sequence_base(now_ms: u64) -> u64 {
+    let clock = (now_ms & ((1u64 << 47) - 1)) * SEQUENCE_STRIDE;
+    let mut last = LAST_SEQUENCE_BASE.load(Ordering::SeqCst);
+    loop {
+        let next = clock.max(last.saturating_add(SEQUENCE_STRIDE));
+        match LAST_SEQUENCE_BASE.compare_exchange(last, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return next,
+            Err(seen) => last = seen,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ReplayWindow {
     states: HashMap<String, ReplayState>,
@@ -482,6 +519,34 @@ mod tests {
         assert_eq!(verified.epoch, 11);
         assert!(verified.sequence > 0);
         assert_eq!(verified.inner_frame, inner);
+    }
+
+    #[test]
+    fn rebuilt_codec_under_the_same_epoch_is_still_accepted() {
+        // Regression: a rebuilt codec restarted at sequence 1 under the same
+        // (sender, epoch), so the receiver rejected its control as replays
+        // until the count passed the old codec's.
+        let receiver = ControlAuthCodec::new(key(), "room-1", "device-b", 22).unwrap();
+        let now = 1_700_000_000_000u64;
+        let first = ControlAuthCodec::new(key(), "room-1", "device-a", 11).unwrap();
+        for _ in 0..200 {
+            assert!(receiver.open(&first.seal(&recv_ack(), now).unwrap(), now).is_some());
+        }
+        let rebuilt = ControlAuthCodec::new(key(), "room-1", "device-a", 11).unwrap();
+        for _ in 0..5 {
+            let opened = receiver.open(&rebuilt.seal(&recv_ack(), now).unwrap(), now);
+            assert!(opened.is_some(), "rebuilt codec's control must not be replay-rejected");
+        }
+    }
+
+    #[test]
+    fn sequence_base_stays_positive_for_kotlin_long() {
+        // Android parses the sequence as a signed Long and rejects <= 0.
+        let base = next_sequence_base(u64::MAX);
+        assert!(base > 0 && base < (1u64 << 63), "{base:#x}");
+        let a = next_sequence_base(1_700_000_000_000);
+        let b = next_sequence_base(1_700_000_000_000);
+        assert!(b >= a + SEQUENCE_STRIDE, "same-ms codecs must get separate ranges");
     }
 
     #[test]
