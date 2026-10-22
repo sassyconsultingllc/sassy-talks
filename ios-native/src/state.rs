@@ -921,7 +921,15 @@ impl StateMachine {
         if self.floor.peer_speaking(now) || self.floor.is_held(now) {
             return AppState::Receiving;
         }
-        *self.state.lock().unwrap()
+        // A TX can end without on_ptt_release: the 60 s safety limit, a remote
+        // that wins arbitration, or yield_local_tx. Those paths clear
+        // is_transmitting but not the stored state, which then read
+        // Transmitting forever: the VM's `state != 3` auto-release never fired,
+        // the mic tap stayed on and the UI said TRANSMITTING with nothing sent.
+        match *self.state.lock().unwrap() {
+            AppState::Transmitting => AppState::Connected,
+            stored => stored,
+        }
     }
 
     /// PTT press - start transmission. Refuses when unpaired or the floor is
@@ -973,6 +981,12 @@ impl StateMachine {
     /// PTT release - stop transmission and emit `OP_PTT_STOP_V2`.
     pub fn on_ptt_release(&mut self) -> Result<(), StateError> {
         if !self.is_transmitting.load(Ordering::SeqCst) {
+            // Rust already ended this TX (limit or preemption); settle the
+            // stored state it left behind.
+            let mut state = self.state.lock().unwrap();
+            if *state == AppState::Transmitting {
+                *state = AppState::Connected;
+            }
             return Ok(());
         }
 
@@ -1484,6 +1498,35 @@ mod tests {
             "same frame live again is a replay"
         );
         assert!(!sm.process_relay_frame(&replay_wrap(&frame)));
+    }
+
+    #[test]
+    fn safety_limit_does_not_leave_transmitting_latched() {
+        // Regression: the 60 s ceiling stopped TX in the TX thread but left
+        // the stored state at Transmitting, so get_state() kept returning 3.
+        let mut sm = paired();
+        sm.on_ptt_press().expect("press");
+        assert_eq!(sm.current_state(), AppState::Transmitting);
+        let past_limit = crate::control::now_ms() - floor_policy::DEFAULT_MAX_TX_MS - 1_000;
+        sm.tx_started_ms.store(past_limit, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while sm.is_transmitting.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!sm.is_transmitting.load(Ordering::SeqCst), "TX thread hit the ceiling");
+        assert_eq!(sm.current_state(), AppState::Connected);
+        sm.on_ptt_release().expect("release");
+        assert_eq!(*sm.state.lock().unwrap(), AppState::Connected);
+    }
+
+    #[test]
+    fn preemption_does_not_leave_transmitting_latched() {
+        let mut sm = paired();
+        sm.on_ptt_press().expect("press");
+        sm.yield_local_tx("test preemption");
+        assert_eq!(sm.current_state(), AppState::Connected);
+        sm.on_ptt_release().expect("release");
+        assert_eq!(*sm.state.lock().unwrap(), AppState::Connected);
     }
 
     #[test]
