@@ -7,6 +7,7 @@ import {
   isControlFrameShape,
   selectReplayFrames,
   selectSubprotocol,
+  replayCutoff,
 } from "../src/ptt-relay.js";
 
 const tlv = (op, len) => {
@@ -56,6 +57,31 @@ describe("selectReplayFrames", () => {
   it("honours a since= cursor and clamps catchup=1 to the TTL", () => {
     expect(selectReplayFrames(buf, now - 2_000, now, "me").map((e) => e.frame)).toEqual([audio(4)]);
     expect(selectReplayFrames(buf, 0, now, "").length).toBe(3);
+  });
+});
+
+describe("replayCutoff", () => {
+  const q = (s) => new URLSearchParams(s);
+
+  it("ignores a bare catchup=1 from 3.2.7 clients, which cannot unwrap replays", () => {
+    // These clients send catchup=1 on every reconnect; the replay reached
+    // their AEAD as garbage and was logged as a key mismatch.
+    expect(replayCutoff(q("catchup=1"))).toBe(null);
+    expect(replayCutoff(q("room=r&peer=p&catchup=1"))).toBe(null);
+  });
+
+  it("replays from a since= cursor", () => {
+    expect(replayCutoff(q("since=1700000095000"))).toBe(1700000095000);
+    expect(replayCutoff(q("catchup=1&since=1700000095000"))).toBe(1700000095000);
+  });
+
+  it("treats an empty or junk since= as no replay, not the whole window", () => {
+    expect(replayCutoff(q("since="))).toBe(null);
+    expect(replayCutoff(q("since=%20"))).toBe(null);
+    expect(replayCutoff(q("since=abc"))).toBe(null);
+    expect(replayCutoff(q("since=0"))).toBe(null);
+    expect(replayCutoff(q("since=-5"))).toBe(null);
+    expect(replayCutoff(q(""))).toBe(null);
   });
 });
 

@@ -117,6 +117,23 @@ export function selectReplayFrames(buffer, cutoff, nowMs, requesterPeer) {
 }
 
 /**
+ * Catch-up request to replay cutoff (epoch ms), or null for no replay.
+ *
+ * Only `?since=<ms>` replays. A bare `?catchup=1` is what every 3.2.7 client
+ * sends on every reconnect, and none of them can unwrap OP_REPLAY_FRAME, so
+ * the replay went into their AEAD as garbage and was logged as a key
+ * mismatch. Clients that can unwrap replays send `since=` instead, so
+ * ignoring the bare flag costs nothing. An empty or non-numeric `since` also
+ * means no replay; `Number("")` is 0, which used to replay the whole window.
+ */
+export function replayCutoff(searchParams) {
+  const raw = searchParams.get("since");
+  if (raw === null || raw.trim() === "") return null;
+  const ms = Number(raw);
+  return Number.isFinite(ms) && ms > 0 ? ms : null;
+}
+
+/**
  * Pick the WebSocket subprotocol to echo. A client that carries its token as a
  * `sassytalk.<token>` subprotocol (see relay-auth extractToken) offered a list;
  * RFC 6455 clients fail the handshake unless the 101 selects one of them.
@@ -365,21 +382,14 @@ export class PttRoom extends DurableObject {
     }));
 
     // Store-and-forward catch-up. Only replay when the client explicitly asks
-    // (so normal joins don't get a replay blast on top of live audio):
-    //   ?catchup=1       → replay the whole retained window
-    //   ?since=<ms>      → replay only frames with ts > <ms> (epoch millis)
-    // A peer woken by the FCM push reconnects with one of these to hear what
-    // it missed. Replay is paced in arrival order, after the welcome, so the
-    // client sees its session is live before the catch-up stream starts.
-    const wantsCatchup = url.searchParams.get("catchup") === "1";
-    const sinceRaw = url.searchParams.get("since");
-    const sinceMs = sinceRaw !== null ? Number(sinceRaw) : NaN;
-    if (wantsCatchup || Number.isFinite(sinceMs)) {
-      // Snapshot the buffer cutoff now; replay runs in waitUntil so it never
-      // blocks the 101 handshake response.
-      const cutoff = Number.isFinite(sinceMs)
-        ? sinceMs
-        : Date.now() - BUFFER_TTL_MS;
+    // with `?since=<ms>` (frames with ts > <ms>, epoch millis), so normal joins
+    // don't get a replay blast on top of live audio. A bare `?catchup=1` from
+    // a 3.2.7 client is ignored (see replayCutoff). A woken peer reconnects
+    // with `since=` to hear what it missed. Replay is paced in arrival order,
+    // after the welcome, so the client sees its session is live first.
+    const cutoff = replayCutoff(url.searchParams);
+    if (cutoff !== null) {
+      // Replay runs in waitUntil so it never blocks the 101 handshake response.
       this.ctx.waitUntil(this.replayBufferedAudio(server, cutoff, clientId, peer));
     }
 
