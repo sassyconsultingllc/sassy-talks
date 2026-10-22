@@ -1052,7 +1052,13 @@ impl StateMachine {
                     break;
                 }
 
-                let frame = match audio.lock().unwrap().read_input_frame() {
+                // Bind first so the audio guard drops at the end of this
+                // statement. Matching on `audio.lock()...` directly kept the
+                // guard alive through the arm, so the thread slept 5 ms holding
+                // the audio lock while the mic tap (which holds the global FFI
+                // lock) waited for it, and every FFI call queued behind them.
+                let read = audio.lock().unwrap().read_input_frame();
+                let frame = match read {
                     Ok(f) => f,
                     Err(_) => {
                         thread::sleep(Duration::from_millis(5));
@@ -1517,6 +1523,25 @@ mod tests {
         assert_eq!(sm.current_state(), AppState::Connected);
         sm.on_ptt_release().expect("release");
         assert_eq!(*sm.state.lock().unwrap(), AppState::Connected);
+    }
+
+    #[test]
+    fn tx_thread_does_not_sleep_holding_the_audio_lock() {
+        // Regression: with an empty mic ring the TX thread slept 5 ms per
+        // iteration holding the audio mutex, so the mic tap (holding the global
+        // FFI lock) waited on it almost every time.
+        let mut sm = paired();
+        sm.on_ptt_press().expect("press");
+        thread::sleep(Duration::from_millis(30));
+        let mut busy = 0;
+        for _ in 0..200 {
+            if sm.audio.try_lock().is_err() {
+                busy += 1;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        sm.on_ptt_release().expect("release");
+        assert!(busy < 100, "audio lock busy on {busy}/200 probes");
     }
 
     #[test]
