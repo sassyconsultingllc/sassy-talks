@@ -40,7 +40,11 @@ internal class AuthenticatedControlCodec(
     private val roomBinding = MessageDigest.getInstance("SHA-256")
         .digest(roomId.toByteArray(Charsets.UTF_8))
         .copyOf(ROOM_BINDING_BYTES)
-    private val txSequence = AtomicLong(0)
+    // Starts above anything an earlier codec in this process sent: receivers
+    // key replay on (sender, epoch), and switching away from a channel and
+    // back rebuilt this codec under the same epoch at sequence 1, so peers
+    // rejected all of its control as replays. Mirrors core's next_sequence_base.
+    private val txSequence = AtomicLong(nextSequenceBase(clockMs()))
     private val replay = ReplayWindow()
 
     fun seal(innerFrame: ByteArray): ByteArray {
@@ -182,6 +186,24 @@ internal class AuthenticatedControlCodec(
         private const val MAX_AGE_MS = 2 * 60 * 1000L
         private const val MAX_FUTURE_SKEW_MS = 30 * 1000L
         private const val MIN_BODY_BYTES = 4 + 1 + ROOM_BINDING_BYTES + 1 + 1 + 8 + 8 + 8 + 2
+
+        /** Sequences reserved per elapsed ms, and the minimum gap between codecs. */
+        internal const val SEQUENCE_STRIDE = 1L shl 16
+        private val lastSequenceBase = AtomicLong(0)
+
+        /**
+         * Wall clock in ms times [SEQUENCE_STRIDE], kept above the previous
+         * codec's base in this process. The clock is masked to 47 bits so the
+         * result stays positive (receivers reject sequence <= 0).
+         */
+        internal fun nextSequenceBase(nowMs: Long): Long {
+            val clock = (nowMs and ((1L shl 47) - 1)) * SEQUENCE_STRIDE
+            while (true) {
+                val last = lastSequenceBase.get()
+                val next = maxOf(clock, last + SEQUENCE_STRIDE)
+                if (lastSequenceBase.compareAndSet(last, next)) return next
+            }
+        }
     }
 }
 

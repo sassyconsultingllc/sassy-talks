@@ -58,6 +58,32 @@ class AuthenticatedControlPlaneTest {
         assertNull(receiver.open(sender.seal(ControlFrame.encodeWake(11, senderNow))))
     }
 
+    @Test
+    fun `codec rebuilt under the same epoch is not replay-rejected`() {
+        // Regression: switching away from a channel and back rebuilt the codec
+        // at sequence 1 under the same (sender, epoch), so the receiver dropped
+        // its control until the count passed the old codec's.
+        val receiver = codec(sender = "device-b", epoch = 22)
+        val first = codec(sender = "device-a", epoch = 11)
+        repeat(200) { assertTrue(receiver.open(first.seal(ControlFrame.encodeRecvAck(11, it, NOW))) != null) }
+        val rebuilt = codec(sender = "device-a", epoch = 11)
+        repeat(5) {
+            assertTrue(
+                "rebuilt codec's control must be accepted",
+                receiver.open(rebuilt.seal(ControlFrame.encodeRecvAck(11, it, NOW))) != null,
+            )
+        }
+    }
+
+    @Test
+    fun `sequence base stays positive and separates same-ms codecs`() {
+        val far = AuthenticatedControlCodec.nextSequenceBase(Long.MAX_VALUE)
+        assertTrue(far > 0)
+        val a = AuthenticatedControlCodec.nextSequenceBase(NOW)
+        val b = AuthenticatedControlCodec.nextSequenceBase(NOW)
+        assertTrue(b >= a + AuthenticatedControlCodec.SEQUENCE_STRIDE)
+    }
+
     @Test(expected = IllegalArgumentException::class)
     fun `legacy control cannot be wrapped as privileged v2`() {
         codec(sender = "device-a").seal(ControlFrame.encodeLegacy(ControlFrame.OP_PTT_START))
