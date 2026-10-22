@@ -3988,6 +3988,7 @@ dependencies = [
  "reqwest 0.12.28",
  "ringbuf",
  "rustls",
+ "rustls-webpki",
  "sassytalkie-core",
  "secret-service",
  "security-framework",
