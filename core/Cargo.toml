@@ -22,6 +22,10 @@ log = "0.4"
 # Crypto stack — identical primitives on Android (libsodium-via-Java is NOT
 # in use; we do pure-Rust AES-GCM). Tauri uses the same versions today.
 aes-gcm        = "0.10"
+# aes-gcm's own `zeroize` feature only wipes a temporary GHASH key. The AES
+# round keys are wiped on drop only with the `aes` crate's `zeroize` feature,
+# enabled here and unified into the aes that aes-gcm uses.
+aes            = { version = "0.8", features = ["zeroize"] }
 x25519-dalek   = { version = "2.0", features = ["static_secrets"] }
 hkdf           = "0.12"
 hmac           = "0.12"

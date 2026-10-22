@@ -6,8 +6,9 @@
 /// Handles key exchange (X25519 ECDH) and packet encryption/decryption.
 /// Each session generates a fresh ephemeral keypair.
 ///
-/// Key hygiene: AES round keys live in `Aes256Gcm` which zeroizes on drop
-/// (via the `zeroize` feature of aes-gcm). The KDF intermediate buffer
+/// Key hygiene: AES round keys live in the `Aes256` inside `Aes256Gcm`, which
+/// zeroizes on drop via the `aes` crate's `zeroize` feature (core/Cargo.toml;
+/// aes-gcm's own feature only covers a temporary GHASH key). The KDF intermediate buffer
 /// is held in `Zeroizing<[u8; 32]>` so it's wiped after the cipher is built.
 /// X25519 ephemerals zeroize on drop via x25519-dalek's `zeroize` feature.
 
@@ -333,6 +334,14 @@ mod tests {
             );
             assert_ne!(frame[0], crate::protocol::OP_REPLAY_FRAME);
         }
+    }
+
+    #[test]
+    fn aes_round_keys_are_wiped_on_drop() {
+        // Compile-time check: without the aes crate's `zeroize` feature this
+        // does not build, and the round keys stayed in freed memory.
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<aes::Aes256>();
     }
 
     #[test]
