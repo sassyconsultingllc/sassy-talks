@@ -9,9 +9,34 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
-## [Unreleased]
+## [3.2.8] (84 Android) - 2026-10-22
 
 ### Fixed
+- **Play paywall never loaded the product (since 2026-07-08):** the gate
+  ended and restarted one BillingClient, and `endConnection()` is terminal,
+  so nobody could buy. Each attempt now gets a new client.
+- **Play purchases could be auto-refunded:** the billing connection ended
+  before purchase acknowledgements returned. It now waits for them.
+- **Paying users locked out after a promo:** a lapsed promo no longer skips
+  the Play check, and a rejected promo no longer clears the purchase flag.
+- **TLS pins:** pins now cover the root keys of every CA Cloudflare issues
+  Universal SSL from (Let's Encrypt incl. Gen Y, Google Trust Services,
+  SSL.com), so a renewal from another CA no longer cuts every client off.
+  Desktop matches pins against the verified path (closes a bypass), and iOS
+  hashes P-384 and RSA-4096 keys correctly.
+- **Senders inaudible to 3.2.7 desktop/iOS (1 session in 16):** sealed
+  frames no longer start in the hint or control byte ranges.
+- **Floor control after a rejoin:** a rebuilt control codec no longer
+  restarts its sequence at 1 (peers rejected its control as replays).
+- **Relay:** a bare `catchup=1` from 3.2.7 clients no longer gets an
+  undecodable replay; the last 15 s of audio is always kept so `since=`
+  catch-up works after a silent drop.
+- **iOS:** no longer reports Transmitting forever after the 60 s limit or a
+  preemption; the TX thread no longer sleeps holding the audio lock.
+- **Crypto hygiene:** AES round keys are now actually wiped on drop; no
+  overflow on an extreme `issued_at`.
+- **Native libraries rebuilt** from current source for both ABIs, so the
+  Rust fixes (including replay unwrapping) actually ship on Android.
 - **Senders silently inaudible on desktop and iPhone (since 3.2):** the
   authenticated control plane treated any frame starting below 0x10 as a
   legacy hint. Sealed audio starts with a per-session random nonce prefix,
