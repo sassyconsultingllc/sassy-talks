@@ -175,10 +175,29 @@ impl CryptoSession {
     }
 }
 
+/// Lowest value the first byte of a nonce prefix may take.
+///
+/// A sealed frame is `nonce || ciphertext || tag`, so the prefix's first byte
+/// is the frame's first byte, and receivers sort frames by it before trying to
+/// open them. Below 0x10, a 3.2.7 desktop or iOS receiver takes the frame for
+/// a legacy hint and drops it (1 sender session in 16, inaudible for the
+/// whole session); 02e81cf fixed that only in receivers that update. 0x10 to
+/// 0x20 is the TLV control window, where a frame whose length happens to match
+/// is classified as control, and 0x19 is OP_REPLAY_FRAME, which Android
+/// unwraps without falling back to audio. Starting every prefix at 0x21 makes
+/// sealed frames unambiguous on every receiver already shipped. The nonce
+/// travels in the frame, so this needs no receiver change, and it costs under
+/// 0.2 bits of the 64-bit random prefix.
+const MIN_PREFIX_FIRST_BYTE: u8 = 0x21;
+
 fn random_nonce_prefix() -> [u8; 8] {
     let mut prefix = [0u8; 8];
-    OsRng.fill_bytes(&mut prefix);
-    prefix
+    loop {
+        OsRng.fill_bytes(&mut prefix);
+        if prefix[0] >= MIN_PREFIX_FIRST_BYTE {
+            return prefix;
+        }
+    }
 }
 
 /// Key exchange helper
@@ -295,5 +314,35 @@ mod tests {
         let b = s.encrypt(b"y").unwrap();
         assert_eq!(a[..8], b[..8], "prefix (first 8 bytes) must match");
         assert_ne!(a[8..12], b[8..12], "counter (bytes 8..12) must differ");
+    }
+
+    #[test]
+    fn sealed_frames_never_start_in_the_hint_or_control_range() {
+        // Regression: an unconstrained prefix put 1 sender session in 16 below
+        // 0x10, where shipped desktop/iOS receivers drop every frame as a
+        // legacy hint, and more into the 0x10..=0x20 control window. 4000
+        // sessions with an unconstrained prefix would all clear 0x20 with
+        // probability (222/256)^4000, which is effectively zero.
+        for _ in 0..4000 {
+            let mut s = CryptoSession::from_psk(&generate_psk());
+            let frame = s.encrypt(b"opus").unwrap();
+            assert!(
+                frame[0] >= MIN_PREFIX_FIRST_BYTE,
+                "sealed frame starts with {:#04x}",
+                frame[0]
+            );
+            assert_ne!(frame[0], crate::protocol::OP_REPLAY_FRAME);
+        }
+    }
+
+    #[test]
+    fn constrained_prefix_still_round_trips() {
+        let key = generate_psk();
+        let mut tx = CryptoSession::from_psk(&key);
+        let rx = CryptoSession::from_psk(&key);
+        for i in 0..64u8 {
+            let frame = tx.encrypt(&[i; 40]).unwrap();
+            assert_eq!(rx.decrypt(&frame).unwrap(), vec![i; 40]);
+        }
     }
 }
