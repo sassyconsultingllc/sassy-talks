@@ -329,18 +329,14 @@ pub fn spawn_tx_thread(
                 // "robotic" artifact. Accumulate into the buffer until a full
                 // CODEC_FRAME_SIZE (960 samples / 20 ms) is captured.
                 let mut filled: usize = 0;
-                let mut read_attempts: u32 = 0;
-                // Exponential backoff on read attempts. On cellular + WiFi
-                // heterogeneous paths, the AudioRecord HAL sometimes needs >50ms
-                // to deliver a full 20ms frame under contention. The 25-attempt
-                // / 50ms cap used to produce partial frames → gaps in the output
-                // → "mosquito"/"drunk" artifacts on the far end. Give the HAL
-                // up to ~200ms total across backed-off sleeps.
-                const MAX_READ_ATTEMPTS_PER_FRAME: u32 = 80;
-                let backoff_ms: [u64; 8] = [2, 4, 8, 16, 32, 32, 32, 32];
-                let mut backoff_idx: usize = 0;
-                while filled < CODEC_FRAME_SIZE && read_attempts < MAX_READ_ATTEMPTS_PER_FRAME {
-                    read_attempts += 1;
+                // Under contention the HAL can need more than the old 50 ms cap
+                // to deliver a full frame, and dropping the partial frame left
+                // gaps the far end heard as "mosquito"/"drunk" audio. Back off
+                // between empty reads for up to CAPTURE_FRAME_BUDGET of wall
+                // time per frame.
+                let frame_started = Instant::now();
+                let mut backoff = CaptureBackoff::new();
+                while filled < CODEC_FRAME_SIZE {
                     let n = {
                         let eng = audio.lock().unwrap();
                         match eng.read_audio(&mut pcm_buffer[filled..CODEC_FRAME_SIZE]) {
@@ -352,22 +348,23 @@ pub fn spawn_tx_thread(
                         }
                     };
                     if n == 0 {
-                        if backoff_idx < backoff_ms.len() {
-                            thread::sleep(Duration::from_millis(backoff_ms[backoff_idx]));
-                            backoff_idx += 1;
-                        } else {
-                            thread::sleep(Duration::from_millis(32));
+                        match backoff.next_sleep(frame_started.elapsed()) {
+                            Some(d) => {
+                                thread::sleep(d);
+                                continue;
+                            }
+                            None => break,
                         }
-                        continue;
                     }
                     filled += n;
-                    // Reset backoff on successful read
-                    backoff_idx = 0;
+                    backoff.on_progress();
                 }
                 if filled < CODEC_FRAME_SIZE {
                     warn!(
-                        "TX: partial frame after {} attempts (filled={}/{}); dropping",
-                        read_attempts, filled, CODEC_FRAME_SIZE
+                        "TX: partial frame after {} ms (filled={}/{}); dropping",
+                        frame_started.elapsed().as_millis(),
+                        filled,
+                        CODEC_FRAME_SIZE
                     );
                     crate::diag::note_tx_partial_frame_drop();
                     continue;
@@ -485,6 +482,42 @@ pub fn spawn_tx_thread(
 }
 
 // ── RX playout helpers ──────────────────────────────────────────────────────
+
+/// Longest the TX loop waits for the HAL to fill one 20 ms frame before it
+/// drops the frame. PTT release is only noticed between frames, so this also
+/// bounds how late a release takes effect when capture stalls.
+const CAPTURE_FRAME_BUDGET: Duration = Duration::from_millis(200);
+
+/// Sleeps between empty AudioRecord reads: short at first, then 32 ms, and
+/// bounded by [CAPTURE_FRAME_BUDGET] in wall time rather than by a count of
+/// attempts.
+struct CaptureBackoff {
+    step: usize,
+}
+
+impl CaptureBackoff {
+    const STEPS_MS: [u64; 5] = [2, 4, 8, 16, 32];
+
+    fn new() -> Self {
+        Self { step: 0 }
+    }
+
+    /// How long to sleep before the next read, or `None` once `elapsed`
+    /// (time since this frame's first read) has used up the budget.
+    fn next_sleep(&mut self, elapsed: Duration) -> Option<Duration> {
+        let left = CAPTURE_FRAME_BUDGET
+            .checked_sub(elapsed)
+            .filter(|d| !d.is_zero())?;
+        let ms = Self::STEPS_MS[self.step.min(Self::STEPS_MS.len() - 1)];
+        self.step += 1;
+        Some(Duration::from_millis(ms).min(left))
+    }
+
+    /// A read returned samples, so the next empty read starts short again.
+    fn on_progress(&mut self) {
+        self.step = 0;
+    }
+}
 
 /// Pace AudioTrack writes at one 20 ms frame per tick. Without this, a burst
 /// of relay packets is decoded and written as fast as the CPU loop runs —
@@ -1217,6 +1250,30 @@ mod tests {
         data[2] = 200; // sender_id_len > MAX_SENDER_ID_LEN (offset shifted by 1 for subchannel)
         let result = unpack_wire_frame(&data);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn capture_backoff_gives_up_within_the_frame_budget() {
+        // A HAL that never delivers. 80 attempts with 32 ms sleeps used to
+        // stall one frame for about 2.5 s, and PTT release is only noticed
+        // between frames, so the mic stayed keyed that long after release.
+        let mut backoff = CaptureBackoff::new();
+        let mut waited = Duration::ZERO;
+        while let Some(d) = backoff.next_sleep(waited) {
+            waited += d;
+        }
+        assert!(waited <= CAPTURE_FRAME_BUDGET, "waited {waited:?}");
+        assert!(waited + Duration::from_millis(32) >= CAPTURE_FRAME_BUDGET);
+    }
+
+    #[test]
+    fn capture_backoff_starts_short_again_after_progress() {
+        let mut backoff = CaptureBackoff::new();
+        let first = backoff.next_sleep(Duration::ZERO).unwrap();
+        let second = backoff.next_sleep(first).unwrap();
+        assert!(second > first);
+        backoff.on_progress();
+        assert_eq!(backoff.next_sleep(first + second), Some(first));
     }
 
     #[test]
