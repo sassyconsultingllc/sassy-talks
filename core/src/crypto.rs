@@ -185,11 +185,14 @@ impl CryptoSession {
 /// whole session); 02e81cf fixed that only in receivers that update. 0x10 to
 /// 0x20 is the TLV control window, where a frame whose length happens to match
 /// is classified as control, and 0x19 is OP_REPLAY_FRAME, which Android
-/// unwraps without falling back to audio. Starting every prefix at 0x21 makes
-/// sealed frames unambiguous on every receiver already shipped. The nonce
-/// travels in the frame, so this needs no receiver change, and it costs under
-/// 0.2 bits of the 64-bit random prefix.
-const MIN_PREFIX_FIRST_BYTE: u8 = 0x21;
+/// unwraps without falling back to audio. COHORT_PING / COHORT_PONG (0x21,
+/// 0x22) sit just above that window, and builds that route them by first byte
+/// widened their window to 0x22. Starting every prefix above the highest
+/// opcode makes sealed frames unambiguous on every receiver already shipped;
+/// keep it above `protocol::ALL_OPCODES` when adding one. The nonce travels in
+/// the frame, so this needs no receiver change, and it costs about 0.21 bits
+/// of the 64-bit random prefix.
+const MIN_PREFIX_FIRST_BYTE: u8 = 0x23;
 
 fn random_nonce_prefix() -> [u8; 8] {
     let mut prefix = [0u8; 8];
@@ -351,9 +354,9 @@ mod tests {
     fn sealed_frames_never_start_in_the_hint_or_control_range() {
         // Regression: an unconstrained prefix put 1 sender session in 16 below
         // 0x10, where shipped desktop/iOS receivers drop every frame as a
-        // legacy hint, and more into the 0x10..=0x20 control window. 4000
-        // sessions with an unconstrained prefix would all clear 0x20 with
-        // probability (222/256)^4000, which is effectively zero.
+        // legacy hint, and more into the 0x10..=0x22 opcode range. 4000
+        // sessions with an unconstrained prefix would all clear 0x22 with
+        // probability (221/256)^4000, which is effectively zero.
         for _ in 0..4000 {
             let mut s = CryptoSession::from_psk(&generate_psk());
             let frame = s.encrypt(b"opus").unwrap();
@@ -363,6 +366,20 @@ mod tests {
                 frame[0]
             );
             assert_ne!(frame[0], crate::protocol::OP_REPLAY_FRAME);
+        }
+    }
+
+    #[test]
+    fn sealed_frames_start_above_every_defined_opcode() {
+        // A new opcode above the floor (COHORT_PING 0x21 / PONG 0x22 landed at
+        // exactly the old floor) puts it back in reach of a sealed frame's
+        // first byte, and any receiver that routes that opcode by first byte
+        // misreads audio as control.
+        for &(name, op) in crate::protocol::ALL_OPCODES {
+            assert!(
+                op < MIN_PREFIX_FIRST_BYTE,
+                "{name} ({op:#04x}) is not below the nonce-prefix floor {MIN_PREFIX_FIRST_BYTE:#04x}"
+            );
         }
     }
 
