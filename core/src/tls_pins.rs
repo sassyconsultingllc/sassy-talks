@@ -74,7 +74,9 @@ pub fn pin_match(presented_b64: &[&str], configured_b64: &[&str]) -> bool {
     if presented_b64.is_empty() || configured_b64.is_empty() {
         return false;
     }
-    presented_b64.iter().any(|p| configured_b64.iter().any(|c| c == p))
+    presented_b64
+        .iter()
+        .any(|p| configured_b64.iter().any(|c| c == p))
 }
 
 pub fn pinning_enabled_from_env() -> bool {
@@ -101,10 +103,7 @@ mod tests {
 
     #[test]
     fn known_intermediate_matches() {
-        assert!(pin_match(
-            &[SPKI_PINS_SHA256_B64[0]],
-            SPKI_PINS_SHA256_B64
-        ));
+        assert!(pin_match(&[SPKI_PINS_SHA256_B64[0]], SPKI_PINS_SHA256_B64));
     }
 
     #[test]
@@ -132,11 +131,26 @@ mod tests {
         // renewal from Let's Encrypt or SSL.com would have failed closed on
         // every client. Each CA's root key must be present.
         for (ca, root) in [
-            ("GTS Root R4 (live anchor)", "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c="),
-            ("ISRG Root X1", "C5+lpZ7tcVwmwQIMcRtPbsQtWLABXhQzejna0wHFr8M="),
-            ("ISRG Root X2", "diGVwiVYbubAI3RW4hB9xU8e/CH2GnkuvVFZE8zmgzI="),
-            ("SSL.com RSA 2022", "K89VOmb1cJAN3TK6bf4ezAbJGC1mLcG2Dh97dnwr3VQ="),
-            ("SSL.com ECC 2022", "G/ANXI8TwJTdF+AFBM8IiIUPEv0Gf6H5LA/b9guG4yE="),
+            (
+                "GTS Root R4 (live anchor)",
+                "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",
+            ),
+            (
+                "ISRG Root X1",
+                "C5+lpZ7tcVwmwQIMcRtPbsQtWLABXhQzejna0wHFr8M=",
+            ),
+            (
+                "ISRG Root X2",
+                "diGVwiVYbubAI3RW4hB9xU8e/CH2GnkuvVFZE8zmgzI=",
+            ),
+            (
+                "SSL.com RSA 2022",
+                "K89VOmb1cJAN3TK6bf4ezAbJGC1mLcG2Dh97dnwr3VQ=",
+            ),
+            (
+                "SSL.com ECC 2022",
+                "G/ANXI8TwJTdF+AFBM8IiIUPEv0Gf6H5LA/b9guG4yE=",
+            ),
         ] {
             assert!(SPKI_PINS_SHA256_B64.contains(&root), "{ca} not pinned");
         }
@@ -155,6 +169,9 @@ mod tests {
             .filter_map(|l| l.split('"').next())
             .filter(|p| p.len() == 44 && p.ends_with('='))
             .collect();
-        assert_eq!(android, SPKI_PINS_SHA256_B64, "Android pins differ from core");
+        assert_eq!(
+            android, SPKI_PINS_SHA256_B64,
+            "Android pins differ from core"
+        );
     }
 }

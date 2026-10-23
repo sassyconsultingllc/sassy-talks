@@ -180,11 +180,18 @@ mod tests {
         // Encode PCM to Opus
         let encoded = encoder.encode(&pcm_in).expect("Encoding failed");
         assert!(!encoded.is_empty(), "Encoded data should not be empty");
-        assert!(encoded.len() < pcm_in.len() * 2, "Opus should compress data");
+        assert!(
+            encoded.len() < pcm_in.len() * 2,
+            "Opus should compress data"
+        );
 
         // Decode Opus back to PCM
         let decoded = decoder.decode(&encoded).expect("Decoding failed");
-        assert_eq!(decoded.len(), FRAME_SIZE, "Decoded sample count must match frame size");
+        assert_eq!(
+            decoded.len(),
+            FRAME_SIZE,
+            "Decoded sample count must match frame size"
+        );
 
         // Warm-up second frame: Opus is stateful, so frame 2 has active prediction state
         let encoded2 = encoder.encode(&pcm_in).expect("Encoding frame 2 failed");

@@ -1519,7 +1519,10 @@ mod tests {
         while sm.is_transmitting.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(!sm.is_transmitting.load(Ordering::SeqCst), "TX thread hit the ceiling");
+        assert!(
+            !sm.is_transmitting.load(Ordering::SeqCst),
+            "TX thread hit the ceiling"
+        );
         assert_eq!(sm.current_state(), AppState::Connected);
         sm.on_ptt_release().expect("release");
         assert_eq!(*sm.state.lock().unwrap(), AppState::Connected);

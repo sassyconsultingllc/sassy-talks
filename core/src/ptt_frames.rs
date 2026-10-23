@@ -154,7 +154,14 @@ pub fn parse_ptt_stop_v2(payload: &[u8]) -> Option<PttStop> {
 
 /// Encode `OP_HEARTBEAT` with the trailing capabilities byte. Appending keeps
 /// the frame readable by 23-byte-only peers (they ignore the extra byte).
-pub fn encode_heartbeat(epoch: u64, seq: u32, ts_ms: u64, state: u8, rtt_ms: u16, caps: u8) -> Vec<u8> {
+pub fn encode_heartbeat(
+    epoch: u64,
+    seq: u32,
+    ts_ms: u64,
+    state: u8,
+    rtt_ms: u16,
+    caps: u8,
+) -> Vec<u8> {
     let mut p = Vec::with_capacity(24);
     p.extend_from_slice(&epoch.to_le_bytes());
     p.extend_from_slice(&seq.to_le_bytes());

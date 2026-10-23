@@ -224,7 +224,11 @@ pub fn client_config() -> Result<ClientConfig, String> {
         .map_err(|e| format!("tls verifier: {e}"))?;
     let pinning = pinning_active();
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let verifier = Arc::new(PinningVerifier { inner, roots, pinning });
+    let verifier = Arc::new(PinningVerifier {
+        inner,
+        roots,
+        pinning,
+    });
     let cfg = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -283,10 +287,13 @@ mod tests {
             CertificateDer::from(&include_bytes!("testdata/relay-we1.der")[..]),
             CertificateDer::from(&include_bytes!("testdata/relay-r4-cross.der")[..]),
         ];
-        let pins = verified_path_pins(&store(), &leaf, &sent, at_capture())
-            .expect("relay chain verifies");
+        let pins =
+            verified_path_pins(&store(), &leaf, &sent, at_capture()).expect("relay chain verifies");
         assert!(pins.iter().any(|p| p == GTS_WE1), "{pins:?}");
-        assert!(pins.iter().any(|p| p == GTS_ROOT_R4), "anchor missing: {pins:?}");
+        assert!(
+            pins.iter().any(|p| p == GTS_ROOT_R4),
+            "anchor missing: {pins:?}"
+        );
         assert!(matches(&pins));
     }
 
@@ -307,7 +314,10 @@ mod tests {
         assert!(matches(&presented), "the old check passes this chain");
         let pins = verified_path_pins(&store(), &leaf, &sent, at_capture())
             .expect("DigiCert chain verifies");
-        assert!(!pins.iter().any(|p| p == GTS_WE1), "WE1 is not on the verified path");
+        assert!(
+            !pins.iter().any(|p| p == GTS_WE1),
+            "WE1 is not on the verified path"
+        );
         assert!(!matches(&pins), "verified path must not match: {pins:?}");
     }
 

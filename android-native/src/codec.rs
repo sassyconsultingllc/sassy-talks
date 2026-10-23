@@ -9,7 +9,6 @@
 ///
 /// libopus is compiled from the audiopus_sys-bundled sources in build.rs;
 /// the FFI declarations live in opus_ffi.rs.
-
 use crate::opus_ffi as ffi;
 
 /// Codec sample rate in Hz.
@@ -34,8 +33,11 @@ fn check_opus_error(code: i32, context: &str) {
     if code < ffi::OPUS_OK {
         let msg = unsafe {
             let ptr = ffi::opus_strerror(code);
-            if ptr.is_null() { "unknown error".to_string() }
-            else { std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+            if ptr.is_null() {
+                "unknown error".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            }
         };
         log::warn!("Opus {} error {}: {}", context, code, msg);
     }
@@ -58,13 +60,19 @@ impl VoiceEncoder {
     pub fn new() -> Self {
         let mut err = 0i32;
         let enc = unsafe {
-            ffi::opus_encoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, ffi::OPUS_APPLICATION_VOIP, &mut err)
+            ffi::opus_encoder_create(
+                CODEC_SAMPLE_RATE,
+                CODEC_CHANNELS,
+                ffi::OPUS_APPLICATION_VOIP,
+                &mut err,
+            )
         };
         if enc.is_null() || err != ffi::OPUS_OK {
             panic!("opus_encoder_create failed: {}", err);
         }
         // Set 24kbps bitrate
-        let ret = unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_BITRATE_REQUEST, VOICE_BITRATE) };
+        let ret =
+            unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_BITRATE_REQUEST, VOICE_BITRATE) };
         check_opus_error(ret, "encoder set_bitrate");
         // Complexity 5 (balanced quality vs CPU)
         let ret = unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_COMPLEXITY_REQUEST, 5i32) };
@@ -73,7 +81,8 @@ impl VoiceEncoder {
         let ret = unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_INBAND_FEC_REQUEST, 1i32) };
         check_opus_error(ret, "encoder set_inband_fec");
         // Tell encoder to expect ~10% packet loss (tunes FEC overhead)
-        let ret = unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10i32) };
+        let ret =
+            unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10i32) };
         check_opus_error(ret, "encoder set_packet_loss_perc");
         Self { enc }
     }
@@ -82,15 +91,28 @@ impl VoiceEncoder {
     pub fn reset(&mut self) {
         let mut err = 0i32;
         let new_enc = unsafe {
-            ffi::opus_encoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, ffi::OPUS_APPLICATION_VOIP, &mut err)
+            ffi::opus_encoder_create(
+                CODEC_SAMPLE_RATE,
+                CODEC_CHANNELS,
+                ffi::OPUS_APPLICATION_VOIP,
+                &mut err,
+            )
         };
         if !new_enc.is_null() && err == ffi::OPUS_OK {
             unsafe { ffi::opus_encoder_destroy(self.enc) };
             self.enc = new_enc;
-            unsafe { ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_BITRATE_REQUEST, VOICE_BITRATE); }
-            unsafe { ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_COMPLEXITY_REQUEST, 5i32); }
-            unsafe { ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_INBAND_FEC_REQUEST, 1i32); }
-            unsafe { ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10i32); }
+            unsafe {
+                ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_BITRATE_REQUEST, VOICE_BITRATE);
+            }
+            unsafe {
+                ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_COMPLEXITY_REQUEST, 5i32);
+            }
+            unsafe {
+                ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_INBAND_FEC_REQUEST, 1i32);
+            }
+            unsafe {
+                ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10i32);
+            }
         }
     }
 
@@ -121,7 +143,9 @@ impl VoiceEncoder {
 }
 
 impl Default for VoiceEncoder {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Drop for VoiceEncoder {
@@ -147,9 +171,7 @@ impl VoiceDecoder {
     /// Create a new decoder.
     pub fn new() -> Self {
         let mut err = 0i32;
-        let dec = unsafe {
-            ffi::opus_decoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, &mut err)
-        };
+        let dec = unsafe { ffi::opus_decoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, &mut err) };
         if dec.is_null() || err != ffi::OPUS_OK {
             panic!("opus_decoder_create failed: {}", err);
         }
@@ -159,7 +181,8 @@ impl VoiceDecoder {
     /// Reset decoder state.
     pub fn reset(&mut self) {
         let mut err = 0i32;
-        let new_dec = unsafe { ffi::opus_decoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, &mut err) };
+        let new_dec =
+            unsafe { ffi::opus_decoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, &mut err) };
         if !new_dec.is_null() && err == ffi::OPUS_OK {
             unsafe { ffi::opus_decoder_destroy(self.dec) };
             self.dec = new_dec;
@@ -192,7 +215,11 @@ impl VoiceDecoder {
             )
         };
         if n <= 0 {
-            log::error!("Opus decode FAILED (code={}, {} input bytes) — returning silence", n, compressed.len());
+            log::error!(
+                "Opus decode FAILED (code={}, {} input bytes) — returning silence",
+                n,
+                compressed.len()
+            );
             check_opus_error(n, "decode");
             crate::diag::note_rx_decode_failure();
             return vec![0i16; CODEC_FRAME_SIZE];
@@ -227,7 +254,11 @@ impl VoiceDecoder {
             )
         };
         if n <= 0 {
-            log::warn!("Opus decode_fec: code={} from {}-byte packet — falling back to PLC", n, next_packet.len());
+            log::warn!(
+                "Opus decode_fec: code={} from {}-byte packet — falling back to PLC",
+                n,
+                next_packet.len()
+            );
             return self.decode_plc();
         }
         buf.truncate(n as usize);
@@ -260,7 +291,9 @@ impl VoiceDecoder {
 }
 
 impl Default for VoiceDecoder {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Drop for VoiceDecoder {

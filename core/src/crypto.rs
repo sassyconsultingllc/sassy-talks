@@ -11,19 +11,18 @@
 /// aes-gcm's own feature only covers a temporary GHASH key). The KDF intermediate buffer
 /// is held in `Zeroizing<[u8; 32]>` so it's wiped after the cipher is built.
 /// X25519 ephemerals zeroize on drop via x25519-dalek's `zeroize` feature.
-
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce,
 };
-use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
 use hkdf::Hkdf;
-use sha2::Sha256;
-use rand::RngCore;
-use zeroize::Zeroizing;
 use log::info;
+use rand::RngCore;
+use sha2::Sha256;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
+use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
+use zeroize::Zeroizing;
 
 /// Nonce size for AES-256-GCM (96 bits / 12 bytes)
 const NONCE_SIZE: usize = 12;
@@ -67,7 +66,10 @@ pub struct CryptoSession {
 }
 
 fn new_replay_window() -> Mutex<(HashSet<[u8; NONCE_SIZE]>, VecDeque<[u8; NONCE_SIZE]>)> {
-    Mutex::new((HashSet::with_capacity(REPLAY_WINDOW), VecDeque::with_capacity(REPLAY_WINDOW)))
+    Mutex::new((
+        HashSet::with_capacity(REPLAY_WINDOW),
+        VecDeque::with_capacity(REPLAY_WINDOW),
+    ))
 }
 
 impl CryptoSession {
@@ -76,8 +78,7 @@ impl CryptoSession {
     pub fn from_shared_secret(shared: &SharedSecret) -> Self {
         let key_bytes = derive_aes_key(shared.as_bytes());
 
-        let cipher = Aes256Gcm::new_from_slice(&*key_bytes)
-            .expect("AES-256-GCM key init failed");
+        let cipher = Aes256Gcm::new_from_slice(&*key_bytes).expect("AES-256-GCM key init failed");
         // key_bytes drops here, zeroizing the intermediate buffer.
 
         Self {
@@ -90,8 +91,7 @@ impl CryptoSession {
 
     /// Create session from raw 32-byte key (for pre-shared key mode)
     pub fn from_psk(key: &[u8; 32]) -> Self {
-        let cipher = Aes256Gcm::new_from_slice(key)
-            .expect("AES-256-GCM key init failed");
+        let cipher = Aes256Gcm::new_from_slice(key).expect("AES-256-GCM key init failed");
 
         Self {
             cipher,
@@ -113,7 +113,8 @@ impl CryptoSession {
         let nonce_bytes = self.next_nonce()?;
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let ciphertext = self.cipher
+        let ciphertext = self
+            .cipher
             .encrypt(nonce, plaintext)
             .map_err(|e| format!("Encryption failed: {}", e))?;
 
@@ -135,7 +136,8 @@ impl CryptoSession {
         let nonce = Nonce::from_slice(&data[..NONCE_SIZE]);
         let ciphertext = &data[NONCE_SIZE..];
 
-        let plaintext = self.cipher
+        let plaintext = self
+            .cipher
             .decrypt(nonce, ciphertext)
             .map_err(|e| format!("Decryption failed: {}", e))?;
 
@@ -166,7 +168,8 @@ impl CryptoSession {
     /// the only safe action on overflow is to refuse to encrypt and signal the
     /// caller that the session must be re-keyed.
     fn next_nonce(&mut self) -> Result<[u8; NONCE_SIZE], String> {
-        self.nonce_counter = self.nonce_counter
+        self.nonce_counter = self
+            .nonce_counter
             .checked_add(1)
             .ok_or("nonce counter exhausted — session must be re-keyed")?;
         let mut nonce = [0u8; NONCE_SIZE];
@@ -229,8 +232,7 @@ impl KeyExchange {
     /// Complete key exchange with remote public key, consumes the secret
     pub fn complete(mut self, remote_public_bytes: &[u8; 32]) -> Result<CryptoSession, String> {
         let remote_public = PublicKey::from(*remote_public_bytes);
-        let secret = self.secret.take()
-            .ok_or("Key exchange already completed")?;
+        let secret = self.secret.take().ok_or("Key exchange already completed")?;
         let shared = secret.diffie_hellman(&remote_public);
 
         info!("Key exchange completed");
@@ -331,7 +333,10 @@ mod tests {
         // First delivery decrypts fine.
         assert_eq!(rx.decrypt(&frame).unwrap(), b"audio frame");
         // Replaying the identical (nonce||ct||tag) frame is rejected.
-        assert!(rx.decrypt(&frame).is_err(), "replayed frame must be rejected");
+        assert!(
+            rx.decrypt(&frame).is_err(),
+            "replayed frame must be rejected"
+        );
 
         // A fresh frame (new nonce) still passes after a replay attempt.
         let frame2 = tx.encrypt(b"next frame").unwrap();

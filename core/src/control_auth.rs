@@ -532,12 +532,17 @@ mod tests {
         let now = 1_700_000_000_000u64;
         let first = ControlAuthCodec::new(key(), "room-1", "device-a", 11).unwrap();
         for _ in 0..200 {
-            assert!(receiver.open(&first.seal(&recv_ack(), now).unwrap(), now).is_some());
+            assert!(receiver
+                .open(&first.seal(&recv_ack(), now).unwrap(), now)
+                .is_some());
         }
         let rebuilt = ControlAuthCodec::new(key(), "room-1", "device-a", 11).unwrap();
         for _ in 0..5 {
             let opened = receiver.open(&rebuilt.seal(&recv_ack(), now).unwrap(), now);
-            assert!(opened.is_some(), "rebuilt codec's control must not be replay-rejected");
+            assert!(
+                opened.is_some(),
+                "rebuilt codec's control must not be replay-rejected"
+            );
         }
     }
 
@@ -549,7 +554,10 @@ mod tests {
         let now = 1_700_000_000_000u64;
         for issued in [1u64 << 63, u64::MAX, 0] {
             let envelope = sender.seal(&recv_ack(), issued).unwrap();
-            assert!(receiver.open(&envelope, now).is_none(), "issued_at {issued:#x}");
+            assert!(
+                receiver.open(&envelope, now).is_none(),
+                "issued_at {issued:#x}"
+            );
         }
     }
 
@@ -560,7 +568,10 @@ mod tests {
         assert!(base > 0 && base < (1u64 << 63), "{base:#x}");
         let a = next_sequence_base(1_700_000_000_000);
         let b = next_sequence_base(1_700_000_000_000);
-        assert!(b >= a + SEQUENCE_STRIDE, "same-ms codecs must get separate ranges");
+        assert!(
+            b >= a + SEQUENCE_STRIDE,
+            "same-ms codecs must get separate ranges"
+        );
     }
 
     #[test]
