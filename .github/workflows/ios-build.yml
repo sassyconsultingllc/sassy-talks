@@ -26,9 +26,17 @@ jobs:
   ios-build:
     name: Build SassyTalkie iOS
     runs-on: macos-latest
+    env:
+      # CMake 4 dropped cmake_minimum_required(< 3.5) compat; audiopus_sys's
+      # bundled libopus still declares it.
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
     defaults:
       run:
         working-directory: ios-native
+        # An explicit bash shell runs with -eo pipefail. The default shell
+        # does not, so `build.sh | tail` and `xcodebuild | tail` reported
+        # success whenever tail did.
+        shell: bash
 
     steps:
       - name: Checkout
@@ -47,10 +55,6 @@ jobs:
       - name: Fetch Rust dependencies
         run: cargo fetch
 
-      - name: Patch audiopus CMakeLists for CMake 4.x compatibility
-        run: |
-          find ~/.cargo/registry/src -name "CMakeLists.txt" -path "*/audiopus_sys-0.2.2/opus/*" -exec sed -i 's/cmake_minimum_required(VERSION 3.1)/cmake_minimum_required(VERSION 3.5)/' {} \;
-
       - name: Build Rust static library for iOS (with verbose output)
         run: |
           set -x
@@ -66,8 +70,8 @@ jobs:
             -sdk iphonesimulator \
             -configuration Debug \
             -derivedDataPath /tmp/sassytalky-dd \
+            CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ENTITLEMENTS="" \
             build 2>&1 | tail -50
 
       - name: Package simulator .app as zip
