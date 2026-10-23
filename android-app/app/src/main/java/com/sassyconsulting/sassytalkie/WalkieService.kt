@@ -67,6 +67,7 @@ class WalkieService : Service() {
         private const val TAG = "WalkieService"
         private const val CHANNEL_ID = "sassytalkie_radio"
         private const val NOTIFICATION_ID = 1
+        private const val JOIN_NOTIFICATION_ID = 43
         const val ACTION_TOGGLE_PTT = "com.sassyconsulting.sassytalkie.action.TOGGLE_PTT"
         /** Sent by [SassyTalkFcmService] when an inbound wake push arrives. */
         const val ACTION_WAKE = "com.sassyconsulting.sassytalkie.action.WAKE"
@@ -1054,8 +1055,11 @@ class WalkieService : Service() {
                 .setShowWhen(true)
                 .setWhen(System.currentTimeMillis())
                 .build()
-            // Unique id so it never collides with the ongoing radio notification.
-            nm.notify((System.currentTimeMillis() % 100_000L).toInt(), notif)
+            // Fixed id: a clock-derived one could land on NOTIFICATION_ID (the
+            // foreground radio notification), the FCM wake notice (42) or the
+            // transcript range (5000..5050) and replace it. A newer join simply
+            // replaces the previous join notice.
+            nm.notify(JOIN_NOTIFICATION_ID, notif)
         } catch (t: Throwable) {
             Log.w(TAG, "join notification failed: ${t.message}")
         }
