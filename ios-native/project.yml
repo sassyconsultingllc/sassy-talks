@@ -47,6 +47,13 @@ targets:
         # Associated Domains (Universal Links for /v/ invite links). The file is
         # hand-maintained like Info.plist; see SassyTalkie.entitlements.
         CODE_SIGN_ENTITLEMENTS: SassyTalkie.entitlements
+      configs:
+        # Free Apple ID ("Personal Team") device testing: a separate bundle id
+        # and entitlements without the paid-program capabilities (multicast,
+        # associated domains, push). See SassyTalkie-Debug.entitlements.
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: com.sassyconsulting.sassytalkie.dev
+          CODE_SIGN_ENTITLEMENTS: SassyTalkie-Debug.entitlements
     # Push Notifications: declared via aps-environment in SassyTalkie.entitlements
     # (and SystemCapabilities.com.apple.Push in project.pbxproj). Do NOT use
     # xcodegen `entitlements:` / nested `attributes.SystemCapabilities` here —

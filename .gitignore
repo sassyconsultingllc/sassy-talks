@@ -93,3 +93,6 @@ android-native/.cargo/config.toml
 # Stray cargo target dir from a desktop remediation build — 1.3GB of build
 # output that is not source. Ignored rather than committed.
 tauri-desktop/src-tauri/target-remediation/
+
+# Xcode per-user state
+xcuserdata/

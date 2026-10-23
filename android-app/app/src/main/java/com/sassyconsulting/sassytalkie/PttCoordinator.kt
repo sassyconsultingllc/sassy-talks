@@ -338,6 +338,34 @@ class PttCoordinator(
     }
 
     /**
+     * Send an AEAD-sealed v2 control frame (e.g. cohort ping/pong) on every
+     * live transport. The envelope is produced by AuthenticatedControlPlane,
+     * so a peer that cannot decrypt it (wrong room key, stale session) will
+     * reject it at open() rather than act on it. This is the same trust
+     * boundary the central dispatcher enforces on the way in.
+     */
+    private fun sendAuthenticatedControl(innerFrame: ByteArray): Boolean {
+        val envelope = AuthenticatedControlPlane.seal(innerFrame) ?: run {
+            Log.w(TAG, "Authenticated control: no session key — cannot seal, skipping")
+            return false
+        }
+        var sentAny = false
+        try {
+            bleSignaling?.broadcastControl(envelope)
+            sentAny = true
+        } catch (t: Throwable) {
+            Log.w(TAG, "Authenticated control: BLE broadcast failed: ${t.message}")
+        }
+        try {
+            cellularClient?.sendBinary(envelope)
+            sentAny = true
+        } catch (t: Throwable) {
+            Log.w(TAG, "Authenticated control: relay send failed: ${t.message}")
+        }
+        return sentAny
+    }
+
+    /**
      * Inbound beacon / stand-down. Decoding is native (bounds-checked, tries
      * the sealed payload then cleartext); this only maps it into UI state.
      * A malformed or hostile frame decodes to null and is dropped.
@@ -1013,6 +1041,11 @@ class PttCoordinator(
         if (heartbeatJob?.isActive == true) return
         heartbeatJob = scope.launch {
             Log.i(TAG, "Heartbeat loop started (epoch=$selfEpoch)")
+            // Send an active OP_COHORT_PING on every Nth heartbeat so peers
+            // have a two-way, AEAD-authenticated liveness signal in addition
+            // to the passive one-way heartbeat. Kept sparse (every 5th HB ≈
+            // 10s) so it stays cheap on cellular.
+            var heartbeatCount = 0
             while (isActive) {
                 val seq = hbSeq.getAndIncrement()
                 val nowMs = System.currentTimeMillis()
@@ -1038,6 +1071,18 @@ class PttCoordinator(
                 bleSignaling?.broadcastControl(frame)
                 cellularClient?.sendBinary(frame)
                 if (BuildConfig.DEBUG) Log.d(TAG, "HB seq=$seq broadcast to ${bleSignaling?.blePeerCount ?: 0} peers (relay=${cellularClient != null})")
+
+                // Active cohort ping (authenticated) every 5th heartbeat.
+                heartbeatCount += 1
+                if (heartbeatCount % 5 == 0) {
+                    val ping = ControlFrame.encodeCohortPing(
+                        selfEpoch,
+                        hbSeq.getAndIncrement(),
+                        System.currentTimeMillis(),
+                    )
+                    sendAuthenticatedControl(ping)
+                    if (BuildConfig.DEBUG) Log.d(TAG, "COHORT_PING sent (epoch=$selfEpoch)")
+                }
 
                 delay(HEARTBEAT_INTERVAL_MS)
             }
@@ -1204,6 +1249,39 @@ class PttCoordinator(
                         )
                         maybeWakeStalePeers()
                     }
+                }
+            }
+            ControlFrame.OP_COHORT_PING -> {
+                // An authenticated peer is asking us to confirm liveness. Echo
+                // back an authenticated PONG so they can measure round-trip
+                // time and confidence in the group. `authenticatedPeerId`
+                // derives directly from the AEAD envelope we already verified,
+                // so only a peer sharing the room key can trigger this.
+                try {
+                    val ping = ControlFrame.parseCohortPing(frame.payload)
+                    if (ping != null) {
+                        val (epoch, seq, _tsMs) = ping
+                        val pong = ControlFrame.encodeCohortPong(epoch, seq, System.currentTimeMillis(), 0)
+                        sendAuthenticatedControl(pong)
+                        Log.d(TAG, "COHORT_PING from $authenticatedPeerId → PONG sent")
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "COHORT_PING handler failed: ${t.message}", t)
+                }
+            }
+            ControlFrame.OP_COHORT_PONG -> {
+                // Round-trip confirmed for this peer. The liveness tracker's
+                // heartbeat already covers passive liveness; this explicit PONG
+                // can drive an active-verification flag in the UI later. For
+                // now we just record it so diagnostics can show the cohort is
+                // truly two-way reachable.
+                try {
+                    if (ControlFrame.parseCohortPong(frame.payload) != null) {
+                        Log.d(TAG, "COHORT_PONG from $authenticatedPeerId")
+                        try { onEmergencyAudit?.invoke("cohort_pong", "from=$authenticatedPeerId") } catch (_: Throwable) {}
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "COHORT_PONG handler failed: ${t.message}", t)
                 }
             }
 

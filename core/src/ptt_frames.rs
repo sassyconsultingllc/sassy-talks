@@ -25,7 +25,8 @@
 //! `None` rather than panicking, because these bytes arrive from the network.
 
 use crate::protocol::{
-    encode_tlv, OP_EOT_ACK, OP_HEARTBEAT, OP_PTT_START_V2, OP_PTT_STOP_V2, OP_RECV_ACK, OP_WAKE,
+    encode_tlv, OP_COHORT_PING, OP_COHORT_PONG, OP_EOT_ACK, OP_HEARTBEAT, OP_PTT_START_V2,
+    OP_PTT_STOP_V2, OP_RECV_ACK, OP_WAKE,
 };
 
 /// Presence advertised in the heartbeat. Values match Android `PresenceState`.
@@ -233,6 +234,71 @@ pub fn parse_wake(payload: &[u8]) -> Option<Wake> {
     })
 }
 
+// ── COHORT_PING / COHORT_PONG ────────────────────────────────────────────
+
+/// Active cohort ping payload (the TLV body, not the full wire frame).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CohortPing {
+    pub epoch: u64,
+    pub seq: u32,
+    /// Sender-side send timestamp (ms since epoch), echoed back in the
+    /// pong so the initiator can measure round-trip time.
+    pub ts_ms: u64,
+}
+
+/// Authenticated cohort pong payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CohortPong {
+    pub epoch: u64,
+    pub seq: u32,
+    pub ts_ms: u64,
+    /// Placeholder reserved for future latency telemetry; not currently
+    /// populated by any sender. Kept so the wire shape is stable.
+    pub rtt_ms: u16,
+}
+
+/// Encode `OP_COHORT_PING`: `[epoch:u64][seq:u32][ts_ms:u64]`.
+pub fn encode_cohort_ping(epoch: u64, seq: u32, ts_ms: u64) -> Vec<u8> {
+    let mut p = Vec::with_capacity(20);
+    p.extend_from_slice(&epoch.to_le_bytes());
+    p.extend_from_slice(&seq.to_le_bytes());
+    p.extend_from_slice(&ts_ms.to_le_bytes());
+    encode_tlv(OP_COHORT_PING, &p)
+}
+
+pub fn parse_cohort_ping(payload: &[u8]) -> Option<CohortPing> {
+    if payload.len() < 20 {
+        return None;
+    }
+    Some(CohortPing {
+        epoch: u64_at(payload, 0)?,
+        seq: u32_at(payload, 8)?,
+        ts_ms: u64_at(payload, 12)?,
+    })
+}
+
+/// Encode `OP_COHORT_PONG`: `[epoch:u64][seq:u32][ts_ms:u64][rtt_ms:u16]`.
+pub fn encode_cohort_pong(epoch: u64, seq: u32, ts_ms: u64, rtt_ms: u16) -> Vec<u8> {
+    let mut p = Vec::with_capacity(22);
+    p.extend_from_slice(&epoch.to_le_bytes());
+    p.extend_from_slice(&seq.to_le_bytes());
+    p.extend_from_slice(&ts_ms.to_le_bytes());
+    p.extend_from_slice(&rtt_ms.to_le_bytes());
+    encode_tlv(OP_COHORT_PONG, &p)
+}
+
+pub fn parse_cohort_pong(payload: &[u8]) -> Option<CohortPong> {
+    if payload.len() < 22 {
+        return None;
+    }
+    Some(CohortPong {
+        epoch: u64_at(payload, 0)?,
+        seq: u32_at(payload, 8)?,
+        ts_ms: u64_at(payload, 12)?,
+        rtt_ms: u16::from_le_bytes(payload.get(20..22)?.try_into().ok()?),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +402,37 @@ mod tests {
             if n < 16 {
                 assert!(parse_wake(&short).is_none());
             }
+            if n < 20 {
+                assert!(parse_cohort_ping(&short).is_none());
+            }
+            if n < 22 {
+                assert!(parse_cohort_pong(&short).is_none());
+            }
         }
+    }
+
+    #[test]
+    fn cohort_ping_round_trips() {
+        let frame = encode_cohort_ping(42, 7, 1_700_000_000_000);
+        let tlv = parse_tlv(&frame).unwrap();
+        assert_eq!(tlv.opcode, OP_COHORT_PING);
+        assert_eq!(tlv.payload.len(), 20);
+        let ping = parse_cohort_ping(tlv.payload).unwrap();
+        assert_eq!(ping.epoch, 42);
+        assert_eq!(ping.seq, 7);
+        assert_eq!(ping.ts_ms, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn cohort_pong_round_trips() {
+        let frame = encode_cohort_pong(42, 7, 1_700_000_000_000, 0);
+        let tlv = parse_tlv(&frame).unwrap();
+        assert_eq!(tlv.opcode, OP_COHORT_PONG);
+        assert_eq!(tlv.payload.len(), 22);
+        let pong = parse_cohort_pong(tlv.payload).unwrap();
+        assert_eq!(pong.epoch, 42);
+        assert_eq!(pong.seq, 7);
+        assert_eq!(pong.ts_ms, 1_700_000_000_000);
+        assert_eq!(pong.rtt_ms, 0);
     }
 }

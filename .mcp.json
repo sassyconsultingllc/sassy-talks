@@ -1,0 +1,13 @@
+{
+	"mcpServers": {
+		"xcode": {
+			"type": "stdio",
+			"command": "xcode",
+			"args": [
+				"--",
+				"xcrun",
+				"mcpbridge"
+			]
+		}
+	}
+}

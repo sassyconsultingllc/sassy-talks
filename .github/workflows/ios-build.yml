@@ -1,0 +1,102 @@
+# Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+# iOS-only build workflow — builds the SassyTalkie iOS app on macOS runner
+# (no Android build, no cloudflare worker, no tauri desktop).
+#
+# Runs on every push to main that touches ios-native/ or core/.
+name: iOS Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ios-native/**'
+      - 'core/**'
+      - '.github/workflows/ios-build.yml'
+  pull_request:
+    paths:
+      - 'ios-native/**'
+      - 'core/**'
+      - '.github/workflows/ios-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ios-build:
+    name: Build SassyTalkie iOS
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: ios-native
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios, x86_64-apple-ios, aarch64-apple-ios-sim
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Fetch Rust dependencies
+        run: cargo fetch
+
+      - name: Patch audiopus CMakeLists for CMake 4.x compatibility
+        run: |
+          find ~/.cargo/registry/src -name "CMakeLists.txt" -path "*/audiopus_sys-0.2.2/opus/*" -exec sed -i 's/cmake_minimum_required(VERSION 3.1)/cmake_minimum_required(VERSION 3.5)/' {} \;
+
+      - name: Build Rust static library for iOS (with verbose output)
+        run: |
+          set -x
+          bash build.sh 2>&1 | tail -100
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build for iOS Simulator
+        run: |
+          xcodebuild -project SassyTalkie.xcodeproj \
+            -scheme SassyTalkie \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            -derivedDataPath /tmp/sassytalky-dd \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ENTITLEMENTS="" \
+            build 2>&1 | tail -50
+
+      - name: Package simulator .app as zip
+        run: |
+          cd /tmp/sassytalky-dd/Build/Products/Debug-iphonesimulator
+          ls -la
+          zip -r /tmp/SassyTalkie-simulator.zip SassyTalkie.app
+          ls -la /tmp/SassyTalkie-simulator.zip
+
+      - name: Upload simulator build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-simulator-build
+          path: /tmp/SassyTalkie-simulator.zip
+
+      - name: Build for iOS Device (Release) - skipped (requires iOS DeviceSupport)
+        if: false
+        run: |
+          echo "Skipping device build - requires iOS DeviceSupport installation on runner"
+          # xcodebuild -project SassyTalkie.xcodeproj \
+          #   -scheme SassyTalkie \
+          #   -sdk iphoneos \
+          #   -configuration Release \
+          #   -derivedDataPath /tmp/sassytalky-dd \
+          #   build
+
+      - name: Upload device build artifacts
+        if: false
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-device-build
+          path: /tmp/SassyTalkie-device.zip

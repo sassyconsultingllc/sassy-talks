@@ -206,11 +206,16 @@ pub fn spawn_tx_thread(
             let mut pcm_buffer = vec![0i16; CODEC_FRAME_SIZE];
             let mut was_transmitting = false;
             let mut idle_ticks = 0u32;
-            // Monotonic wire timestamps for the current PTT press. Wall-clock
-            // now_ms() can repeat within the same millisecond on fast devices,
-            // which makes the cross-transport dedup layer drop real frames.
+            // Per-sender monotonic epoch: tracks how many encoder frames have been
+            // emitted since the current PTT press began. This sidesteps the
+            // wall-clock granularity issue (now_ms() can repeat within the same
+            // ms on fast devices) and guarantees unique, strictly-increasing
+            // frame indices even under OS preemption or thread preemption.
             let mut tx_frame_index: u64 = 0;
-            let mut tx_stream_epoch_ms: u64 = 0;
+            // Stable per-press stream epoch, set once at PTT start and reused for
+            // every frame of that press so the receiver's epoch/sequence tracking
+            // stays coherent.
+            let mut tx_epoch: u64 = 0;
 
             // Buffer for burst-send mode: accumulates wire frames during PTT
             let mut tx_frame_buffer: Vec<Vec<u8>> = Vec::new();
@@ -303,7 +308,7 @@ pub fn spawn_tx_thread(
                         Ok(()) => {
                             was_transmitting = true;
                             tx_frame_index = 0;
-                            tx_stream_epoch_ms = next_stream_epoch();
+                            tx_epoch = next_stream_epoch();
                             info!("TX: started recording (PTT pressed)");
                         }
                         Err(e) => {
@@ -325,7 +330,15 @@ pub fn spawn_tx_thread(
                 // CODEC_FRAME_SIZE (960 samples / 20 ms) is captured.
                 let mut filled: usize = 0;
                 let mut read_attempts: u32 = 0;
-                const MAX_READ_ATTEMPTS_PER_FRAME: u32 = 25; // ~50 ms cap; avoids hang on broken HAL
+                // Exponential backoff on read attempts. On cellular + WiFi
+                // heterogeneous paths, the AudioRecord HAL sometimes needs >50ms
+                // to deliver a full 20ms frame under contention. The 25-attempt
+                // / 50ms cap used to produce partial frames → gaps in the output
+                // → "mosquito"/"drunk" artifacts on the far end. Give the HAL
+                // up to ~200ms total across backed-off sleeps.
+                const MAX_READ_ATTEMPTS_PER_FRAME: u32 = 80;
+                let backoff_ms: [u64; 8] = [2, 4, 8, 16, 32, 32, 32, 32];
+                let mut backoff_idx: usize = 0;
                 while filled < CODEC_FRAME_SIZE && read_attempts < MAX_READ_ATTEMPTS_PER_FRAME {
                     read_attempts += 1;
                     let n = {
@@ -339,16 +352,24 @@ pub fn spawn_tx_thread(
                         }
                     };
                     if n == 0 {
-                        thread::sleep(Duration::from_millis(2));
+                        if backoff_idx < backoff_ms.len() {
+                            thread::sleep(Duration::from_millis(backoff_ms[backoff_idx]));
+                            backoff_idx += 1;
+                        } else {
+                            thread::sleep(Duration::from_millis(32));
+                        }
                         continue;
                     }
                     filled += n;
+                    // Reset backoff on successful read
+                    backoff_idx = 0;
                 }
                 if filled < CODEC_FRAME_SIZE {
                     warn!(
                         "TX: partial frame after {} attempts (filled={}/{}); dropping",
                         read_attempts, filled, CODEC_FRAME_SIZE
                     );
+                    crate::diag::note_tx_partial_frame_drop();
                     continue;
                 }
 
@@ -427,7 +448,7 @@ pub fn spawn_tx_thread(
                     subch,
                     &local_sender_id,
                     &local_device_name,
-                    tx_stream_epoch_ms,
+                    tx_epoch,
                     sequence,
                     timestamp,
                     &compressed,
@@ -486,10 +507,15 @@ impl PlayoutPacer {
         if now < self.next_playout {
             thread::sleep(self.next_playout - now);
         } else {
-            // More than ~200 ms behind — snap forward instead of playing back
+            // More than ~500 ms behind — snap forward instead of playing back
             // a multi-second backlog at 20 ms/frame (sounds slowed-down).
+            // 500ms accommodates wide cellular latency variance while still
+            // preventing multi-second drift. The 200ms threshold was too
+            // aggressive on lossy paths and caused premature snap-forward,
+            // which the far end heard as abrupt speed changes ("drunk"
+            // slowdown / "mosquito" speed-up).
             let behind = now.saturating_duration_since(self.next_playout);
-            if behind > Duration::from_millis(200) {
+            if behind > Duration::from_millis(500) {
                 self.next_playout = now;
             }
         }

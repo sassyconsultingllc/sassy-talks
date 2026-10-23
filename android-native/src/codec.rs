@@ -194,6 +194,7 @@ impl VoiceDecoder {
         if n <= 0 {
             log::error!("Opus decode FAILED (code={}, {} input bytes) — returning silence", n, compressed.len());
             check_opus_error(n, "decode");
+            crate::diag::note_rx_decode_failure();
             return vec![0i16; CODEC_FRAME_SIZE];
         }
         buf.truncate(n as usize);

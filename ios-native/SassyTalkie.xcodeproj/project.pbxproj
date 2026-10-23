@@ -265,7 +265,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = SassyTalkie.entitlements;
+				CODE_SIGN_ENTITLEMENTS = "SassyTalkie-Debug.entitlements";
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 85;
@@ -275,7 +275,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 3.2.7;
-				PRODUCT_BUNDLE_IDENTIFIER = com.sassyconsulting.sassytalkie;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sassyconsulting.sassytalkie.dev;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};

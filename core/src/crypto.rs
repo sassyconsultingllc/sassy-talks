@@ -288,6 +288,36 @@ mod tests {
         assert!(session_b.decrypt(&encrypted).is_err());
     }
 
+    /// The "encryption verifier": AEAD integrity must reject ANY byte flip in
+    /// the ciphertext or tag. This is the safeguard that stops a truncated or
+    /// corrupted relay frame (or an active MITM tamper) from reaching the
+    /// audio decoder as garbled "mosquito"/"drunk" audio.
+    #[test]
+    fn test_tampered_ciphertext_is_rejected() {
+        let key = generate_psk();
+        let mut tx = CryptoSession::from_psk(&key);
+        let rx = CryptoSession::from_psk(&key);
+
+        let frame = tx.encrypt(b"a real audio frame").unwrap();
+        // Sanity: the intact frame decrypts.
+        assert_eq!(rx.decrypt(&frame).unwrap(), b"a real audio frame");
+
+        // Flip every byte of the ciphertext+tag region (after the 12-byte
+        // nonce). Each single-bit corruption must fail GCM authentication.
+        for i in 12..frame.len() {
+            let mut corrupt = frame.clone();
+            corrupt[i] ^= 0x01;
+            assert!(
+                rx.decrypt(&corrupt).is_err(),
+                "bit flip at ciphertext byte {i} must be rejected"
+            );
+        }
+
+        // The sender's next clean frame still decrypts (window not poisoned).
+        let next = tx.encrypt(b"still clear").unwrap();
+        assert_eq!(rx.decrypt(&next).unwrap(), b"still clear");
+    }
+
     #[test]
     fn test_replay_is_rejected() {
         let key = generate_psk();

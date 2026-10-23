@@ -1037,6 +1037,30 @@ class WalkieService : Service() {
         }
     }
 
+    /**
+     * Post a transient "user joined" notification after a successful invite
+     * link import. Distinct from the ongoing radio notification (different id,
+     * auto-cancel) so the user gets an explicit confirm that tap-on-invite
+     * landed — the key feedback that was missing when links felt "dead".
+     */
+    fun notifyPeerJoined(label: String) {
+        try {
+            val nm = getSystemService(NotificationManager::class.java)
+            val notif = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                .setContentTitle("Joined radio room")
+                .setContentText(label)
+                .setAutoCancel(true)
+                .setShowWhen(true)
+                .setWhen(System.currentTimeMillis())
+                .build()
+            // Unique id so it never collides with the ongoing radio notification.
+            nm.notify((System.currentTimeMillis() % 100_000L).toInt(), notif)
+        } catch (t: Throwable) {
+            Log.w(TAG, "join notification failed: ${t.message}")
+        }
+    }
+
     private var translationNotifJob: kotlinx.coroutines.Job? = null
     @Volatile private var lastNotificationStatus: String = "Radio standby"
 
