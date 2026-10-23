@@ -1273,12 +1273,13 @@ class PttCoordinator(
                 // Round-trip confirmed for this peer. The liveness tracker's
                 // heartbeat already covers passive liveness; this explicit PONG
                 // can drive an active-verification flag in the UI later. For
-                // now we just record it so diagnostics can show the cohort is
-                // truly two-way reachable.
+                // now it is only logged. It must not go to onEmergencyAudit:
+                // that store keeps the last 500 events, and pongs from every
+                // peer to every ping (about (N-1)^2 per 10 s) pushed real
+                // emergency records out within minutes.
                 try {
                     if (ControlFrame.parseCohortPong(frame.payload) != null) {
                         Log.d(TAG, "COHORT_PONG from $authenticatedPeerId")
-                        try { onEmergencyAudit?.invoke("cohort_pong", "from=$authenticatedPeerId") } catch (_: Throwable) {}
                     }
                 } catch (t: Throwable) {
                     Log.w(TAG, "COHORT_PONG handler failed: ${t.message}", t)

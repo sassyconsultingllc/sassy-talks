@@ -137,10 +137,9 @@ pub const OP_HYBRID_CONFIRM_ACK: u8 = 0x20;
 pub const OP_COHORT_PING: u8 = 0x21;
 
 /// Cohort pong — the authenticated reply to [OP_COHORT_PING]. Payload:
-/// `[epoch:u64][seq:u32][ts_ms:u64][rtt_ms:u16]` (22 B). The `rtt_ms`
-/// field holds the responder's measured round-trip time in radians/sample
-/// units is NOT used — it is a placeholder reserved for future latency
-/// telemetry so the wire shape is stable.
+/// `[epoch:u64][seq:u32][ts_ms:u64][rtt_ms:u16]` (22 B). `rtt_ms` is not
+/// populated yet (senders write 0); it is reserved for latency telemetry so
+/// the wire shape stays stable.
 pub const OP_COHORT_PONG: u8 = 0x22;
 
 /// Every opcode this protocol defines, for uniqueness checking and for
