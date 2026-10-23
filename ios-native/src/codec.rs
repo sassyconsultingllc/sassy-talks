@@ -191,19 +191,19 @@ mod tests {
         let decoded2 = decoder.decode(&encoded2).expect("Decoding frame 2 failed");
         assert_eq!(decoded2.len(), FRAME_SIZE);
 
-        // Compute RMS error on warmed-up frame
-        let mut sq_error_sum = 0.0f64;
-        for i in 0..FRAME_SIZE {
-            let diff = (pcm_in[i] as f64) - (decoded2[i] as f64);
-            sq_error_sum += diff * diff;
-        }
-        let rms_error = f64::sqrt(sq_error_sum / FRAME_SIZE as f64);
-
-        // Opus speech codec at 32kbps produces ~12k RMS on pure sine wave due to CELT/SILK model
+        // Opus delays its output by a few milliseconds, so a sample-by-sample
+        // error against the input mostly measures that phase shift: an error
+        // bound loose enough for it also passes a decoder that returns silence.
+        // Compare energy on a warmed-up frame instead.
+        let encoded3 = encoder.encode(&pcm_in).expect("Encoding frame 3 failed");
+        let decoded3 = decoder.decode(&encoded3).expect("Decoding frame 3 failed");
+        let rms = |x: &[i16]| {
+            (x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / x.len() as f64).sqrt()
+        };
+        let ratio = rms(&decoded3) / rms(&pcm_in);
         assert!(
-            rms_error < 14000.0,
-            "RMS error too high: {} (signal degraded excessively)",
-            rms_error
+            (0.5..1.5).contains(&ratio),
+            "decoded/input RMS ratio {ratio:.2} (silence or clipping)"
         );
     }
 }
