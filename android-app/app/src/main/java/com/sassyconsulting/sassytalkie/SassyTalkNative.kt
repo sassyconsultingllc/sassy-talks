@@ -1141,6 +1141,7 @@ object SassyTalkNative {
         if (!initialized) return false
         return try {
             nativeCellularOnConnected()
+            true
         } catch (e: Exception) {
             Log.e(TAG, "cellularOnConnected failed: ${e.message}")
             false
@@ -1549,7 +1550,8 @@ object SassyTalkNative {
     // Cellular Transport (WebSocket relay)
     @JvmStatic private external fun nativeCellularSetRoom(roomId: String)
     @JvmStatic private external fun nativeCellularGetWsUrl(): String
-    @JvmStatic private external fun nativeCellularOnConnected(): Boolean
+    // Rust returns void; declaring Boolean read a garbage return register.
+    @JvmStatic private external fun nativeCellularOnConnected()
     @JvmStatic private external fun nativeCellularOnDisconnected(reason: String)
     @JvmStatic private external fun nativeCellularOnMessage(data: ByteArray)
     @JvmStatic private external fun nativeCellularOnError(error: String)

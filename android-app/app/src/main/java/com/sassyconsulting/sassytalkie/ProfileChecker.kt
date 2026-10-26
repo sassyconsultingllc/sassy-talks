@@ -25,7 +25,9 @@ object ProfileChecker {
             null
         }
         val managedProfile = try {
-            um?.isManagedProfile == true
+            // UserManager.isManagedProfile is API 30; below that it threw
+            // NoSuchMethodError (caught), so report not-managed explicitly.
+            android.os.Build.VERSION.SDK_INT >= 30 && um?.isManagedProfile == true
         } catch (_: Throwable) {
             false
         }

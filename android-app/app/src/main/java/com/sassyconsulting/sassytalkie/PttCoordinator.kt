@@ -534,7 +534,7 @@ class PttCoordinator(
                 if (needLink) {
                     for (device in blePeers) {
                         if (!bt.isConnectedTo(device.address)) {
-                            Log.i(TAG, "RFCOMM retry → ${device.name ?: device.address}")
+                            Log.i(TAG, "RFCOMM retry → ${btLabel(device)}")
                             bt.connectDevice(device)
                         }
                     }
@@ -977,8 +977,12 @@ class PttCoordinator(
         Log.i(TAG, "\u2190 READY_ACK from $deviceAddress (total: $count)")
     }
 
+    /** Name for logs; BluetoothDevice.getName throws if BLUETOOTH_CONNECT was revoked mid-session. */
+    private fun btLabel(device: android.bluetooth.BluetoothDevice): String =
+        try { device.name } catch (_: SecurityException) { null } ?: device.address
+
     override fun onPeerDiscovered(device: android.bluetooth.BluetoothDevice) {
-        Log.i(TAG, "Peer discovered: ${device.name ?: device.address}")
+        Log.i(TAG, "Peer discovered: ${btLabel(device)}")
         // Auto-connect RFCOMM data channel when BLE peer found
         if (btTransport?.isConnectedTo(device.address) != true) {
             btTransport?.connectDevice(device)
