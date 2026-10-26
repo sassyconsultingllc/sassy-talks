@@ -247,17 +247,26 @@ impl TransportManager {
 
     fn decrypt_live_or_pending(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
         if let Some(ref crypto) = self.crypto {
-            if let Ok(pt) = crypto.decrypt(data) {
-                return Ok(pt);
+            match crypto.decrypt(data) {
+                Ok(pt) => return Ok(pt),
+                // The tag verified under the live key, so this is a duplicate
+                // (dual-path copy, catch-up overlap), not a key mismatch. Keep
+                // the error so diagnostics count it as a replay.
+                Err(e) if e.contains("Replay") => return Err(e),
+                Err(_) => {}
             }
         }
         if let Some(ref pending) = self.pending_rx {
-            if let Ok(pt) = pending.decrypt(data) {
-                if let Some(session) = self.pending_rx.take() {
-                    self.crypto = Some(session);
-                    info!("TransportManager: staged hybrid RX promoted to live TX");
+            match pending.decrypt(data) {
+                Err(e) if e.contains("Replay") => return Err(e),
+                Err(_) => {}
+                Ok(pt) => {
+                    if let Some(session) = self.pending_rx.take() {
+                        self.crypto = Some(session);
+                        info!("TransportManager: staged hybrid RX promoted to live TX");
+                    }
+                    return Ok(pt);
                 }
-                return Ok(pt);
             }
         }
         if self.crypto.is_none() && self.pending_rx.is_none() {
@@ -649,6 +658,20 @@ impl Drop for TransportManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A duplicate (dual-path copy, catch-up overlap) must reach diagnostics as
+    /// a replay, not a decrypt failure ("peers on different keys").
+    #[test]
+    fn duplicate_frame_reports_replay_not_decrypt_failure() {
+        let key = [7u8; 32];
+        let mut tm = TransportManager::new("test").unwrap();
+        tm.set_crypto(CryptoSession::from_psk(&key));
+        tm.arm_pending_rx(CryptoSession::from_psk(&[9u8; 32]));
+        let sealed = CryptoSession::from_psk(&key).encrypt(b"frame").unwrap();
+        assert_eq!(tm.decrypt_raw(&sealed).unwrap(), b"frame");
+        let err = tm.decrypt_raw(&sealed).unwrap_err();
+        assert!(err.contains("Replay"), "got {err}");
+    }
 
     #[test]
     fn bluetooth_promoted_when_cellular_dies_and_rfcomm_up() {
