@@ -31,4 +31,32 @@ class RelayCatchupTest {
     fun matchesCoreForBackwardsClockStep() {
         assertEquals(t + 250L, RelayCatchup.sinceMs(t + 500L, t))
     }
+
+    @Test
+    fun cursorReplaysGapInSameRoom() {
+        val c = RelayCatchup.Cursor()
+        c.enterRoom("r1")
+        c.markAlive(t - 2_000L)
+        c.enterRoom("r1")
+        assertEquals(t - 2_250L, c.sinceMs(t))
+    }
+
+    /** A joiner switching rooms must not get the new room's pre-join audio. */
+    @Test
+    fun cursorResetsOnRoomChange() {
+        val c = RelayCatchup.Cursor()
+        c.enterRoom("r1")
+        c.markAlive(t - 2_000L)
+        c.enterRoom("r2")
+        assertNull(c.sinceMs(t))
+        c.markAlive(t - 1_000L)
+        assertEquals(t - 1_250L, c.sinceMs(t))
+    }
+
+    @Test
+    fun cursorAsksForNothingBeforeFirstFrame() {
+        val c = RelayCatchup.Cursor()
+        c.enterRoom("r1")
+        assertNull(c.sinceMs(t))
+    }
 }

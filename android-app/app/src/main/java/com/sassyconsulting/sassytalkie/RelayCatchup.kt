@@ -25,4 +25,31 @@ object RelayCatchup {
         if (nowMs - lastAliveMs > MAX_GAP_MS) return null
         return (lastAliveMs - MARGIN_MS).coerceAtLeast(0L)
     }
+
+    /**
+     * Per-room cursor. Entering a different room starts fresh, so a client
+     * that was live in R1 and reconnects into R2 asks for no catch-up instead
+     * of replaying R2 audio from before it joined.
+     */
+    class Cursor {
+        private var room: String? = null
+        private var lastAliveMs = 0L
+
+        @Synchronized
+        fun enterRoom(room: String) {
+            if (room != this.room) {
+                this.room = room
+                lastAliveMs = 0L
+            }
+        }
+
+        /** The current room's socket was alive at [nowMs] (open or any inbound frame). */
+        @Synchronized
+        fun markAlive(nowMs: Long) {
+            lastAliveMs = nowMs
+        }
+
+        @Synchronized
+        fun sinceMs(nowMs: Long): Long? = sinceMs(lastAliveMs, nowMs)
+    }
 }
