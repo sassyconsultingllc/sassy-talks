@@ -85,7 +85,7 @@ class WalkieService : Service() {
          * the setup cost. Longer would keep the phone line "busy" past
          * conversational usefulness; shorter would chop every reply.
          */
-        private const val RX_STAY_HOT_MS: Long = 5_000L
+        private const val RX_IDLE_POLL_MS: Long = 500L
     }
 
     inner class LocalBinder : Binder() {
@@ -99,20 +99,22 @@ class WalkieService : Service() {
     @Volatile private var lastWakeRenewMs = 0L
     private var audioFocusRequest: AudioFocusRequest? = null
     private var hasAudioFocus = false
+    /** RX gain to restore after a duck, or null when not ducked. */
+    private var gainBeforeDuck: Float? = null
     private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { change ->
-        when (change) {
-            AudioManager.AUDIOFOCUS_GAIN,
-            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
-            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK -> {
+        when (RadioFocusPolicy.onFocusChange(change)) {
+            RadioFocusPolicy.FocusAction.REGAIN -> {
                 hasAudioFocus = true
+                unduckRx()
                 try { SassyTalkNative.reassertRxRoute() } catch (_: Throwable) {}
             }
-            AudioManager.AUDIOFOCUS_LOSS,
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+            RadioFocusPolicy.FocusAction.DUCK -> duckRx()
+            RadioFocusPolicy.FocusAction.STOP_TX -> {
                 hasAudioFocus = false
+                unduckRx()
                 pttCoordinator?.forceStop("audio-focus-loss")
             }
+            null -> {}
         }
     }
     private var rxWakeHoldJob: Job? = null
@@ -578,7 +580,7 @@ class WalkieService : Service() {
             updateRouteKeeper()
             if (active) {
                 requestRadioAudioFocus()
-            } else if (!rxRouteActive) {
+            } else if (RadioFocusPolicy.mayAbandon(rxRouteActive, txRouteActive)) {
                 abandonRadioAudioFocus()
             }
         }
@@ -846,13 +848,12 @@ class WalkieService : Service() {
     }
 
     /**
-     * Called for every inbound audio frame — engages focus + starts a "stay
-     * hot" window so back-to-back bursts don't pay the focus/comm-mode
-     * setup cost on every "yeah"/"copy".
-     *
-     * Stay-hot window: [RX_STAY_HOT_MS]. Longer than a natural pause between
-     * quick replies (~2s), shorter than a break in conversation, so the
-     * phone-line-busy signal doesn't linger longer than the user expects.
+     * Called when a peer starts talking — engages focus and holds it until no
+     * inbound frame has arrived for [RadioFocusPolicy.RX_STAY_HOT_MS], so
+     * back-to-back bursts don't pay the focus/comm-mode setup cost on every
+     * "yeah"/"copy". Timing from the last frame (not the start of the burst)
+     * keeps focus through transmissions longer than the window, and still
+     * releases it if the sender vanishes mid-burst.
      *
      * WakeLock: refreshed here too; its own 3-minute timeout backstops us.
      */
@@ -864,15 +865,35 @@ class WalkieService : Service() {
         try { SassyTalkNative.reassertRxRoute() } catch (_: Throwable) {}
         rxWakeHoldJob?.cancel()
         rxWakeHoldJob = serviceScope.launch {
-            delay(RX_STAY_HOT_MS)
+            while (!RadioFocusPolicy.rxIdle(System.currentTimeMillis(), TranscriptionBridge.lastRemoteFrameMs)) {
+                delay(RX_IDLE_POLL_MS)
+            }
             // Silence ended the burst — release focus so the volume rocker
             // stops adjusting STREAM_VOICE_CALL and the OS considers the
             // phone line free again (conference-call add-line, incoming
-            // ring routing, etc. all depend on this).
-            abandonRadioAudioFocus()
+            // ring routing, etc. all depend on this). Not while the user is
+            // transmitting: TX shares the focus request and drops it itself.
             rxRouteActive = false
             updateRouteKeeper()
+            if (RadioFocusPolicy.mayAbandon(rxRouteActive, txRouteActive)) {
+                abandonRadioAudioFocus()
+            }
         }
+    }
+
+    @Synchronized
+    private fun duckRx() {
+        if (gainBeforeDuck != null) return
+        val gain = SassyTalkNative.getRxGain()
+        gainBeforeDuck = gain
+        SassyTalkNative.setRxGain(gain * RadioFocusPolicy.DUCK_GAIN)
+    }
+
+    @Synchronized
+    private fun unduckRx() {
+        val gain = gainBeforeDuck ?: return
+        gainBeforeDuck = null
+        SassyTalkNative.setRxGain(gain)
     }
 
     private fun releaseWakeLock() {
@@ -935,6 +956,7 @@ class WalkieService : Service() {
         }
         audioFocusRequest = null
         hasAudioFocus = false
+        unduckRx()
     }
 
     private fun startInboundAudioWatch() {

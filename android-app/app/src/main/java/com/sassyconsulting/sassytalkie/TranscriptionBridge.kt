@@ -258,6 +258,10 @@ object TranscriptionBridge {
      * No blocking calls, no Thread.sleep, no heavy computation.
      */
     @JvmStatic
+    /** Wall-clock ms of the last inbound frame from a peer (speech or silence). */
+    @Volatile var lastRemoteFrameMs = 0L
+        private set
+
     fun onAudioReceived(
         senderId: String,
         senderName: String,
@@ -273,6 +277,7 @@ object TranscriptionBridge {
         isSelf: Boolean,
     ) {
         if (!enabled || !initialized) return
+        if (!isSelf) lastRemoteFrameMs = System.currentTimeMillis()
 
         val rms = computeRms(pcmSamples)
         val isSpeech = rms >= SILENCE_THRESHOLD
