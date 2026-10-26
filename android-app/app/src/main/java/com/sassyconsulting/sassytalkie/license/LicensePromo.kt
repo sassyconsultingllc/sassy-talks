@@ -74,7 +74,12 @@ object LicensePromo {
                     p.edit().putLong(LicenseStore.KEY_RECEIPT_EXP, res.expiresAt).apply()
                     onResult(true)
                 }
-                is ApiResult.Rejected -> {
+                is ApiResult.Rejected -> if (!isRevocation(res.httpCode, res.message)) {
+                    // Rate limit (shared/CGNAT IP), auth hiccup, a changed
+                    // device id: not a revocation. Keep the receipt until exp.
+                    Log.w(TAG, "Promo refresh refused (${res.httpCode}), keeping receipt: ${res.message}")
+                    onResult(true)
+                } else {
                     Log.w(TAG, "Promo rejected on refresh: ${res.message}")
                     // Leave KEY_UNLOCKED alone: a promo never sets it, and on
                     // Play it is the permanent purchase flag, so clearing it
@@ -91,6 +96,15 @@ object LicensePromo {
         }
     }
 
+    /**
+     * Only an explicit revocation (unknown code, or a 403 for a revoked,
+     * disabled or expired one) may delete a stored promo on refresh. The
+     * worker's 403 "fully redeemed" means this device id is not on the
+     * redemption list, which a refresh hits when the id changed.
+     */
+    internal fun isRevocation(httpCode: Int, error: String): Boolean =
+        httpCode == 404 || (httpCode == 403 && !error.contains("fully redeemed", ignoreCase = true))
+
     private fun persist(context: Context, code: String, expiresAt: Long) {
         // Promo entitlement is RECEIPT-DRIVEN (time-limited): store only the
         // expiry + kind, and let isUnlockedCached honor it via hasValidReceipt.
@@ -105,7 +119,7 @@ object LicensePromo {
 
     private sealed class ApiResult {
         class Ok(val expiresAt: Long) : ApiResult()
-        class Rejected(val message: String) : ApiResult()
+        class Rejected(val httpCode: Int, val message: String) : ApiResult()
         data object NetworkError : ApiResult()
     }
 
@@ -133,7 +147,7 @@ object LicensePromo {
                     resp.isSuccessful && json.optBoolean("ok") ->
                         ApiResult.Ok(json.optLong("expires_at"))
                     resp.code >= 500 -> ApiResult.NetworkError
-                    else -> ApiResult.Rejected(json.optString("error", "Promo rejected"))
+                    else -> ApiResult.Rejected(resp.code, json.optString("error", "Promo rejected"))
                 }
             }
         } catch (e: Exception) {
