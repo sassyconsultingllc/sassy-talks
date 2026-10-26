@@ -173,22 +173,16 @@ fn read_build_props() -> (String, String, String) {
     // Read android.os.Build.{MANUFACTURER,MODEL,DEVICE} via JNI. If the
     // JVM is unavailable (running unit tests) return empty strings so the
     // default profile is picked.
-    let vm = match crate::jni_bridge::get_jvm() {
-        Ok(vm) => vm,
-        Err(_) => return (String::new(), String::new(), String::new()),
-    };
-    let mut env = match vm.attach_current_thread() {
-        Ok(e) => e,
-        Err(_) => return (String::new(), String::new(), String::new()),
-    };
-    let build_class = match env.find_class("android/os/Build") {
-        Ok(c) => c,
-        Err(_) => return (String::new(), String::new(), String::new()),
-    };
-    let mfr = read_string_field(&mut env, &build_class, "MANUFACTURER");
-    let model = read_string_field(&mut env, &build_class, "MODEL");
-    let device = read_string_field(&mut env, &build_class, "DEVICE");
-    (mfr, model, device)
+    crate::jni_bridge::with_env(|env| {
+        let build_class = env.find_class("android/os/Build").ok()?;
+        let mfr = read_string_field(env, &build_class, "MANUFACTURER");
+        let model = read_string_field(env, &build_class, "MODEL");
+        let device = read_string_field(env, &build_class, "DEVICE");
+        Some((mfr, model, device))
+    })
+    .ok()
+    .flatten()
+    .unwrap_or_default()
 }
 
 fn read_string_field(env: &mut jni::JNIEnv, cls: &jni::objects::JClass, name: &str) -> String {

@@ -1060,7 +1060,7 @@ fn dispatch_committed_utterances(commits: &[(u64, String, String, u64)]) {
         Ok(v) => v,
         Err(_) => return,
     };
-    let mut env = match vm.attach_current_thread() {
+    let mut env = match vm.attach_current_thread_as_daemon() {
         Ok(e) => e,
         Err(_) => return,
     };
@@ -1137,7 +1137,7 @@ fn call_transcription_bridge(
         Err(_) => return, // JVM not available (running tests)
     };
 
-    let mut env = match vm.attach_current_thread() {
+    let mut env = match vm.attach_current_thread_as_daemon() {
         Ok(e) => e,
         Err(_) => return,
     };

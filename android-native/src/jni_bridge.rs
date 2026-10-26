@@ -44,6 +44,84 @@ pub fn get_jvm() -> Result<Arc<JavaVM>, String> {
         .ok_or_else(|| "JavaVM not initialized".to_string())
 }
 
+/// Run `f` with this thread's JNIEnv.
+///
+/// The thread is attached once, as a daemon, and jni-rs detaches it when the
+/// thread exits. The sassy-rx/sassy-tx Rust threads call into Java every
+/// 20 ms; a scoped attach detached them (and minted a new java.lang.Thread
+/// peer) on every call. Each call gets its own local-ref frame, since a
+/// long-lived attached thread never frees local refs otherwise.
+///
+/// A failed JNI call returns Err but leaves the Java exception pending. It is
+/// logged and cleared here before returning: ART kills the process when a
+/// thread detaches with an exception pending, and every later JNI call on the
+/// thread misbehaves until it is cleared.
+pub fn with_env<T>(f: impl FnOnce(&mut JNIEnv) -> T) -> Result<T, String> {
+    let vm = get_jvm()?;
+    let mut env = vm
+        .attach_current_thread_as_daemon()
+        .map_err(|e| format!("Failed to attach thread: {}", e))?;
+    env.push_local_frame(16)
+        .map_err(|e| format!("Failed to push local frame: {}", e))?;
+    let result = f(&mut env);
+    clear_pending_exception(&mut env);
+    unsafe {
+        let _ = env.pop_local_frame(&JObject::null());
+    }
+    Ok(result)
+}
+
+/// Log and clear a pending Java exception, if any. Returns true if one was pending.
+pub fn clear_pending_exception(env: &mut JNIEnv) -> bool {
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+        warn!("JNI: cleared a pending Java exception");
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(all(test, feature = "jvm-tests"))]
+mod jvm_tests {
+    use super::*;
+    use jni::InitArgsBuilder;
+
+    /// A Rust thread that hits a Java exception keeps a clean, attached env,
+    /// and is detached when it exits.
+    #[test]
+    fn with_env_clears_exceptions_and_attaches_once() {
+        let args = InitArgsBuilder::new().build().unwrap();
+        init_jvm(JavaVM::new(args).unwrap());
+        let vm = get_jvm().unwrap();
+        let before = vm.threads_attached();
+
+        let worker = std::thread::spawn(|| {
+            let parse = |env: &mut JNIEnv, text: &str| {
+                let s = env.new_string(text).unwrap();
+                env.call_static_method(
+                    "java/lang/Integer",
+                    "parseInt",
+                    "(Ljava/lang/String;)I",
+                    &[JValue::Object(&s)],
+                )
+                .and_then(|v| v.i())
+            };
+            // NumberFormatException: Err, and nothing left pending.
+            assert!(with_env(|env| parse(env, "x")).unwrap().is_err());
+            let vm = get_jvm().unwrap();
+            let attached = vm.threads_attached();
+            let mut env = vm.get_env().expect("still attached after the call");
+            assert!(!env.exception_check().unwrap());
+            assert_eq!(with_env(|env| parse(env, "7")).unwrap().unwrap(), 7);
+            assert_eq!(vm.threads_attached(), attached, "no re-attach per call");
+        });
+        worker.join().unwrap();
+        assert_eq!(vm.threads_attached(), before, "detached at thread exit");
+    }
+}
+
 //==============================================================================
 // AUDIO JNI BRIDGE
 //==============================================================================
@@ -57,17 +135,14 @@ impl AndroidAudioRecord {
     /// Get the integer value of a `MediaRecorder.AudioSource` constant by name.
     /// Returns None if the field doesn't exist on this SDK level.
     pub fn audio_source_id(name: &str) -> Option<i32> {
-        let vm = get_jvm().ok()?;
-        let mut env = vm.attach_current_thread().ok()?;
-        let source_class = env
-            .find_class("android/media/MediaRecorder$AudioSource")
-            .ok()?;
-        let val = env
-            .get_static_field(&source_class, name, "I")
-            .ok()?
-            .i()
-            .ok()?;
-        Some(val)
+        with_env(|env| {
+            let source_class = env
+                .find_class("android/media/MediaRecorder$AudioSource")
+                .ok()?;
+            env.get_static_field(&source_class, name, "I").ok()?.i().ok()
+        })
+        .ok()
+        .flatten()
     }
 
     /// Create AudioRecord instance with an explicit audio source (e.g.
@@ -81,69 +156,64 @@ impl AndroidAudioRecord {
         audio_format: i32,
         buffer_size: i32,
     ) -> Result<Self, String> {
-        let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
+        with_env(|env| {
+            let recorder_class = env
+                .find_class("android/media/AudioRecord")
+                .map_err(|e| format!("Failed to find AudioRecord class: {}", e))?;
 
-        let recorder_class = env
-            .find_class("android/media/AudioRecord")
-            .map_err(|e| format!("Failed to find AudioRecord class: {}", e))?;
+            let recorder = env
+                .new_object(
+                    &recorder_class,
+                    "(IIIII)V",
+                    &[
+                        JValue::Int(audio_source),
+                        JValue::Int(sample_rate),
+                        JValue::Int(channel_config),
+                        JValue::Int(audio_format),
+                        JValue::Int(buffer_size),
+                    ],
+                )
+                .map_err(|e| format!("Failed to create AudioRecord: {}", e))?;
 
-        let recorder = env
-            .new_object(
-                &recorder_class,
-                "(IIIII)V",
-                &[
-                    JValue::Int(audio_source),
-                    JValue::Int(sample_rate),
-                    JValue::Int(channel_config),
-                    JValue::Int(audio_format),
-                    JValue::Int(buffer_size),
-                ],
-            )
-            .map_err(|e| format!("Failed to create AudioRecord: {}", e))?;
+            // Verify the recorder actually initialized (some OEM HALs reject
+            // certain sources silently — STATE_UNINITIALIZED = 0).
+            let state_initialized = env
+                .get_static_field(&recorder_class, "STATE_INITIALIZED", "I")
+                .map_err(|e| format!("Failed to get STATE_INITIALIZED: {}", e))?
+                .i()
+                .map_err(|e| format!("Failed to convert STATE_INITIALIZED: {}", e))?;
+            let state = env
+                .call_method(&recorder, "getState", "()I", &[])
+                .map_err(|e| format!("Failed to call getState: {}", e))?
+                .i()
+                .map_err(|e| format!("Failed to convert getState: {}", e))?;
+            if state != state_initialized {
+                let _ = env.call_method(&recorder, "release", "()V", &[]);
+                return Err(format!(
+                    "AudioRecord state={} (not STATE_INITIALIZED) for source={}",
+                    state, audio_source
+                ));
+            }
 
-        // Verify the recorder actually initialized (some OEM HALs reject
-        // certain sources silently — STATE_UNINITIALIZED = 0).
-        let state_initialized = env
-            .get_static_field(&recorder_class, "STATE_INITIALIZED", "I")
-            .map_err(|e| format!("Failed to get STATE_INITIALIZED: {}", e))?
-            .i()
-            .map_err(|e| format!("Failed to convert STATE_INITIALIZED: {}", e))?;
-        let state = env
-            .call_method(&recorder, "getState", "()I", &[])
-            .map_err(|e| format!("Failed to call getState: {}", e))?
-            .i()
-            .map_err(|e| format!("Failed to convert getState: {}", e))?;
-        if state != state_initialized {
-            let _ = env.call_method(&recorder, "release", "()V", &[]);
-            return Err(format!(
-                "AudioRecord state={} (not STATE_INITIALIZED) for source={}",
-                state, audio_source
-            ));
-        }
+            let global_ref = env
+                .new_global_ref(&recorder)
+                .map_err(|e| format!("Failed to create global ref: {}", e))?;
 
-        let global_ref = env
-            .new_global_ref(&recorder)
-            .map_err(|e| format!("Failed to create global ref: {}", e))?;
-
-        Ok(Self {
-            recorder: global_ref,
-        })
+            Ok(Self {
+                recorder: global_ref,
+            })
+        })?
     }
 
     /// Get the AudioRecord's session ID — needed to attach AEC/NS/AGC
     /// effects to this specific recording chain.
     pub fn audio_session_id(&self) -> Result<i32, String> {
-        let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        env.call_method(self.recorder.as_obj(), "getAudioSessionId", "()I", &[])
-            .map_err(|e| format!("Failed getAudioSessionId: {}", e))?
-            .i()
-            .map_err(|e| format!("Failed to convert sessionId: {}", e))
+        with_env(|env| {
+            env.call_method(self.recorder.as_obj(), "getAudioSessionId", "()I", &[])
+                .map_err(|e| format!("Failed getAudioSessionId: {}", e))?
+                .i()
+                .map_err(|e| format!("Failed to convert sessionId: {}", e))
+        })?
     }
 
     /// Legacy constructor — defaults to MIC. Prefer `new_with_source` so
@@ -164,118 +234,103 @@ impl AndroidAudioRecord {
         channel_config: i32,
         audio_format: i32,
     ) -> Result<i32, String> {
-        let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
+        with_env(|env| {
+            let recorder_class = env
+                .find_class("android/media/AudioRecord")
+                .map_err(|e| format!("Failed to find AudioRecord class: {}", e))?;
 
-        let recorder_class = env
-            .find_class("android/media/AudioRecord")
-            .map_err(|e| format!("Failed to find AudioRecord class: {}", e))?;
+            let size = env
+                .call_static_method(
+                    recorder_class,
+                    "getMinBufferSize",
+                    "(III)I",
+                    &[
+                        JValue::Int(sample_rate),
+                        JValue::Int(channel_config),
+                        JValue::Int(audio_format),
+                    ],
+                )
+                .map_err(|e| format!("Failed to get min buffer size: {}", e))?
+                .i()
+                .map_err(|e| format!("Failed to convert result: {}", e))?;
 
-        let size = env
-            .call_static_method(
-                recorder_class,
-                "getMinBufferSize",
-                "(III)I",
-                &[
-                    JValue::Int(sample_rate),
-                    JValue::Int(channel_config),
-                    JValue::Int(audio_format),
-                ],
-            )
-            .map_err(|e| format!("Failed to get min buffer size: {}", e))?
-            .i()
-            .map_err(|e| format!("Failed to convert result: {}", e))?;
-
-        Ok(size)
+            Ok(size)
+        })?
     }
 
     /// Start recording
     pub fn start_recording(&self) -> Result<(), String> {
-        let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
+        with_env(|env| {
+            env.call_method(self.recorder.as_obj(), "startRecording", "()V", &[])
+                .map_err(|e| format!("Failed to start recording: {}", e))?;
 
-        env.call_method(self.recorder.as_obj(), "startRecording", "()V", &[])
-            .map_err(|e| format!("Failed to start recording: {}", e))?;
-
-        Ok(())
+            Ok(())
+        })?
     }
 
     /// Stop recording
     pub fn stop(&self) -> Result<(), String> {
-        let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
+        with_env(|env| {
+            env.call_method(self.recorder.as_obj(), "stop", "()V", &[])
+                .map_err(|e| format!("Failed to stop recording: {}", e))?;
 
-        env.call_method(self.recorder.as_obj(), "stop", "()V", &[])
-            .map_err(|e| format!("Failed to stop recording: {}", e))?;
-
-        Ok(())
+            Ok(())
+        })?
     }
 
     /// Read audio data
     pub fn read(&self, buffer: &mut [i16]) -> Result<usize, String> {
-        let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
+        with_env(|env| {
+            // Push a local-ref frame so the short[] we allocate each call is freed
+            // on return. The audio thread stays attached for the life of the app,
+            // so without this the local-ref table overflows after thousands of frames.
+            env.push_local_frame(4)
+                .map_err(|e| format!("Failed to push local frame: {}", e))?;
 
-        // Push a local-ref frame so the short[] we allocate each call is freed
-        // on return. The audio thread stays attached for the life of the app,
-        // so without this the local-ref table overflows after thousands of frames.
-        env.push_local_frame(4)
-            .map_err(|e| format!("Failed to push local frame: {}", e))?;
+            let result: Result<usize, String> = (|| {
+                let jarray = env
+                    .new_short_array(buffer.len() as i32)
+                    .map_err(|e| format!("Failed to create short array: {}", e))?;
+                let jarray_obj = unsafe { JObject::from_raw(jarray.as_raw()) };
+                let bytes_read = env
+                    .call_method(
+                        self.recorder.as_obj(),
+                        "read",
+                        "([SII)I",
+                        &[
+                            JValue::Object(&jarray_obj),
+                            JValue::Int(0),
+                            JValue::Int(buffer.len() as i32),
+                        ],
+                    )
+                    .map_err(|e| format!("Failed to read: {}", e))?
+                    .i()
+                    .map_err(|e| format!("Failed to convert result: {}", e))?;
 
-        let result: Result<usize, String> = (|| {
-            let jarray = env
-                .new_short_array(buffer.len() as i32)
-                .map_err(|e| format!("Failed to create short array: {}", e))?;
-            let jarray_obj = unsafe { JObject::from_raw(jarray.as_raw()) };
-            let bytes_read = env
-                .call_method(
-                    self.recorder.as_obj(),
-                    "read",
-                    "([SII)I",
-                    &[
-                        JValue::Object(&jarray_obj),
-                        JValue::Int(0),
-                        JValue::Int(buffer.len() as i32),
-                    ],
-                )
-                .map_err(|e| format!("Failed to read: {}", e))?
-                .i()
-                .map_err(|e| format!("Failed to convert result: {}", e))?;
+                if bytes_read <= 0 {
+                    return Ok(0);
+                }
 
-            if bytes_read <= 0 {
-                return Ok(0);
+                env.get_short_array_region(&jarray, 0, buffer)
+                    .map_err(|e| format!("Failed to copy shorts: {}", e))?;
+                Ok(bytes_read as usize)
+            })();
+
+            unsafe {
+                let _ = env.pop_local_frame(&JObject::null());
             }
-
-            env.get_short_array_region(&jarray, 0, buffer)
-                .map_err(|e| format!("Failed to copy shorts: {}", e))?;
-            Ok(bytes_read as usize)
-        })();
-
-        unsafe {
-            let _ = env.pop_local_frame(&JObject::null());
-        }
-        result
+            result
+        })?
     }
 
     /// Release resources
     pub fn release(&self) -> Result<(), String> {
-        let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
+        with_env(|env| {
+            env.call_method(self.recorder.as_obj(), "release", "()V", &[])
+                .map_err(|e| format!("Failed to release: {}", e))?;
 
-        env.call_method(self.recorder.as_obj(), "release", "()V", &[])
-            .map_err(|e| format!("Failed to release: {}", e))?;
-
-        Ok(())
+            Ok(())
+        })?
     }
 }
 
@@ -293,28 +348,26 @@ impl AndroidAudioTrack {
         channel_config: i32,
         audio_format: i32,
     ) -> Result<i32, String> {
-        let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
-        let track_class = env
-            .find_class("android/media/AudioTrack")
-            .map_err(|e| format!("Failed to find AudioTrack class: {}", e))?;
-        let size = env
-            .call_static_method(
-                track_class,
-                "getMinBufferSize",
-                "(III)I",
-                &[
-                    JValue::Int(sample_rate),
-                    JValue::Int(channel_config),
-                    JValue::Int(audio_format),
-                ],
-            )
-            .map_err(|e| format!("Failed to get min buffer size: {}", e))?
-            .i()
-            .map_err(|e| format!("Failed to convert result: {}", e))?;
-        Ok(size)
+        with_env(|env| {
+            let track_class = env
+                .find_class("android/media/AudioTrack")
+                .map_err(|e| format!("Failed to find AudioTrack class: {}", e))?;
+            let size = env
+                .call_static_method(
+                    track_class,
+                    "getMinBufferSize",
+                    "(III)I",
+                    &[
+                        JValue::Int(sample_rate),
+                        JValue::Int(channel_config),
+                        JValue::Int(audio_format),
+                    ],
+                )
+                .map_err(|e| format!("Failed to get min buffer size: {}", e))?
+                .i()
+                .map_err(|e| format!("Failed to convert result: {}", e))?;
+            Ok(size)
+        })?
     }
 
     /// Create AudioTrack instance.
@@ -334,163 +387,175 @@ impl AndroidAudioTrack {
         audio_format: i32,
         buffer_size: i32,
     ) -> Result<Self, String> {
-        let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
+        with_env(|env| {
+            let track_class = env
+                .find_class("android/media/AudioTrack")
+                .map_err(|e| format!("Failed to find AudioTrack class: {}", e))?;
+            let attrs_class = env
+                .find_class("android/media/AudioAttributes")
+                .map_err(|e| format!("Failed to find AudioAttributes class: {}", e))?;
+            let attrs_builder_class = env
+                .find_class("android/media/AudioAttributes$Builder")
+                .map_err(|e| format!("Failed to find AudioAttributes.Builder class: {}", e))?;
+            let _format_class = env
+                .find_class("android/media/AudioFormat")
+                .map_err(|e| format!("Failed to find AudioFormat class: {}", e))?;
+            let format_builder_class = env
+                .find_class("android/media/AudioFormat$Builder")
+                .map_err(|e| format!("Failed to find AudioFormat.Builder class: {}", e))?;
 
-        let track_class = env
-            .find_class("android/media/AudioTrack")
-            .map_err(|e| format!("Failed to find AudioTrack class: {}", e))?;
-        let attrs_class = env
-            .find_class("android/media/AudioAttributes")
-            .map_err(|e| format!("Failed to find AudioAttributes class: {}", e))?;
-        let attrs_builder_class = env
-            .find_class("android/media/AudioAttributes$Builder")
-            .map_err(|e| format!("Failed to find AudioAttributes.Builder class: {}", e))?;
-        let _format_class = env
-            .find_class("android/media/AudioFormat")
-            .map_err(|e| format!("Failed to find AudioFormat class: {}", e))?;
-        let format_builder_class = env
-            .find_class("android/media/AudioFormat$Builder")
-            .map_err(|e| format!("Failed to find AudioFormat.Builder class: {}", e))?;
+            let usage_voice_comm = env
+                .get_static_field(&attrs_class, "USAGE_VOICE_COMMUNICATION", "I")
+                .map_err(|e| format!("Failed to get USAGE_VOICE_COMMUNICATION: {}", e))?
+                .i()
+                .map_err(|e| format!("Failed to convert field: {}", e))?;
+            let content_speech = env
+                .get_static_field(&attrs_class, "CONTENT_TYPE_SPEECH", "I")
+                .map_err(|e| format!("Failed to get CONTENT_TYPE_SPEECH: {}", e))?
+                .i()
+                .map_err(|e| format!("Failed to convert field: {}", e))?;
 
-        let usage_voice_comm = env
-            .get_static_field(&attrs_class, "USAGE_VOICE_COMMUNICATION", "I")
-            .map_err(|e| format!("Failed to get USAGE_VOICE_COMMUNICATION: {}", e))?
-            .i()
-            .map_err(|e| format!("Failed to convert field: {}", e))?;
-        let content_speech = env
-            .get_static_field(&attrs_class, "CONTENT_TYPE_SPEECH", "I")
-            .map_err(|e| format!("Failed to get CONTENT_TYPE_SPEECH: {}", e))?
-            .i()
-            .map_err(|e| format!("Failed to convert field: {}", e))?;
+            let mode_stream = env
+                .get_static_field(&track_class, "MODE_STREAM", "I")
+                .map_err(|e| format!("Failed to get MODE_STREAM field: {}", e))?
+                .i()
+                .map_err(|e| format!("Failed to convert field: {}", e))?;
+            // `AUDIO_SESSION_ID_GENERATE` lives on `AudioManager`, not
+            // `AudioTrack` — looking it up on AudioTrack throws
+            // NoSuchFieldError and crashes audio init. Value is 0, documented
+            // public API since L (API 21).
+            let session_id_none: i32 = 0;
 
-        let mode_stream = env
-            .get_static_field(&track_class, "MODE_STREAM", "I")
-            .map_err(|e| format!("Failed to get MODE_STREAM field: {}", e))?
-            .i()
-            .map_err(|e| format!("Failed to convert field: {}", e))?;
-        // `AUDIO_SESSION_ID_GENERATE` lives on `AudioManager`, not
-        // `AudioTrack` — looking it up on AudioTrack throws
-        // NoSuchFieldError and crashes audio init. Value is 0, documented
-        // public API since L (API 21).
-        let session_id_none: i32 = 0;
+            // Build AudioAttributes(usage=VOICE_COMMUNICATION, contentType=SPEECH)
+            let attrs_builder = env
+                .new_object(&attrs_builder_class, "()V", &[])
+                .map_err(|e| format!("Failed to create AudioAttributes.Builder: {}", e))?;
+            let attrs_builder = env
+                .call_method(
+                    &attrs_builder,
+                    "setUsage",
+                    "(I)Landroid/media/AudioAttributes$Builder;",
+                    &[JValue::Int(usage_voice_comm)],
+                )
+                .map_err(|e| format!("Failed setUsage: {}", e))?
+                .l()
+                .map_err(|e| format!("Failed setUsage return: {}", e))?;
+            let attrs_builder = env
+                .call_method(
+                    &attrs_builder,
+                    "setContentType",
+                    "(I)Landroid/media/AudioAttributes$Builder;",
+                    &[JValue::Int(content_speech)],
+                )
+                .map_err(|e| format!("Failed setContentType: {}", e))?
+                .l()
+                .map_err(|e| format!("Failed setContentType return: {}", e))?;
+            let audio_attrs = env
+                .call_method(
+                    &attrs_builder,
+                    "build",
+                    "()Landroid/media/AudioAttributes;",
+                    &[],
+                )
+                .map_err(|e| format!("Failed AudioAttributes.build: {}", e))?
+                .l()
+                .map_err(|e| format!("Failed AudioAttributes.build return: {}", e))?;
 
-        // Build AudioAttributes(usage=VOICE_COMMUNICATION, contentType=SPEECH)
-        let attrs_builder = env
-            .new_object(&attrs_builder_class, "()V", &[])
-            .map_err(|e| format!("Failed to create AudioAttributes.Builder: {}", e))?;
-        let attrs_builder = env
-            .call_method(
-                &attrs_builder,
-                "setUsage",
-                "(I)Landroid/media/AudioAttributes$Builder;",
-                &[JValue::Int(usage_voice_comm)],
-            )
-            .map_err(|e| format!("Failed setUsage: {}", e))?
-            .l()
-            .map_err(|e| format!("Failed setUsage return: {}", e))?;
-        let attrs_builder = env
-            .call_method(
-                &attrs_builder,
-                "setContentType",
-                "(I)Landroid/media/AudioAttributes$Builder;",
-                &[JValue::Int(content_speech)],
-            )
-            .map_err(|e| format!("Failed setContentType: {}", e))?
-            .l()
-            .map_err(|e| format!("Failed setContentType return: {}", e))?;
-        let audio_attrs = env
-            .call_method(
-                &attrs_builder,
-                "build",
-                "()Landroid/media/AudioAttributes;",
-                &[],
-            )
-            .map_err(|e| format!("Failed AudioAttributes.build: {}", e))?
-            .l()
-            .map_err(|e| format!("Failed AudioAttributes.build return: {}", e))?;
+            // Build AudioFormat(encoding=PCM_16, sampleRate, channelMask=channel_config)
+            let format_builder = env
+                .new_object(&format_builder_class, "()V", &[])
+                .map_err(|e| format!("Failed to create AudioFormat.Builder: {}", e))?;
+            let format_builder = env
+                .call_method(
+                    &format_builder,
+                    "setEncoding",
+                    "(I)Landroid/media/AudioFormat$Builder;",
+                    &[JValue::Int(audio_format)],
+                )
+                .map_err(|e| format!("Failed setEncoding: {}", e))?
+                .l()
+                .map_err(|e| format!("Failed setEncoding return: {}", e))?;
+            let format_builder = env
+                .call_method(
+                    &format_builder,
+                    "setSampleRate",
+                    "(I)Landroid/media/AudioFormat$Builder;",
+                    &[JValue::Int(sample_rate)],
+                )
+                .map_err(|e| format!("Failed setSampleRate: {}", e))?
+                .l()
+                .map_err(|e| format!("Failed setSampleRate return: {}", e))?;
+            let format_builder = env
+                .call_method(
+                    &format_builder,
+                    "setChannelMask",
+                    "(I)Landroid/media/AudioFormat$Builder;",
+                    &[JValue::Int(channel_config)],
+                )
+                .map_err(|e| format!("Failed setChannelMask: {}", e))?
+                .l()
+                .map_err(|e| format!("Failed setChannelMask return: {}", e))?;
+            let audio_format_obj = env
+                .call_method(
+                    &format_builder,
+                    "build",
+                    "()Landroid/media/AudioFormat;",
+                    &[],
+                )
+                .map_err(|e| format!("Failed AudioFormat.build: {}", e))?
+                .l()
+                .map_err(|e| format!("Failed AudioFormat.build return: {}", e))?;
 
-        // Build AudioFormat(encoding=PCM_16, sampleRate, channelMask=channel_config)
-        let format_builder = env
-            .new_object(&format_builder_class, "()V", &[])
-            .map_err(|e| format!("Failed to create AudioFormat.Builder: {}", e))?;
-        let format_builder = env
-            .call_method(
-                &format_builder,
-                "setEncoding",
-                "(I)Landroid/media/AudioFormat$Builder;",
-                &[JValue::Int(audio_format)],
-            )
-            .map_err(|e| format!("Failed setEncoding: {}", e))?
-            .l()
-            .map_err(|e| format!("Failed setEncoding return: {}", e))?;
-        let format_builder = env
-            .call_method(
-                &format_builder,
-                "setSampleRate",
-                "(I)Landroid/media/AudioFormat$Builder;",
-                &[JValue::Int(sample_rate)],
-            )
-            .map_err(|e| format!("Failed setSampleRate: {}", e))?
-            .l()
-            .map_err(|e| format!("Failed setSampleRate return: {}", e))?;
-        let format_builder = env
-            .call_method(
-                &format_builder,
-                "setChannelMask",
-                "(I)Landroid/media/AudioFormat$Builder;",
-                &[JValue::Int(channel_config)],
-            )
-            .map_err(|e| format!("Failed setChannelMask: {}", e))?
-            .l()
-            .map_err(|e| format!("Failed setChannelMask return: {}", e))?;
-        let audio_format_obj = env
-            .call_method(
-                &format_builder,
-                "build",
-                "()Landroid/media/AudioFormat;",
-                &[],
-            )
-            .map_err(|e| format!("Failed AudioFormat.build: {}", e))?
-            .l()
-            .map_err(|e| format!("Failed AudioFormat.build return: {}", e))?;
+            // AudioTrack(AudioAttributes, AudioFormat, bufferSizeInBytes, mode, sessionId)
+            let track = env
+                .new_object(
+                    &track_class,
+                    "(Landroid/media/AudioAttributes;Landroid/media/AudioFormat;III)V",
+                    &[
+                        JValue::Object(&audio_attrs),
+                        JValue::Object(&audio_format_obj),
+                        JValue::Int(buffer_size),
+                        JValue::Int(mode_stream),
+                        JValue::Int(session_id_none),
+                    ],
+                )
+                .map_err(|e| format!("Failed to create AudioTrack (voice): {}", e))?;
 
-        // AudioTrack(AudioAttributes, AudioFormat, bufferSizeInBytes, mode, sessionId)
-        let track = env
-            .new_object(
-                &track_class,
-                "(Landroid/media/AudioAttributes;Landroid/media/AudioFormat;III)V",
-                &[
-                    JValue::Object(&audio_attrs),
-                    JValue::Object(&audio_format_obj),
-                    JValue::Int(buffer_size),
-                    JValue::Int(mode_stream),
-                    JValue::Int(session_id_none),
-                ],
-            )
-            .map_err(|e| format!("Failed to create AudioTrack (voice): {}", e))?;
+            // AudioFlinger can refuse a track (audio server restart, call in
+            // progress) without throwing; play() on it then throws on the RX
+            // thread. Same check AudioRecord gets.
+            let state_initialized = env
+                .get_static_field(&track_class, "STATE_INITIALIZED", "I")
+                .map_err(|e| format!("Failed to get STATE_INITIALIZED: {}", e))?
+                .i()
+                .map_err(|e| format!("Failed to convert STATE_INITIALIZED: {}", e))?;
+            let state = env
+                .call_method(&track, "getState", "()I", &[])
+                .map_err(|e| format!("Failed to call getState: {}", e))?
+                .i()
+                .map_err(|e| format!("Failed to convert getState: {}", e))?;
+            if state != state_initialized {
+                let _ = env.call_method(&track, "release", "()V", &[]);
+                return Err(format!("AudioTrack state={} (not STATE_INITIALIZED)", state));
+            }
 
-        let global_ref = env
-            .new_global_ref(&track)
-            .map_err(|e| format!("Failed to create global ref: {}", e))?;
+            let global_ref = env
+                .new_global_ref(&track)
+                .map_err(|e| format!("Failed to create global ref: {}", e))?;
 
-        info!("AudioTrack created with USAGE_VOICE_COMMUNICATION + CONTENT_TYPE_SPEECH (bypasses OEM media post-processing)");
-        Ok(Self { track: global_ref })
+            info!("AudioTrack created with USAGE_VOICE_COMMUNICATION + CONTENT_TYPE_SPEECH (bypasses OEM media post-processing)");
+            Ok(Self { track: global_ref })
+        })?
     }
 
     /// Start playback
     pub fn play(&self) -> Result<(), String> {
-        let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
+        with_env(|env| {
+            env.call_method(self.track.as_obj(), "play", "()V", &[])
+                .map_err(|e| format!("Failed to start playback: {}", e))?;
 
-        env.call_method(self.track.as_obj(), "play", "()V", &[])
-            .map_err(|e| format!("Failed to start playback: {}", e))?;
-
-        Ok(())
+            Ok(())
+        })?
     }
 
     /// Pin this track to the sticky RX sink (loudspeaker unless a real
@@ -503,71 +568,62 @@ impl AndroidAudioTrack {
 
     /// Stop playback
     pub fn stop(&self) -> Result<(), String> {
-        let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
+        with_env(|env| {
+            env.call_method(self.track.as_obj(), "stop", "()V", &[])
+                .map_err(|e| format!("Failed to stop playback: {}", e))?;
 
-        env.call_method(self.track.as_obj(), "stop", "()V", &[])
-            .map_err(|e| format!("Failed to stop playback: {}", e))?;
-
-        Ok(())
+            Ok(())
+        })?
     }
 
     /// Write audio data
     pub fn write(&self, buffer: &[i16]) -> Result<usize, String> {
-        let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
+        with_env(|env| {
+            // Bound local refs per call so the playback thread's ref table
+            // doesn't grow unbounded across every written audio frame.
+            env.push_local_frame(4)
+                .map_err(|e| format!("Failed to push local frame: {}", e))?;
 
-        // Bound local refs per call so the playback thread's ref table
-        // doesn't grow unbounded across every written audio frame.
-        env.push_local_frame(4)
-            .map_err(|e| format!("Failed to push local frame: {}", e))?;
+            let result: Result<usize, String> = (|| {
+                let jarray = env
+                    .new_short_array(buffer.len() as i32)
+                    .map_err(|e| format!("Failed to create short array: {}", e))?;
 
-        let result: Result<usize, String> = (|| {
-            let jarray = env
-                .new_short_array(buffer.len() as i32)
-                .map_err(|e| format!("Failed to create short array: {}", e))?;
+                env.set_short_array_region(&jarray, 0, buffer)
+                    .map_err(|e| format!("Failed to copy shorts: {}", e))?;
 
-            env.set_short_array_region(&jarray, 0, buffer)
-                .map_err(|e| format!("Failed to copy shorts: {}", e))?;
+                let bytes_written = env
+                    .call_method(
+                        self.track.as_obj(),
+                        "write",
+                        "([SII)I",
+                        &[
+                            JValue::Object(&jarray.into()),
+                            JValue::Int(0),
+                            JValue::Int(buffer.len() as i32),
+                        ],
+                    )
+                    .map_err(|e| format!("Failed to write: {}", e))?
+                    .i()
+                    .map_err(|e| format!("Failed to convert result: {}", e))?;
+                Ok(bytes_written as usize)
+            })();
 
-            let bytes_written = env
-                .call_method(
-                    self.track.as_obj(),
-                    "write",
-                    "([SII)I",
-                    &[
-                        JValue::Object(&jarray.into()),
-                        JValue::Int(0),
-                        JValue::Int(buffer.len() as i32),
-                    ],
-                )
-                .map_err(|e| format!("Failed to write: {}", e))?
-                .i()
-                .map_err(|e| format!("Failed to convert result: {}", e))?;
-            Ok(bytes_written as usize)
-        })();
-
-        unsafe {
-            let _ = env.pop_local_frame(&JObject::null());
-        }
-        result
+            unsafe {
+                let _ = env.pop_local_frame(&JObject::null());
+            }
+            result
+        })?
     }
 
     /// Release resources
     pub fn release(&self) -> Result<(), String> {
-        let vm = get_jvm()?;
-        let mut env = vm
-            .attach_current_thread()
-            .map_err(|e| format!("Failed to attach thread: {}", e))?;
+        with_env(|env| {
+            env.call_method(self.track.as_obj(), "release", "()V", &[])
+                .map_err(|e| format!("Failed to release: {}", e))?;
 
-        env.call_method(self.track.as_obj(), "release", "()V", &[])
-            .map_err(|e| format!("Failed to release: {}", e))?;
-
-        Ok(())
+            Ok(())
+        })?
     }
 }
 

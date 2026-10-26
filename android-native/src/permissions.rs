@@ -9,8 +9,9 @@
 /// Copyright 2025 Sassy Consulting LLC. All rights reserved.
 
 use log::{error, info, warn};
-use crate::jni_bridge::get_jvm;
+use crate::jni_bridge::with_env;
 use jni::objects::{JObject, JString, JValue};
+use jni::JNIEnv;
 
 /// Permission state
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -71,21 +72,13 @@ impl PermissionManager {
 
     /// Check if a specific permission is granted via JNI
     fn check_permission_jni(&self, permission: &str) -> PermissionState {
-        let vm = match get_jvm() {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Failed to get JVM: {}", e);
-                return PermissionState::Unknown;
-            }
-        };
+        with_env(|env| self.check_permission_with(env, permission)).unwrap_or_else(|e| {
+            error!("JNI unavailable: {}", e);
+            PermissionState::Unknown
+        })
+    }
 
-        let mut env = match vm.attach_current_thread() {
-            Ok(e) => e,
-            Err(e) => {
-                error!("Failed to attach thread: {}", e);
-                return PermissionState::Unknown;
-            }
-        };
+    fn check_permission_with(&self, env: &mut JNIEnv, permission: &str) -> PermissionState {
 
         // Get application context via ActivityThread
         let activity_thread_class = match env.find_class("android/app/ActivityThread") {
@@ -149,7 +142,7 @@ impl PermissionManager {
             Ok(c) => c,
             Err(_) => {
                 // Fallback to Context.checkSelfPermission for older apps
-                return self.check_permission_legacy(&mut env, &context, &permission_jstr);
+                return self.check_permission_legacy(env, &context, &permission_jstr);
             }
         };
 

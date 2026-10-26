@@ -28,6 +28,8 @@ standalone-ui = ["eframe", "egui", "android-activity"]
 # published crate and point OPUS_SRC_DIR at its `opus/` dir; see the
 # "Fetch bundled libopus sources" step in .github/workflows/build-aab.yml.
 _prefetch-opus-src = ["audiopus_sys"]
+# Host tests against a real JVM (needs a JDK; JAVA_HOME or java on PATH).
+jvm-tests = ["jni/invocation"]
 
 [dependencies]
 # Android

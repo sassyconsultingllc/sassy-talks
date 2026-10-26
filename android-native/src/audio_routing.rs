@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::audio_route_policy::{self, Target};
-use crate::jni_bridge::get_jvm;
+use crate::jni_bridge::with_env;
 
 /// Cached AudioManager reference + saved state, so we can restore on
 /// release. One global router — there's only one AudioManager per app.
@@ -68,13 +68,13 @@ pub fn reassert() -> Result<(), String> {
 }
 
 fn apply_route() -> Result<(), String> {
-    let force_speaker = desired_speaker();
-    let vm = get_jvm()?;
-    let mut env = vm
-        .attach_current_thread()
-        .map_err(|e| format!("attach: {}", e))?;
+    with_env(apply_route_with)?
+}
 
-    let am_ref = obtain_audio_manager(&mut env)?;
+fn apply_route_with(env: &mut JNIEnv) -> Result<(), String> {
+    let force_speaker = desired_speaker();
+
+    let am_ref = obtain_audio_manager(env)?;
 
     let first_engage = ROUTER
         .lock()
@@ -100,28 +100,28 @@ fn apply_route() -> Result<(), String> {
         false
     };
 
-    let sdk = sdk_int(&mut env).unwrap_or(0);
-    set_mode_in_communication(&mut env, am_ref.as_obj())?;
+    let sdk = sdk_int(env).unwrap_or(0);
+    set_mode_in_communication(env, am_ref.as_obj())?;
 
-    let types = collect_output_types(&mut env, am_ref.as_obj()).unwrap_or_default();
+    let types = collect_output_types(env, am_ref.as_obj()).unwrap_or_default();
     let target = audio_route_policy::resolve(force_speaker, &types);
-    let current = current_output_type(&mut env, am_ref.as_obj(), sdk);
+    let current = current_output_type(env, am_ref.as_obj(), sdk);
 
     if audio_route_policy::should_apply(target, current) {
         match target {
             Target::Loudspeaker => {
-                apply_builtin(&mut env, am_ref.as_obj(), sdk, true)?;
+                apply_builtin(env, am_ref.as_obj(), sdk, true)?;
                 info!("audio_routing: RX → loudspeaker (sdk={})", sdk);
             }
             Target::Earpiece => {
-                apply_builtin(&mut env, am_ref.as_obj(), sdk, false)?;
+                apply_builtin(env, am_ref.as_obj(), sdk, false)?;
                 info!(
                     "audio_routing: RX → earpiece (user preference, sdk={})",
                     sdk
                 );
             }
             Target::External => {
-                clear_forced_builtin(&mut env, am_ref.as_obj(), sdk);
+                clear_forced_builtin(env, am_ref.as_obj(), sdk);
                 info!("audio_routing: RX → external accessory (left in place)");
             }
         }
@@ -145,17 +145,17 @@ pub fn pin_track(track: &JObject) -> Result<(), String> {
     if track.is_null() {
         return Ok(());
     }
-    let vm = get_jvm()?;
-    let mut env = vm
-        .attach_current_thread()
-        .map_err(|e| format!("attach: {}", e))?;
-    let am_ref = obtain_audio_manager(&mut env)?;
-    let types = collect_output_types(&mut env, am_ref.as_obj()).unwrap_or_default();
+    with_env(|env| pin_track_with(env, track))?
+}
+
+fn pin_track_with(env: &mut JNIEnv, track: &JObject) -> Result<(), String> {
+    let am_ref = obtain_audio_manager(env)?;
+    let types = collect_output_types(env, am_ref.as_obj()).unwrap_or_default();
     let target = audio_route_policy::resolve(desired_speaker(), &types);
     match target {
         Target::Loudspeaker => {
             if let Some(dev) = find_output_device(
-                &mut env,
+                env,
                 am_ref.as_obj(),
                 &[
                     audio_route_policy::TYPE_BUILTIN_SPEAKER,
@@ -172,7 +172,7 @@ pub fn pin_track(track: &JObject) -> Result<(), String> {
         }
         Target::Earpiece => {
             if let Some(dev) = find_output_device(
-                &mut env,
+                env,
                 am_ref.as_obj(),
                 &[audio_route_policy::TYPE_BUILTIN_EARPIECE],
             ) {
@@ -203,15 +203,10 @@ pub fn release() {
         Some(s) if s.active => s,
         _ => return,
     };
-    let vm = match get_jvm() {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let mut env = match vm.attach_current_thread() {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+    let _ = with_env(|env| restore(env, &state));
+}
 
+fn restore(env: &mut JNIEnv, state: &RouterState) {
     if let Err(e) = env.call_method(
         state.am.as_obj(),
         "setMode",
@@ -220,7 +215,7 @@ pub fn release() {
     ) {
         warn!("audio_routing release: setMode failed: {}", e);
     }
-    let sdk = sdk_int(&mut env).unwrap_or(0);
+    let sdk = sdk_int(env).unwrap_or(0);
     if sdk >= 31 {
         let _ = env.call_method(state.am.as_obj(), "clearCommunicationDevice", "()V", &[]);
     }

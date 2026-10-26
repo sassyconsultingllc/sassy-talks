@@ -19,7 +19,7 @@ use jni::objects::GlobalRef;
 use log::{info, warn};
 
 use crate::device_quirks::EffectsConfig;
-use crate::jni_bridge::get_jvm;
+use crate::jni_bridge::with_env;
 
 pub struct AppliedEffects {
     _aec: Option<GlobalRef>,
@@ -40,23 +40,19 @@ impl AppliedEffects {
 /// effects that were actually active (some devices return `isAvailable()=true`
 /// but enabled stays false — trust the applied state, not the config).
 pub fn apply(session_id: i32, config: &EffectsConfig) -> AppliedEffects {
-    let vm = match get_jvm() {
-        Ok(v) => v,
-        Err(_) => return AppliedEffects::none(),
-    };
-    let mut env = match vm.attach_current_thread() {
-        Ok(e) => e,
-        Err(_) => return AppliedEffects::none(),
-    };
+    with_env(|env| apply_with(env, session_id, config)).unwrap_or_else(|_| AppliedEffects::none())
+}
+
+fn apply_with(env: &mut jni::JNIEnv, session_id: i32, config: &EffectsConfig) -> AppliedEffects {
 
     let aec = if config.enable_aec {
-        try_create_effect(&mut env, "android/media/audiofx/AcousticEchoCanceler", session_id)
+        try_create_effect(env, "android/media/audiofx/AcousticEchoCanceler", session_id)
     } else { None };
     let ns = if config.enable_ns {
-        try_create_effect(&mut env, "android/media/audiofx/NoiseSuppressor", session_id)
+        try_create_effect(env, "android/media/audiofx/NoiseSuppressor", session_id)
     } else { None };
     let agc = if config.enable_agc {
-        try_create_effect(&mut env, "android/media/audiofx/AutomaticGainControl", session_id)
+        try_create_effect(env, "android/media/audiofx/AutomaticGainControl", session_id)
     } else { None };
 
     let applied = AppliedEffects {
