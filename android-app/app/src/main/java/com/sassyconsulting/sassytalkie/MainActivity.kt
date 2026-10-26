@@ -381,6 +381,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // A recreate (language, font size, density on an external display:
+        // changes configChanges doesn't cover) is not the user leaving. The
+        // new instance rebinds; tearing down here dropped the relay, BLE and
+        // any in-progress TX.
+        if (isChangingConfigurations) return
         // Full shutdown: stop native + stop service
         SassyTalkNative.shutdown()
         stopService(Intent(this, WalkieService::class.java))
