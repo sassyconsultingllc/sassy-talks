@@ -674,8 +674,9 @@ class CellularWebSocketClient {
                         // what arrived after our last live frame. catchup=1 (the
                         // whole ~30 s window, every reconnect) replayed audio we
                         // had already heard and stale control; a long gap gets no
-                        // replay at all rather than a late burst.
-                        catchup.sinceMs(System.currentTimeMillis())?.let {
+                        // replay at all rather than a late burst. After an FCM
+                        // wake, also fetch the transmission that sent the push.
+                        catchup.sinceMs(System.currentTimeMillis(), RelayCatchup.takePendingWake())?.let {
                             builder.setQueryParameter("since", it.toString())
                         }
                         val authedUrl = builder.build().toString().let { toWsScheme(it) }

@@ -128,6 +128,9 @@ class SassyTalkFcmService : FirebaseMessagingService() {
         val room = data["room"] ?: ""
         val wakeTs = data["ts"] ?: data["sentAt"]
         Log.i(TAG, "WAKE push received room=$room ts=$wakeTs")
+        // The reconnect this wake triggers asks the relay for the transmission
+        // that sent it, however long the socket was dark.
+        RelayCatchup.noteWake(System.currentTimeMillis())
 
         // Persist so a cold-started service can act on it.
         wakePrefs()?.edit()

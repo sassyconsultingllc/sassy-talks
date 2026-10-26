@@ -59,4 +59,36 @@ class RelayCatchupTest {
         c.enterRoom("r1")
         assertNull(c.sinceMs(t))
     }
+
+    /** F3: after a doze longer than the cap, a wake still fetches the transmission that sent it. */
+    @Test
+    fun wakeAnchorsCatchupAfterLongDoze() {
+        val c = RelayCatchup.Cursor()
+        c.enterRoom("r1")
+        c.markAlive(t - 60_000L)
+        assertNull(c.sinceMs(t))
+        assertEquals(t - 1_000L - 2_250L, c.sinceMs(t, wakeMs = t - 1_000L))
+    }
+
+    @Test
+    fun earlierAnchorWins() {
+        val c = RelayCatchup.Cursor()
+        c.enterRoom("r1")
+        c.markAlive(t - 5_000L)
+        assertEquals(t - 5_250L, c.sinceMs(t, wakeMs = t - 1_000L))
+    }
+
+    @Test
+    fun coldStartWakeWithNoLiveSocketStillCatchesUp() {
+        val c = RelayCatchup.Cursor()
+        c.enterRoom("r1")
+        assertEquals(t - 2_250L, c.sinceMs(t, wakeMs = t))
+    }
+
+    @Test
+    fun pendingWakeIsTakenOnce() {
+        RelayCatchup.noteWake(t)
+        assertEquals(t, RelayCatchup.takePendingWake())
+        assertEquals(0L, RelayCatchup.takePendingWake())
+    }
 }

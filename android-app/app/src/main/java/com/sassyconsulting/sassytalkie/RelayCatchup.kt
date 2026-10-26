@@ -19,6 +19,33 @@ object RelayCatchup {
     /** Covers the frame in flight when the socket died. */
     private const val MARGIN_MS = 250L
 
+    /** Wake pushes fire on PTT_START, so catch-up starts this far before the push arrived. */
+    private const val WAKE_LEAD_MS = 2_000L
+
+    // A wake can land before any client exists (cold start), so it is kept
+    // process-wide until the next reconnect takes it. Mirrors iOS RelayClient.
+    private val pendingWakeMs = java.util.concurrent.atomic.AtomicLong(0L)
+
+    /** An FCM wake push arrived at [nowMs]. */
+    fun noteWake(nowMs: Long) {
+        pendingWakeMs.set(nowMs)
+    }
+
+    /** The pending wake time (0 if none), cleared so it anchors one reconnect only. */
+    fun takePendingWake(): Long = pendingWakeMs.getAndSet(0L)
+
+    /**
+     * Earliest of the last live frame and the wake lead-in that is still inside
+     * [MAX_GAP_MS]; 0 if neither is. A plain min() would pick a last-alive time
+     * from before a long doze, fail the cap, and lose the wake catch-up.
+     */
+    fun anchorMs(lastAliveMs: Long, wakeMs: Long, nowMs: Long): Long {
+        val wakeAnchor = if (wakeMs > WAKE_LEAD_MS) wakeMs - WAKE_LEAD_MS else 0L
+        return listOf(lastAliveMs, wakeAnchor)
+            .filter { it > 0L && nowMs - it <= MAX_GAP_MS }
+            .minOrNull() ?: 0L
+    }
+
     /** `since=` value for a reconnect, or null to skip catch-up. */
     fun sinceMs(lastAliveMs: Long, nowMs: Long): Long? {
         if (lastAliveMs <= 0L) return null
@@ -49,7 +76,9 @@ object RelayCatchup {
             lastAliveMs = nowMs
         }
 
+        /** [wakeMs] is a pending wake push time (see [takePendingWake]), or 0. */
         @Synchronized
-        fun sinceMs(nowMs: Long): Long? = sinceMs(lastAliveMs, nowMs)
+        fun sinceMs(nowMs: Long, wakeMs: Long = 0L): Long? =
+            RelayCatchup.sinceMs(anchorMs(lastAliveMs, wakeMs, nowMs), nowMs)
     }
 }
