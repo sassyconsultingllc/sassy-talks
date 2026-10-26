@@ -128,7 +128,9 @@ class MainActivity : ComponentActivity() {
         // A permanently-denied permission resolves instantly, so a re-request
         // here loops forever and ANRs. The gate screen button is the retry path.
         permissionsGranted.value = coreGranted()
-        if (!isGranted(Manifest.permission.RECORD_AUDIO)) {
+        if (isGranted(Manifest.permission.RECORD_AUDIO)) {
+            walkieService.value?.refreshForegroundTypes()
+        } else {
             walkieService.value?.pttCoordinator?.forceStop("microphone-permission-denied")
                 ?: SassyTalkNative.pttStop()
         }

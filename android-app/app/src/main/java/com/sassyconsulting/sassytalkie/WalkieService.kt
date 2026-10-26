@@ -5,6 +5,7 @@ package com.sassyconsulting.sassytalkie
 
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
+import android.Manifest
 import android.media.AudioManager
 import android.app.Notification
 import android.app.NotificationChannel
@@ -17,7 +18,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.ServiceInfo
+import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
@@ -26,6 +27,7 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
@@ -230,33 +232,7 @@ class WalkieService : Service() {
         }
 
         try {
-            // On API 34+ the foreground service type must be passed explicitly or
-            // the system raises MissingForegroundServiceTypeException and kills us.
-            //
-            // FOREGROUND_SERVICE_TYPE_MICROPHONE is OR'd in for API 34+ so the new
-            // PttAudioPipeline (com.sassyconsulting.sassytalkie.audio) can keep
-            // AudioRecord alive in the background. The Rust pipeline historically
-            // captured under mediaPlayback, which API 34 deprecates for mic input.
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                ServiceCompat.startForeground(
-                    this,
-                    NOTIFICATION_ID,
-                    buildNotification("Radio standby", showPttAction = false),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-                )
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ServiceCompat.startForeground(
-                    this,
-                    NOTIFICATION_ID,
-                    buildNotification("Radio standby", showPttAction = false),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-                )
-            } else {
-                startForeground(NOTIFICATION_ID, buildNotification("Radio standby", showPttAction = false))
-            }
+            promoteForeground()
         } catch (e: Exception) {
             // Foreground promotion failed (denied permission, policy, etc). Stop
             // the service cleanly rather than let the OS crash the whole app.
@@ -266,6 +242,43 @@ class WalkieService : Service() {
         }
 
         return START_STICKY
+    }
+
+    /**
+     * On API 34+ the foreground service type must be passed explicitly or
+     * the system raises MissingForegroundServiceTypeException and kills us.
+     *
+     * FOREGROUND_SERVICE_TYPE_MICROPHONE is OR'd in on API 34+ once
+     * RECORD_AUDIO is granted, so AudioRecord stays alive in the background
+     * (mediaPlayback no longer covers mic input there). See [ForegroundTypes].
+     */
+    private fun promoteForeground() {
+        val notification = buildNotification("Radio standby", showPttAction = false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val micGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                notification,
+                ForegroundTypes.mask(Build.VERSION.SDK_INT, micGranted),
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    /**
+     * Re-promote after a runtime permission grant (MainActivity's permission
+     * callback), so a first-launch service picks up the MICROPHONE type
+     * without waiting for the next onStart.
+     */
+    fun refreshForegroundTypes() {
+        try {
+            promoteForeground()
+        } catch (e: Exception) {
+            Log.w(TAG, "foreground re-promotion failed: ${e.message}")
+        }
     }
 
     /**
