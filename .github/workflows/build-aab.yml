@@ -199,12 +199,14 @@ jobs:
           GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
         run: |
           set -euo pipefail
-          # Gradle applies the Google Services plugin only if this file exists
-          # (local builds without FCM stay optional). Release CI must have it.
+          # Gradle applies the Google Services plugin only if this file exists,
+          # so without it the AAB builds with FCM inert. That matches every
+          # release shipped so far (3.2.6 / vc 82 on Play has no google_app_id
+          # resource), so a missing secret warns instead of blocking the build.
           if [ -z "${GOOGLE_SERVICES_JSON:-}" ]; then
-            echo "::error::GOOGLE_SERVICES_JSON secret is not set — Play release needs google-services.json for FCM."
-            echo "::error::Add the Firebase google-services.json contents as repo secret GOOGLE_SERVICES_JSON."
-            exit 1
+            echo "::warning::GOOGLE_SERVICES_JSON secret is not set — building without FCM (same as the live Play release)."
+            echo "::warning::Add the Firebase google-services.json contents as repo secret GOOGLE_SERVICES_JSON to enable push wake-ups."
+            exit 0
           fi
           printf '%s' "$GOOGLE_SERVICES_JSON" > android-app/app/google-services.json
           test -s android-app/app/google-services.json || {
