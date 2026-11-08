@@ -435,12 +435,13 @@ fun AppNavigation(
             }
             Screen.Users -> currentScreen = Screen.Main
             Screen.Activity -> currentScreen = Screen.Main
-            Screen.About -> currentScreen = Screen.Main
+            Screen.About -> currentScreen = Screen.Settings
             Screen.Settings -> currentScreen = Screen.Main
             else -> {}
         }
     }
 
+    val goTab: (Tab) -> Unit = { currentScreen = it.screen }
     when (currentScreen) {
         Screen.Gate -> Entitlements.GateScreen(
             onUnlocked = {
@@ -471,7 +472,7 @@ fun AppNavigation(
                 TranscriptionBridge.clearEntries()
             },
         ) }
-        Screen.Main -> MainScreen(
+        Screen.Main -> TabFrame(Tab.Radio, goTab) { MainScreen(
             onDisconnect = {
                 autoConnect.disconnect()
                 walkieService?.releaseMulticastLock()
@@ -494,21 +495,31 @@ fun AppNavigation(
             },
             walkieService = walkieService,
             autoConnect = autoConnect
-        )
-        Screen.Users -> UsersScreen(
+        ) }
+        Screen.Users -> TabFrame(Tab.People, goTab) { UsersScreen(
             onBack = { currentScreen = Screen.Main },
             onEditProfile = { currentScreen = Screen.Profile },
+            onEndSession = {
+                walkieService?.pttCoordinator?.onPttReleased()
+                autoConnect.disconnect()
+                walkieService?.releaseMulticastLock()
+                SassyTalkNative.clearSession() // also clears encrypted per-channel session prefs
+                SassyTalkNative.clearAudioCache()
+                TranscriptionBridge.clearEntries()
+                currentScreen = Screen.Auth
+            },
             walkieService = walkieService
-        )
-        Screen.Activity -> TranscriptionFeedScreen(
+        ) }
+        Screen.Activity -> TabFrame(Tab.Activity, goTab) { TranscriptionFeedScreen(
             entries = TranscriptionBridge.entries.collectAsState().value,
             onBack = { currentScreen = Screen.Main }
-        )
+        ) }
         Screen.About -> AboutScreen(
-            onBack = { currentScreen = Screen.Main }
+            onBack = { currentScreen = Screen.Settings }
         )
-        Screen.Settings -> SettingsScreen(
+        Screen.Settings -> TabFrame(Tab.Settings, goTab) { SettingsScreen(
             onBack = { currentScreen = Screen.Main },
+            onShowAbout = { currentScreen = Screen.About },
             walkieService = walkieService,
             onTransportPrefsChanged = {
                 // Tear the active transports down so MainScreen's auto-connect
@@ -516,7 +527,7 @@ fun AppNavigation(
                 // status badge will briefly flicker through DETECTING.
                 autoConnect.disconnect()
             }
-        )
+        ) }
     }
 }
 

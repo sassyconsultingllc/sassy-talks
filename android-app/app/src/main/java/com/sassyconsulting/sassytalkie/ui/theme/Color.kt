@@ -84,3 +84,34 @@ val TextMuted         = TextMutedToken
 val StatusConnected   = StatusOnline
 val StatusDisconnected = StatusErrorToken
 val StatusTransmitting = Coral
+
+/**
+ * 3.2.8 UI tokens (see the "SassyTalkie UI Overhaul" design canvas). One dark
+ * ground, one accent (teal) for ready/active, orange only while on air, red
+ * only for SOS / destructive actions. New and restyled screens use these.
+ */
+object Ui {
+    val Bg = Color(0xFF0B1220)
+    val Bar = Color(0xFF0E1626)
+    val Surface = Color(0xFF131C2E)
+    val Surface2 = Color(0xFF1B2740)
+    val Line = Color(0xFF26334D)
+    val Text = Color(0xFFF1F5F9)
+    val TextMid = Color(0xFFCBD5E1)
+    val TextDim = Color(0xFF9AA8BD)
+    val Accent = Color(0xFF2DD4BF)
+    val AccentInk = Color(0xFF04211D)
+    val AccentSoft = Color(0xFF10302C)
+    val AccentLine = Color(0xFF1F5A52)
+    val AccentText = Color(0xFF99F6E4)
+    val OnAir = Color(0xFFFB923C)
+    val OnAirInk = Color(0xFF2A1305)
+    val OnAirSoft = Color(0xFF3A2210)
+    val OnAirLine = Color(0xFF7C3E12)
+    val OnAirText = Color(0xFFFED7AA)
+    val Sos = Color(0xFFEF4444)
+    val SosText = Color(0xFFFCA5A5)
+    val Ok = Color(0xFF22C55E)
+    val OkText = Color(0xFF86EFAC)
+    val Warn = Color(0xFFEAB308)
+}

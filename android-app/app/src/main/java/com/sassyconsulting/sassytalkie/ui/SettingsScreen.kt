@@ -6,6 +6,7 @@ package com.sassyconsulting.sassytalkie.ui
 import android.content.Context
 import android.content.Intent
 import androidx.compose.foundation.background
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -62,6 +63,7 @@ private const val KEY_SEALED_SENDER = "sealed_sender"
 @Composable
 fun SettingsScreen(
     onBack: () -> Unit,
+    onShowAbout: () -> Unit = {},
     onTransportPrefsChanged: () -> Unit = {},
     walkieService: com.sassyconsulting.sassytalkie.WalkieService? = null,
 ) {
@@ -107,35 +109,15 @@ fun SettingsScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(DarkBg)
-            .padding(16.dp)
+            .background(Ui.Bg)
     ) {
-        // Header
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = TextGray)
-            }
-
-            Text(
-                text = "Settings",
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Bold,
-                color = BrandPurpleLight
-            )
-
-            Spacer(modifier = Modifier.width(48.dp))
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
+        ScreenHeader(title = "Settings")
 
         Column(
             modifier = Modifier
                 .weight(1f)
                 .verticalScroll(scrollState)
+                .padding(horizontal = 20.dp)
         ) {
             // PTT Settings
             SettingsCard(title = "Push-to-Talk") {
@@ -157,14 +139,52 @@ fun SettingsScreen(
             // practice the radio gets held left-handed, right-handed, thumbed
             // from the bottom edge, or palmed in a mount. Every dimension is
             // adjustable, and shape is a spectrum rather than a preset list.
-            SettingsCard(title = "PTT Button") {
-                Text(
-                    text = "Shape and place the talk button for how you actually hold the radio. Changes apply when you return to the radio screen.",
-                    fontSize = 11.sp,
-                    color = TextMuted
+            SettingsCard(title = "Talk button") {
+                // Presets cover how the radio is actually held; the five
+                // geometry sliders stay available under Fine-tune.
+                val presets = listOf(
+                    Triple("Small", 180f, 1.0f),
+                    Triple("Large", PTT_DEFAULT_SIZE, PTT_DEFAULT_WIDTH_SCALE),
+                    Triple("Full width", 220f, 1.6f),
                 )
-                Spacer(modifier = Modifier.height(10.dp))
-
+                fun applyPreset(size: Float, width: Float) {
+                    pttSize = size; pttWidth = width; pttRound = PTT_DEFAULT_CIRCULARITY
+                    pttOffX = 0f; pttOffY = 0f
+                    prefs.edit()
+                        .putFloat(KEY_PTT_SIZE, size)
+                        .putFloat(KEY_PTT_WIDTH_SCALE, width)
+                        .putFloat(KEY_PTT_CIRCULARITY, PTT_DEFAULT_CIRCULARITY)
+                        .putFloat(KEY_PTT_OFFSET_X, 0f)
+                        .putFloat(KEY_PTT_OFFSET_Y, 0f)
+                        .apply()
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Ui.Bg)
+                        .padding(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    presets.forEach { (label, size, width) ->
+                        val on = pttSize == size && pttWidth == width && pttOffX == 0f && pttOffY == 0f
+                        TextButton(
+                            onClick = { applyPreset(size, width) },
+                            modifier = Modifier.weight(1f).height(40.dp),
+                            shape = RoundedCornerShape(9.dp),
+                            colors = ButtonDefaults.textButtonColors(
+                                containerColor = if (on) Ui.Accent else androidx.compose.ui.graphics.Color.Transparent,
+                                contentColor = if (on) Ui.AccentInk else Ui.TextDim,
+                            ),
+                            contentPadding = PaddingValues(0.dp),
+                        ) { Text(label, fontSize = 13.sp, fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal) }
+                    }
+                }
+                var fineTune by remember { mutableStateOf(false) }
+                TextButton(onClick = { fineTune = !fineTune }) {
+                    Text(if (fineTune) "Hide fine-tune" else "Fine-tune size, shape and position", color = Ui.Accent, fontSize = 13.sp)
+                }
+                if (fineTune) {
                 PttSlider(
                     label = "Size",
                     valueLabel = "${pttSize.toInt()} dp tall",
@@ -231,6 +251,7 @@ fun SettingsScreen(
                     modifier = Modifier.fillMaxWidth().height(40.dp),
                 ) {
                     Text("Reset to defaults", fontSize = 13.sp)
+                }
                 }
             }
 
@@ -722,6 +743,23 @@ fun SettingsScreen(
                     Text("Clear session keys", fontSize = 14.sp)
                 }
             }
+
+            Spacer(modifier = Modifier.height(12.dp))
+            SettingsCard(title = "About") {
+                TextButton(
+                    onClick = onShowAbout,
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(0.dp),
+                ) {
+                    Text(
+                        "SassyTalk ${com.sassyconsulting.sassytalkie.BuildConfig.VERSION_NAME} " +
+                            "(${com.sassyconsulting.sassytalkie.BuildConfig.VERSION_CODE})",
+                        color = Ui.Text, fontSize = 15.sp, modifier = Modifier.weight(1f),
+                    )
+                    Text("Details \u203a", color = Ui.TextDim, fontSize = 13.sp)
+                }
+            }
+            Spacer(modifier = Modifier.height(24.dp))
         }
     }
 }
@@ -829,20 +867,9 @@ private fun SettingsCard(
     title: String,
     content: @Composable ColumnScope.() -> Unit
 ) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = CardBg),
-        shape = RoundedCornerShape(12.dp)
-    ) {
+    SectionLabel(title)
+    UiCard {
         Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                text = title,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = Cyan,
-                letterSpacing = 1.sp
-            )
-            Spacer(modifier = Modifier.height(12.dp))
             content()
         }
     }

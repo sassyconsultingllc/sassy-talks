@@ -7,6 +7,7 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -310,7 +311,7 @@ fun MainScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Brush.radialGradient(listOf(BgMedium, BgDark)))
+            .background(Ui.Bg)
     ) {
     Column(
         modifier = Modifier
@@ -320,108 +321,69 @@ fun MainScreen(
             .widthIn(max = 560.dp)
             .fillMaxWidth()
             .align(Alignment.TopCenter)
-            .padding(16.dp),
+            .padding(horizontal = 20.dp, vertical = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // Header with back + users buttons
+        // ── Header: channel, link status, invite, SOS ──
+        // The overflow menu is gone: Activity / People / Settings live in the
+        // bottom tab bar, End Session moved to People. SOS sits top-right, as
+        // far from the talk button as the screen allows, and still needs the
+        // confirm dialog, so a stray thumb cannot broadcast it.
+        val channelGroupName = remember(currentChannel) {
+            SassyTalkNative.getGroupName(currentChannel)
+        }
+        val subLabel = listOf("Main", "A", "B").getOrElse(currentSubchannel) { "Main" }
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+                .padding(top = 4.dp, bottom = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            IconButton(onClick = {
-                // Plain navigation — deliberately NOT SassyTalkNative.disconnect().
-                // That native call wipes transport crypto (TransportManager.
-                // disconnect sets crypto=None), so backing out once and
-                // Continue-ing back in landed on Main un-encrypted: every PTT
-                // press was rejected ("Authenticate via QR first") while the
-                // roster still showed peers. Full teardown = End Session menu.
-                onDisconnect()
-            }) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Leave radio screen", tint = TextGray)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = channelGroupName.ifEmpty { "Channel $currentChannel" } + " \u00b7 " + subLabel,
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Ui.Text,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                LinkStatusLine(
+                    connectState = connectState,
+                    statusText = connectStatusText,
+                    planeLabel = transportAdvisory?.activeLabel ?: transportName,
+                    encrypted = isEncrypted,
+                    sealed = sealedSenderOn && autoConnect.isUsingRelay(),
+                    peers = trialPeerIds.size,
+                    onReconnect = {
+                        scope.launch {
+                            autoConnect.reset()
+                            autoConnect.autoConnect(walkieService)
+                        }
+                    },
+                )
             }
-
-            // Group name (editable per-channel) — defaults to "Sassy-Talk" if no name set
-            val channelGroupName = remember(currentChannel) {
-                SassyTalkNative.getGroupName(currentChannel)
+            IconButton(
+                onClick = { showQrDialog = true },
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Ui.Surface)
+                    .border(1.dp, Ui.Line, RoundedCornerShape(12.dp)),
+            ) {
+                Icon(Icons.Default.QrCode2, contentDescription = "Invite with QR code", tint = Ui.Text, modifier = Modifier.size(20.dp))
             }
-            // Brand title — blue→teal tactical gradient (see ui/theme/Color.kt).
-            Text(
-                text = channelGroupName.ifEmpty { "Sassy-Talk" },
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Bold,
-                style = androidx.compose.ui.text.TextStyle(
-                    brush = Brush.linearGradient(GradientPrimary)
-                ),
-                maxLines = 1
-            )
-
-            Row {
-                // Show QR for current session
-                IconButton(onClick = { showQrDialog = true }) {
-                    Icon(Icons.Default.QrCode2, contentDescription = "Show QR", tint = Cyan, modifier = Modifier.size(22.dp))
-                }
-
-                // Reconnect button
-                IconButton(onClick = {
-                    scope.launch {
-                        autoConnect.reset()
-                        autoConnect.autoConnect(walkieService)
-                    }
-                }) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Reconnect", tint = if (connectState != ConnectState.CONNECTED) Orange else Cyan, modifier = Modifier.size(22.dp))
-                }
-
-                // Hamburger menu for remaining options
-                Box {
-                    IconButton(onClick = { showMenu = true }) {
-                        Icon(Icons.Default.MoreVert, contentDescription = "Menu", tint = Cyan, modifier = Modifier.size(22.dp))
-                    }
-                    DropdownMenu(
-                        expanded = showMenu,
-                        onDismissRequest = { showMenu = false },
-                        modifier = Modifier.background(CardBg)
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("Activity", color = TextWhite) },
-                            onClick = { showMenu = false; onShowActivity() },
-                            leadingIcon = { Icon(Icons.Default.History, contentDescription = null, tint = Cyan, modifier = Modifier.size(20.dp)) }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Users", color = TextWhite) },
-                            onClick = { showMenu = false; onShowUsers() },
-                            leadingIcon = { Icon(Icons.Default.People, contentDescription = null, tint = Cyan, modifier = Modifier.size(20.dp)) }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Settings", color = TextWhite) },
-                            onClick = { showMenu = false; onShowSettings() },
-                            leadingIcon = { Icon(Icons.Default.Settings, contentDescription = null, tint = Cyan, modifier = Modifier.size(20.dp)) }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("About", color = TextWhite) },
-                            onClick = { showMenu = false; onShowAbout() },
-                            leadingIcon = { Icon(Icons.Default.Info, contentDescription = null, tint = Cyan, modifier = Modifier.size(20.dp)) }
-                        )
-                        Divider(color = SurfaceBg)
-                        // Emergency SOS lives at menu level: on the radio
-                        // screen it competed for space with the PTT target and
-                        // sat where a sliding thumb lands. Reaching it is now
-                        // menu -> item -> confirm, which is deliberate enough
-                        // that the press itself needs no hold gesture.
-                        DropdownMenuItem(
-                            text = { Text("Emergency SOS", color = EmergencyRed) },
-                            onClick = { showMenu = false; showSosConfirm = true },
-                            leadingIcon = { Icon(Icons.Default.Warning, contentDescription = null, tint = EmergencyRed, modifier = Modifier.size(20.dp)) }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("End Session", color = Color(0xFFFF6B6B)) },
-                            onClick = { showMenu = false; showEndSessionDialog = true },
-                            leadingIcon = { Icon(Icons.Default.StopCircle, contentDescription = null, tint = Color(0xFFFF6B6B), modifier = Modifier.size(20.dp)) }
-                        )
-                    }
-                }
+            OutlinedButton(
+                onClick = { showSosConfirm = true },
+                modifier = Modifier.height(44.dp),
+                shape = RoundedCornerShape(12.dp),
+                border = androidx.compose.foundation.BorderStroke(1.5.dp, Ui.Sos),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Ui.SosText),
+                contentPadding = PaddingValues(horizontal = 14.dp),
+            ) {
+                Text("SOS", fontWeight = FontWeight.Bold, fontSize = 15.sp, letterSpacing = 1.sp)
             }
         }
 
@@ -447,83 +409,6 @@ fun MainScreen(
         if (trialWarn) {
             TrialCountdownBanner(sessionsLeft = trialLeft, onUpgrade = onShowUpgrade)
             Spacer(modifier = Modifier.height(6.dp))
-        }
-
-        // Connection status — single line for encrypted audio plane
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            when (connectState) {
-                ConnectState.CONNECTED -> {
-                    val planeColor = when (transportAdvisory?.activePlane) {
-                        AudioPlane.BOTH_WIFI_RELAY -> StatusConnected
-                        AudioPlane.WIFI -> Color(0xFF4CD964)
-                        AudioPlane.RELAY -> Orange
-                        AudioPlane.BLUETOOTH -> Cyan
-                        else -> StatusConnected
-                    }
-                    Box(
-                        modifier = Modifier
-                            .size(10.dp)
-                            .clip(CircleShape)
-                            .background(planeColor)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    val planeLabel = transportAdvisory?.activeLabel ?: transportName
-                    Text(
-                        text = planeLabel,
-                        fontSize = 13.sp,
-                        color = TextGray
-                    )
-                    if (sealedSenderOn && autoConnect.isUsingRelay()) {
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "· Sealed",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = TealLight
-                        )
-                    }
-                }
-                ConnectState.FAILED -> {
-                    Box(
-                        modifier = Modifier
-                            .size(10.dp)
-                            .clip(CircleShape)
-                            .background(StatusDisconnected)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = connectStatusText,
-                        fontSize = 13.sp,
-                        color = Color(0xFFFF6B6B)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    TextButton(onClick = {
-                        // Match the header Reconnect icon: clear the prior
-                        // FAILED state before re-attempting so the two retry
-                        // paths behave identically.
-                        scope.launch { autoConnect.reset(); autoConnect.autoConnect(walkieService) }
-                    }) {
-                        Text("Retry", fontSize = 12.sp, color = Cyan)
-                    }
-                }
-                else -> {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(14.dp),
-                        strokeWidth = 2.dp,
-                        color = Cyan
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = connectStatusText,
-                        fontSize = 13.sp,
-                        color = TextGray
-                    )
-                }
-            }
         }
 
         // Transport advisory — only when action may help (not routine OK states)
@@ -670,87 +555,53 @@ fun MainScreen(
             }
         }
 
-        // Incoming audio — hide when cache strip already shows the same speaker.
-        if (incomingAudio && !isTransmitting && activeSpeaker.isNotBlank() &&
-            cacheSnap.currentSpeakerName != activeSpeaker
-        ) {
-            Spacer(modifier = Modifier.height(4.dp))
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF1A3A2A)),
-                shape = RoundedCornerShape(8.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.Center
-                ) {
-                    Icon(Icons.Default.VolumeUp, contentDescription = null, tint = StatusConnected, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "$activeSpeaker is speaking",
-                        fontSize = 13.sp,
-                        color = StatusConnected,
-                        fontWeight = FontWeight.Medium
-                    )
-                }
+        // ── Clip / channel area ──
+        // Whole-clip playback: a transmission is heard only once it has fully
+        // arrived, so the screen shows what is playing and what is still
+        // arriving. When nothing is, the channel controls take this slot.
+        val playingName = cacheSnap.currentSpeakerName?.takeIf { it.isNotBlank() && it != "null" }
+        val arriving = cacheSnap.receiving
+        val rxBusy = !isTransmitting && (playingName != null || arriving.isNotEmpty())
+        var txElapsedMs by remember { mutableLongStateOf(0L) }
+        LaunchedEffect(isTransmitting) {
+            val start = System.currentTimeMillis()
+            txElapsedMs = 0L
+            while (isTransmitting) {
+                txElapsedMs = System.currentTimeMillis() - start
+                kotlinx.coroutines.delay(250L)
             }
         }
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        // Channel Selector
-        ChannelSelector(
-            channel = currentChannel,
-            onChannelChange = { newChannel ->
-                currentChannel = newChannel
-                SassyTalkNative.setChannel(newChannel)
-            }
-        )
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        // Subchannel selector (Main / A / B)
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.Center,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            val subLabels = listOf("Main", "A", "B")
-            subLabels.forEachIndexed { idx, label ->
-                val selected = idx == currentSubchannel
-                TextButton(
-                    onClick = {
-                        currentSubchannel = idx
-                        SassyTalkNative.setSubchannel(idx)
-                    },
-                    colors = ButtonDefaults.textButtonColors(
-                        contentColor = if (selected) Teal else TextMuted
-                    )
-                ) {
-                    Text(
-                        text = label,
-                        fontSize = 14.sp,
-                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+        Spacer(modifier = Modifier.height(4.dp))
+        when {
+            isTransmitting -> OnAirCard(
+                elapsedMs = txElapsedMs,
+                peers = trialPeerIds.size,
+                limitMs = walkieService?.pttCoordinator?.maxTxMs,
+            )
+            rxBusy -> Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (playingName != null) {
+                    NowPlayingCard(
+                        name = playingName,
+                        positionMs = cacheSnap.playingMs,
+                        totalMs = cacheSnap.playingTotalMs,
+                        onSkip = { SassyTalkNative.skipCurrentUtterance() },
                     )
                 }
+                arriving.take(2).forEach { clip ->
+                    ArrivingCard(name = clip.name, ms = clip.ms, playsNext = playingName != null)
+                }
             }
-
-            Spacer(modifier = Modifier.width(16.dp))
-
-            // PTT Hold toggle
-            Text(text = "Hold", color = TextMuted, fontSize = 12.sp)
-            Spacer(modifier = Modifier.width(4.dp))
-            Switch(
-                checked = pttHoldMode,
-                onCheckedChange = { pttHoldMode = it },
-                colors = SwitchDefaults.colors(
-                    checkedThumbColor = Teal,
-                    checkedTrackColor = Teal.copy(alpha = 0.3f),
-                    uncheckedThumbColor = TextMuted,
-                    uncheckedTrackColor = SurfaceBg
-                ),
-                modifier = Modifier.height(24.dp)
+            else -> ChannelSelector(
+                channel = currentChannel,
+                subchannel = currentSubchannel,
+                onChannelChange = { newChannel ->
+                    currentChannel = newChannel
+                    SassyTalkNative.setChannel(newChannel)
+                },
+                onSubchannelChange = { idx ->
+                    currentSubchannel = idx
+                    SassyTalkNative.setSubchannel(idx)
+                },
             )
         }
 
@@ -857,6 +708,8 @@ fun MainScreen(
 
         PTTButton(
             isTransmitting = isTransmitting,
+            busy = rxBusy,
+            holdMode = pttHoldMode,
             pulseScale = pulseScale,
             enabled = pttEnabled,
             dimmed = anyPeerStale,
@@ -896,7 +749,8 @@ fun MainScreen(
                 } else {
                     "Acknowledged by ${deliveryProgress.acknowledged}/?" to Color(0xFF4CAF50)
                 }
-            else -> (if (pttHoldMode) "Ready — tap PTT to talk" else "Ready — hold PTT to talk") to TextGray
+            rxBusy -> "You can still talk over them" to Ui.TextDim
+            else -> "Ready" to Ui.TextDim
         }
         Spacer(modifier = Modifier.height(12.dp))
         Row(
@@ -925,6 +779,19 @@ fun MainScreen(
                 fontWeight = FontWeight.Medium,
                 color = pttHint.second,
             )
+            if (!isTransmitting) {
+                Spacer(modifier = Modifier.width(12.dp))
+                OutlinedButton(
+                    onClick = { pttHoldMode = !pttHoldMode },
+                    modifier = Modifier.height(32.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, if (pttHoldMode) Ui.Accent else Ui.Line),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = if (pttHoldMode) Ui.Accent else Ui.TextMid),
+                    contentPadding = PaddingValues(horizontal = 12.dp),
+                ) {
+                    Text(if (pttHoldMode) "Tap mode: on" else "Tap mode: off", fontSize = 13.sp)
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(12.dp))
@@ -945,49 +812,8 @@ fun MainScreen(
             )
         }
 
-        // v2.7.1: cache mini-strip — only visible when cache is non-idle.
-        // Compact mirror of TranscriptionFeedScreen's cache bar so the user
-        // can see "audio is queued / playing" without leaving the main screen.
-        if (cacheSnap.currentSpeakerName != null || cacheSnap.queuedUtterances > 0 ||
-            cacheSnap.mode == "Queue" || cacheSnap.mode == "Mix"
-        ) {
-            val pipColor = when (cacheSnap.mode) {
-                "Queue"  -> Orange
-                "Mix"    -> Cyan
-                "Replay" -> OrangeLight
-                else     -> TextMuted
-            }
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .clip(CircleShape)
-                        .background(pipColor),
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = when {
-                        // Guard against a blank/"null" speaker name leaking to the
-                        // UI as literal "Playing null" (unresolved relay peer name).
-                        !cacheSnap.currentSpeakerName.isNullOrBlank() &&
-                            cacheSnap.currentSpeakerName != "null" ->
-                            "Playing ${cacheSnap.currentSpeakerName}" +
-                                (if (cacheSnap.queuedUtterances > 0) " · ${cacheSnap.queuedUtterances} queued" else "")
-                        cacheSnap.queuedUtterances > 0 -> "${cacheSnap.queuedUtterances} queued"
-                        else -> cacheSnap.mode
-                    },
-                    fontSize = 11.sp,
-                    color = TextMuted,
-                )
-            }
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
+        // Room for the diagnostics chip that sits above the tab bar.
+        Spacer(modifier = Modifier.height(36.dp))
     }
 
     androidx.compose.material3.SnackbarHost(
@@ -1375,64 +1201,181 @@ private fun SelfEmergencyBanner(onClear: () -> Unit) {
 @Composable
 private fun ChannelSelector(
     channel: Int,
-    onChannelChange: (Int) -> Unit
+    subchannel: Int,
+    onChannelChange: (Int) -> Unit,
+    onSubchannelChange: (Int) -> Unit,
 ) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = CardBg),
-        shape = RoundedCornerShape(16.dp)
+    UiCard {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                IconButton(
+                    onClick = { if (channel > 1) onChannelChange(channel - 1) },
+                    modifier = Modifier.size(52.dp).clip(RoundedCornerShape(16.dp)).background(Ui.Surface2),
+                ) {
+                    Icon(Icons.Default.Remove, contentDescription = "Channel Down", tint = Ui.Text, modifier = Modifier.size(28.dp))
+                }
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("CHANNEL", fontSize = 12.sp, color = Ui.TextDim, letterSpacing = 1.5.sp)
+                    Text("%02d".format(channel), fontSize = 48.sp, fontWeight = FontWeight.Bold, color = Ui.Accent)
+                }
+                IconButton(
+                    onClick = { if (channel < 99) onChannelChange(channel + 1) },
+                    modifier = Modifier.size(52.dp).clip(RoundedCornerShape(16.dp)).background(Ui.Surface2),
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = "Channel Up", tint = Ui.Text, modifier = Modifier.size(28.dp))
+                }
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Ui.Bg)
+                    .padding(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                listOf("Main", "A", "B").forEachIndexed { idx, label ->
+                    val on = idx == subchannel
+                    TextButton(
+                        onClick = { onSubchannelChange(idx) },
+                        modifier = Modifier.weight(1f).height(40.dp),
+                        shape = RoundedCornerShape(9.dp),
+                        colors = ButtonDefaults.textButtonColors(
+                            containerColor = if (on) Ui.Accent else Color.Transparent,
+                            contentColor = if (on) Ui.AccentInk else Ui.TextDim,
+                        ),
+                    ) {
+                        Text(label, fontSize = 14.sp, fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** One-line link status under the channel title; tap to reconnect. */
+@Composable
+private fun LinkStatusLine(
+    connectState: ConnectState,
+    statusText: String,
+    planeLabel: String,
+    encrypted: Boolean,
+    sealed: Boolean,
+    peers: Int,
+    onReconnect: () -> Unit,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .clickable(onClickLabel = "Reconnect", onClick = onReconnect),
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(
-                onClick = { if (channel > 1) onChannelChange(channel - 1) },
-                modifier = Modifier
-                    .size(56.dp)
-                    .clip(CircleShape)
-                    .background(SurfaceBg)
-            ) {
-                Icon(
-                    Icons.Default.Remove,
-                    contentDescription = "Channel Down",
-                    tint = Cyan,
-                    modifier = Modifier.size(32.dp)
-                )
-            }
-
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        when (connectState) {
+            ConnectState.CONNECTED -> {
+                Box(Modifier.size(8.dp).clip(CircleShape).background(Ui.Ok))
+                Spacer(Modifier.width(8.dp))
+                val parts = buildList {
+                    add(planeLabel)
+                    add(if (encrypted) "Encrypted" else "Not encrypted")
+                    if (sealed) add("Sealed")
+                    add(if (peers == 0) "No one else yet" else "$peers on channel")
+                }
                 Text(
-                    text = "CHANNEL",
-                    fontSize = 12.sp,
-                    color = TextMuted,
-                    letterSpacing = 2.sp
-                )
-                Text(
-                    text = "%02d".format(channel),
-                    fontSize = 48.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = TealLight
+                    parts.joinToString(" \u00b7 "),
+                    fontSize = 13.sp,
+                    color = if (encrypted) Ui.TextDim else Ui.SosText,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                 )
             }
+            ConnectState.FAILED -> {
+                Box(Modifier.size(8.dp).clip(CircleShape).background(Ui.Sos))
+                Spacer(Modifier.width(8.dp))
+                Text("$statusText \u00b7 Tap to retry", fontSize = 13.sp, color = Ui.SosText, maxLines = 1)
+            }
+            else -> {
+                CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 1.5.dp, color = Ui.Accent)
+                Spacer(Modifier.width(8.dp))
+                Text(statusText, fontSize = 13.sp, color = Ui.TextDim, maxLines = 1)
+            }
+        }
+    }
+}
 
-            IconButton(
-                onClick = { if (channel < 99) onChannelChange(channel + 1) },
-                modifier = Modifier
-                    .size(56.dp)
-                    .clip(CircleShape)
-                    .background(SurfaceBg)
-            ) {
-                Icon(
-                    Icons.Default.Add,
-                    contentDescription = "Channel Up",
-                    tint = Cyan,
-                    modifier = Modifier.size(32.dp)
+private fun clock(ms: Long): String {
+    val s = (ms / 1000).coerceAtLeast(0)
+    return "%d:%02d".format(s / 60, s % 60)
+}
+
+/** The received clip currently playing, with progress. */
+@Composable
+private fun NowPlayingCard(name: String, positionMs: Long, totalMs: Long, onSkip: () -> Unit) {
+    UiCard(container = Ui.AccentSoft, border = Ui.AccentLine) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier.size(44.dp).clip(CircleShape).background(Ui.Accent),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(name.take(2).uppercase(), color = Ui.AccentInk, fontWeight = FontWeight.Bold)
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(name, color = Ui.Text, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, maxLines = 1)
+                    Text(
+                        "Playing clip \u00b7 ${clock(positionMs.coerceAtMost(totalMs))} of ${clock(totalMs)}",
+                        color = Ui.AccentText,
+                        fontSize = 13.sp,
+                    )
+                }
+                IconButton(onClick = onSkip) {
+                    Icon(Icons.Default.SkipNext, contentDescription = "Skip this clip", tint = Ui.AccentText)
+                }
+            }
+            LinearProgressIndicator(
+                progress = if (totalMs > 0) (positionMs.toFloat() / totalMs).coerceIn(0f, 1f) else 0f,
+                modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+                color = Ui.Accent,
+                trackColor = Ui.AccentLine,
+            )
+        }
+    }
+}
+
+/** A transmission still arriving; it plays once it ends. */
+@Composable
+private fun ArrivingCard(name: String, ms: Long, playsNext: Boolean) {
+    UiCard {
+        Row(Modifier.padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.GraphicEq, contentDescription = null, tint = Ui.OnAir, modifier = Modifier.size(24.dp))
+            Spacer(Modifier.width(12.dp))
+            Column {
+                Text("$name is talking", color = Ui.Text, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                Text(
+                    "Receiving \u00b7 ${clock(ms)} so far \u00b7 " + if (playsNext) "plays next" else "plays when they let go",
+                    color = Ui.TextDim,
+                    fontSize = 13.sp,
                 )
             }
+        }
+    }
+}
+
+/** Shown while we transmit. */
+@Composable
+private fun OnAirCard(elapsedMs: Long, peers: Int, limitMs: Long?) {
+    UiCard(container = Ui.OnAirSoft, border = Ui.OnAirLine) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("ON AIR", color = Ui.OnAir, fontWeight = FontWeight.Bold, fontSize = 15.sp, letterSpacing = 1.2.sp)
+                Text(clock(elapsedMs), color = Ui.OnAirText, fontWeight = FontWeight.SemiBold, fontSize = 28.sp)
+            }
+            val who = if (peers == 1) "1 person" else "$peers people"
+            val limit = limitMs?.let { " \u00b7 limit ${clock(com.sassyconsulting.sassytalkie.TxSafetyPolicy.normalizeMaxTxMs(it))}" } ?: ""
+            Text("Sending to $who \u00b7 they hear it when you let go$limit", color = Ui.OnAirText, fontSize = 13.sp)
         }
     }
 }
@@ -1444,7 +1387,7 @@ private fun rememberTxPulseScale(transmitting: Boolean): Float {
     LaunchedEffect(transmitting) {
         if (transmitting) {
             while (true) {
-                scale.animateTo(1.15f, tween(600, easing = EaseInOut))
+                scale.animateTo(1.04f, tween(600, easing = EaseInOut))
                 scale.animateTo(1f, tween(600, easing = EaseInOut))
             }
         } else if (scale.value != 1f) {
@@ -1465,6 +1408,8 @@ private fun rememberTxPulseScale(transmitting: Boolean): Float {
 @Composable
 private fun PTTButton(
     isTransmitting: Boolean,
+    busy: Boolean = false,
+    holdMode: Boolean = false,
     pulseScale: Float,
     enabled: Boolean = true,
     dimmed: Boolean = false,
@@ -1476,13 +1421,27 @@ private fun PTTButton(
     // Gradient fill to match the Tauri desktop PTT: teal→purple (GradientCool)
     // idle, coral→purple (GradientWarm) while transmitting. Was a flat single-
     // color fill, which is why the Android PTT read as "unchanged" vs desktop.
-    val buttonBrush = if (isTransmitting) {
-        Brush.linearGradient(GradientWarm)
-    } else {
-        Brush.linearGradient(GradientCool)
+    // 3.2.8 design: flat fills. Teal = ready, orange = on air, grey = a peer
+    // holds the channel (still pressable: barge-in stays possible).
+    val fill = when {
+        isTransmitting -> Ui.OnAir
+        busy || dimmed -> Ui.Surface2
+        else -> Ui.Accent
     }
-    val ringColor = if (isTransmitting) Coral else if (dimmed) TextMuted else Teal
-    val innerColor = if (isTransmitting) CoralLight else BgCard
+    val buttonBrush = Brush.linearGradient(listOf(fill, fill))
+    val ringColor = if (isTransmitting) Ui.OnAirLine else Ui.Surface2
+    val ink = when {
+        isTransmitting -> Ui.OnAirInk
+        busy || dimmed -> Ui.TextMid
+        else -> Ui.AccentInk
+    }
+    val label = when {
+        isTransmitting && holdMode -> "Tap to send"
+        isTransmitting -> "Release to send"
+        busy -> "Channel busy"
+        holdMode -> "Tap to talk"
+        else -> "Hold to talk"
+    }
 
     // User-shaped target. Height stays the configured size; width is scaled
     // independently because a thumb reaching across the screen contacts a wide
@@ -1537,7 +1496,7 @@ private fun PTTButton(
                     .background(
                         Brush.radialGradient(
                             colors = listOf(
-                                Orange.copy(alpha = 0.3f),
+                                Ui.OnAir.copy(alpha = 0.25f),
                                 Color.Transparent
                             )
                         )
@@ -1550,7 +1509,7 @@ private fun PTTButton(
             modifier = Modifier
                 .size(width = w, height = h)
                 .clip(btnShape)
-                .border(8.dp, ringColor, btnShape)
+                .border(10.dp, ringColor, btnShape)
                 .background(buttonBrush)
                 .pointerInteropFilter { event ->
                     if (!enabled) {
@@ -1575,30 +1534,15 @@ private fun PTTButton(
                     }
                 }
         ) {
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .size(120.dp)
-                    .clip(CircleShape)
-                    .background(innerColor)
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        Icons.Default.Mic,
-                        contentDescription = if (isTransmitting) "Transmitting" else "Push to talk",
-                        tint = if (isTransmitting) TextWhite else TextGray,
-                        modifier = Modifier.size(48.dp)
-                    )
-                    if (isTransmitting) {
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = "TX",
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = TextWhite
-                        )
-                    }
-                }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Icon(
+                    Icons.Default.Mic,
+                    contentDescription = if (isTransmitting) "Transmitting" else "Push to talk",
+                    tint = ink,
+                    modifier = Modifier.size(52.dp),
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(text = label, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = ink)
             }
         }
     }
