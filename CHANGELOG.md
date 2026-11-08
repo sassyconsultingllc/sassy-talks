@@ -11,6 +11,11 @@ All notable changes to SassyTalkie. Format loosely follows
 
 ## [Unreleased]
 
+## [3.2.9] (85) - 2026-11-08
+
+versionCode 84 (3.2.8) was already used on Google Play; this is the same
+work re-cut under a new versionCode.
+
 ### Changed
 - **Android UI overhaul:** bottom tab bar (Radio, Activity, People, Settings)
   replaces the radio screen's overflow menu; one dark theme with a single teal
