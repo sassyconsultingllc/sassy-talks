@@ -15,6 +15,7 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.LockSupport
 
 /**
  * WebSocket client for cellular PTT relay.
@@ -32,10 +33,20 @@ class CellularWebSocketClient {
 
     companion object {
         private const val TAG = "CellularWS"
-        // Idle poll between JNI outbound drains. Was 2 ms (~500 JNI/s while
-        // idle); 20 ms still keeps TX latency fine for 20 ms Opus frames and
-        // the pump drains the full queue each wake for bursts.
+        // Poll between JNI outbound drains while audio is flowing (PTT held,
+        // or a buffer-mode flush just went out). Was 2 ms (~500 JNI/s); 20 ms
+        // keeps TX latency fine for 20 ms Opus frames, and the pump drains the
+        // full queue each wake for bursts.
         private const val POLL_INTERVAL_MS = 20L
+        // With nothing to send, the poll interval doubles from 20 ms up to
+        // this cap, so a connected but quiet relay wakes ~4x/s instead of
+        // ~50x/s and lets the CPU sleep. Idle traffic on this queue is only
+        // the ~10 s presence beacon, which can wait 250 ms. PTT start calls
+        // wakeOutbound(), so a press never waits out an idle sleep.
+        private const val IDLE_POLL_MAX_MS = 250L
+        // Stay at the fast interval this long after the last outbound packet,
+        // so the buffer-mode flush that follows a release goes out at full rate.
+        private const val FAST_HOLD_MS = 2_000L
         private const val PING_INTERVAL_SEC = 15L
         private const val MAX_RECONNECT_ATTEMPTS = 8
         // After the fast exponential retries, keep trying at this fixed floor
@@ -107,7 +118,11 @@ class CellularWebSocketClient {
     // second socket in the room, stealing outbound frames, duplicating inbound
     // ones, and flapping the shared native transport state on every DO reap.
     private val closed = AtomicBoolean(false)
-    private var outboundThread: Thread? = null
+    @Volatile private var outboundThread: Thread? = null
+    // Outbound pump pacing (see IDLE_POLL_MAX_MS). Written by the pump and by
+    // wakeOutbound() from the PTT coroutine.
+    @Volatile private var lastOutboundActivityMs = 0L
+    @Volatile private var idlePollMs = POLL_INTERVAL_MS
 
     // Outbound send-rate window — single-thread state, touched only by the
     // outbound pump (see paceSend).
@@ -493,8 +508,21 @@ class CellularWebSocketClient {
                         sendWithRetry(ws, packet)
                         sentAny = true
                     }
+                    val now = System.currentTimeMillis()
+                    if (sentAny) lastOutboundActivityMs = now
+                    if (sentAny ||
+                        now - lastOutboundActivityMs < FAST_HOLD_MS ||
+                        SassyTalkNative.isPttActive()
+                    ) {
+                        idlePollMs = POLL_INTERVAL_MS
+                    } else {
+                        idlePollMs = (idlePollMs * 2).coerceAtMost(IDLE_POLL_MAX_MS)
+                    }
                     if (!sentAny) {
-                        Thread.sleep(POLL_INTERVAL_MS)
+                        // parkNanos, not sleep: wakeOutbound() unparks this
+                        // thread to cut an idle wait short.
+                        LockSupport.parkNanos(this, idlePollMs * 1_000_000L)
+                        if (Thread.currentThread().isInterrupted) break
                     }
                 } catch (e: InterruptedException) {
                     break
@@ -507,6 +535,18 @@ class CellularWebSocketClient {
         }, "cellular-outbound")
         outboundThread?.isDaemon = true
         outboundThread?.start()
+    }
+
+    /**
+     * Put the outbound pump back on the fast interval and wake it now. Call
+     * when audio is about to be queued (native PTT start): the pump may be in
+     * an idle wait of up to [IDLE_POLL_MAX_MS], and isPttActive() is not yet
+     * true when the PTT_START control frame goes out.
+     */
+    fun wakeOutbound() {
+        lastOutboundActivityMs = System.currentTimeMillis()
+        idlePollMs = POLL_INTERVAL_MS
+        outboundThread?.let { LockSupport.unpark(it) }
     }
 
     private fun stopOutboundPump() {

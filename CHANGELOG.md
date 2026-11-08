@@ -11,6 +11,12 @@ All notable changes to SassyTalkie. Format loosely follows
 
 ## [Unreleased]
 
+### Changed
+- **Android relay battery use:** the relay outbound pump no longer polls every
+  20 ms while idle. With nothing to send it backs off to 250 ms (about 4
+  wakeups/s instead of 50), returns to 20 ms while PTT is held and for 2 s
+  after the last packet, and PTT start wakes it immediately.
+
 ## [3.2.9] (85) - 2026-11-08
 
 versionCode 84 (3.2.8) was already used on Google Play; this is the same

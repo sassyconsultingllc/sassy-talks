@@ -661,6 +661,8 @@ class PttCoordinator(
 
             // Step 3: Start native audio (mic -> ADPCM -> transport)
             SassyTalkNative.pttStart()
+            // The relay pump may be in an idle wait; get it polling at frame rate.
+            cellularClient?.wakeOutbound()
             if (!SassyTalkNative.isPttActive()) {
                 _pttRejectReason.value = "Transmission failed: no live bearer"
                 try { onEmergencyAudit?.invoke("tx_failed", "reason=native_start") } catch (_: Throwable) {}
