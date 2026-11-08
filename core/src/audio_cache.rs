@@ -51,9 +51,77 @@ const SPEECH_GAP_MS: u64 = 800;
 /// hears 300-800ms of silence followed by delayed audio.
 const ACTIVE_SPEAKER_WINDOW_MS: u64 = 200;
 
-/// Maximum cached frames per speaker (prevents memory bloat)
-/// At 20ms/frame, 500 frames = 10 seconds of audio per speaker
-const MAX_FRAMES_PER_SPEAKER: usize = 500;
+/// Frames per speaker buffer before it is cut into an utterance: 15,000
+/// frames = 300 s, the longest transmission the TX watchdog allows
+/// (TxSafetyPolicy.MAX_MAX_TX_MS), so a real clip is never split. The bound
+/// exists only so a misbehaving peer cannot grow one buffer without limit.
+const MAX_FRAMES_PER_SPEAKER: usize = 15_000;
+
+/// Whole-clip mode: silence (no frames) this long ends a transmission and
+/// releases it for playback. Longer than SPEECH_GAP_MS so a cellular stall
+/// mid-transmission does not cut one clip in two.
+const CLIP_END_GAP_MS: u64 = 1_200;
+
+/// Whole-clip mode: clips shorter than this are dropped, not played. Peers
+/// send a one-frame presence beacon every 10 s; played as a "clip" it started
+/// the speaker and took the phone line every 10 s and littered history.
+const MIN_CLIP_FRAMES: usize = 5;
+
+/// Whole-clip level normalization: one fixed gain per clip (no dynamics, so
+/// no compression or pumping), chosen to bring the clip's active-audio RMS
+/// to CLIP_TARGET_RMS, never above CLIP_MAX_GAIN, and never so high that the
+/// clip's peak passes CLIP_PEAK_CEILING. Raw phone mics without hardware AGC
+/// arrive 20-30 dB below a comfortable level.
+const CLIP_TARGET_RMS: f32 = 0.15;
+const CLIP_MAX_GAIN: f32 = 16.0;
+const CLIP_PEAK_CEILING: f32 = 0.89;
+/// Frames quieter than this (about -50 dBFS) count as silence and are left
+/// out of the level measurement, so pauses don't inflate the gain.
+const CLIP_ACTIVE_RMS_FLOOR: f32 = 0.003;
+
+/// Apply one fixed gain to a whole clip (see CLIP_TARGET_RMS).
+fn normalize_clip(frames: &mut [CachedFrame]) -> f32 {
+    let mut sum_sq = 0.0f64;
+    let mut n = 0usize;
+    let mut peak = 0i32;
+    for f in frames.iter() {
+        if f.samples.is_empty() {
+            continue;
+        }
+        let fs: f64 = f.samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
+        let frame_rms = ((fs / f.samples.len() as f64).sqrt() / 32768.0) as f32;
+        for &s in &f.samples {
+            peak = peak.max((s as i32).abs());
+        }
+        if frame_rms >= CLIP_ACTIVE_RMS_FLOOR {
+            sum_sq += fs;
+            n += f.samples.len();
+        }
+    }
+    if n == 0 || peak == 0 {
+        return 1.0;
+    }
+    let rms = ((sum_sq / n as f64).sqrt() / 32768.0) as f32;
+    let peak_limit = CLIP_PEAK_CEILING * 32768.0 / peak as f32;
+    let gain = (CLIP_TARGET_RMS / rms).min(CLIP_MAX_GAIN).min(peak_limit);
+    if gain <= 1.0 {
+        return 1.0; // only ever raise quiet clips; loud ones play as sent
+    }
+    for f in frames.iter_mut() {
+        for s in f.samples.iter_mut() {
+            *s = ((*s as f32) * gain).round().clamp(-32768.0, 32767.0) as i16;
+        }
+    }
+    gain
+}
+
+/// Total audio kept in replay history, across all entries (15,000 frames =
+/// 5 minutes, ~29 MB of PCM). Oldest entries go first.
+const HISTORY_MAX_FRAMES: usize = 15_000;
+
+/// Hard memory ceiling. Only reached if tick() stops running; frames past it
+/// are dropped.
+const SPEAKER_HARD_CAP_FRAMES: usize = MAX_FRAMES_PER_SPEAKER * 2;
 
 /// Maximum number of speakers we'll cache simultaneously
 const MAX_CACHED_SPEAKERS: usize = 16;
@@ -221,7 +289,7 @@ impl SpeakerBuffer {
         self.recent_pushes.push_back(now);
         self.prune_recent_pushes(now);
 
-        if self.frames.len() < MAX_FRAMES_PER_SPEAKER {
+        if self.frames.len() < SPEAKER_HARD_CAP_FRAMES {
             self.frames.push(frame);
         } else {
             warn!(
@@ -245,11 +313,16 @@ impl SpeakerBuffer {
     }
 
     /// Returns true if enough silence has passed to finalize this utterance
-    fn is_speech_complete(&self) -> bool {
+    fn is_speech_complete(&self, gap_ms: u64) -> bool {
         if self.frames.is_empty() {
             return false;
         }
-        self.last_frame_at.elapsed() > Duration::from_millis(SPEECH_GAP_MS)
+        // Cut a full buffer into its own utterance and keep accumulating.
+        // Dropping here truncated every transmission longer than 10 s.
+        if self.frames.len() >= MAX_FRAMES_PER_SPEAKER {
+            return true;
+        }
+        self.last_frame_at.elapsed() > Duration::from_millis(gap_ms)
     }
 
     /// Returns true if this speaker has produced ACTIVE_SPEAKER_MIN_FRAMES+
@@ -342,6 +415,12 @@ pub struct AudioCache {
     /// Max history entries
     max_history: usize,
 
+    /// Whole-clip playback: buffer each transmission until it has fully
+    /// arrived, then play it start to finish. No live passthrough, so network
+    /// jitter can never starve the speaker mid-clip. Latency is the length of
+    /// the clip. Off by default; Android turns it on.
+    whole_clip_mode: bool,
+
     /// Shadow accumulator for Live mode — captures frames for history even
     /// though they're passed through immediately for playback
     live_accumulator: HashMap<String, SpeakerBuffer>,
@@ -428,6 +507,7 @@ impl AudioCache {
             user_info: HashMap::new(),
             history: VecDeque::new(),
             max_history: 50,
+            whole_clip_mode: false,
             live_accumulator: HashMap::new(),
             live_jitter: HashMap::new(),
             live_adaptive_extra: 0,
@@ -666,6 +746,12 @@ impl AudioCache {
             .unwrap()
             .push_frame(frame);
 
+        // Whole-clip mode: every frame waits in its speaker buffer; tick()
+        // releases the finished clip to the playback queue.
+        if self.whole_clip_mode {
+            return None;
+        }
+
         // Count only speakers whose last frame is within the active window.
         // A stale buffer (drained Live-mode entry, or a 10-second-ago presence
         // beacon) is NOT a concurrent speaker — counting it as one used to
@@ -808,6 +894,7 @@ impl AudioCache {
     /// Called periodically by the RX/playback thread to check for completed utterances
     /// and move them to the playback queue
     pub fn tick(&mut self) {
+        let gap_ms = if self.whole_clip_mode { CLIP_END_GAP_MS } else { SPEECH_GAP_MS };
         // Age out stale entries in each speaker's recent-push deque so
         // is_actively_speaking() can return false for speakers who haven't
         // produced anything within ACTIVE_SPEAKER_WINDOW_MS — even if no
@@ -824,7 +911,7 @@ impl AudioCache {
         let live_completed: Vec<String> = self
             .live_accumulator
             .iter()
-            .filter(|(_, buf)| buf.is_speech_complete())
+            .filter(|(_, buf)| buf.is_speech_complete(gap_ms))
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -845,10 +932,7 @@ impl AudioCache {
                         utterance.sender_name.clone(),
                         utterance.duration_ms(),
                     );
-                    if self.history.len() >= self.max_history {
-                        self.history.pop_front();
-                    }
-                    self.history.push_back(utterance);
+                    self.push_history(utterance);
                     self.newly_committed_ids.push(commit);
                 }
             }
@@ -858,7 +942,7 @@ impl AudioCache {
         let completed_ids: Vec<String> = self
             .active_buffers
             .iter()
-            .filter(|(_, buf)| buf.is_speech_complete())
+            .filter(|(_, buf)| buf.is_speech_complete(gap_ms))
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -877,6 +961,16 @@ impl AudioCache {
                 let utterance = buffer.drain_to_utterance(&name, is_fav);
                 if utterance.frames.is_empty() {
                     continue;
+                }
+                if self.whole_clip_mode && utterance.frames.len() < MIN_CLIP_FRAMES {
+                    continue; // presence beacon, not speech
+                }
+                let mut utterance = utterance;
+                if self.whole_clip_mode {
+                    let gain = normalize_clip(&mut utterance.frames);
+                    if gain > 1.0 {
+                        info!("AudioCache: clip from {} raised {:.1} dB", name, 20.0 * gain.log10());
+                    }
                 }
 
                 info!(
@@ -916,6 +1010,7 @@ impl AudioCache {
         // talker's audio for up to SPEECH_GAP_MS=800ms of silence at end of
         // sentence — producing the 300-800ms blank-noise glitch users hear.
         if self.mode == CacheMode::Queue
+            && !self.whole_clip_mode
             && self.playback_queue.is_empty()
             && self.now_playing.is_none()
         {
@@ -973,10 +1068,7 @@ impl AudioCache {
                 finished.sender_name.clone(),
                 finished.duration_ms(),
             );
-            if self.history.len() >= self.max_history {
-                self.history.pop_front();
-            }
-            self.history.push_back(finished);
+            self.push_history(finished);
             self.newly_committed_ids.push(commit);
         }
 
@@ -1293,7 +1385,7 @@ impl AudioCache {
         self.history.clear();
         self.now_playing = None;
         self.play_cursor = 0;
-        self.mode = CacheMode::Live;
+        self.mode = if self.whole_clip_mode { CacheMode::Queue } else { CacheMode::Live };
         info!("AudioCache: cleared all caches (incl. history)");
     }
 
@@ -1327,10 +1419,7 @@ impl AudioCache {
                         utt.sender_name.clone(),
                         utt.duration_ms(),
                     );
-                    if self.history.len() >= self.max_history {
-                        self.history.pop_front();
-                    }
-                    self.history.push_back(utt);
+                    self.push_history(utt);
                     self.newly_committed_ids.push(commit);
                 }
             }
@@ -1349,7 +1438,7 @@ impl AudioCache {
         self.live_adaptive_extra = 0;
         self.now_playing = None;
         self.play_cursor = 0;
-        self.mode = CacheMode::Live;
+        self.mode = if self.whole_clip_mode { CacheMode::Queue } else { CacheMode::Live };
         info!(
             "AudioCache: cleared active buffers (history kept: {} entries)",
             self.history.len()
@@ -1359,7 +1448,31 @@ impl AudioCache {
     /// Serialize cache status to JSON (for JNI bridge)
     pub fn status_json(&self) -> String {
         let status = self.status();
+        // Clip playback progress (20 ms frames). The cursor runs up to ~200 ms
+        // ahead of the speaker because of the native playout queue.
+        let (playing_ms, playing_total_ms) = match self.now_playing.as_ref() {
+            Some(u) => ((self.play_cursor as u64) * 20, (u.frames.len() as u64) * 20),
+            None => (0, 0),
+        };
+        // Transmissions still arriving (whole-clip mode buffers them here).
+        let receiving: Vec<serde_json::Value> = self
+            .active_buffers
+            .iter()
+            .filter(|(_, b)| b.frames.len() >= MIN_CLIP_FRAMES)
+            .map(|(id, b)| {
+                let name = self
+                    .user_info
+                    .get(id)
+                    .map(|(n, _, _)| n.clone())
+                    .unwrap_or_else(|| id.clone());
+                serde_json::json!({ "sender": id, "name": name, "ms": (b.frames.len() as u64) * 20 })
+            })
+            .collect();
         serde_json::json!({
+            "whole_clip": self.whole_clip_mode,
+            "playing_ms": playing_ms,
+            "playing_total_ms": playing_total_ms,
+            "receiving": receiving,
             "mode": format!("{:?}", status.mode),
             "queued_utterances": status.queued_utterances,
             "queued_duration_ms": status.queued_duration_ms,
@@ -1390,6 +1503,39 @@ impl AudioCache {
     /// arrival order (stable insert), which is what a real walkie-talkie
     /// audience expects: when two people start at the same instant with the
     /// same length, the one whose first frame hit the wire first plays first.
+    /// Append to replay history, evicting oldest entries past the entry
+    /// count or the total-audio budget.
+    fn push_history(&mut self, utterance: Utterance) {
+        self.history.push_back(utterance);
+        let mut frames: usize = self.history.iter().map(|u| u.frames.len()).sum();
+        while self.history.len() > 1
+            && (self.history.len() > self.max_history || frames > HISTORY_MAX_FRAMES)
+        {
+            if let Some(old) = self.history.pop_front() {
+                frames -= old.frames.len();
+            }
+        }
+    }
+
+    /// Turn whole-clip playback on or off (see `whole_clip_mode`).
+    pub fn set_whole_clip_mode(&mut self, on: bool) {
+        if self.whole_clip_mode == on {
+            return;
+        }
+        self.whole_clip_mode = on;
+        if on {
+            // Anything parked for live playout joins its clip instead.
+            self.flush_live_jitter_into_buffers();
+            self.mix_pending.clear();
+            self.mode = CacheMode::Queue;
+        }
+        info!("AudioCache: whole-clip mode {}", if on { "on" } else { "off" });
+    }
+
+    pub fn is_whole_clip_mode(&self) -> bool {
+        self.whole_clip_mode
+    }
+
     fn insert_prioritized(&mut self, utterance: Utterance) {
         // Bound search to the priority tier of this utterance.
         let (tier_start, tier_end) = if utterance.is_favorite {
@@ -2097,5 +2243,220 @@ mod tests {
         let result = cache.ingest_frame("overflow_speaker", 1000, vec![1i16; FRAME_SIZE]);
         assert!(result.is_none());
         assert_eq!(cache.active_buffers.len(), MAX_CACHED_SPEAKERS);
+    }
+}
+
+#[cfg(test)]
+mod long_transmission_tests {
+    use super::*;
+
+    fn drain(cache: &mut AudioCache, out: &mut Vec<(String, i16)>) {
+        while let Some((sid, s)) = cache.next_playback_frame() {
+            out.push((sid, s[0]));
+        }
+    }
+
+    /// Two people keyed at once for 15 s puts the cache in Queue mode, where
+    /// each talker's frames buffer per speaker. Every frame of both must
+    /// still play; the old 500-frame cap kept only the first 10 s of each.
+    #[test]
+    fn overlapping_15s_transmissions_are_not_truncated() {
+        let mut cache = AudioCache::new();
+        let total = 750u32; // 15 s at 20 ms
+        let mut out = Vec::new();
+        for i in 0..total {
+            for (sid, mark) in [("alice", 1i16), ("bob", 2i16)] {
+                if let Some(s) = cache.ingest_logical_frame(sid, 9, i, 1_000 + i as u64 * 20, vec![mark; 960]) {
+                    out.push((sid.to_string(), s[0]));
+                }
+            }
+            cache.tick();
+            drain(&mut cache, &mut out);
+        }
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(20));
+            cache.tick();
+            drain(&mut cache, &mut out);
+        }
+        let alice = out.iter().filter(|(s, _)| s == "alice").count();
+        let bob = out.iter().filter(|(s, _)| s == "bob").count();
+        assert_eq!((alice, bob), (total as usize, total as usize));
+    }
+
+    /// Live mode: replay history for one long transmission keeps every frame.
+    #[test]
+    fn live_history_keeps_all_frames_of_a_15s_transmission() {
+        let mut cache = AudioCache::new();
+        let total = 750u32;
+        for i in 0..total {
+            let _ = cache.ingest_logical_frame("talker", 9, i, 1_000 + i as u64 * 20, vec![1i16; 960]);
+            cache.tick();
+        }
+        std::thread::sleep(Duration::from_millis(SPEECH_GAP_MS + 50));
+        cache.tick();
+        let frames: usize = cache.history.iter().map(|u| u.frames.len()).sum();
+        assert_eq!(frames, total as usize);
+    }
+}
+
+#[cfg(test)]
+mod whole_clip_tests {
+    use super::*;
+
+    /// Sample 0 carries the frame index; the rest is loud enough that
+    /// per-clip normalization leaves the clip at gain 1.
+    fn frame(i: u32) -> Vec<i16> {
+        let mut v = vec![20_000i16; 960];
+        v[0] = (i % 30_000) as i16 + 1;
+        v
+    }
+
+    /// Nothing reaches the speaker while a clip is still arriving; once it
+    /// ends, the whole 60 s clip plays as one utterance, in order.
+    #[test]
+    fn plays_a_60s_clip_only_after_it_has_fully_arrived() {
+        let mut cache = AudioCache::new();
+        cache.set_whole_clip_mode(true);
+        let total = 3_000u32; // 60 s
+        for i in 0..total {
+            assert!(cache.ingest_logical_frame("talker", 4, i, 1_000 + i as u64 * 20, frame(i)).is_none());
+            cache.tick();
+            assert!(cache.next_playback_frame().is_none(), "played before the clip ended");
+        }
+        std::thread::sleep(Duration::from_millis(CLIP_END_GAP_MS + 50));
+        cache.tick();
+        let mut played = Vec::new();
+        while let Some((_, s)) = cache.next_playback_frame() {
+            played.push(s[0] as u32 - 1);
+        }
+        assert_eq!(played.len(), total as usize);
+        assert!(played.windows(2).all(|w| w[1] == w[0] + 1), "out of order");
+        assert_eq!(cache.history.len(), 1, "clip was split");
+    }
+
+    /// A short stall inside a transmission (under CLIP_END_GAP_MS) does not
+    /// cut it in two.
+    #[test]
+    fn short_stall_keeps_one_clip() {
+        let mut cache = AudioCache::new();
+        cache.set_whole_clip_mode(true);
+        for i in 0..100u32 {
+            cache.ingest_logical_frame("talker", 4, i, 1_000 + i as u64 * 20, frame(i));
+            cache.tick();
+            if i == 50 {
+                std::thread::sleep(Duration::from_millis(SPEECH_GAP_MS + 100));
+                cache.tick();
+                assert!(cache.next_playback_frame().is_none(), "stall ended the clip");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(CLIP_END_GAP_MS + 50));
+        cache.tick();
+        let mut n = 0;
+        while cache.next_playback_frame().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 100);
+        assert_eq!(cache.history.len(), 1);
+    }
+
+    /// History keeps at most HISTORY_MAX_FRAMES of audio in total.
+    #[test]
+    fn history_respects_audio_budget() {
+        let mut cache = AudioCache::new();
+        for k in 0..4u64 {
+            let frames = (0..6_000u32)
+                .map(|i| CachedFrame {
+                    sender_id: "t".into(),
+                    timestamp: k * 1_000_000 + i as u64 * 20,
+                    samples: vec![1; 4],
+                    received_at: Instant::now(),
+                })
+                .collect();
+            cache.push_history(Utterance {
+                id: k,
+                sender_id: "t".into(),
+                sender_name: "t".into(),
+                is_favorite: false,
+                started_at: 0,
+                ended_at: 0,
+                frames,
+                fully_played: true,
+            });
+        }
+        let total: usize = cache.history.iter().map(|u| u.frames.len()).sum();
+        assert!(total <= HISTORY_MAX_FRAMES, "history holds {} frames", total);
+        assert_eq!(cache.history.back().unwrap().id, 3, "newest entry evicted");
+    }
+}
+
+#[cfg(test)]
+mod beacon_tests {
+    use super::*;
+
+    #[test]
+    fn whole_clip_mode_ignores_presence_beacons() {
+        let mut cache = AudioCache::new();
+        cache.set_whole_clip_mode(true);
+        cache.ingest_logical_frame("peer", 4, 0, 1_000, vec![0; 960]);
+        cache.tick();
+        std::thread::sleep(Duration::from_millis(CLIP_END_GAP_MS + 50));
+        cache.tick();
+        assert!(cache.next_playback_frame().is_none());
+        assert!(cache.history.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    fn clip(amp: i16, frames: usize) -> Vec<CachedFrame> {
+        (0..frames)
+            .map(|i| CachedFrame {
+                sender_id: "t".into(),
+                timestamp: i as u64 * 20,
+                samples: (0..960)
+                    .map(|k| ((k as f32 * 0.13).sin() * amp as f32) as i16)
+                    .collect(),
+                received_at: Instant::now(),
+            })
+            .collect()
+    }
+
+    fn rms(frames: &[CachedFrame]) -> f32 {
+        let (s, n) = frames.iter().flat_map(|f| f.samples.iter()).fold((0f64, 0usize), |(s, n), &x| {
+            (s + (x as f64) * (x as f64), n + 1)
+        });
+        ((s / n as f64).sqrt() / 32768.0) as f32
+    }
+
+    #[test]
+    fn quiet_clip_is_raised_without_clipping() {
+        let mut c = clip(600, 50); // about -38 dBFS RMS
+        let g = normalize_clip(&mut c);
+        assert!(g > 10.0 && g <= CLIP_MAX_GAIN, "gain {}", g);
+        let peak = c.iter().flat_map(|f| f.samples.iter()).map(|&s| (s as i32).abs()).max().unwrap();
+        assert!(peak as f32 <= CLIP_PEAK_CEILING * 32768.0 + 1.0);
+        assert!(rms(&c) > 0.1);
+    }
+
+    #[test]
+    fn loud_clip_is_left_alone() {
+        let mut c = clip(20_000, 50);
+        let before = c[3].samples.clone();
+        assert_eq!(normalize_clip(&mut c), 1.0);
+        assert_eq!(c[3].samples, before);
+    }
+
+    #[test]
+    fn one_gain_for_the_whole_clip() {
+        // Quiet start, louder end: both scale by the same factor (no dynamics).
+        let mut c = clip(300, 25);
+        c.extend(clip(1_200, 25));
+        let a0 = c[0].samples[10];
+        let b0 = c[30].samples[10];
+        let g = normalize_clip(&mut c);
+        assert!((c[0].samples[10] as f32 - a0 as f32 * g).abs() <= 1.0);
+        assert!((c[30].samples[10] as f32 - b0 as f32 * g).abs() <= 1.0);
     }
 }

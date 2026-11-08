@@ -70,7 +70,13 @@ impl StateMachine {
             state: Arc::new(Mutex::new(AppState::Initializing)),
             transport: Arc::new(Mutex::new(TransportManager::new(&device_name).unwrap())),
             audio: Arc::new(Mutex::new(AudioEngine::new().unwrap())),
-            audio_cache: Arc::new(Mutex::new(AudioCache::new())),
+            audio_cache: Arc::new(Mutex::new({
+                // Play each received transmission whole, after it has fully
+                // arrived, instead of streaming it live (see AudioCache).
+                let mut cache = AudioCache::new();
+                cache.set_whole_clip_mode(true);
+                cache
+            })),
             user_registry: Arc::new(Mutex::new(UserRegistry::new())),
             ptt_pressed: ptt,
             current_channel: channel,

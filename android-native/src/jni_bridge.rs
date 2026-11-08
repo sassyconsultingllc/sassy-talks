@@ -1542,6 +1542,19 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         .unwrap_or(0)
 }
 
+/// JNI: true while received audio is being played (AudioTrack held open).
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeIsRxPlaybackActive(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    if crate::audio_pipeline::is_rx_playback_active() {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
 /// JNI: true while any live audio bearer exists (not merely a sticky slot).
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeHasLiveAudioPath(

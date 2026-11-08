@@ -292,6 +292,16 @@ object SassyTalkNative {
 
     fun isConnected(): Boolean = hasLiveAudioPath()
 
+    /** True while received audio is playing (native AudioTrack held open). */
+    fun isRxPlaybackActive(): Boolean {
+        if (!initialized) return false
+        return try {
+            nativeIsRxPlaybackActive()
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     /** True while a live audio bearer exists. Sticky Cellular after disconnect is not live. */
     fun hasLiveAudioPath(): Boolean {
         if (!initialized) return false
@@ -1476,6 +1486,7 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeGetTransport(): Byte
     @JvmStatic private external fun nativeGetPreferredTransport(): Byte
     @JvmStatic private external fun nativeHasLiveAudioPath(): Boolean
+    @JvmStatic private external fun nativeIsRxPlaybackActive(): Boolean
 
     // Connection
     @JvmStatic private external fun nativeDisconnect(): Boolean

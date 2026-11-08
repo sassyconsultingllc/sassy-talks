@@ -11,7 +11,51 @@ All notable changes to SassyTalkie. Format loosely follows
 
 ## [Unreleased]
 
+### Changed
+- **Android UI overhaul:** bottom tab bar (Radio, Activity, People, Settings)
+  replaces the radio screen's overflow menu; one dark theme with a single teal
+  accent, orange only on air, red only for SOS. The radio screen shows link
+  status, peer count and encryption in one line under the title, invite and
+  SOS in the header, and in place of the channel card a "Playing clip" card
+  with progress and skip, "X is talking" cards for clips still arriving, or an
+  ON AIR card with a timer while transmitting. End Session moved to People;
+  About moved under Settings; PTT geometry sliders sit behind Small / Large /
+  Full width presets. The diagnostics chip moved off the screen headers.
+- **Whole-clip receive (Android):** each incoming transmission is buffered
+  until it has fully arrived (1.2 s of no frames), then played start to
+  finish. No live passthrough, so network jitter can no longer chop playback.
+  Per-speaker buffer raised from 10 s to 300 s (the TX limit); replay history
+  capped at 5 minutes of audio in total. iOS and desktop keep live playback
+  for now (`AudioCache::set_whole_clip_mode`).
+- **Audio quality:** Opus 64 kbps, complexity 10, full-fidelity (AUDIO) mode
+  on Android, iOS and desktop (was 32 kbps VoIP, complexity 5 on Android).
+  Hardware AGC off by default (it compressed and pumped on whistles and loud
+  voices).
+- **Android:** screenshots and screen recording allowed on every screen while
+  the "Show diagnostics panel" setting is on, for debug sessions.
+
 ### Fixed
+- **Transmissions longer than ~10 s broke on the receiver:** focus and the
+  speaker route were dropped 5 s into speech (stay-hot timer armed once at
+  speech start), the per-speaker buffer dropped every frame after 10 s, and a
+  queued clip was dumped into a ~1 s playout buffer, keeping only its last
+  second.
+- **Presence beacons played as 20 ms clips** every 10 s, starting the speaker
+  and taking the phone line each time.
+- **Local builds shipped stale native code:** the committed `jniLibs` were
+  from Sep 22; rebuilt with cargo-ndk.
+- **Android R8 (Play "DEX code optimization below threshold", 12%):**
+  proguard-rules.pro blanket-kept Compose, Firebase, all of Play Services,
+  ML Kit, CameraX, Material and security-crypto, so R8 barely ran. Rules
+  now keep only what JNI or reflection needs (SassyTalkNative,
+  TranscriptionBridge, ContextCompat.checkSelfPermission, native methods)
+  plus Firebase/ML Kit ComponentRegistrar constructors, which R8 otherwise
+  strips and which silently kill the QR scanner and translator. ~97% of
+  classes are now obfuscated; verified on a minified build.
+- **Android RX audio focus race:** the RX stay-hot timer ran on
+  Dispatchers.Default and could abandon audio focus and drop the route
+  keeper right after a quick reply re-took them. Focus/route state is now
+  confined to the main thread.
 - **Senders silently inaudible on desktop and iPhone (since 3.2):** the
   authenticated control plane treated any frame starting below 0x10 as a
   legacy hint. Sealed audio starts with a per-session random nonce prefix,
