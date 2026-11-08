@@ -11,6 +11,8 @@ All notable changes to SassyTalkie. Format loosely follows
 
 ## [Unreleased]
 
+## [3.2.10] (86) - 2026-11-08
+
 ### Changed
 - **Android relay battery use:** the relay outbound pump no longer polls every
   20 ms while idle. With nothing to send it backs off to 250 ms (about 4
