@@ -44,6 +44,23 @@ pub fn get_jvm() -> Result<Arc<JavaVM>, String> {
         .ok_or_else(|| "JavaVM not initialized".to_string())
 }
 
+/// Attach the calling native thread to the JVM for the rest of its life.
+///
+/// Call first thing on every Rust-spawned thread that calls into Java per
+/// frame (TX: AudioRecord.read, RX: AudioTrack.write and the transcription
+/// bridge). `attach_current_thread()` on a thread that is not yet attached
+/// attaches AND detaches again when its guard drops, so those threads were
+/// paying a full attach/detach (plus a new java.lang.Thread object) 50 times
+/// a second. Once attached here, those calls find the thread attached and
+/// leave it be. jni-rs detaches automatically when the thread exits.
+pub fn attach_audio_thread() {
+    if let Ok(vm) = get_jvm() {
+        if let Err(e) = vm.attach_current_thread_permanently() {
+            log::warn!("attach_audio_thread failed: {}", e);
+        }
+    }
+}
+
 //==============================================================================
 // AUDIO JNI BRIDGE
 //==============================================================================
@@ -1216,6 +1233,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let spawn_result = std::thread::Builder::new()
         .name(format!("sassy-replay-{}", utterance_id))
         .spawn(move || {
+            attach_audio_thread();
             // ── Single-owner playback gate ───────────────────────────
             // Replay MUST defer to live RX traffic. Polls `gate_clock`:
             //   - If RX wrote in the last GATE_MIN_IDLE_MS → wait + retry.

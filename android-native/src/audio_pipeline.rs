@@ -210,6 +210,7 @@ pub fn spawn_tx_thread(
     thread::Builder::new()
         .name("sassy-tx".into())
         .spawn(move || {
+            crate::jni_bridge::attach_audio_thread();
             info!("TX thread started");
 
             let mut encoder = VoiceEncoder::new();
@@ -870,6 +871,7 @@ pub fn spawn_rx_thread(
     thread::Builder::new()
         .name("sassy-rx".into())
         .spawn(move || {
+            crate::jni_bridge::attach_audio_thread();
             info!("RX thread started");
 
             let mut recv_buffer = vec![0u8; 2048];

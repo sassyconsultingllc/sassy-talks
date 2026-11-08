@@ -690,7 +690,7 @@ impl AudioCache {
         stream_epoch: u64,
         sequence: u32,
         timestamp: u64,
-        samples: Vec<i16>,
+        mut samples: Vec<i16>,
     ) -> Option<Vec<i16>> {
         // Cross-transport dedup. Every RX path converges here with the frame's
         // (sender_id, timestamp) from the shared wire header, so a frame delivered
@@ -725,7 +725,9 @@ impl AudioCache {
         let frame = CachedFrame {
             sender_id: sender_id.to_string(),
             timestamp,
-            samples: samples.clone(),
+            // Whole-clip mode never uses `samples` again, so move it rather
+            // than copy 960 samples per frame.
+            samples: if self.whole_clip_mode { std::mem::take(&mut samples) } else { samples.clone() },
             received_at: Instant::now(),
         };
 
