@@ -30,8 +30,8 @@ impl FileSecretStore {
     /// process memory; persistence of the master key itself is the documented
     /// OS-vault gap on desktop.
     pub fn new(path: impl AsRef<Path>, master_key: &[u8; 32]) -> Result<Self, String> {
-        let cipher = Aes256Gcm::new_from_slice(master_key)
-            .map_err(|e| format!("secret store key: {e}"))?;
+        let cipher =
+            Aes256Gcm::new_from_slice(master_key).map_err(|e| format!("secret store key: {e}"))?;
         Ok(Self {
             path: path.as_ref().to_path_buf(),
             cipher,

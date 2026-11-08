@@ -43,8 +43,21 @@ pub enum ControlAction {
     /// Not a control TLV — caller should treat as audio.
     NotControl,
     Ignore,
-    Rejected { reason: &'static str, opcode: u8 },
+    Rejected {
+        reason: &'static str,
+        opcode: u8,
+    },
     Heartbeat,
+    /// Authenticated OP_PTT_START_V2: `sender` requests the floor.
+    FloorStart {
+        sender: String,
+        start: sassytalkie_core::ptt_frames::PttStart,
+    },
+    /// Authenticated OP_PTT_STOP_V2: `sender` released the floor.
+    FloorStop {
+        sender: String,
+        stop: sassytalkie_core::ptt_frames::PttStop,
+    },
     HybridOutbound(Vec<u8>),
     Emergency,
     InstalledPq,
@@ -65,8 +78,7 @@ impl ControlPlane {
 
     pub fn install_psk(&self, key: [u8; 32], room_id: &str, sender_id: &str, epoch: u64) {
         *self.psk.lock().unwrap() = Some(key);
-        *self.codec.lock().unwrap() =
-            ControlAuthCodec::new(key, room_id, sender_id, epoch).ok();
+        *self.codec.lock().unwrap() = ControlAuthCodec::new(key, room_id, sender_id, epoch).ok();
     }
 
     pub fn clear(&self) {
@@ -79,7 +91,12 @@ impl ControlPlane {
     }
 
     pub fn seal(&self, inner: &[u8], now_ms: u64) -> Option<Vec<u8>> {
-        self.codec.lock().unwrap().as_ref()?.seal(inner, now_ms).ok()
+        self.codec
+            .lock()
+            .unwrap()
+            .as_ref()?
+            .seal(inner, now_ms)
+            .ok()
     }
 
     pub fn encode_heartbeat_sealed(
@@ -141,9 +158,27 @@ impl ControlPlane {
             | sassytalkie_core::protocol::OP_RECV_ACK
             | sassytalkie_core::protocol::OP_EOT_ACK
             | sassytalkie_core::protocol::OP_WAKE
-            | sassytalkie_core::protocol::OP_PTT_START_V2
-            | sassytalkie_core::protocol::OP_PTT_STOP_V2
             | sassytalkie_core::protocol::OP_PARTNER_OFFLINE => ControlAction::Heartbeat,
+            // Floor control used to be swallowed here as a "heartbeat": the
+            // desktop never yielded to, or blocked on, anyone's transmission.
+            sassytalkie_core::protocol::OP_PTT_START_V2 => {
+                match sassytalkie_core::ptt_frames::parse_ptt_start_v2(decoded.payload) {
+                    Some(start) => ControlAction::FloorStart {
+                        sender: verified.sender_id.clone(),
+                        start,
+                    },
+                    None => ControlAction::Ignore,
+                }
+            }
+            sassytalkie_core::protocol::OP_PTT_STOP_V2 => {
+                match sassytalkie_core::ptt_frames::parse_ptt_stop_v2(decoded.payload) {
+                    Some(stop) => ControlAction::FloorStop {
+                        sender: verified.sender_id.clone(),
+                        stop,
+                    },
+                    None => ControlAction::Ignore,
+                }
+            }
             OP_EMERGENCY | OP_MANDOWN | OP_EMERGENCY_CLEAR => ControlAction::Emergency,
             OP_HYBRID_INIT => self.on_hybrid_init(decoded.payload, now_ms),
             OP_HYBRID_RESP => self.on_hybrid_resp(decoded.payload, now_ms),
@@ -257,7 +292,12 @@ impl ControlPlane {
                 opcode: OP_HYBRID_CONFIRM,
             };
         };
-        if !confirm_acceptable(Some(&staged.token), Some(token), now_ms, staged.staged_at_ms) {
+        if !confirm_acceptable(
+            Some(&staged.token),
+            Some(token),
+            now_ms,
+            staged.staged_at_ms,
+        ) {
             return ControlAction::Rejected {
                 reason: "hybrid_confirm",
                 opcode: OP_HYBRID_CONFIRM,

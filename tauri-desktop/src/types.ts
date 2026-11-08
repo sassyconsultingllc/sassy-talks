@@ -27,6 +27,10 @@ export interface AppStatus {
   peer_count: number;
   is_transmitting: boolean;
   is_receiving: boolean;
+  /** Another radio holds the floor; PTT would be refused. */
+  channel_busy: boolean;
+  /** Why our transmission ended on its own (preempted / time limit). */
+  tx_notice: string | null;
 }
 
 export interface DeviceInfo {

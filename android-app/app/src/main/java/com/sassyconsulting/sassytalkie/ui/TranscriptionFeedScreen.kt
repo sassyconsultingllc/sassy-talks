@@ -90,7 +90,8 @@ fun TranscriptionFeedScreen(
     val others = entries.filter { !it.isFavorite && !it.isMuted }
     val timeFormatter = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
 
-    val cacheStatus = TranscriptionBridge.cacheSnapshot.collectAsState().value.toUi()
+    val cacheSnap = TranscriptionBridge.cacheSnapshot.collectAsState().value
+    val cacheStatus = cacheSnap.toUi()
     DisposableEffect(Unit) {
         TranscriptionBridge.acquireCacheUi()
         onDispose {
@@ -105,44 +106,26 @@ fun TranscriptionFeedScreen(
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHost) },
-        containerColor = DarkBg,
+        containerColor = Ui.Bg,
         modifier = modifier.fillMaxSize(),
     ) { padding ->
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(padding)
-            .background(DarkBg)
-            .padding(16.dp)
+            .background(Ui.Bg)
     ) {
-        // Header
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = TextGray)
-            }
-
-            Text(
-                text = "Timeline",
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Bold,
-                color = Orange
-            )
-
-            Spacer(modifier = Modifier.width(48.dp)) // balance the back button
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
+        ScreenHeader(title = "Activity")
+    Column(modifier = Modifier.padding(horizontal = 20.dp)) {
 
         // Cache status chip — surfaces mode + queue depth + current speaker,
         // plus a Skip button when something is mid-playback. Without this the
         // user has no way to tell that "this entry is queued waiting on the
         // current one to finish" or that the replay they just tapped is
         // actually running.
-        CacheStatusBar(
+        // Whole-clip playback keeps the cache in Queue mode permanently, so the
+        // bar only earns its space while something is actually playing or queued.
+        if (cacheSnap.currentSpeakerName != null || cacheSnap.queuedUtterances > 0) CacheStatusBar(
             status = cacheStatus,
             onSkip = {
                 SassyTalkNative.skipCurrentUtterance()
@@ -241,6 +224,7 @@ fun TranscriptionFeedScreen(
                 }
             }
         }
+    } // close padded content
     }
     } // close Scaffold content
 }

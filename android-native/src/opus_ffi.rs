@@ -16,6 +16,7 @@ pub struct OpusDecoder(u8);
 
 pub const OPUS_OK: i32 = 0;
 pub const OPUS_APPLICATION_VOIP: i32 = 2048;
+pub const OPUS_APPLICATION_AUDIO: i32 = 2049;
 pub const OPUS_SET_BITRATE_REQUEST: i32 = 4002;
 pub const OPUS_SET_VBR_REQUEST: i32 = 4006;
 pub const OPUS_SET_COMPLEXITY_REQUEST: i32 = 4010;

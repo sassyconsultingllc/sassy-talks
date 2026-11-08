@@ -41,7 +41,7 @@ pub use tones::{ToneError, TonePlayer, ToneType};
 pub use transport::{PeerInfo, TransportConfig, TransportManager};
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -72,6 +72,10 @@ pub enum AppError {
 
     #[error("Not transmitting")]
     NotTransmitting,
+
+    /// Floor control refused the press (e.g. "Channel busy").
+    #[error("{0}")]
+    Floor(&'static str),
 }
 
 /// Connection status
@@ -127,6 +131,14 @@ pub struct AppState {
     connection_status: Arc<RwLock<ConnectionStatus>>,
     is_transmitting: Arc<AtomicBool>,
     is_receiving: Arc<AtomicBool>,
+    /// Wall-clock ms of the last inbound frame handed to the speaker. The RX
+    /// loop's `is_receiving` flag is only true for the microseconds a frame is
+    /// in flight, so a 250 ms UI poll almost never saw it; the UI reads this
+    /// instead (see [`AppState::is_receiving`]).
+    last_rx_ms: Arc<AtomicU64>,
+    /// One-shot reason a transmission ended on its own (preempted, time
+    /// limit), shown by the UI on its next status poll.
+    tx_notice: Arc<Mutex<Option<String>>>,
 
     // PTT threads
     tx_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -177,6 +189,8 @@ impl AppState {
             connection_status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
             is_transmitting: Arc::new(AtomicBool::new(false)),
             is_receiving: Arc::new(AtomicBool::new(false)),
+            last_rx_ms: Arc::new(AtomicU64::new(0)),
+            tx_notice: Arc::new(Mutex::new(None)),
             tx_thread: Arc::new(Mutex::new(None)),
             rx_thread: Arc::new(Mutex::new(None)),
             cellular: Arc::new(Mutex::new(None)),
@@ -292,6 +306,7 @@ impl AppState {
             Arc::clone(&self.audio),
             audio_rx,
             Arc::clone(&self.is_receiving),
+            Arc::clone(&self.last_rx_ms),
             Arc::clone(&self.is_transmitting),
             Arc::clone(&self.audio_cache),
         );
@@ -341,6 +356,12 @@ impl AppState {
             return Err(AppError::AlreadyTransmitting);
         }
 
+        // Claim the relay floor first: refused while another radio is talking
+        // (same policy as Android/iOS), and announces us to every peer.
+        if let Some(cell) = self.cellular.lock().await.as_ref() {
+            cell.floor_request(false).map_err(AppError::Floor)?;
+        }
+
         info!("Starting transmission");
 
         self.is_transmitting.store(true, Ordering::Relaxed);
@@ -369,6 +390,12 @@ impl AppState {
 
         // Stop TX thread
         self.stop_tx_thread().await;
+
+        // PTT_STOP_V2: peers drain for 300 ms and ACK instead of waiting out
+        // the 1.5 s stale hold.
+        if let Some(cell) = self.cellular.lock().await.as_ref() {
+            cell.floor_release();
+        }
 
         // Stop audio recording
         let audio = self.audio.lock().await;
@@ -399,10 +426,13 @@ impl AppState {
         let audio = Arc::clone(&self.audio);
         let transport = Arc::clone(&self.transport);
         let is_transmitting = Arc::clone(&self.is_transmitting);
+        let connection_status = Arc::clone(&self.connection_status);
+        let tx_notice = Arc::clone(&self.tx_notice);
         let _channel = self.current_channel.load(Ordering::Relaxed);
         // Snapshot transports at PTT-press time and fan out to every live plane
         // (relay + UDP). XOR-routing here silenced mixed-protocol peers.
         let cellular = self.cellular.lock().await.clone();
+        let started = Instant::now();
 
         let handle = tokio::spawn(async move {
             let mut encoder = match OpusEncoder::new() {
@@ -421,6 +451,29 @@ impl AppState {
             let mut buffer = vec![0i16; FRAME_SIZE];
 
             while is_transmitting.load(Ordering::Relaxed) {
+                // Ended by the floor (another radio won arbitration) or by the
+                // 60 s safety ceiling every other client enforces: stop here,
+                // since the UI only learns of it from the next status poll.
+                let preempted = cellular.as_ref().is_some_and(|c| c.take_preempted());
+                let over_limit = started.elapsed()
+                    >= Duration::from_millis(sassytalkie_core::floor::DEFAULT_MAX_TX_MS);
+                if preempted || over_limit {
+                    let reason = if preempted {
+                        sassytalkie_core::floor::REJECT_PREEMPTED
+                    } else {
+                        sassytalkie_core::floor::REJECT_MAX_TX
+                    };
+                    info!("Transmission ended: {reason}");
+                    is_transmitting.store(false, Ordering::Relaxed);
+                    if let Some(c) = cellular.as_ref() {
+                        c.floor_release();
+                    }
+                    let _ = audio.lock().await.stop_recording();
+                    *connection_status.write().await = ConnectionStatus::Connected;
+                    *tx_notice.lock().await = Some(reason.to_string());
+                    break;
+                }
+
                 // Read audio samples
                 let audio_lock = audio.lock().await;
                 let samples_read = audio_lock.read_samples(&mut buffer);
@@ -469,6 +522,7 @@ impl AppState {
             Arc::clone(&self.audio),
             audio_rx,
             Arc::clone(&self.is_receiving),
+            Arc::clone(&self.last_rx_ms),
             Arc::clone(&self.is_transmitting),
             Arc::clone(&self.audio_cache),
         );
@@ -501,9 +555,26 @@ impl AppState {
         self.current_channel.load(Ordering::Relaxed)
     }
 
-    /// True while the RX loop is decoding inbound audio.
+    /// True while inbound audio is playing: a frame reached the speaker within
+    /// the last [`RX_ACTIVE_HOLD_MS`]. Covers 20 ms frame spacing plus relay
+    /// jitter so a 250 ms UI poll sees one continuous "receiving" span per
+    /// transmission (and the incoming chime fires once, not never).
+    /// Take the one-shot "your transmission ended" reason, if any.
+    pub async fn take_tx_notice(&self) -> Option<String> {
+        self.tx_notice.lock().await.take()
+    }
+
+    /// Another radio holds the relay floor right now (PTT would be refused).
+    pub async fn channel_busy(&self) -> bool {
+        match self.cellular.lock().await.as_ref() {
+            Some(c) => c.floor().is_held(unix_ms()),
+            None => false,
+        }
+    }
+
     pub fn is_receiving(&self) -> bool {
-        self.is_receiving.load(Ordering::Relaxed)
+        rx_recent(self.last_rx_ms.load(Ordering::Relaxed), unix_ms())
+            || self.is_receiving.load(Ordering::Relaxed)
     }
 
     /// Set channel (clamped to valid range 1-16)
@@ -683,6 +754,7 @@ fn spawn_audio_rx_loop(
     audio: Arc<Mutex<AudioEngine>>,
     mut audio_rx: transport::RealtimeReceiver<transport::AudioFrame>,
     is_receiving: Arc<AtomicBool>,
+    last_rx_ms: Arc<AtomicU64>,
     is_transmitting: Arc<AtomicBool>,
     cache: Arc<Mutex<sassytalkie_core::audio_cache::AudioCache>>,
 ) -> JoinHandle<()> {
@@ -737,6 +809,8 @@ fn spawn_audio_rx_loop(
                 peer.synth_ts
             };
 
+            last_rx_ms.store(unix_ms(), Ordering::Relaxed);
+
             // Live mode → Some(pcm) for immediate playback. Queue/Mix mode →
             // None; frames drain via the loop below on tick(). Hold the shared
             // cache lock across ingest+tick+drain so two RX loops can't
@@ -768,6 +842,21 @@ fn spawn_audio_rx_loop(
 
         info!("RX thread stopped");
     })
+}
+
+/// How long after the last played frame the UI still shows "receiving".
+const RX_ACTIVE_HOLD_MS: u64 = 400;
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Pure so the hold window is unit-testable without a clock.
+fn rx_recent(last_rx_ms: u64, now_ms: u64) -> bool {
+    last_rx_ms != 0 && now_ms.saturating_sub(last_rx_ms) < RX_ACTIVE_HOLD_MS
 }
 
 const MAX_RX_DECODERS: usize = 32;
@@ -825,6 +914,23 @@ impl RxPeerPool {
             });
         peer.last_used = now;
         peer
+    }
+}
+
+#[cfg(test)]
+mod rx_indicator_tests {
+    use super::*;
+
+    #[test]
+    fn receiving_spans_frame_gaps_then_clears() {
+        let t0 = 1_700_000_000_000;
+        assert!(!rx_recent(0, t0), "never received");
+        assert!(rx_recent(t0, t0));
+        // 20 ms frames plus a jittery 250 ms relay gap stay one "receiving" span.
+        assert!(rx_recent(t0, t0 + 250));
+        assert!(!rx_recent(t0, t0 + RX_ACTIVE_HOLD_MS));
+        // Clock stepping backwards must not wedge the indicator on.
+        assert!(rx_recent(t0, t0 - 5));
     }
 }
 

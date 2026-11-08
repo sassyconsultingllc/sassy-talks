@@ -32,6 +32,38 @@ use crate::users::UserRegistry;
 /// AudioTrack underruns on the RX path.
 static TRANSCRIPTION_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// True while the RX thread holds the AudioTrack open for received audio
+/// (from first write until it is released after RX_STAY_HOT of silence).
+/// Kotlin keeps audio focus while this is set: with whole-clip playback the
+/// clip plays after the transmission has ended.
+static RX_PLAYBACK_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn is_rx_playback_active() -> bool {
+    RX_PLAYBACK_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Wall-clock ms of the last peer audio frame accepted for our channel and
+/// sub-channel on any transport (0 = none yet). Kotlin's RECV_ACK loop for
+/// relay/Wi-Fi peers sends receipts only while this is fresh, so a receipt
+/// means audio really arrived, not merely that PTT_START did.
+static LAST_RX_AUDIO_MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Milliseconds since the last accepted peer audio frame, or -1 if none.
+pub fn last_rx_audio_age_ms() -> i64 {
+    let last = LAST_RX_AUDIO_MS.load(Ordering::Relaxed);
+    if last == 0 {
+        return -1;
+    }
+    now_wall_ms().saturating_sub(last) as i64
+}
+
 /// Toggle whether the RX thread invokes the Kotlin TranscriptionBridge.
 /// Called from Kotlin via JNI (see jni_bridge.rs `nativeSetTranscriptionBridgeEnabled`).
 pub fn set_transcription_bridge_enabled(enabled: bool) {
@@ -200,6 +232,7 @@ pub fn spawn_tx_thread(
     thread::Builder::new()
         .name("sassy-tx".into())
         .spawn(move || {
+            crate::jni_bridge::attach_audio_thread();
             info!("TX thread started");
 
             let mut encoder = VoiceEncoder::new();
@@ -659,6 +692,11 @@ pub struct RxSharedState {
 /// live instead of playing seconds-late audio after a network burst.
 const MAX_PLAYOUT_QUEUE_FRAMES: usize = 48;
 
+/// Target depth when refilling playout from the cache's utterance queue
+/// (~200 ms): enough to ride out scheduling hiccups, small enough to leave
+/// headroom under MAX_PLAYOUT_QUEUE_FRAMES for live frames.
+const PLAYOUT_REFILL_FRAMES: usize = 10;
+
 pub const RX_FRAME_PERIOD_MS: u64 = 20;
 pub const RX_MAX_PLC_FRAMES: u64 = 5;
 /// Wait for a late/reordered frame before FEC/PLC. Cellular relay often
@@ -742,9 +780,17 @@ impl RxSharedState {
     }
 
     /// Pull queue/jitter-drain frames from the cache into the playout queue.
+    ///
+    /// Tops up to PLAYOUT_REFILL_FRAMES rather than draining the cache. A
+    /// queued utterance can be hundreds of frames; pulling it all at once
+    /// overflowed MAX_PLAYOUT_QUEUE_FRAMES and threw away everything but its
+    /// last second. The rest stays in the cache and plays at 20 ms pace.
     pub fn drain_cache_playout(&mut self, cache: &mut AudioCache) {
-        while let Some((_sender, samples)) = cache.next_playback_frame() {
-            self.enqueue_playout(samples);
+        while self.playout_queue.len() < PLAYOUT_REFILL_FRAMES {
+            match cache.next_playback_frame() {
+                Some((_sender, samples)) => self.enqueue_playout(samples),
+                None => break,
+            }
         }
     }
 
@@ -791,6 +837,7 @@ pub fn process_incoming_wire_frame(
         reg.register_user(sender_id, device_name);
         return;
     }
+    LAST_RX_AUDIO_MS.store(now_wall_ms(), Ordering::Relaxed);
 
     {
         let mut reg = user_registry.lock().unwrap();
@@ -847,6 +894,7 @@ pub fn spawn_rx_thread(
     thread::Builder::new()
         .name("sassy-rx".into())
         .spawn(move || {
+            crate::jni_bridge::attach_audio_thread();
             info!("RX thread started");
 
             let mut recv_buffer = vec![0u8; 2048];
@@ -943,6 +991,7 @@ pub fn spawn_rx_thread(
                         let eng = audio.lock().unwrap();
                         let _ = eng.start_playing();
                         playback_started = true;
+                        RX_PLAYBACK_ACTIVE.store(true, Ordering::Relaxed);
                     }
                     let eng = audio.lock().unwrap();
                     let _ = eng.write_audio(&samples);
@@ -961,6 +1010,7 @@ pub fn spawn_rx_thread(
                                 let _ = eng.stop_playing();
                                 playback_started = false;
                                 last_write_at = None;
+                                RX_PLAYBACK_ACTIVE.store(false, Ordering::Relaxed);
                             }
                         }
                     }
@@ -975,6 +1025,7 @@ pub fn spawn_rx_thread(
                 let eng = audio.lock().unwrap();
                 let _ = eng.stop_playing();
             }
+            RX_PLAYBACK_ACTIVE.store(false, Ordering::Relaxed);
             info!("RX thread stopped");
         })
 }
@@ -1201,5 +1252,40 @@ mod tests {
         data[3] = 200; // name_len > MAX_DEVICE_NAME_LEN
         let result = unpack_wire_frame(&data);
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod playout_refill_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A queued utterance of hundreds of frames must reach the speaker in
+    /// full. Draining it in one go overflowed the 48-frame playout queue and
+    /// kept only the last second.
+    #[test]
+    fn queued_utterance_plays_in_full() {
+        let mut cache = AudioCache::new();
+        let mut rx = RxSharedState::new();
+        // Two overlapping talkers force Queue mode.
+        for i in 0..300u32 {
+            for (sid, mark) in [("alice", 1i16), ("bob", 2i16)] {
+                if let Some(s) = cache.ingest_logical_frame(sid, 3, i, 1_000 + i as u64 * 20, vec![mark; 960]) {
+                    rx.enqueue_playout(s);
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(900));
+        let mut played = 0usize;
+        for _ in 0..2_000 {
+            cache.tick();
+            rx.drain_cache_playout(&mut cache);
+            assert!(rx.playout_pending() <= MAX_PLAYOUT_QUEUE_FRAMES);
+            match rx.pop_playout() {
+                Some(_) => played += 1,
+                None => break,
+            }
+        }
+        assert_eq!(played, 600);
     }
 }

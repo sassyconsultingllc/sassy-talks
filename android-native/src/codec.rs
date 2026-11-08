@@ -22,11 +22,20 @@ pub const CODEC_CHANNELS: i32 = 1;
 pub const CODEC_FRAME_SIZE: usize = 960;
 
 /// Maximum Opus packet size for allocation. Real voice frames: 20-80 bytes.
-pub const COMPRESSED_FRAME_SIZE: usize = 256;
+pub const COMPRESSED_FRAME_SIZE: usize = 512;
 
-/// Voice bitrate for Opus (bps). 32kbps gives better quality margin under
-/// network stress while staying low-bandwidth for relay transport.
-const VOICE_BITRATE: i32 = 32000;
+/// Opus bitrate (bps). 64 kbps in full-fidelity (AUDIO) mode: current phones
+/// and networks carry it easily, and voice, whistling and background sound
+/// survive without the thin, smeared sound of 24-32 kbps VoIP mode. Must stay
+/// in step with ios-native and tauri-desktop codec.rs.
+const VOICE_BITRATE: i32 = 64000;
+
+/// Opus complexity 0-10. 10 is best quality; encoding one 20 ms frame is
+/// still well under 1 ms on any phone this app supports.
+const VOICE_COMPLEXITY: i32 = 10;
+
+/// Full-fidelity mode rather than speech-tuned VoIP mode.
+const OPUS_APPLICATION: i32 = ffi::OPUS_APPLICATION_AUDIO;
 
 // ── Helper ──
 
@@ -54,20 +63,20 @@ pub struct VoiceEncoder {
 unsafe impl Send for VoiceEncoder {}
 
 impl VoiceEncoder {
-    /// Create a new encoder configured for VoIP at 24kbps.
+    /// Create a new encoder (see VOICE_BITRATE / OPUS_APPLICATION).
     pub fn new() -> Self {
         let mut err = 0i32;
         let enc = unsafe {
-            ffi::opus_encoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, ffi::OPUS_APPLICATION_VOIP, &mut err)
+            ffi::opus_encoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, OPUS_APPLICATION, &mut err)
         };
         if enc.is_null() || err != ffi::OPUS_OK {
             panic!("opus_encoder_create failed: {}", err);
         }
-        // Set 24kbps bitrate
+        // Bitrate: see VOICE_BITRATE
         let ret = unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_BITRATE_REQUEST, VOICE_BITRATE) };
         check_opus_error(ret, "encoder set_bitrate");
-        // Complexity 5 (balanced quality vs CPU)
-        let ret = unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_COMPLEXITY_REQUEST, 5i32) };
+        // Complexity: see VOICE_COMPLEXITY
+        let ret = unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_COMPLEXITY_REQUEST, VOICE_COMPLEXITY) };
         check_opus_error(ret, "encoder set_complexity");
         // Enable in-band FEC so the decoder can recover lost packets
         let ret = unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_INBAND_FEC_REQUEST, 1i32) };
@@ -82,13 +91,13 @@ impl VoiceEncoder {
     pub fn reset(&mut self) {
         let mut err = 0i32;
         let new_enc = unsafe {
-            ffi::opus_encoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, ffi::OPUS_APPLICATION_VOIP, &mut err)
+            ffi::opus_encoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, OPUS_APPLICATION, &mut err)
         };
         if !new_enc.is_null() && err == ffi::OPUS_OK {
             unsafe { ffi::opus_encoder_destroy(self.enc) };
             self.enc = new_enc;
             unsafe { ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_BITRATE_REQUEST, VOICE_BITRATE); }
-            unsafe { ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_COMPLEXITY_REQUEST, 5i32); }
+            unsafe { ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_COMPLEXITY_REQUEST, VOICE_COMPLEXITY); }
             unsafe { ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_INBAND_FEC_REQUEST, 1i32); }
             unsafe { ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10i32); }
         }

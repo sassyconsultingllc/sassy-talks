@@ -90,8 +90,14 @@ class CellularWebSocketClient {
     private val isRunning = AtomicBoolean(false)
     private val isConnecting = AtomicBoolean(false)
     private val reconnectAttempts = AtomicInteger(0)
-    /** True after at least one successful WS open on this client — drives ?catchup=1. */
+    /** True after at least one successful WS open on this client. */
     @Volatile private var hasCompletedHandshake = false
+    /**
+     * Wall-clock ms the current/last socket was last known alive (open or any
+     * inbound frame). On reconnect it becomes the relay's `since=` cursor so
+     * only the gap we actually missed is replayed — see [RelayCatchup].
+     */
+    @Volatile private var lastAliveMs = 0L
     /** Invalidates auth callbacks, sockets, pumps, and reconnect tasks together. */
     private val generation = GenerationOwner()
     // Set by disconnect(), cleared by an explicit connect(). While true, every
@@ -243,6 +249,7 @@ class CellularWebSocketClient {
                 isConnecting.set(false)
                 isConnected.set(true)
                 hasCompletedHandshake = true
+                lastAliveMs = System.currentTimeMillis()
                 reconnectAttempts.set(0)
                 SassyTalkNative.cellularOnConnected()
                 startOutboundPump()
@@ -251,6 +258,7 @@ class CellularWebSocketClient {
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 if (!generation.owns(ownerGeneration)) return
+                lastAliveMs = System.currentTimeMillis()
                 val raw = bytes.toByteArray()
                 // Validate full TLV structure before routing to PttCoordinator:
                 // byte[0] opcode in 0x10..0x20, bytes[1..2] payload length (u16 LE),
@@ -279,6 +287,7 @@ class CellularWebSocketClient {
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (!generation.owns(ownerGeneration)) return
+                lastAliveMs = System.currentTimeMillis()
                 if (BuildConfig.DEBUG) Log.d(TAG, "Control: $text")
                 try {
                     val obj = JSONObject(text)
@@ -662,11 +671,15 @@ class CellularWebSocketClient {
                         peerId?.takeIf { it.isNotBlank() }?.let {
                             builder.setQueryParameter("peer", it)
                         }
-                        // Reconnect (not the first open of this client): ask the
-                        // DO to replay the retained catchup window. No since=
-                        // cursor — we don't persist one yet; catchup=1 alone is enough.
+                        // Reconnect after a short drop: ask the DO to replay only
+                        // what arrived after our last live frame. catchup=1 (the
+                        // whole ~30 s window, every reconnect) replayed audio we
+                        // had already heard and stale control; a long gap gets no
+                        // replay at all rather than a late burst.
                         if (hasCompletedHandshake) {
-                            builder.setQueryParameter("catchup", "1")
+                            RelayCatchup.sinceMs(lastAliveMs, System.currentTimeMillis())?.let {
+                                builder.setQueryParameter("since", it.toString())
+                            }
                         }
                         val authedUrl = builder.build().toString().let { toWsScheme(it) }
                         onResult(authedUrl, null)

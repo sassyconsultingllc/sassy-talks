@@ -38,7 +38,7 @@ pub const KEEPALIVE_INTERVAL_SECS: u64 = 10;
 pub const SAMPLE_RATE: u32 = 48000; // 48kHz for Opus
 pub const FRAME_SIZE: usize = 960; // 20ms at 48kHz
 pub const FRAME_DURATION_MS: u32 = 20;
-pub const OPUS_BITRATE: i32 = 32000; // 32kbps VBR
+pub const OPUS_BITRATE: i32 = 64000; // 64kbps VBR
 
 /// Channel configuration
 pub const MIN_CHANNEL: u8 = 1;

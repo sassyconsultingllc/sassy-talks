@@ -35,6 +35,9 @@ env:
   # Must match android-app/app/build.gradle.kts `ndkVersion`, or the libs CI
   # builds are compiled against a different sysroot than Gradle expects.
   NDK_VERSION: 27.1.12297006
+  # CMake 4 removed compatibility with cmake_minimum_required(< 3.5), which the
+  # bundled libopus in audiopus_sys 0.2.2 still declares.
+  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
 
 jobs:
   build-aab:
@@ -52,6 +55,10 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          # The action's default list includes the long-removed `tools` package;
+          # current sdkmanager exits 1 on it and the job dies before Gradle runs.
+          packages: 'platform-tools'
 
       - name: Cache Gradle packages
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4

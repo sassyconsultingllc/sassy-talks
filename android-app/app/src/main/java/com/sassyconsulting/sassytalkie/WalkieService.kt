@@ -573,12 +573,16 @@ class WalkieService : Service() {
             renewActivityWakeLock()
         }
         coord.onTxStateChanged = { active ->
-            txRouteActive = active
-            updateRouteKeeper()
-            if (active) {
-                requestRadioAudioFocus()
-            } else if (!rxRouteActive) {
-                abandonRadioAudioFocus()
+            // PttCoordinator may call this off the main thread; hop to main so
+            // focus/route state has a single writer (see noteInboundRx).
+            serviceScope.launch(Dispatchers.Main.immediate) {
+                txRouteActive = active
+                updateRouteKeeper()
+                if (active) {
+                    requestRadioAudioFocus()
+                } else if (!rxRouteActive) {
+                    abandonRadioAudioFocus()
+                }
             }
         }
         coord.onEmergencyAudit = { event, detail ->
@@ -845,7 +849,7 @@ class WalkieService : Service() {
     }
 
     /**
-     * Called for every inbound audio frame — engages focus + starts a "stay
+     * Called when a peer starts talking — engages focus + starts a "stay
      * hot" window so back-to-back bursts don't pay the focus/comm-mode
      * setup cost on every "yeah"/"copy".
      *
@@ -854,6 +858,14 @@ class WalkieService : Service() {
      * phone-line-busy signal doesn't linger longer than the user expects.
      *
      * WakeLock: refreshed here too; its own 3-minute timeout backstops us.
+     *
+     * Threading: main thread only. Audio-focus and route state (hasAudioFocus,
+     * audioFocusRequest, rxRouteActive, rxWakeHoldJob) are also written by the
+     * focus-change listener (main) and onTxStateChanged. When this and the
+     * stay-hot timer ran on Dispatchers.Default, a timer already past its
+     * delay could not be cancelled and would abandon focus and clear
+     * rxRouteActive right after a new burst set them, so a quick reply played
+     * without focus or route keeping. One thread makes cancel() effective.
      */
     fun noteInboundRx() {
         renewActivityWakeLock()
@@ -862,8 +874,23 @@ class WalkieService : Service() {
         if (!hasAudioFocus) requestRadioAudioFocus()
         try { SassyTalkNative.reassertRxRoute() } catch (_: Throwable) {}
         rxWakeHoldJob?.cancel()
-        rxWakeHoldJob = serviceScope.launch {
-            delay(RX_STAY_HOT_MS)
+        rxWakeHoldJob = serviceScope.launch(Dispatchers.Main.immediate) {
+            // incomingAudio only flips true at speech start, so this runs once
+            // per burst, not per frame. Hold focus and route while the peer is
+            // talking or a received clip is playing (whole-clip playback starts
+            // after the transmission ends), and release RX_STAY_HOT_MS after
+            // both stop. A fixed 5 s timer dropped them mid-sentence. The cap
+            // (receive + play back the longest allowed transmission) covers a
+            // flag left set by a stream that stopped mid-word.
+            var heldMs = 0L
+            var idleMs = 0L
+            while (idleMs < RX_STAY_HOT_MS && heldMs < 2 * TxSafetyPolicy.MAX_MAX_TX_MS) {
+                delay(250L)
+                heldMs += 250L
+                val busy = TranscriptionBridge.incomingAudio.value ||
+                    SassyTalkNative.isRxPlaybackActive()
+                idleMs = if (busy) 0L else idleMs + 250L
+            }
             // Silence ended the burst — release focus so the volume rocker
             // stops adjusting STREAM_VOICE_CALL and the OS considers the
             // phone line free again (conference-call add-line, incoming
@@ -938,7 +965,9 @@ class WalkieService : Service() {
 
     private fun startInboundAudioWatch() {
         if (inboundAudioWatchJob?.isActive == true) return
-        inboundAudioWatchJob = serviceScope.launch {
+        // Main thread: noteInboundRx shares audio-focus state with the focus
+        // listener and the stay-hot timer (see noteInboundRx).
+        inboundAudioWatchJob = serviceScope.launch(Dispatchers.Main.immediate) {
             TranscriptionBridge.incomingAudio.collectLatest { incoming ->
                 if (incoming) noteInboundRx()
             }

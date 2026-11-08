@@ -53,14 +53,15 @@ impl OpusEncoder {
     pub fn new() -> Result<Self, CodecError> {
         let sample_rate = SampleRate::Hz48000;
         let channels = Channels::Mono;
-        let application = Application::Voip; // Optimized for voice
+        // Full-fidelity mode at 64 kbps, matching android-native codec.rs.
+        let application = Application::Audio;
 
         let mut encoder = OpusEncoderImpl::new(sample_rate, channels, application)
             .map_err(|e| CodecError::EncoderError(format!("{:?}", e)))?;
 
         // Configure for low latency voice
         encoder
-            .set_bitrate(Bitrate::BitsPerSecond(32000))
+            .set_bitrate(Bitrate::BitsPerSecond(64000))
             .map_err(|e| CodecError::EncoderError(format!("{:?}", e)))?;
 
         encoder

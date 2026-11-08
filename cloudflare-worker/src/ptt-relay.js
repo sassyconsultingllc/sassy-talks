@@ -59,8 +59,11 @@ const PRESENCE_CACHE_TTL_MS = 5_000;
 // control frames from audio nonce bytes that happen to start with the same
 // opcode value.
 const PUSH_TRIGGER_FRAME_SHAPES = {
-  0x15: 12,  // OP_PTT_START_V2 — [epoch:u64][startSeq:u32]
-  0x17: 16,  // OP_WAKE         — [epoch:u64][senderTsMs:u64]
+  // OP_PTT_START_V2 — [epoch:u64][startSeq:u32] plus, since 3.2, a trailing
+  // emergency-priority byte (core::ptt_frames). Accepting only 12 meant every
+  // current unsealed PTT start silently stopped waking offline peers.
+  0x15: [12, 13],
+  0x17: [16],  // OP_WAKE         — [epoch:u64][senderTsMs:u64]
 };
 export function looksLikeTrigger(bytes) {
   if (bytes.length < 3) return false;
@@ -74,12 +77,58 @@ export function looksLikeTrigger(bytes) {
     return bytes.length === 3 + payloadLen && payloadLen >= 30 &&
       bytes[3] === 1 && (bytes[4] === 0x15 || bytes[4] === 0x17);
   }
-  const expected = PUSH_TRIGGER_FRAME_SHAPES[bytes[0]];
-  if (expected === undefined) return false;
+  const allowed = PUSH_TRIGGER_FRAME_SHAPES[bytes[0]];
+  if (allowed === undefined) return false;
   const payloadLen = bytes[1] | (bytes[2] << 8);
-  if (payloadLen !== expected) return false;
-  if (bytes.length < 3 + expected) return false;
+  if (!allowed.includes(payloadLen)) return false;
+  if (bytes.length < 3 + payloadLen) return false;
   return true;
+}
+
+/**
+ * Same classifier the clients use (core::protocol::is_control_frame_shape):
+ * opcode 0x10..0x20 AND a TLV length that exactly covers the frame. Sealed
+ * control (0x18) matches; sealed audio (random nonce first) practically never.
+ */
+export function isControlFrameShape(bytes) {
+  if (bytes.length < 3 || bytes[0] < 0x10 || bytes[0] > 0x20) return false;
+  const payloadLen = bytes[1] | (bytes[2] << 8);
+  return bytes.length === 3 + payloadLen;
+}
+
+/**
+ * Which retained frames a reconnecting peer should be replayed. Pure so the
+ * policy is unit-testable without a Durable Object:
+ *   - only frames newer than `cutoff`, and never older than the TTL;
+ *   - never the requester's own transmissions (it would hear itself);
+ *   - never control frames: catch-up is for audio, and a stale PTT_START or
+ *     heartbeat replayed seconds later corrupts floor/liveness state.
+ */
+export function selectReplayFrames(buffer, cutoff, nowMs, requesterPeer) {
+  const floor = Math.max(cutoff, nowMs - BUFFER_TTL_MS);
+  const out = [];
+  for (const entry of buffer) {
+    if (entry.ts <= floor) continue;
+    if (requesterPeer && entry.from === requesterPeer) continue;
+    if (isControlFrameShape(entry.frame)) continue;
+    out.push(entry);
+  }
+  return out;
+}
+
+/**
+ * Pick the WebSocket subprotocol to echo. A client that carries its token as a
+ * `sassytalk.<token>` subprotocol (see relay-auth extractToken) offered a list;
+ * RFC 6455 clients fail the handshake unless the 101 selects one of them.
+ * Returns null when nothing sassytalk-shaped was offered.
+ */
+export function selectSubprotocol(header) {
+  if (!header) return null;
+  for (const part of header.split(",")) {
+    const p = part.trim();
+    if (p === "sassytalk" || p.startsWith("sassytalk.")) return p;
+  }
+  return null;
 }
 
 // Per-socket rate limit. Normal PTT traffic is ~50 frames/sec (20 ms Opus
@@ -269,6 +318,7 @@ export class PttRoom extends DurableObject {
     // attacker-controlled query data so v2 identity survives into membership.
     const verifiedPeer = request.headers.get("X-Sassy-Verified-Peer") || "";
     const peer = verifiedPeer.substring(0, MAX_PEER_ID_LEN) || queryPeer;
+    const subprotocol = selectSubprotocol(request.headers.get("Sec-WebSocket-Protocol"));
     const authClass = request.headers.get("X-Sassy-Verified-Auth-Class") || "none";
     const tokenVersion = Number.parseInt(
       request.headers.get("X-Sassy-Token-Version") || "0", 10,
@@ -330,7 +380,7 @@ export class PttRoom extends DurableObject {
       const cutoff = Number.isFinite(sinceMs)
         ? sinceMs
         : Date.now() - BUFFER_TTL_MS;
-      this.ctx.waitUntil(this.replayBufferedAudio(server, cutoff, clientId));
+      this.ctx.waitUntil(this.replayBufferedAudio(server, cutoff, clientId, peer));
     }
 
     // Start sweeper alarm if not already running. In-memory flag avoids a
@@ -340,7 +390,8 @@ export class PttRoom extends DurableObject {
       this.alarmArmed = true;
     }
 
-    return new Response(null, { status: 101, webSocket: client });
+    const upgradeHeaders = subprotocol ? { "Sec-WebSocket-Protocol": subprotocol } : undefined;
+    return new Response(null, { status: 101, webSocket: client, headers: upgradeHeaders });
   }
 
   /**
@@ -448,7 +499,10 @@ export class PttRoom extends DurableObject {
       if (Date.now() <= this.bufferUntilMs) {
         const framed = new Uint8Array(bytes.length);
         framed.set(bytes);
-        this.audioBuffer.push({ ts: Date.now(), frame: framed });
+        // `from` lets replay skip a peer's own frames. The relay still never
+        // parses audio; this is the sender's socket identity, not content.
+        const from = (sessRefresh && (sessRefresh.peer || sessRefresh.id)) || "";
+        this.audioBuffer.push({ ts: Date.now(), frame: framed, from });
         this.audioBufferBytes += framed.length;
         // O(1) trim: shift the oldest until both caps are satisfied. `shift()`
         // on a JS array is amortized cheap and we only ever drop a handful per
@@ -724,15 +778,11 @@ export class PttRoom extends DurableObject {
    * `this.audioBuffer` (the live hot path keeps running) can't shift indices
    * out from under us. peer_id is emitted empty — see buildReplayFrame.
    */
-  async replayBufferedAudio(ws, cutoff, clientId) {
-    // Drop anything older than the TTL even if `since` reaches further back —
-    // the buffer never retains beyond ~30 s anyway, but this keeps the cutoff
-    // honest if a client sends an ancient `since`.
-    const floor = Math.max(cutoff, Date.now() - BUFFER_TTL_MS);
-    const pending = [];
-    for (const entry of this.audioBuffer) {
-      if (entry.ts > floor) pending.push(entry.frame);
-    }
+  async replayBufferedAudio(ws, cutoff, clientId, requesterPeer = "") {
+    // selectReplayFrames clamps to the TTL even if `since` reaches further
+    // back, and drops the requester's own audio and all control frames.
+    const pending = selectReplayFrames(this.audioBuffer, cutoff, Date.now(), requesterPeer)
+      .map((entry) => entry.frame);
     if (pending.length === 0) return;
 
     // Pace the replay so a full ~1500-frame window doesn't land as one

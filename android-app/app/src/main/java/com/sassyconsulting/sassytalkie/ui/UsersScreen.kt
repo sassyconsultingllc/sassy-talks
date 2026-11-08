@@ -37,8 +37,10 @@ import com.sassyconsulting.sassytalkie.ui.theme.*
 fun UsersScreen(
     onBack: () -> Unit,
     onEditProfile: () -> Unit = {},
+    onEndSession: () -> Unit = {},
     walkieService: WalkieService? = null
 ) {
+    var showEndSessionDialog by remember { mutableStateOf(false) }
     val context = LocalContext.current
     var users by remember { mutableStateOf(emptyList<SassyTalkNative.UserInfo>()) }
     var isRefreshing by remember { mutableStateOf(false) }
@@ -107,28 +109,12 @@ fun UsersScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(DarkBg)
-            .padding(16.dp)
+            .background(Ui.Bg)
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = TextGray)
-            }
-
-            Text(
-                text = "People",
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Bold,
-                color = Orange
-            )
-
+        ScreenHeader(title = "People") {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 IconButton(onClick = onEditProfile) {
-                    Icon(Icons.Default.Edit, contentDescription = "Edit Profile", tint = Cyan)
+                    Icon(Icons.Default.Edit, contentDescription = "Edit Profile", tint = Ui.Accent)
                 }
                 IconButton(
                     onClick = {
@@ -147,15 +133,16 @@ fun UsersScreen(
                             color = Cyan,
                         )
                     } else {
-                        Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = Cyan)
+                        Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = Ui.Accent)
                     }
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
-
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        LazyColumn(
+            modifier = Modifier.padding(horizontal = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
             item {
                 SectionHeader(
                     title = "You",
@@ -273,7 +260,78 @@ fun UsersScreen(
                     }
                 }
             }
+
+            // Session details + End Session (moved here from the radio
+            // screen's overflow menu, away from the talk button).
+            item {
+                SectionLabel("Session")
+                val roomId = remember { SassyTalkNative.getSessionId().orEmpty() }
+                UiCard {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text("Room", color = Ui.TextDim, fontSize = 14.sp)
+                        Text(
+                            if (roomId.length > 12) roomId.take(4) + "\u2026" + roomId.takeLast(4) else roomId.ifEmpty { "None" },
+                            color = Ui.Text, fontSize = 14.sp,
+                        )
+                    }
+                    Divider(color = Ui.Line)
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text("Encryption", color = Ui.TextDim, fontSize = 14.sp)
+                        Text(
+                            if (SassyTalkNative.isEncrypted()) "End to end" else "Off",
+                            color = if (SassyTalkNative.isEncrypted()) Ui.Text else Ui.SosText,
+                            fontSize = 14.sp,
+                        )
+                    }
+                    Divider(color = Ui.Line)
+                    TextButton(
+                        onClick = { showEndSessionDialog = true },
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
+                        shape = RoundedCornerShape(0.dp),
+                    ) {
+                        Text(
+                            "End session on this device",
+                            color = Ui.SosText,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+            }
         }
+    }
+
+    if (showEndSessionDialog) {
+        AlertDialog(
+            onDismissRequest = { showEndSessionDialog = false },
+            confirmButton = {
+                TextButton(onClick = {
+                    showEndSessionDialog = false
+                    onEndSession()
+                }) { Text("End session", color = Ui.SosText) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showEndSessionDialog = false }) { Text("Cancel", color = Ui.Accent) }
+            },
+            title = { Text("End session?", color = Ui.Text) },
+            text = {
+                Text(
+                    "This ends every encrypted session on this device and disconnects all " +
+                        "transports. You will need to scan a QR code to rejoin.",
+                    color = Ui.TextMid,
+                    fontSize = 14.sp,
+                )
+            },
+            containerColor = Ui.Surface,
+        )
     }
 }
 
@@ -339,7 +397,7 @@ private fun YouCard(
     onEditProfile: () -> Unit
 ) {
     Card(
-        colors = CardDefaults.cardColors(containerColor = CardBg),
+        colors = CardDefaults.cardColors(containerColor = Ui.Surface),
         shape = RoundedCornerShape(12.dp),
         modifier = Modifier.fillMaxWidth()
     ) {
@@ -434,7 +492,7 @@ private fun UserCard(
     val isMuted = user.isMuted
 
     Card(
-        colors = CardDefaults.cardColors(containerColor = CardBg),
+        colors = CardDefaults.cardColors(containerColor = Ui.Surface),
         shape = RoundedCornerShape(12.dp),
         modifier = Modifier
             .fillMaxWidth()

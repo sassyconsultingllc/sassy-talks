@@ -59,7 +59,12 @@ pub struct ControlAuthCodec {
 }
 
 impl ControlAuthCodec {
-    pub fn new(key: [u8; 32], room_id: &str, sender_id: &str, epoch: u64) -> Result<Self, ControlAuthError> {
+    pub fn new(
+        key: [u8; 32],
+        room_id: &str,
+        sender_id: &str,
+        epoch: u64,
+    ) -> Result<Self, ControlAuthError> {
         let sender_bytes = sender_id.as_bytes();
         if sender_bytes.is_empty() || sender_bytes.len() > MAX_SENDER_BYTES {
             return Err(ControlAuthError::Malformed);
@@ -81,7 +86,12 @@ impl ControlAuthCodec {
         self.seal_with_rng(inner_frame, now_ms, |buf| rand::rngs::OsRng.fill_bytes(buf))
     }
 
-    pub fn seal_with_rng<F>(&self, inner_frame: &[u8], now_ms: u64, mut fill_nonce: F) -> Result<Vec<u8>, ControlAuthError>
+    pub fn seal_with_rng<F>(
+        &self,
+        inner_frame: &[u8],
+        now_ms: u64,
+        mut fill_nonce: F,
+    ) -> Result<Vec<u8>, ControlAuthError>
     where
         F: FnMut(&mut [u8]),
     {
@@ -92,13 +102,25 @@ impl ControlAuthCodec {
         if inner_frame.len() > MAX_INNER_BYTES {
             return Err(ControlAuthError::TooLarge);
         }
-        let seq = self.tx_sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let seq = self
+            .tx_sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         if seq == 0 {
             return Err(ControlAuthError::SequenceExhausted);
         }
         let sender = self.sender_id.as_bytes();
         let mut body = Vec::with_capacity(
-            MAGIC.len() + 1 + ROOM_BINDING_BYTES + 1 + sender.len() + 8 + 8 + 8 + 2 + inner_frame.len(),
+            MAGIC.len()
+                + 1
+                + ROOM_BINDING_BYTES
+                + 1
+                + sender.len()
+                + 8
+                + 8
+                + 8
+                + 2
+                + inner_frame.len(),
         );
         body.extend_from_slice(MAGIC);
         body.push(decoded.opcode);
@@ -116,7 +138,13 @@ impl ControlAuthCodec {
         let aad = outer_aad(decoded.opcode);
         let ciphertext = self
             .cipher
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: &body, aad: &aad })
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &body,
+                    aad: &aad,
+                },
+            )
             .map_err(|_| ControlAuthError::Crypto)?;
 
         let mut payload = Vec::with_capacity(2 + NONCE_BYTES + ciphertext.len());
@@ -141,7 +169,13 @@ impl ControlAuthCodec {
         let aad = outer_aad(opcode_hint);
         let plaintext = self
             .cipher
-            .decrypt(Nonce::from_slice(nonce), Payload { msg: ciphertext, aad: &aad })
+            .decrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            )
             .ok()?;
         if plaintext.len() < MIN_BODY_BYTES {
             return None;
@@ -160,10 +194,14 @@ impl ControlAuthCodec {
         i += ROOM_BINDING_BYTES;
         let sender_len = plaintext[i] as usize;
         i += 1;
-        if !(1..=MAX_SENDER_BYTES).contains(&sender_len) || plaintext.len() < i + sender_len + 8 + 8 + 8 + 2 {
+        if !(1..=MAX_SENDER_BYTES).contains(&sender_len)
+            || plaintext.len() < i + sender_len + 8 + 8 + 8 + 2
+        {
             return None;
         }
-        let sender = std::str::from_utf8(&plaintext[i..i + sender_len]).ok()?.to_string();
+        let sender = std::str::from_utf8(&plaintext[i..i + sender_len])
+            .ok()?
+            .to_string();
         i += sender_len;
         let sender_epoch = u64::from_le_bytes(plaintext[i..i + 8].try_into().ok()?);
         i += 8;
@@ -178,7 +216,10 @@ impl ControlAuthCodec {
         }
         let inner = plaintext[i..].to_vec();
         let decoded = decode_control_frame(&inner)?;
-        if decoded.opcode != bound_opcode || decoded.opcode != opcode_hint || decoded.opcode == OP_AUTHENTICATED {
+        if decoded.opcode != bound_opcode
+            || decoded.opcode != opcode_hint
+            || decoded.opcode == OP_AUTHENTICATED
+        {
             return None;
         }
         let age = now_ms as i64 - issued_at_ms as i64;
@@ -222,13 +263,25 @@ pub enum InboundControl {
 }
 
 /// Classify an inbound binary frame. `codec == None` still rejects raw privileged ops.
-pub fn classify_inbound(codec: Option<&ControlAuthCodec>, bytes: &[u8], now_ms: u64) -> InboundControl {
+pub fn classify_inbound(
+    codec: Option<&ControlAuthCodec>,
+    bytes: &[u8],
+    now_ms: u64,
+) -> InboundControl {
     if bytes.is_empty() {
         return InboundControl::NotControl;
     }
     let op = bytes[0];
     if op < 0x10 {
-        return InboundControl::LegacyHint { opcode: op };
+        // Legacy hints are exactly one byte (`encode_legacy` / BLE). Anything
+        // longer is sealed audio whose random nonce happens to start below
+        // 0x10 — 1 frame in 16. Classifying those as hints made the desktop
+        // and iOS relay paths silently drop ~6% of all received audio.
+        return if bytes.len() == 1 {
+            InboundControl::LegacyHint { opcode: op }
+        } else {
+            InboundControl::NotControl
+        };
     }
     if !is_control_tlv(bytes) {
         return InboundControl::NotControl;
@@ -267,7 +320,10 @@ pub fn decode_control_frame(bytes: &[u8]) -> Option<DecodedControl<'_>> {
     }
     let op = bytes[0];
     if op < 0x10 {
-        return Some(DecodedControl { opcode: op, payload: &[] });
+        return Some(DecodedControl {
+            opcode: op,
+            payload: &[],
+        });
     }
     parse_tlv_exact(bytes)
 }
@@ -342,17 +398,60 @@ impl ReplayWindow {
                 self.order.remove(0);
             }
         }
-        self.states.insert(key.clone(), ReplayState { highest: sequence, bitmap: 1 });
+        self.states.insert(
+            key.clone(),
+            ReplayState {
+                highest: sequence,
+                bitmap: 1,
+            },
+        );
         self.order.push(key);
         true
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::{encode_tlv, OP_HEARTBEAT, OP_PTT_START, OP_PTT_START_V2, OP_RECV_ACK};
+
+    /// Regression (3.2 → 3.2.7): any frame whose first byte was below 0x10 was
+    /// a "legacy hint" and dropped by every client that classifies before
+    /// decrypting (desktop relay, iOS relay + LAN). The first nonce byte is a
+    /// per-SESSION random prefix byte, so this was not 6% loss: in 1 session
+    /// in 16 a sender was completely inaudible to those clients until restart.
+    #[test]
+    fn sealed_audio_is_never_classified_as_control_whatever_the_prefix() {
+        let key = [9u8; 32];
+        let codec = ControlAuthCodec::new(key, "room-1", "peer-a", 7).unwrap();
+        let mut tx = crate::crypto::CryptoSession::from_psk(&key);
+        let real = tx.encrypt(&[0x55u8; 80]).unwrap();
+        for first in 0u8..=255 {
+            let mut frame = real.clone();
+            frame[0] = first;
+            // A TLV-exact frame really is control-shaped; audio never is,
+            // because its length bytes are nonce bytes, not a length.
+            if crate::protocol::is_control_frame_shape(&frame) {
+                continue;
+            }
+            assert!(
+                matches!(
+                    classify_inbound(Some(&codec), &frame, 0),
+                    InboundControl::NotControl
+                ),
+                "{}-byte audio frame with first byte {first:#04x} misclassified",
+                frame.len()
+            );
+        }
+    }
+
+    #[test]
+    fn single_byte_legacy_hint_is_still_recognised() {
+        assert!(matches!(
+            classify_inbound(None, &[OP_PTT_START], 0),
+            InboundControl::LegacyHint { opcode } if opcode == OP_PTT_START
+        ));
+    }
 
     fn key() -> [u8; 32] {
         let mut k = [0u8; 32];
@@ -376,7 +475,9 @@ mod tests {
         let receiver = ControlAuthCodec::new(key(), "room-1", "device-b", 22).unwrap();
         let inner = recv_ack();
         let now = 1_700_000_000_000u64;
-        let verified = receiver.open(&sender.seal(&inner, now).unwrap(), now).unwrap();
+        let verified = receiver
+            .open(&sender.seal(&inner, now).unwrap(), now)
+            .unwrap();
         assert_eq!(verified.sender_id, "device-a");
         assert_eq!(verified.epoch, 11);
         assert!(verified.sequence > 0);
@@ -387,13 +488,17 @@ mod tests {
     fn forged_and_wrong_room_fail_closed() {
         let sender = ControlAuthCodec::new(key(), "room-1", "device-a", 11).unwrap();
         let now = 1_700_000_000_000u64;
-        let mut envelope = sender.seal(&encode_tlv(OP_PTT_START_V2, &[0; 12]), now).unwrap();
+        let mut envelope = sender
+            .seal(&encode_tlv(OP_PTT_START_V2, &[0; 12]), now)
+            .unwrap();
         let last = envelope.len() - 1;
         envelope[last] ^= 1;
         let receiver = ControlAuthCodec::new(key(), "room-1", "device-b", 22).unwrap();
         assert!(receiver.open(&envelope, now).is_none());
 
-        let valid = sender.seal(&encode_tlv(OP_HEARTBEAT, &[0; 23]), now).unwrap();
+        let valid = sender
+            .seal(&encode_tlv(OP_HEARTBEAT, &[0; 23]), now)
+            .unwrap();
         let other_room = ControlAuthCodec::new(key(), "other-room", "device-b", 22).unwrap();
         assert!(other_room.open(&valid, now).is_none());
     }
@@ -403,8 +508,12 @@ mod tests {
         let sender = ControlAuthCodec::new(key(), "room-1", "device-a", 11).unwrap();
         let receiver = ControlAuthCodec::new(key(), "room-1", "device-b", 22).unwrap();
         let now = 1_700_000_000_000u64;
-        let first = sender.seal(&encode_tlv(OP_HEARTBEAT, &[1; 23]), now).unwrap();
-        let second = sender.seal(&encode_tlv(OP_HEARTBEAT, &[2; 23]), now).unwrap();
+        let first = sender
+            .seal(&encode_tlv(OP_HEARTBEAT, &[1; 23]), now)
+            .unwrap();
+        let second = sender
+            .seal(&encode_tlv(OP_HEARTBEAT, &[2; 23]), now)
+            .unwrap();
         assert!(receiver.open(&second, now).is_some());
         assert!(receiver.open(&first, now).is_some());
         assert!(receiver.open(&first, now).is_none());
@@ -415,9 +524,13 @@ mod tests {
         let sender = ControlAuthCodec::new(key(), "room-1", "device-a", 11).unwrap();
         let receiver = ControlAuthCodec::new(key(), "room-1", "device-b", 22).unwrap();
         let now = 1_700_000_000_000u64;
-        let stale = sender.seal(&encode_tlv(OP_HEARTBEAT, &[0; 23]), now - 121_000).unwrap();
+        let stale = sender
+            .seal(&encode_tlv(OP_HEARTBEAT, &[0; 23]), now - 121_000)
+            .unwrap();
         assert!(receiver.open(&stale, now).is_none());
-        let future = sender.seal(&encode_tlv(OP_HEARTBEAT, &[0; 23]), now + 31_000).unwrap();
+        let future = sender
+            .seal(&encode_tlv(OP_HEARTBEAT, &[0; 23]), now + 31_000)
+            .unwrap();
         assert!(receiver.open(&future, now).is_none());
     }
 

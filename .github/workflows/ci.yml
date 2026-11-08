@@ -54,6 +54,9 @@ jobs:
           distribution: temurin
           cache: gradle
       - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          # Default list includes the removed `tools` package (sdkmanager exit 1).
+          packages: 'platform-tools'
       - run: chmod +x android-app/gradlew
       - name: Run both distribution flavors
         working-directory: android-app
@@ -166,6 +169,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # CMake 4 dropped cmake_minimum_required(< 3.5) compat; audiopus_sys's
+      # bundled libopus still declares it.
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
     defaults:
       run:
         working-directory: tauri-desktop
@@ -189,3 +196,34 @@ jobs:
       - name: Check desktop Rust host build
         working-directory: tauri-desktop/src-tauri
         run: cargo check --locked
+
+  ios-build:
+    name: iOS simulator build (Rust + Swift)
+    # Nothing else compiles the Swift side: the host `cargo test` above only
+    # exercises portable Rust. This links the static lib into the Xcode project
+    # exactly as build.sh does and builds for the simulator, unsigned.
+    runs-on: macos-15
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+    defaults:
+      run:
+        working-directory: ios-native
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@1ff72ee08e3cb84d84adba594e0a297990fc1ed3 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-ios-sim,x86_64-apple-ios
+      - name: Build Rust static lib (simulator slices)
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target aarch64-apple-ios-sim
+          cargo build --release --locked --target x86_64-apple-ios
+          mkdir -p target/universal-sim/release
+          lipo -create             target/aarch64-apple-ios-sim/release/libsassytalkie_ios.a             target/x86_64-apple-ios/release/libsassytalkie_ios.a             -output target/universal-sim/release/libsassytalkie_ios.a
+      - name: Bridging header matches the Rust FFI
+        run: python3 ../scripts/check-ios-ffi.py
+      - name: Build app for simulator (unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild -project SassyTalkie.xcodeproj -scheme SassyTalkie             -sdk iphonesimulator -configuration Debug             -destination 'generic/platform=iOS Simulator'             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO             build | tail -200

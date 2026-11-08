@@ -79,7 +79,14 @@ object TranscriptionBridge {
         val queuedDurationMs: Long = 0L,
         val currentSpeakerName: String? = null,
         val historyCount: Int = 0,
+        /** Position / length of the clip now playing, ms (0 when idle). */
+        val playingMs: Long = 0L,
+        val playingTotalMs: Long = 0L,
+        /** Transmissions still arriving (whole-clip mode), longest first. */
+        val receiving: List<ReceivingClip> = emptyList(),
     )
+
+    data class ReceivingClip(val senderId: String, val name: String, val ms: Long)
 
     private val _cacheSnapshot = MutableStateFlow(CacheSnapshot())
     val cacheSnapshot: StateFlow<CacheSnapshot> = _cacheSnapshot.asStateFlow()
@@ -159,6 +166,19 @@ object TranscriptionBridge {
                             currentSpeakerName = st.optString("current_speaker_name", "")
                                 .ifEmpty { null },
                             historyCount = st.optInt("history_count", 0),
+                            playingMs = st.optLong("playing_ms", 0L),
+                            playingTotalMs = st.optLong("playing_total_ms", 0L),
+                            receiving = st.optJSONArray("receiving")?.let { arr ->
+                                (0 until arr.length()).mapNotNull { i ->
+                                    arr.optJSONObject(i)?.let { o ->
+                                        ReceivingClip(
+                                            senderId = o.optString("sender"),
+                                            name = o.optString("name").ifBlank { "A device" },
+                                            ms = o.optLong("ms", 0L),
+                                        )
+                                    }
+                                }.sortedByDescending { it.ms }
+                            } ?: emptyList(),
                         )
                     }
                 } catch (_: Throwable) { /* JNI may be unavailable in tests */ }

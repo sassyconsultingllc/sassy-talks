@@ -37,18 +37,19 @@
 /// existing TX/RX threads in `lib.rs` drive either transport with one branch.
 ///
 /// Copyright 2025 Sassy Consulting LLC. All rights reserved.
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::{connect_async_tls_with_config, Connector};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, HeaderValue};
+use tokio_tungstenite::tungstenite::http::header::{HeaderValue, AUTHORIZATION};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tokio_tungstenite::{connect_async_tls_with_config, Connector};
 use tracing::{debug, info, warn};
 
 use sassytalkie_core::crypto::CryptoSession;
+use sassytalkie_core::floor::{self as floor_policy, FloorState};
 use sassytalkie_core::wire;
 
 use super::control;
@@ -146,8 +147,22 @@ pub struct CellularTransport {
     packets_sent: AtomicU32,
     packets_received: AtomicU32,
 
-    /// After the first successful dial, reconnects request ?catchup=1.
+    /// After the first successful dial, reconnects ask the relay to replay the
+    /// gap they missed (`since=`, see `core::protocol::catchup_since_ms`).
     has_completed_handshake: AtomicBool,
+    /// Wall-clock ms the socket was last known alive (dial or inbound frame).
+    last_alive_ms: AtomicU64,
+
+    /// Floor occupancy shared with the UI (`core::floor`, same as iOS).
+    floor: Arc<FloorState>,
+    /// We hold an open floor claim (PTT_START_V2 sent, STOP not yet sent).
+    local_tx: AtomicBool,
+    /// Set when another radio wins arbitration mid-transmission; the TX loop
+    /// takes it and stops. Mirrors Android handlePttStartV2 → onPttReleased.
+    preempted: AtomicBool,
+    /// Audio frames sent this session: PTT_START/STOP sequence numbers, which
+    /// Android's "Delivered" tick matches against our EOT_ACKs.
+    tx_seq: AtomicU32,
 
     control: ControlPlane,
 }
@@ -178,8 +193,114 @@ impl CellularTransport {
             packets_sent: AtomicU32::new(0),
             packets_received: AtomicU32::new(0),
             has_completed_handshake: AtomicBool::new(false),
+            last_alive_ms: AtomicU64::new(0),
+            floor: Arc::new(FloorState::new()),
+            local_tx: AtomicBool::new(false),
+            preempted: AtomicBool::new(false),
+            tx_seq: AtomicU32::new(0),
             control,
         })
+    }
+
+    // ── Floor control (OP_PTT_START_V2 / OP_PTT_STOP_V2) ──────────────────
+    //
+    // The desktop used to transmit without ever claiming or checking the
+    // floor: it keyed over Android/iOS talkers (neither side yielded) and,
+    // never sending PTT_STOP_V2, left every peer waiting out the 1.5 s stale
+    // hold after each desktop transmission instead of the 300 ms drain.
+
+    /// Shared floor state (owner, holds, last rejection reason).
+    pub fn floor(&self) -> &Arc<FloorState> {
+        &self.floor
+    }
+
+    /// Claim the floor before transmitting. Refuses while another radio holds
+    /// it (unless `emergency`); otherwise sends an authenticated PTT_START_V2
+    /// so every peer runs the same arbitration.
+    pub fn floor_request(&self, emergency: bool) -> Result<(), &'static str> {
+        let now = unix_now_ms();
+        self.floor.set_self_emergency(emergency);
+        if self.floor.should_block_local(now) {
+            // Returned to the caller (shown as the PTT error); not also queued
+            // as a notice, or the UI would show it twice.
+            return Err(floor_policy::REJECT_CHANNEL_BUSY);
+        }
+        self.floor.clear_reject_reason();
+        self.preempted.store(false, Ordering::SeqCst);
+        let start_seq = self.tx_seq.load(Ordering::SeqCst).wrapping_add(1);
+        let inner = sassytalkie_core::ptt_frames::encode_ptt_start_v2(
+            self.session_epoch,
+            start_seq,
+            emergency,
+        );
+        self.send_control(&inner, now);
+        self.local_tx.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Close our floor claim (PTT release, preemption, or teardown). No-op if
+    /// we hold no claim.
+    pub fn floor_release(&self) {
+        if !self.local_tx.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let inner = sassytalkie_core::ptt_frames::encode_ptt_stop_v2(
+            self.session_epoch,
+            self.tx_seq.load(Ordering::SeqCst),
+        );
+        self.send_control(&inner, unix_now_ms());
+    }
+
+    /// True once if another radio took the floor from us since the last call.
+    pub fn take_preempted(&self) -> bool {
+        self.preempted.swap(false, Ordering::SeqCst)
+    }
+
+    fn send_control(&self, inner: &[u8], now_ms: u64) {
+        match self.control.seal(inner, now_ms) {
+            Some(sealed) => {
+                let _ = self.outbound_tx.try_send(sealed);
+            }
+            None => warn!("Cellular: floor frame not sent — no authenticated control context"),
+        }
+    }
+
+    fn on_floor_start(&self, sender: &str, start: sassytalkie_core::ptt_frames::PttStart) {
+        let now = unix_now_ms();
+        if self.local_tx.load(Ordering::SeqCst) {
+            let remote_wins = floor_policy::remote_wins(
+                self.session_epoch,
+                self.floor.self_emergency(),
+                start.epoch,
+                start.emergency,
+                &self.config.peer_id,
+                sender,
+            );
+            if !remote_wins {
+                info!("Cellular: concurrent floor request from {sender} denied by arbitration");
+                return;
+            }
+            info!(
+                "Cellular: floor preempted by {sender} (emergency={})",
+                start.emergency
+            );
+            self.floor.set_reject_reason(floor_policy::REJECT_PREEMPTED);
+            self.preempted.store(true, Ordering::SeqCst);
+            self.floor_release();
+        }
+        self.floor.hold(sender, floor_policy::STALE_HOLD_MS, now);
+    }
+
+    fn on_floor_stop(self: &Arc<Self>, sender: &str, stop: sassytalkie_core::ptt_frames::PttStop) {
+        self.floor.release_after_drain(sender, unix_now_ms());
+        // EOT_ACK after the jitter-buffer drain window, like Android
+        // handlePttStopV2: drives the sender's "Delivered" tick.
+        let this = Arc::clone(self);
+        let ack = sassytalkie_core::ptt_frames::encode_eot_ack(stop.epoch, stop.end_seq);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(floor_policy::DRAIN_HOLD_MS)).await;
+            this.send_control(&ack, unix_now_ms());
+        });
     }
 
     /// Connect to the relay. Awaits the FIRST dial so auth/connect failures are
@@ -269,7 +390,14 @@ impl CellularTransport {
             uuid::Uuid::new_v4(),
         );
         if self.has_completed_handshake.load(Ordering::Relaxed) {
-            url.push_str("&catchup=1");
+            // Only the gap we missed; catchup=1 replayed the whole ~30 s window
+            // (already-heard audio + stale control) on every reconnect.
+            if let Some(since) = sassytalkie_core::protocol::catchup_since_ms(
+                self.last_alive_ms.load(Ordering::Relaxed),
+                unix_now_ms(),
+            ) {
+                url.push_str(&format!("&since={since}"));
+            }
         }
         let mut request = url
             .into_client_request()
@@ -283,20 +411,16 @@ impl CellularTransport {
         let tls = super::tls_pinning::client_config()
             .map_err(|e| DialError::TerminalAuth(format!("tls config: {e}")))?;
         let connector = Connector::Rustls(std::sync::Arc::new(tls));
-        let (stream, _resp) = connect_async_tls_with_config(
-            request,
-            None,
-            false,
-            Some(connector),
-        )
-        .await
-        .map_err(|e| match &e {
-            WsError::Http(response) if is_terminal_http_status(response.status().as_u16()) => {
-                DialError::TerminalAuth(format!("ws upgrade http {}", response.status()))
-            }
-            _ => DialError::Retryable(format!("ws connect failed: {}", e)),
-        })?;
+        let (stream, _resp) = connect_async_tls_with_config(request, None, false, Some(connector))
+            .await
+            .map_err(|e| match &e {
+                WsError::Http(response) if is_terminal_http_status(response.status().as_u16()) => {
+                    DialError::TerminalAuth(format!("ws upgrade http {}", response.status()))
+                }
+                _ => DialError::Retryable(format!("ws connect failed: {}", e)),
+            })?;
         self.has_completed_handshake.store(true, Ordering::Relaxed);
+        self.last_alive_ms.store(unix_now_ms(), Ordering::Relaxed);
         Ok(stream)
     }
 
@@ -403,12 +527,23 @@ impl CellularTransport {
         }
     }
 
-    /// Route an inbound binary frame: authenticated control first, else audio.
-    fn handle_inbound(&self, bytes: Vec<u8>) {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+    /// Route an inbound binary frame: relay catch-up unwrapped first, then
+    /// authenticated control, else audio.
+    fn handle_inbound(self: &Arc<Self>, bytes: Vec<u8>) {
+        let now_ms = unix_now_ms();
+        self.last_alive_ms.store(now_ms, Ordering::Relaxed);
+        // OP_REPLAY_FRAME is not a TLV and must be unwrapped before the AEAD
+        // sees it. Only audio is caught up; replayed control is dropped.
+        if let Some(inner) = sassytalkie_core::protocol::replay_inner(&bytes) {
+            if sassytalkie_core::protocol::is_control_frame_shape(inner) {
+                return;
+            }
+            if self.handle_audio(inner.to_vec()) {
+                return;
+            }
+            // Did not open as catch-up: a live frame whose per-session nonce
+            // prefix merely looks like a replay header. Fall through.
+        }
         match self.control.handle_inbound(&bytes, now_ms, |session| {
             *self.crypto.lock().unwrap() = session;
         }) {
@@ -424,11 +559,25 @@ impl CellularTransport {
             ControlAction::Heartbeat | ControlAction::Emergency | ControlAction::InstalledPq => {
                 return;
             }
+            ControlAction::FloorStart { sender, start } => {
+                self.on_floor_start(&sender, start);
+                return;
+            }
+            ControlAction::FloorStop { sender, stop } => {
+                self.on_floor_stop(&sender, stop);
+                return;
+            }
             ControlAction::HybridOutbound(frame) => {
                 let _ = self.outbound_tx.try_send(frame);
                 return;
             }
         }
+        self.handle_audio(bytes);
+    }
+
+    /// Decrypt a sealed audio frame (live or unwrapped catch-up) and queue it.
+    /// Returns whether the frame authenticated under a session we hold.
+    fn handle_audio(&self, bytes: Vec<u8>) -> bool {
         let plain = {
             let live = self.crypto.lock().unwrap().decrypt(&bytes);
             match live {
@@ -442,7 +591,7 @@ impl CellularTransport {
                     }
                     None => {
                         debug!("Cellular: decrypt failed ({} bytes)", bytes.len());
-                        return;
+                        return false;
                     }
                 },
             }
@@ -450,8 +599,10 @@ impl CellularTransport {
         match wire::unpack_wire_frame(&plain) {
             Ok((_ch, _sub, sender, _name, ts, opus)) => {
                 if sender == self.config.peer_id {
-                    return;
+                    return true;
                 }
+                self.floor
+                    .hold(&sender, floor_policy::STALE_HOLD_MS, unix_now_ms());
                 self.packets_received.fetch_add(1, Ordering::Relaxed);
                 let _ = self.inbound_tx.try_send(super::AudioFrame {
                     sender,
@@ -467,6 +618,7 @@ impl CellularTransport {
                 );
             }
         }
+        true
     }
 
     /// Update the channel stamped into outbound wire frames (kept in sync with
@@ -481,13 +633,13 @@ impl CellularTransport {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        self.control.encode_heartbeat_sealed(
-            self.session_epoch,
-            seq,
-            now_ms,
-            control::PresenceState::Idle,
-            0,
-        )
+        let presence = if self.local_tx.load(Ordering::Relaxed) {
+            control::PresenceState::Speaking
+        } else {
+            control::PresenceState::Idle
+        };
+        self.control
+            .encode_heartbeat_sealed(self.session_epoch, seq, now_ms, presence, 0)
     }
 
     /// Encrypt an Opus frame and queue it for the relay. Mirrors the UDP
@@ -518,6 +670,7 @@ impl CellularTransport {
             .map_err(|e| format!("encrypt failed: {}", e))?;
         self.outbound_tx.try_send(sealed).map_err(str::to_string)?;
         self.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.tx_seq.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -601,20 +754,18 @@ fn https_base() -> String {
         .replacen("ws://", "http://", 1)
 }
 
-/// Is this a non-audio control frame? Matches the relay/Kotlin classifier:
-/// opcode in 0x10..=0x1F AND a TLV payload length that exactly accounts for the
-/// frame size. Encrypted audio frames begin with a 12-byte random nonce, so the
-/// joint opcode + exact-length check makes a false positive astronomically rare.
+/// Is this a non-audio control frame? Shared with every other client via
+/// `core::protocol::is_control_frame_shape` (opcode in 0x10..=0x20 AND a TLV
+/// length that exactly accounts for the frame).
 fn is_control_frame(b: &[u8]) -> bool {
-    if b.len() < 3 {
-        return false;
-    }
-    let op = b[0];
-    if !(0x10..=0x20).contains(&op) {
-        return false;
-    }
-    let payload_len = u16::from_le_bytes([b[1], b[2]]) as usize;
-    b.len() == 3 + payload_len
+    sassytalkie_core::protocol::is_control_frame_shape(b)
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Minimal percent-encoding for query values (RFC 3986 unreserved set passes
@@ -685,6 +836,160 @@ mod tests {
         assert!(!is_control_frame(&frame));
         let recovered = rx.decrypt(&frame).unwrap();
         assert_eq!(&recovered, opus);
+    }
+
+    fn replay_wrap(original: &[u8]) -> Vec<u8> {
+        let mut out = vec![sassytalkie_core::protocol::OP_REPLAY_FRAME, 0, 0];
+        out.extend_from_slice(original);
+        out
+    }
+
+    fn test_transport(key: [u8; 32]) -> Arc<CellularTransport> {
+        CellularTransport::new(
+            CellularConfig {
+                room_id: "room-test-0001".into(),
+                device_name: "desk".into(),
+                peer_id: "desk-peer".into(),
+            },
+            CryptoSession::from_psk(&key),
+            key,
+        )
+    }
+
+    /// The 3.2.6 regression: reconnects asked for catch-up but the replay
+    /// header went straight into the AEAD, so nothing replayed ever played.
+    #[tokio::test]
+    async fn replayed_audio_from_a_peer_decrypts_and_plays_once() {
+        let key = generate_psk();
+        let t = test_transport(key);
+        let mut rx = t.take_audio_receiver().unwrap();
+
+        let mut phone = CryptoSession::from_psk(&key);
+        let wire = wire::pack_wire_frame(1, wire::SUBCH_MAIN, "phone", "Phone", 42, b"opus-bytes");
+        let sealed = phone.encrypt(&wire).unwrap();
+
+        t.handle_inbound(replay_wrap(&sealed));
+        let frame = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("replayed frame must reach the decoder")
+            .unwrap();
+        assert_eq!(frame.sender, "phone");
+        assert_eq!(frame.opus, b"opus-bytes");
+
+        // Heard live already → the same sealed frame replayed is rejected by
+        // the AEAD replay window, not played twice.
+        t.handle_inbound(replay_wrap(&sealed));
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn replayed_control_and_own_audio_never_play() {
+        let key = generate_psk();
+        let t = test_transport(key);
+        let mut rx = t.take_audio_receiver().unwrap();
+
+        let ctrl = sassytalkie_core::protocol::encode_tlv(
+            sassytalkie_core::protocol::OP_AUTHENTICATED,
+            &[5u8; 40],
+        );
+        t.handle_inbound(replay_wrap(&ctrl));
+
+        let mut me = CryptoSession::from_psk(&key);
+        let own = wire::pack_wire_frame(1, wire::SUBCH_MAIN, "desk-peer", "desk", 7, b"mine");
+        t.handle_inbound(replay_wrap(&me.encrypt(&own).unwrap()));
+
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_err());
+    }
+
+    fn phone_control(key: [u8; 32], inner: &[u8]) -> Vec<u8> {
+        sassytalkie_core::control_auth::ControlAuthCodec::new(key, "room-test-0001", "phone", 0x10)
+            .unwrap()
+            .seal(inner, unix_now_ms())
+            .unwrap()
+    }
+
+    /// Opcodes of the sealed control frames the desktop queued for the relay.
+    async fn sent_opcodes(key: [u8; 32], rx: &mut RealtimeReceiver<Vec<u8>>) -> Vec<u8> {
+        let peer = sassytalkie_core::control_auth::ControlAuthCodec::new(
+            key,
+            "room-test-0001",
+            "observer",
+            0x20,
+        )
+        .unwrap();
+        let mut ops = Vec::new();
+        while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_millis(20), rx.recv()).await
+        {
+            if let Some(v) = peer.open(&frame, unix_now_ms()) {
+                ops.push(v.inner_frame[0]);
+            }
+        }
+        ops
+    }
+
+    #[tokio::test]
+    async fn desktop_refuses_ptt_while_another_radio_holds_the_floor() {
+        let key = generate_psk();
+        let t = test_transport(key);
+        t.handle_inbound(phone_control(
+            key,
+            &sassytalkie_core::ptt_frames::encode_ptt_start_v2(0x10, 1, false),
+        ));
+        assert_eq!(
+            t.floor_request(false),
+            Err(floor_policy::REJECT_CHANNEL_BUSY)
+        );
+        // A local emergency is never blocked.
+        assert!(t.floor_request(true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn inbound_audio_alone_locks_the_floor() {
+        let key = generate_psk();
+        let t = test_transport(key);
+        let _rx = t.take_audio_receiver().unwrap();
+        let mut phone = CryptoSession::from_psk(&key);
+        let wire = wire::pack_wire_frame(1, wire::SUBCH_MAIN, "phone", "Phone", 1, b"opus");
+        t.handle_inbound(phone.encrypt(&wire).unwrap());
+        assert!(
+            t.floor().is_held(unix_now_ms()),
+            "lost PTT_START must not mean a free channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_start_preempts_and_desktop_sends_stop() {
+        let key = generate_psk();
+        let t = test_transport(key);
+        let mut out = t.outbound_rx.lock().unwrap().take().unwrap();
+
+        t.floor_request(false).unwrap();
+        assert_eq!(
+            sent_opcodes(key, &mut out).await,
+            vec![sassytalkie_core::protocol::OP_PTT_START_V2]
+        );
+
+        t.handle_inbound(phone_control(
+            key,
+            &sassytalkie_core::ptt_frames::encode_ptt_start_v2(u64::MAX, 1, true),
+        ));
+        assert!(t.take_preempted(), "emergency always wins the floor");
+        assert!(!t.take_preempted(), "one-shot");
+        assert_eq!(
+            sent_opcodes(key, &mut out).await,
+            vec![sassytalkie_core::protocol::OP_PTT_STOP_V2]
+        );
+        assert_eq!(
+            t.floor().take_reject_reason().as_deref(),
+            Some(floor_policy::REJECT_PREEMPTED)
+        );
+        // Releasing again (the UI's PTT-up) sends nothing more.
+        t.floor_release();
+        assert!(sent_opcodes(key, &mut out).await.is_empty());
     }
 
     #[test]

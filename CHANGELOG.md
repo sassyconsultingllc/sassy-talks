@@ -9,6 +9,90 @@ All notable changes to SassyTalkie. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions map to Android
 `versionName` (versionCode in parentheses).
 
+## [Unreleased]
+
+### Changed
+- **Android UI overhaul:** bottom tab bar (Radio, Activity, People, Settings)
+  replaces the radio screen's overflow menu; one dark theme with a single teal
+  accent, orange only on air, red only for SOS. The radio screen shows link
+  status, peer count and encryption in one line under the title, invite and
+  SOS in the header, and in place of the channel card a "Playing clip" card
+  with progress and skip, "X is talking" cards for clips still arriving, or an
+  ON AIR card with a timer while transmitting. End Session moved to People;
+  About moved under Settings; PTT geometry sliders sit behind Small / Large /
+  Full width presets. The diagnostics chip moved off the screen headers.
+- **Whole-clip receive (Android):** each incoming transmission is buffered
+  until it has fully arrived (1.2 s of no frames), then played start to
+  finish. No live passthrough, so network jitter can no longer chop playback.
+  Per-speaker buffer raised from 10 s to 300 s (the TX limit); replay history
+  capped at 5 minutes of audio in total. iOS and desktop keep live playback
+  for now (`AudioCache::set_whole_clip_mode`).
+- **Audio quality:** Opus 64 kbps, complexity 10, full-fidelity (AUDIO) mode
+  on Android, iOS and desktop (was 32 kbps VoIP, complexity 5 on Android).
+  Hardware AGC off by default (it compressed and pumped on whistles and loud
+  voices).
+- **Android:** screenshots and screen recording allowed on every screen while
+  the "Show diagnostics panel" setting is on, for debug sessions.
+
+### Fixed
+- **Transmissions longer than ~10 s broke on the receiver:** focus and the
+  speaker route were dropped 5 s into speech (stay-hot timer armed once at
+  speech start), the per-speaker buffer dropped every frame after 10 s, and a
+  queued clip was dumped into a ~1 s playout buffer, keeping only its last
+  second.
+- **False "Not reaching peer" on every relay transmission:** receivers sent
+  RECV_ACK only for Bluetooth audio. They now also send it for relay and
+  Wi-Fi audio, but only while peer audio is actually arriving, and the same
+  loop keeps the floor held (it was released 1.5 s into each relay
+  transmission). Authenticated control frames carrying our own sender id
+  (echoes) are now ignored instead of being treated as a peer.
+- **Presence beacons played as 20 ms clips** every 10 s, starting the speaker
+  and taking the phone line each time.
+- **Local builds shipped stale native code:** the committed `jniLibs` were
+  from Sep 22; rebuilt with cargo-ndk.
+- **Android R8 (Play "DEX code optimization below threshold", 12%):**
+  proguard-rules.pro blanket-kept Compose, Firebase, all of Play Services,
+  ML Kit, CameraX, Material and security-crypto, so R8 barely ran. Rules
+  now keep only what JNI or reflection needs (SassyTalkNative,
+  TranscriptionBridge, ContextCompat.checkSelfPermission, native methods)
+  plus Firebase/ML Kit ComponentRegistrar constructors, which R8 otherwise
+  strips and which silently kill the QR scanner and translator. ~97% of
+  classes are now obfuscated; verified on a minified build.
+- **Android RX audio focus race:** the RX stay-hot timer ran on
+  Dispatchers.Default and could abandon audio focus and drop the route
+  keeper right after a quick reply re-took them. Focus/route state is now
+  confined to the main thread.
+- **Senders silently inaudible on desktop and iPhone (since 3.2):** the
+  authenticated control plane treated any frame starting below 0x10 as a
+  legacy hint. Sealed audio starts with a per-session random nonce prefix,
+  so in 1 session in 16 a sender was dropped entirely by desktop and iOS
+  listeners until it restarted. Legacy hints are now single-byte only.
+- **Reconnect catch-up (since 3.2.6):** every reconnect asked the relay for
+  `catchup=1`, and no client unwrapped OP_REPLAY_FRAME, so up to 30 s of
+  replay went into the AEAD as garbage (diagnostics read it as a key
+  mismatch). Clients now unwrap replays, drop replayed control, and ask only
+  for the gap they missed (`since=`, 15 s cap). Relay: no self-echo or stale
+  control in replays; 13-byte PTT_START_V2 wakes offline peers again.
+- **Desktop:** receiving indicator and incoming chime never fired (3.2.7);
+  Linux build (stylesheet case, libsecret vault that never compiled);
+  invite links pasted inside chat text.
+- **iOS:** relay stayed offline after one failed /auth; app stuck on
+  "Receiving"; status messages overwritten every 100 ms; init failed without
+  Wi-Fi multicast; one Opus decoder shared by every relay talker; AirPods /
+  route changes silenced audio; render thread took the global lock; stale mic
+  audio at the start of each press; random per-launch identity; channel
+  stepper past the 8 sessions support; mic left hot after preemption or the
+  60 s limit; PaywallView did not compile for iOS 14; no StoreKit
+  `Transaction.updates` listener; restore without `AppStore.sync()`; promo
+  users who later bought were locked out when the promo lapsed.
+
+### Added
+- **Desktop floor control:** claims and releases the floor with
+  PTT_START_V2/STOP_V2, refuses "Channel busy", yields to emergency / lower
+  epoch, EOT_ACKs peers, 60 s safety limit (Android/iOS parity).
+- **CI:** first green run. iOS simulator build (Rust + Swift) with a bridging
+  header vs Rust FFI drift check; Android SDK and CMake 4 fixes.
+
 ## [3.2.7] (83 Android / 85 iOS) - 2026-09-24
 
 ### Added

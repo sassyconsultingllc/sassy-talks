@@ -45,6 +45,8 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.sassyconsulting.sassytalkie.debug.DebugOverlay
 import com.sassyconsulting.sassytalkie.debug.DiagnosticsPrefs
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import com.sassyconsulting.sassytalkie.input.HardwarePttController
 import com.sassyconsulting.sassytalkie.ui.theme.SassyTalkTheme
 import com.sassyconsulting.sassytalkie.ui.AppNavigation
@@ -176,6 +178,11 @@ class MainActivity : ComponentActivity() {
         // capture via setScreenshotsAllowed() so users can photograph QR codes.
         if (BuildConfig.NO_SCREENSHOTS) {
             setScreenshotsAllowed(false)
+            // Diagnostics mode lifts the block everywhere so a debug session
+            // can be screen-recorded; turning diagnostics off restores it.
+            lifecycleScope.launch {
+                DiagnosticsPrefs.overlayEnabled.collect { applyCapturePolicy() }
+            }
         }
 
         // Capture the initial deep-link URI if we were launched via VIEW intent.
@@ -223,8 +230,10 @@ class MainActivity : ComponentActivity() {
                     if (!pipActive && showHud) {
                         DebugOverlay(
                             modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .padding(top = 80.dp, end = 8.dp)
+                                // Bottom-right, above the tab bar: top-right sat on
+                                // every screen's title and header buttons.
+                                .align(Alignment.BottomEnd)
+                                .padding(bottom = 88.dp, end = 8.dp)
                                 .wrapContentWidth()
                                 .widthIn(max = 280.dp),
                         )
@@ -348,11 +357,19 @@ class MainActivity : ComponentActivity() {
     /**
      * Release builds block screenshots on the live radio screen (FLAG_SECURE).
      * Auth / QR screens allow capture so remote users can photograph a QR code
-     * when invite links fail.
+     * when invite links fail. While the diagnostics panel setting is on,
+     * capture is allowed on every screen for debug screen recordings.
      */
     fun setScreenshotsAllowed(allowed: Boolean) {
+        screenAllowsCapture = allowed
+        applyCapturePolicy()
+    }
+
+    private var screenAllowsCapture = false
+
+    private fun applyCapturePolicy() {
         if (!BuildConfig.NO_SCREENSHOTS) return
-        if (allowed) {
+        if (screenAllowsCapture || DiagnosticsPrefs.overlayEnabled.value) {
             window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
         } else {
             window.setFlags(

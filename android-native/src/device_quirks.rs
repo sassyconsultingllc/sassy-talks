@@ -34,13 +34,15 @@ pub struct EffectsConfig {
 }
 
 impl Default for EffectsConfig {
-    /// PTT defaults: AEC off (half-duplex doesn't need it), NS off (OEM NS
-    /// too aggressive on average), AGC on (helps distance-to-mic variation).
+    /// PTT defaults: all hardware effects off. AEC: half-duplex doesn't need
+    /// it. NS: OEM NS is too aggressive on average. AGC: it is a dynamic-range
+    /// compressor that pumps on whistles, music and loud voices, and current
+    /// phone mics don't need it; the software mic-gain setting covers level.
     fn default() -> Self {
         Self {
             enable_aec: false,
             enable_ns: false,
-            enable_agc: true,
+            enable_agc: false,
         }
     }
 }
@@ -147,10 +149,10 @@ fn samsung_profile() -> Profile {
         effects: EffectsConfig {
             enable_aec: false,
             enable_ns: false,
-            enable_agc: true,
+            enable_agc: false,
         },
         output_force_comm_mode: true,
-        notes: "Samsung: NS too aggressive on quiet speakers; AGC works fine. \
+        notes: "Samsung: NS too aggressive on quiet speakers; AGC off (compresses). \
                 Force comm-mode loudspeaker on RX (earpiece is not the default).",
         ..Profile::default()
     }
@@ -161,7 +163,7 @@ fn xiaomi_profile() -> Profile {
         effects: EffectsConfig {
             enable_aec: false,
             enable_ns: false,
-            enable_agc: true,
+            enable_agc: false,
         },
         output_force_comm_mode: true,
         notes: "Xiaomi: MIUI sound enhance mangles voice; force comm mode output.",
@@ -239,7 +241,7 @@ mod tests {
     fn samsung_picked_for_samsung_manufacturer() {
         let p = pick_profile("samsung", "SM-G998U", "g0q");
         assert!(p.notes.starts_with("Samsung"));
-        assert!(p.effects.enable_agc);
+        assert!(!p.effects.enable_agc);
         assert!(!p.effects.enable_ns);
         assert!(p.output_force_comm_mode);
     }

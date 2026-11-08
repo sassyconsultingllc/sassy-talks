@@ -160,6 +160,10 @@ pub struct AppStatus {
     pub peer_count: usize,
     pub is_transmitting: bool,
     pub is_receiving: bool,
+    /// Another radio holds the floor; a PTT press would be refused.
+    pub channel_busy: bool,
+    /// Why our last transmission ended on its own (preempted / time limit).
+    pub tx_notice: Option<String>,
 }
 
 /// Get application status
@@ -170,6 +174,8 @@ pub async fn get_status(state: State<'_, Arc<AppState>>) -> Result<AppStatus, St
     let peers = state.get_nearby_devices().await;
     let peer_count = peers.len();
     let is_receiving = state.is_receiving();
+    let channel_busy = state.channel_busy().await;
+    let tx_notice = state.take_tx_notice().await;
 
     Ok(AppStatus {
         connection_status,
@@ -177,6 +183,8 @@ pub async fn get_status(state: State<'_, Arc<AppState>>) -> Result<AppStatus, St
         peer_count,
         is_transmitting: matches!(connection_status, ConnectionStatus::Transmitting),
         is_receiving,
+        channel_busy,
+        tx_notice,
     })
 }
 
