@@ -40,6 +40,12 @@ All notable changes to SassyTalkie. Format loosely follows
   speech start), the per-speaker buffer dropped every frame after 10 s, and a
   queued clip was dumped into a ~1 s playout buffer, keeping only its last
   second.
+- **False "Not reaching peer" on every relay transmission:** receivers sent
+  RECV_ACK only for Bluetooth audio. They now also send it for relay and
+  Wi-Fi audio, but only while peer audio is actually arriving, and the same
+  loop keeps the floor held (it was released 1.5 s into each relay
+  transmission). Authenticated control frames carrying our own sender id
+  (echoes) are now ignored instead of being treated as a peer.
 - **Presence beacons played as 20 ms clips** every 10 s, starting the speaker
   and taking the phone line each time.
 - **Local builds shipped stale native code:** the committed `jniLibs` were

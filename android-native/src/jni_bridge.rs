@@ -1560,6 +1560,15 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         .unwrap_or(0)
 }
 
+/// JNI: ms since the last accepted peer audio frame on any transport, -1 if none.
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeLastRxAudioAgeMs(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jlong {
+    crate::audio_pipeline::last_rx_audio_age_ms()
+}
+
 /// JNI: true while received audio is being played (AudioTrack held open).
 #[no_mangle]
 pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeIsRxPlaybackActive(

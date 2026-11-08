@@ -119,6 +119,10 @@ class PttCoordinator(
         // 500ms while audio is in flight caused 50-200ms RFCOMM stalls on
         // most chipsets (audible as garble/dropouts during BT fallback).
         private const val RECV_ACK_INTERVAL_MS = 1_500L
+        /** Relay/Wi-Fi receipts: well inside REACHING_PEER_TIMEOUT_MS. */
+        private const val IP_RECV_ACK_INTERVAL_MS = 1_000L
+        /** Peer audio counts as "arriving" if a frame landed this recently. */
+        private const val IP_AUDIO_FRESH_MS = 600L
         // Bumped from 1s to 2.5s so one missed ACK at the new 1.5s interval
         // doesn't continuously flag reachingPeer=false. With the slower
         // ACK cadence we need at most one missed packet of slack.
@@ -1129,6 +1133,13 @@ class PttCoordinator(
         } else {
             null // Legacy BLE hints remain non-privileged compatibility signals.
         }
+        // Our own frames can come back to us (relay catch-up replay, a second
+        // socket). Treated as a peer, they flipped "peer epoch changed" every
+        // couple of seconds, raised concurrent-floor denials against
+        // ourselves and fed us our own EOT_ACKs.
+        if (verified != null && selfPeerId.isNotEmpty() && verified.senderId == selfPeerId) {
+            return
+        }
         val authenticatedBytes = verified?.innerFrame ?: bytes
         val authenticatedPeerId = verified?.let { "auth:${it.senderId}" } ?: peerId
         val frame = ControlFrame.decode(authenticatedBytes) ?: return
@@ -1636,6 +1647,46 @@ class PttCoordinator(
         }
         holdFloor(peerId, FloorArbitration.STALE_HOLD_MS)
         setPeerSpeaking(true)
+        startIpRecvAck(peerId, remoteEpoch)
+    }
+
+    /**
+     * RECV_ACK for a peer whose audio arrives over the relay or Wi-Fi. Those
+     * frames are decoded natively and never reach [onAudioFrameReceived] (the
+     * Bluetooth path), so the sender's reaching-peer watchdog reported "Not
+     * reaching peer" on every relay transmission. Receipts go out only while
+     * native reports fresh peer audio, so one still means audio arrived. The
+     * same loop keeps the floor held, which relay audio never refreshed (it
+     * was released 1.5 s into every relay transmission). Stopped by
+     * PTT_STOP_V2 ([stopRecvAckJob]) or when the audio stops.
+     */
+    private fun startIpRecvAck(peerId: String, epoch: Long) {
+        val now = System.currentTimeMillis()
+        val st = rxAckStates.getOrPut(peerId) { RxAckState(epoch, 0, now) }
+        st.epoch = epoch
+        st.lastFrameMs = now
+        if (st.job?.isActive == true) return
+        st.job = scope.launch {
+            var lastSentMs = 0L
+            while (isActive) {
+                delay(250L)
+                val nowMs = System.currentTimeMillis()
+                val age = SassyTalkNative.lastRxAudioAgeMs()
+                if (age in 0..IP_AUDIO_FRESH_MS) {
+                    st.lastFrameMs = nowMs
+                    if (nowMs - lastSentMs >= IP_RECV_ACK_INTERVAL_MS) {
+                        val frame = ControlFrame.encodeRecvAck(st.epoch, st.seq, nowMs)
+                        cellularClient?.sendBinary(frame)
+                        bleSignaling?.sendControl(peerId, frame)
+                        holdFloor(peerId, FloorArbitration.STALE_HOLD_MS)
+                        lastSentMs = nowMs
+                    }
+                } else if (nowMs - st.lastFrameMs > RECV_ACK_INTERVAL_MS * 3) {
+                    Log.d(TAG, "IP RECV_ACK loop stopping for $peerId: no audio")
+                    break
+                }
+            }
+        }
     }
 
     /**

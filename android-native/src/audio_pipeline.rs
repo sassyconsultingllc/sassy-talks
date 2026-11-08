@@ -42,6 +42,28 @@ pub fn is_rx_playback_active() -> bool {
     RX_PLAYBACK_ACTIVE.load(Ordering::Relaxed)
 }
 
+/// Wall-clock ms of the last peer audio frame accepted for our channel and
+/// sub-channel on any transport (0 = none yet). Kotlin's RECV_ACK loop for
+/// relay/Wi-Fi peers sends receipts only while this is fresh, so a receipt
+/// means audio really arrived, not merely that PTT_START did.
+static LAST_RX_AUDIO_MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Milliseconds since the last accepted peer audio frame, or -1 if none.
+pub fn last_rx_audio_age_ms() -> i64 {
+    let last = LAST_RX_AUDIO_MS.load(Ordering::Relaxed);
+    if last == 0 {
+        return -1;
+    }
+    now_wall_ms().saturating_sub(last) as i64
+}
+
 /// Toggle whether the RX thread invokes the Kotlin TranscriptionBridge.
 /// Called from Kotlin via JNI (see jni_bridge.rs `nativeSetTranscriptionBridgeEnabled`).
 pub fn set_transcription_bridge_enabled(enabled: bool) {
@@ -815,6 +837,7 @@ pub fn process_incoming_wire_frame(
         reg.register_user(sender_id, device_name);
         return;
     }
+    LAST_RX_AUDIO_MS.store(now_wall_ms(), Ordering::Relaxed);
 
     {
         let mut reg = user_registry.lock().unwrap();

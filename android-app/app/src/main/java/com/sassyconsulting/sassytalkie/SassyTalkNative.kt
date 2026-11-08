@@ -292,6 +292,16 @@ object SassyTalkNative {
 
     fun isConnected(): Boolean = hasLiveAudioPath()
 
+    /** Ms since the last peer audio frame on any transport; -1 if none or unavailable. */
+    fun lastRxAudioAgeMs(): Long {
+        if (!initialized) return -1L
+        return try {
+            nativeLastRxAudioAgeMs()
+        } catch (_: Throwable) {
+            -1L
+        }
+    }
+
     /** True while received audio is playing (native AudioTrack held open). */
     fun isRxPlaybackActive(): Boolean {
         if (!initialized) return false
@@ -1487,6 +1497,7 @@ object SassyTalkNative {
     @JvmStatic private external fun nativeGetPreferredTransport(): Byte
     @JvmStatic private external fun nativeHasLiveAudioPath(): Boolean
     @JvmStatic private external fun nativeIsRxPlaybackActive(): Boolean
+    @JvmStatic private external fun nativeLastRxAudioAgeMs(): Long
 
     // Connection
     @JvmStatic private external fun nativeDisconnect(): Boolean
