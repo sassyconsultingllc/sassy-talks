@@ -1,3 +1,8 @@
+<!--
+   Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+   Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+   CodeMark: SCLLC1-sassytalkie-FJVMO4M5KDGF
+-->
 # Transport verification matrix — v3.1.12
 
 Physical devices required for BT RFCOMM and reliable WiFi multicast. Emulators are relay-only and must not be used to sign off local planes.

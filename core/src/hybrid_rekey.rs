@@ -1,5 +1,8 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-IKHFLMHSBKXT
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 //! Staged hybrid/PQC rekey: neither side TXes on the new key until the
 //! 4-way completes without a split. Auto-PQC initiation stays off unless a
 //! caller explicitly enables it.
