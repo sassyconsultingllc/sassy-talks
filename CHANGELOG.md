@@ -11,6 +11,34 @@ All notable changes to SassyTalkie. Format loosely follows
 
 ## [Unreleased]
 
+## [3.2.12] (88) - 2026-11-09
+
+Merges the July swarm-audit branch (#17) and the desktop npm bumps (#36).
+
+### Fixed
+- **Android presence:** `WalkieService` now gives the PTT coordinator a real
+  `PresenceSensor`, so heartbeats carry actual presence instead of always
+  "listening".
+- **Android people list:** mute, favorite and remove act on the running state
+  machine's user registry, not a separate copy that the UI never read.
+- **Android rotation:** `MainActivity` no longer shuts down the backend and
+  service on a configuration change, only when the user actually leaves.
+- **Android session key:** the sealed-relay session key is zeroized when it is
+  replaced or cleared.
+- **Desktop VOX:** the VOX setting now gates outbound frames by level; before,
+  it was stored but never used.
+
+### Added
+- **Relay rate limiting:** per-IP fixed-window limits on `/auth`, `/presence`
+  and `/share` (takes effect on the next relay deploy).
+- **Desktop recent sessions:** a persisted cohort history (no key material).
+- **Core:** bitrate guard; `pqc`, `channels` and `emergency` behind the default
+  `roadmap` feature.
+
+### Changed
+- **Desktop deps:** nanoid 3.3.18, postcss 8.5.26, browserslist 4.28.9,
+  baseline-browser-mapping 2.11.35.
+
 ## [3.2.11] (87) - 2026-11-09
 
 ### Fixed
