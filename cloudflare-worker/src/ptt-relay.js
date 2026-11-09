@@ -618,16 +618,17 @@ export class PttRoom extends DurableObject {
         if (att) this.sessions.set(ws, att);
       }
       const session = this.sessions.get(ws);
+      // A socket we already closed can linger in getWebSockets() for a while;
+      // re-hydrating its attachment made every sweep announce it again.
+      if (session && session.offlineNotified) {
+        this.sessions.delete(ws);
+        continue;
+      }
       if (session && session.lastSeenMs && now - session.lastSeenMs > HEARTBEAT_STALE_MS) {
         // A stale peer is being dropped — it may reconnect with ?catchup.
         this.bufferUntilMs = now + BUFFER_TTL_MS;
-        // Push PARTNER_OFFLINE to other peers, keyed on the stable peer id.
-        const frame = buildPartnerOfflineFrame(session.peer || session.id || "unknown");
-        for (const peer of this.ctx.getWebSockets()) {
-          if (peer !== ws) {
-            this.safeSend(peer, frame);
-          }
-        }
+        this.announcePartnerOffline(ws, session);
+        try { ws.serializeAttachment({ ...session, offlineNotified: true }); } catch {}
         try { ws.close(1001, "Heartbeat stale"); } catch {}
         this.sessions.delete(ws);
       } else {
@@ -664,15 +665,26 @@ export class PttRoom extends DurableObject {
     // window so the store-and-forward ring actually retains what it missed.
     this.bufferUntilMs = Date.now() + BUFFER_TTL_MS;
 
-    const sockets = this.ctx.getWebSockets();
+    // The sweeper already announced (and closed) this socket.
+    if (session.offlineNotified) return;
+    this.announcePartnerOffline(ws, session);
+  }
 
-    // Push binary PARTNER_OFFLINE TLV to remaining peers, keyed on the STABLE
-    // per-install peer id (not session.id, the per-connection UUID the other
-    // side never learned). Receivers track partners by the stable peer id, so
-    // keying on session.id meant the offline notice never matched a partner.
-    const offlineFrame = buildPartnerOfflineFrame(session.peer || session.id || "unknown");
-    for (const peer of sockets) {
-      this.safeSend(peer, offlineFrame);
+  /**
+   * Push binary PARTNER_OFFLINE TLV to the remaining peers, keyed on the
+   * STABLE per-install peer id (not session.id, the per-connection UUID the
+   * other side never learned). Skips the leaving socket and any newer socket
+   * of the same peer, which would otherwise be told it went offline itself.
+   */
+  announcePartnerOffline(ws, session) {
+    const offlineId = session.peer || session.id || "unknown";
+    const frame = buildPartnerOfflineFrame(offlineId);
+    for (const peer of this.ctx.getWebSockets()) {
+      if (peer === ws) continue;
+      const other = this.sessions.get(peer) || peer.deserializeAttachment() || {};
+      if (other.offlineNotified) continue;
+      if (session.peer && other.peer === session.peer) continue;
+      this.safeSend(peer, frame);
     }
   }
 
