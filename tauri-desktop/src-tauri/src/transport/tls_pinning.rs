@@ -1,5 +1,8 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-2NQG3N56REPF
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 //! Desktop TLS pin-set for the Cloudflare relay. Uses GTS intermediate SPKI
 //! pins from `sassytalkie_core::tls_pins` (primary + backups). Enabled by
 //! default when the pin-set is complete; `SASSYTALKIE_TLS_PINNING=0` disables.

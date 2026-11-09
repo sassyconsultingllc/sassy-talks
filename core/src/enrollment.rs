@@ -1,5 +1,8 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-E5M4RT22BU3I
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 //! Room ID is not authorization. Join requires a room-secret proof (PSK HMAC)
 //! and, when MDM supplies an enrollment token, that token must match.
 

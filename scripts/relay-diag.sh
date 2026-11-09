@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 # Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+# CodeMark: SCLLC1-sassytalkie-REP5XJSZIZD3
+# Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+# Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 # scripts/relay-diag.sh — watch a transfer through the relay across every
 # attached device, side by side.
 #

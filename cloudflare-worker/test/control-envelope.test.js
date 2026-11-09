@@ -1,4 +1,7 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
+// Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
+// CodeMark: SCLLC1-sassytalkie-JHJQ4TNWSYJO
+// Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 import { describe, expect, it } from "vitest";
 import { looksLikeTrigger } from "../src/ptt-relay.js";
 
