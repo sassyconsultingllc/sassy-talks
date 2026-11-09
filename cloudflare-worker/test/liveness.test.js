@@ -2,7 +2,7 @@
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-PNM7QL45MWMC
 import { describe, it, expect } from "vitest";
-import { buildPartnerOfflineFrame, buildReplayFrame } from "../src/ptt-relay.js";
+import { buildPartnerOfflineFrame, buildReplayFrame, PttRoom } from "../src/ptt-relay.js";
 
 describe("buildPartnerOfflineFrame", () => {
   it("encodes opcode 0x14 with TLV format", () => {
@@ -37,5 +37,61 @@ describe("buildReplayFrame", () => {
     expect(f[0]).toBe(0x19);
     expect(f[1] | (f[2] << 8)).toBe(0); // peer_id_len
     expect(Array.from(f.slice(3))).toEqual([0xAA, 0xBB, 0xCC]);
+  });
+});
+
+describe("PARTNER_OFFLINE fan-out", () => {
+  function sock(att) {
+    return {
+      att,
+      sent: [],
+      closed: false,
+      deserializeAttachment() { return this.att; },
+      serializeAttachment(a) { this.att = a; },
+      close() { this.closed = true; },
+    };
+  }
+  function room(sockets) {
+    const r = Object.create(PttRoom.prototype);
+    r.sessions = new Map();
+    r.ctx = {
+      getWebSockets: () => sockets,
+      storage: { setAlarm: async () => {} },
+    };
+    r.safeSend = (peer, frame) => { peer.sent.push(frame); return true; };
+    return r;
+  }
+  const stale = () => Date.now() - 60_000;
+
+  it("announces a stale socket once, even while it lingers in getWebSockets", async () => {
+    const gone = sock({ peer: "emu", lastSeenMs: stale() });
+    const phone = sock({ peer: "phone", lastSeenMs: Date.now() });
+    const r = room([gone, phone]);
+    await r.alarm();
+    r.sessions.clear(); // hibernation wake: state comes back from attachments
+    await r.alarm();
+    await r.alarm();
+    expect(phone.sent.length).toBe(1);
+    expect(phone.sent[0][0]).toBe(0x14);
+    expect(gone.closed).toBe(true);
+  });
+
+  it("does not tell a peer's reconnected socket that the peer went offline", async () => {
+    const oldEmu = sock({ peer: "emu", lastSeenMs: Date.now() });
+    const newEmu = sock({ peer: "emu", lastSeenMs: Date.now() });
+    const phone = sock({ peer: "phone", lastSeenMs: Date.now() });
+    const r = room([newEmu, phone]);
+    await r.webSocketClose(oldEmu, 1006, "", false);
+    expect(newEmu.sent.length).toBe(0);
+    expect(phone.sent.length).toBe(1);
+  });
+
+  it("skips the close-time notice when the sweeper already sent it", async () => {
+    const gone = sock({ peer: "emu", lastSeenMs: stale() });
+    const phone = sock({ peer: "phone", lastSeenMs: Date.now() });
+    const r = room([gone, phone]);
+    await r.alarm();
+    await r.webSocketClose(gone, 1001, "Heartbeat stale", true);
+    expect(phone.sent.length).toBe(1);
   });
 });

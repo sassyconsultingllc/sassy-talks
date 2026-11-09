@@ -123,6 +123,8 @@ class PttCoordinator(
         private const val IP_RECV_ACK_INTERVAL_MS = 1_000L
         /** Peer audio counts as "arriving" if a frame landed this recently. */
         private const val IP_AUDIO_FRESH_MS = 600L
+        /** The relay sweeper can repeat one notice; act on it once. */
+        private const val PARTNER_OFFLINE_DEDUP_MS = 30_000L
         // Bumped from 1s to 2.5s so one missed ACK at the new 1.5s interval
         // doesn't continuously flag reachingPeer=false. With the slower
         // ACK cadence we need at most one missed packet of slack.
@@ -711,6 +713,27 @@ class PttCoordinator(
         return true
     }
 
+    private val partnerOfflineSeenMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * Relay notice that a peer's socket went away. Sticky session: a WS drop is
+     * not leaving the channel, so the roster entry stays and goes STALE, and
+     * PTT/wake can still reach the peer's foreground service via push.
+     */
+    private fun handlePartnerOffline(payload: ByteArray) {
+        if (payload.isEmpty()) return
+        val idLen = payload[0].toInt() and 0xFF
+        if (idLen == 0 || payload.size < 1 + idLen) return
+        val offlinePeerId = String(payload, 1, idLen, Charsets.UTF_8)
+        // After our own reconnect the relay reports our previous socket.
+        if (selfPeerId.isNotEmpty() && offlinePeerId == selfPeerId) return
+        val now = System.currentTimeMillis()
+        val last = partnerOfflineSeenMs.put(offlinePeerId, now)
+        if (last != null && now - last < PARTNER_OFFLINE_DEDUP_MS) return
+        Log.i(TAG, "Partner socket idle: $offlinePeerId — keeping on channel for wake")
+        maybeWakeStalePeers()
+    }
+
     fun onPttReleased() = forceStop("release")
 
     /**
@@ -1121,6 +1144,13 @@ class PttCoordinator(
     fun onControlFrame(peerId: String, bytes: ByteArray) {
         if (bytes.isEmpty()) return
         val outerOpcode = bytes[0].toInt() and 0xff
+        // PARTNER_OFFLINE is minted by the relay server, which holds no room
+        // key, so it can never be authenticated. Accept it only off the relay
+        // socket; it is a presence hint (log + rate-limited wake), not a command.
+        if (outerOpcode == (ControlFrame.OP_PARTNER_OFFLINE.toInt() and 0xff) && peerId.startsWith("relay")) {
+            ControlFrame.decode(bytes)?.let { handlePartnerOffline(it.payload) }
+            return
+        }
         val verified = if (outerOpcode >= 0x10) {
             if (outerOpcode != (ControlFrame.OP_AUTHENTICATED.toInt() and 0xff)) {
                 Log.w(TAG, "Rejected unauthenticated control opcode=0x${outerOpcode.toString(16)} from $peerId")
@@ -1203,22 +1233,7 @@ class PttCoordinator(
             } catch (t: Throwable) {
                 Log.e(TAG, "hybrid CONFIRM_ACK handler failed: ${t.message}", t)
             }
-            ControlFrame.OP_PARTNER_OFFLINE -> {
-                if (frame.payload.isNotEmpty()) {
-                    val idLen = frame.payload[0].toInt() and 0xFF
-                    if (frame.payload.size >= 1 + idLen) {
-                        val offlinePeerId = String(frame.payload, 1, idLen, Charsets.UTF_8)
-                        // Sticky session: WS drop ≠ left the channel. Keep the
-                        // roster entry so health goes STALE and PTT/wake can
-                        // still reach their foreground service via FCM.
-                        android.util.Log.i(
-                            "PttCoord",
-                            "Partner socket idle: $offlinePeerId — keeping on channel for wake",
-                        )
-                        maybeWakeStalePeers()
-                    }
-                }
-            }
+            ControlFrame.OP_PARTNER_OFFLINE -> handlePartnerOffline(frame.payload)
 
             else -> {
                 // Future opcodes — no-op for now

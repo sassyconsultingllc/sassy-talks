@@ -11,6 +11,21 @@ All notable changes to SassyTalkie. Format loosely follows
 
 ## [Unreleased]
 
+## [3.2.11] (87) - 2026-11-09
+
+### Fixed
+- **Partner-offline notices:** the relay's PARTNER_OFFLINE notice (sent when a
+  peer's socket goes stale or closes) was rejected by Android as an
+  unauthenticated control frame, since the relay holds no room key. Android
+  now accepts it only from the relay socket, treats it as a presence hint
+  (log plus the existing rate-limited wake), ignores notices about itself,
+  and drops repeats for the same peer within 30 s.
+- **Relay notice storm:** a stale socket that lingered after hibernation was
+  re-announced on every 2 s alarm sweep (16 notices in about 45 s during the
+  smoke test). The relay now announces each socket once, skips the close
+  handler's notice if the sweeper already sent it, and no longer tells a
+  peer's own reconnected socket that the peer went offline.
+
 ## [3.2.10] (86) - 2026-11-08
 
 ### Changed
