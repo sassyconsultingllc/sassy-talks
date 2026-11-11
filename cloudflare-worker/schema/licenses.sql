@@ -50,3 +50,12 @@ CREATE TABLE IF NOT EXISTS promo_redemptions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_promo_redemptions_code ON promo_redemptions(code_hash);
+
+-- Failed promo-code attempts per source (HMAC of the IP) and hour window.
+-- An atomic counter: the worker upserts n = n + 1 before each lookup.
+CREATE TABLE IF NOT EXISTS promo_attempts (
+  ip_hash TEXT NOT NULL,
+  win     INTEGER NOT NULL,
+  n       INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (ip_hash, win)
+);

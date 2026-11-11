@@ -238,6 +238,12 @@ pub fn spawn_tx_thread(
             let mut encoder = VoiceEncoder::new();
             let mut pcm_buffer = vec![0i16; CODEC_FRAME_SIZE];
             let mut was_transmitting = false;
+            // Consecutive mic failures. A press that cannot capture must
+            // drop the PTT latch instead of showing "transmitting" forever.
+            let mut tx_start_failures: u32 = 0;
+            let mut tx_dead_frames: u32 = 0;
+            const TX_START_MAX_FAILURES: u32 = 3; // ~150 ms of retries
+            const TX_DEAD_FRAMES_MAX: u32 = 10; // ~500 ms without a full frame
             let mut idle_ticks = 0u32;
             // Monotonic wire timestamps for the current PTT press. Wall-clock
             // now_ms() can repeat within the same millisecond on fast devices,
@@ -331,16 +337,33 @@ pub fn spawn_tx_thread(
                 // PTT is pressed: transmit
                 if !was_transmitting {
                     // PTT just pressed: start recording
-                    let eng = audio.lock().unwrap();
-                    match eng.start_recording() {
+                    // Scope the engine lock to the call: holding it across
+                    // the retry sleep stalled RX playout and setRxMuted.
+                    let started = { audio.lock().unwrap().start_recording() };
+                    match started {
                         Ok(()) => {
                             was_transmitting = true;
+                            tx_start_failures = 0;
+                            tx_dead_frames = 0;
                             tx_frame_index = 0;
                             tx_stream_epoch_ms = next_stream_epoch();
                             info!("TX: started recording (PTT pressed)");
                         }
                         Err(e) => {
-                            error!("TX: failed to start recording: {}", e);
+                            tx_start_failures += 1;
+                            error!(
+                                "TX: failed to start recording (attempt {}): {}",
+                                tx_start_failures, e
+                            );
+                            if tx_start_failures >= TX_START_MAX_FAILURES {
+                                // Mic unavailable (held by another app,
+                                // permission revoked). Same contract as a
+                                // send failure: drop the latch and count it,
+                                // so the UI stops claiming to transmit.
+                                tx_start_failures = 0;
+                                ptt_pressed.store(false, Ordering::SeqCst);
+                                crate::diag::note_tx_failure();
+                            }
                             thread::sleep(Duration::from_millis(50));
                             continue;
                         }
@@ -361,15 +384,21 @@ pub fn spawn_tx_thread(
                 const MAX_READ_ATTEMPTS_PER_FRAME: u32 = 25; // ~50 ms cap; avoids hang on broken HAL
                 while filled < CODEC_FRAME_SIZE && read_attempts < MAX_READ_ATTEMPTS_PER_FRAME {
                     read_attempts += 1;
-                    let n = {
-                        let eng = audio.lock().unwrap();
-                        match eng.read_audio(&mut pcm_buffer[filled..CODEC_FRAME_SIZE]) {
+                    // Take the recorder handle under the engine lock, then
+                    // do the blocking AudioRecord.read without it, so a mic
+                    // HAL stall cannot hold up RX playout or PTT release.
+                    let recorder = { audio.lock().unwrap().recorder_handle() };
+                    let n = match recorder {
+                        Some(rec) => match rec.read(&mut pcm_buffer[filled..CODEC_FRAME_SIZE]) {
                             Ok(n) => n,
                             Err(e) => {
-                                warn!("TX: read_audio failed: {}", e);
+                                if read_attempts == 1 && tx_dead_frames == 0 {
+                                    warn!("TX: read_audio failed: {}", e);
+                                }
                                 0
                             }
-                        }
+                        },
+                        None => 0,
                     };
                     if n == 0 {
                         thread::sleep(Duration::from_millis(2));
@@ -378,12 +407,24 @@ pub fn spawn_tx_thread(
                     filled += n;
                 }
                 if filled < CODEC_FRAME_SIZE {
-                    warn!(
-                        "TX: partial frame after {} attempts (filled={}/{}); dropping",
-                        read_attempts, filled, CODEC_FRAME_SIZE
-                    );
+                    tx_dead_frames += 1;
+                    if tx_dead_frames == 1 {
+                        warn!(
+                            "TX: partial frame after {} attempts (filled={}/{}); dropping",
+                            read_attempts, filled, CODEC_FRAME_SIZE
+                        );
+                    }
+                    if tx_dead_frames >= TX_DEAD_FRAMES_MAX {
+                        // The mic stopped delivering. Stop pretending to
+                        // transmit; the release branch stops the recorder.
+                        warn!("TX: mic delivered no audio for {} frames; dropping PTT", tx_dead_frames);
+                        tx_dead_frames = 0;
+                        ptt_pressed.store(false, Ordering::SeqCst);
+                        crate::diag::note_tx_failure();
+                    }
                     continue;
                 }
+                tx_dead_frames = 0;
 
                 // Apply user-configured mic gain in place (unity by default).
                 // For clogged-mic users this lifts a weak signal up; for
@@ -837,7 +878,12 @@ pub fn process_incoming_wire_frame(
         reg.register_user(sender_id, device_name);
         return;
     }
-    LAST_RX_AUDIO_MS.store(now_wall_ms(), Ordering::Relaxed);
+    // Presence beacons are a lone sequence-0 silence frame. Only frames
+    // past the first prove a talk burst is arriving, so a beacon from an
+    // idle member cannot make a delivery receipt look fresh.
+    if sequence > 0 {
+        LAST_RX_AUDIO_MS.store(now_wall_ms(), Ordering::Relaxed);
+    }
 
     {
         let mut reg = user_registry.lock().unwrap();
@@ -916,7 +962,9 @@ pub fn spawn_rx_thread(
 
                 // Drain WiFi AND cellular every iteration — dual-path TX means
                 // both queues can have audio regardless of `active` transport.
-                loop {
+                // Re-check the stop flag here: a sustained inbound flood
+                // otherwise keeps this loop alive and blocks disconnect in join().
+                while rx_running.load(Ordering::SeqCst) {
                     let (wifi_n, cell_n) = {
                         let mut tm = transport.lock().unwrap();
                         let w = tm.poll_wifi_into(&mut recv_buffer).unwrap_or(0);

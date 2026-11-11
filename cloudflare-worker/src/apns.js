@@ -60,7 +60,8 @@ export async function sendApnsWakePush(env, token, roomId) {
   }
 
   const host = useSandbox(env) ? "api.sandbox.push.apple.com" : "api.push.apple.com";
-  const url = `https://${host}/3/device/${token}`;
+  // Encoded so a malformed token cannot alter the request path.
+  const url = `https://${host}/3/device/${encodeURIComponent(token)}`;
   const wakeTs = String(Date.now());
   const payload = {
     aps: { "content-available": 1 },

@@ -146,6 +146,11 @@ const RATE_WINDOW_MS = 1_000;
 // backpressured send used to kill the receiver mid-talk (fan-out catch →
 // close), which looked like high loss on the sender's diagnostics.
 const SEND_FAIL_CLOSE_THRESHOLD = 3;
+// Largest frame a client may send. Audio frames are a few hundred bytes and
+// hybrid-PQC rekey frames a few KB; anything near this is abuse. Without a
+// cap one member could fan out multi-megabyte frames to the whole room and
+// push the Durable Object past its memory limit.
+const MAX_INBOUND_FRAME_BYTES = 64 * 1024;
 
 // ── Store-and-forward (async voice / catch-up) ────────────────────────────
 // A bounded, DO-local in-memory ring buffer of the most recent broadcast
@@ -411,6 +416,15 @@ export class PttRoom extends DurableObject {
       }
     }
 
+    // Size cap before anything copies, parses or fans the frame out.
+    const inboundSize = typeof message === "string" ? message.length : message.byteLength;
+    if (inboundSize > MAX_INBOUND_FRAME_BYTES) {
+      this.markClosing(ws);
+      try { ws.close(1009, "Frame too large"); } catch { /* already closed */ }
+      this.sessions.delete(ws);
+      return;
+    }
+
     // Per-socket rate limit. Soft-drop excess frames first; only hard-close
     // on extreme sustained abuse (SOFT_RATE_CLOSE_MULT × cap). Closing on the
     // first overshoot caused reconnect flaps that looked like packet loss.
@@ -423,6 +437,7 @@ export class PttRoom extends DurableObject {
       }
       rlSession.msgCount++;
       if (rlSession.msgCount > MAX_MESSAGES_PER_SEC * SOFT_RATE_CLOSE_MULT) {
+        this.markClosing(ws);
         try { ws.close(1008, "Rate limit exceeded"); } catch {}
         this.sessions.delete(ws);
         return;
@@ -595,6 +610,7 @@ export class PttRoom extends DurableObject {
       this.sendFailCounts.set(peer, fails);
       this.droppedFanout++;
       if (fails >= SEND_FAIL_CLOSE_THRESHOLD) {
+        this.markClosing(peer);
         try { peer.close(1011, "Send failed"); } catch { /* already closed */ }
         this.sessions.delete(peer);
         this.sendFailCounts.delete(peer);
@@ -694,8 +710,20 @@ export class PttRoom extends DurableObject {
   async webSocketError(ws, error) {
     const session = this.sessions.get(ws) || {};
     console.error(`WebSocket error for ${session.id || "unknown"}: ${error}`);
+    this.markClosing(ws);
     this.sessions.delete(ws);
     try { ws.close(1011, "Error"); } catch { /* ignore */ }
+  }
+
+  /**
+   * Flag a socket this object is closing, so the wake-push path stops
+   * treating its peer as attached while the close handshake is pending.
+   */
+  markClosing(ws) {
+    try {
+      const att = this.sessions.get(ws) || ws.deserializeAttachment();
+      if (att) ws.serializeAttachment({ ...att, closing: true });
+    } catch { /* socket already gone */ }
   }
 
   /**
@@ -723,10 +751,17 @@ export class PttRoom extends DurableObject {
     if (this.fcmRoomPushCount >= FCM_ROOM_PUSH_BUDGET) return; // budget exhausted this window
 
     // Build the set of currently-attached peerIds.
+    // A socket we closed can linger in getWebSockets() until the peer
+    // completes the close handshake, which a dead phone never does. Counting
+    // it as attached suppressed the wake push for exactly the peer that
+    // needed one.
     const attached = new Set();
     for (const ws of activeSockets) {
       const s = this.sessions.get(ws) || ws.deserializeAttachment() || null;
-      if (s && s.peer) attached.add(s.peer);
+      if (!s || !s.peer) continue;
+      if (s.offlineNotified || s.closing) continue;
+      if (typeof ws.readyState === "number" && ws.readyState !== 1) continue;
+      attached.add(s.peer);
     }
 
     // Get the room's presence list (cached briefly to keep KV traffic sane

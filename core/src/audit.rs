@@ -190,7 +190,12 @@ pub fn redact_detail(detail: &str) -> String {
         }
         out.push_str(redacted);
         if out.len() >= MAX_DETAIL_CHARS {
-            out.truncate(MAX_DETAIL_CHARS);
+            // String::truncate panics off a char boundary; back up to one.
+            let mut end = MAX_DETAIL_CHARS;
+            while end > 0 && !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.truncate(end);
             break;
         }
     }

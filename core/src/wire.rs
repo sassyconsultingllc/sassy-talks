@@ -80,11 +80,20 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Longest prefix of `s` that fits in `max` bytes without splitting a UTF-8
+/// character, so a clipped name never decodes to U+FFFD on the receiver.
+fn utf8_prefix_len(s: &str, max: usize) -> usize {
+    let mut n = s.len().min(max);
+    while n > 0 && !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    n
+}
+
 /// Encapsulate one Opus frame for transport over the wire.
 ///
-/// `sender_id` / `device_name` are truncated to their max lengths (on a UTF-8
-/// boundary-safe byte prefix; over-long inputs are clipped to whole bytes,
-/// matching the historical Android behaviour). The returned buffer is the
+/// `sender_id` / `device_name` are truncated to their max lengths on a UTF-8
+/// character boundary. The returned buffer is the
 /// cleartext frame — the transport seals it before sending.
 pub fn pack_wire_frame(
     channel: u8,
@@ -95,9 +104,9 @@ pub fn pack_wire_frame(
     compressed: &[u8],
 ) -> Vec<u8> {
     let id_bytes = sender_id.as_bytes();
-    let id_len = id_bytes.len().min(MAX_SENDER_ID_LEN);
+    let id_len = utf8_prefix_len(sender_id, MAX_SENDER_ID_LEN);
     let name_bytes = device_name.as_bytes();
-    let name_len = name_bytes.len().min(MAX_DEVICE_NAME_LEN);
+    let name_len = utf8_prefix_len(device_name, MAX_DEVICE_NAME_LEN);
 
     let mut packet = Vec::with_capacity(2 + 1 + id_len + 1 + name_len + 8 + compressed.len());
     packet.push(channel);
@@ -127,9 +136,9 @@ pub fn pack_wire_frame_v2(
     compressed: &[u8],
 ) -> Vec<u8> {
     let id_bytes = sender_id.as_bytes();
-    let id_len = id_bytes.len().min(MAX_SENDER_ID_LEN);
+    let id_len = utf8_prefix_len(sender_id, MAX_SENDER_ID_LEN);
     let name_bytes = device_name.as_bytes();
-    let name_len = name_bytes.len().min(MAX_DEVICE_NAME_LEN);
+    let name_len = utf8_prefix_len(device_name, MAX_DEVICE_NAME_LEN);
     let mut packet =
         Vec::with_capacity(V2_PREFIX_LEN + 1 + id_len + 1 + name_len + 8 + compressed.len());
     packet.extend_from_slice(&[channel, subchannel, V2_MARKER, V2_VERSION]);
