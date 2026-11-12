@@ -173,7 +173,26 @@ class PttCoordinator(
 
     val liveness = LivenessTracker()
     val selfEpoch: Long = SessionEpoch.generate()
-    private var hbSeq = AtomicInteger(0)
+    // Random start: RTT is matched by seq, and two devices both counting from 0
+    // would mistake each other's ordinary heartbeats for echoes of their own.
+    private val hbSeq = AtomicInteger(kotlin.random.Random.nextInt(1, 1 shl 30))
+
+    /**
+     * Authenticated peer id ("auth:<installId>") -> BLE address it was last
+     * heard on. Liveness, floor and roster are keyed by the authenticated id,
+     * but a GATT write needs the address; without this map every targeted
+     * control frame (echo, capabilities, hybrid rekey, RECV/EOT ack) was
+     * dropped at "No GATT client for auth:…".
+     */
+    private val bleRouteByPeerId = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** Targeted BLE control send by logical peer id. Silent no-op for relay-only peers. */
+    private fun sendBleControl(peerId: String, frame: ByteArray): Boolean {
+        val ble = bleSignaling ?: return false
+        val address = bleRouteByPeerId[peerId] ?: peerId
+        if (!ble.hasControlLink(address)) return false
+        return ble.sendControl(address, frame)
+    }
     private var heartbeatJob: Job? = null
     private var staleCheckJob: Job? = null
 
@@ -270,7 +289,20 @@ class PttCoordinator(
     /** True while THIS device is broadcasting a distress beacon. */
     val selfEmergencyActive = MutableStateFlow(false)
 
+    /**
+     * False while the latest beacon reached NO transport (no BLE peer accepted
+     * the write and the relay socket is down). The beacon stays armed and is
+     * retried every second, but the UI must not claim "Broadcasting" meanwhile.
+     */
+    val selfEmergencyDelivered = MutableStateFlow(true)
+
     private var emergencyBeaconJob: Job? = null
+
+    /** Latest beacon that reached nobody; re-sent every tick until it lands. */
+    @Volatile private var undeliveredEmergencyFrame: ByteArray? = null
+
+    /** Envelope-authenticated peer that raised each active emergency (by sender id). */
+    private val emergencyRaisedBy = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /**
      * Raise a distress beacon and start the re-broadcast loop.
@@ -278,7 +310,9 @@ class PttCoordinator(
      * @param kind [SassyTalkNative.EMERGENCY_KIND_SOS] or ..._MANDOWN
      * @param coord optional (latE7, lonE7) fixed-point fix; attached only when
      *   a session key exists to seal it (enforced natively).
-     * @return true if a beacon frame went out.
+     * @return true if a beacon frame reached at least one transport. On false
+     *   the emergency is still armed ([selfEmergencyActive]) and keeps retrying;
+     *   false only means nobody has received it yet.
      */
     fun raiseEmergency(
         kind: Byte = SassyTalkNative.EMERGENCY_KIND_SOS,
@@ -295,12 +329,28 @@ class PttCoordinator(
             Log.e(TAG, "EMERGENCY: native activate returned no frame")
             return false
         }
-        broadcastEmergencyFrame(frame)
+        val delivered = sendEmergencyBeacon(frame)
         selfEmergencyActive.value = true
-        try { onEmergencyAudit?.invoke("self_raised", "kind=$kind coord=${coord != null}") } catch (_: Throwable) {}
-        Log.w(TAG, "EMERGENCY RAISED kind=$kind coord=${coord != null}")
+        try {
+            onEmergencyAudit?.invoke("self_raised", "kind=$kind coord=${coord != null} delivered=$delivered")
+        } catch (_: Throwable) {}
+        Log.w(TAG, "EMERGENCY RAISED kind=$kind coord=${coord != null} delivered=$delivered")
         startEmergencyBeacon()
-        return true
+        return delivered
+    }
+
+    /** Broadcast a beacon and record whether anyone could have received it. */
+    private fun sendEmergencyBeacon(frame: ByteArray): Boolean {
+        val delivered = broadcastEmergencyFrame(frame)
+        undeliveredEmergencyFrame = if (delivered) null else frame
+        if (selfEmergencyDelivered.value != delivered) {
+            selfEmergencyDelivered.value = delivered
+            try {
+                onEmergencyAudit?.invoke(if (delivered) "self_beacon_delivered" else "self_beacon_undelivered", "")
+            } catch (_: Throwable) {}
+            if (!delivered) Log.e(TAG, "EMERGENCY beacon reached no transport — retrying every second")
+        }
+        return delivered
     }
 
     /** Stand down. Broadcasts the clear frame once and stops the beacon loop. */
@@ -309,6 +359,8 @@ class PttCoordinator(
         emergencyBeaconJob = null
         val frame = SassyTalkNative.emergencyClear()
         selfEmergencyActive.value = false
+        selfEmergencyDelivered.value = true
+        undeliveredEmergencyFrame = null
         try { onEmergencyAudit?.invoke("self_cleared", "") } catch (_: Throwable) {}
         if (frame != null) {
             broadcastEmergencyFrame(frame)
@@ -326,21 +378,26 @@ class PttCoordinator(
         emergencyBeaconJob = scope.launch {
             while (isActive && SassyTalkNative.emergencyIsActive()) {
                 delay(1_000L)
-                val frame = SassyTalkNative.emergencyTick() ?: continue
-                broadcastEmergencyFrame(frame)
+                // A beacon that reached nobody does not wait for the core
+                // cadence: retry it every second until a transport takes it.
+                val frame = SassyTalkNative.emergencyTick() ?: undeliveredEmergencyFrame ?: continue
+                sendEmergencyBeacon(frame)
                 Log.d(TAG, "EMERGENCY beacon re-broadcast")
             }
         }
     }
 
-    /** Put a beacon frame on every transport we have. */
-    private fun broadcastEmergencyFrame(frame: ByteArray) {
-        try { bleSignaling?.broadcastControl(frame) } catch (t: Throwable) {
+    /** Put a beacon frame on every transport we have. @return true if any took it. */
+    private fun broadcastEmergencyFrame(frame: ByteArray): Boolean {
+        val ble = try { (bleSignaling?.broadcastControl(frame) ?: 0) > 0 } catch (t: Throwable) {
             Log.w(TAG, "EMERGENCY: BLE broadcast failed: ${t.message}")
+            false
         }
-        try { cellularClient?.sendBinary(frame) } catch (t: Throwable) {
+        val relay = try { cellularClient?.sendBinary(frame) ?: false } catch (t: Throwable) {
             Log.w(TAG, "EMERGENCY: relay send failed: ${t.message}")
+            false
         }
+        return ble || relay
     }
 
     /**
@@ -358,6 +415,23 @@ class PttCoordinator(
             val sender = o.optString("sender", "").ifEmpty { peerId }
             when (o.optString("op")) {
                 "clear" -> {
+                    // The inner sender id is self-declared. Without this check
+                    // any room member could silence someone else's SOS by
+                    // naming them in a clear frame.
+                    val active = peerEmergencies.value[sender] ?: return
+                    val raisedBy = emergencyRaisedBy[sender]
+                    if (raisedBy != null && raisedBy != peerId) {
+                        Log.w(TAG, "EMERGENCY clear for $sender rejected: sent by $peerId, raised by $raisedBy")
+                        try {
+                            onEmergencyAudit?.invoke("peer_clear_rejected", "sender=$sender reason=not_raiser")
+                        } catch (_: Throwable) {}
+                        return
+                    }
+                    if (o.optLong("ts", 0L) < active.timestampMs) {
+                        Log.w(TAG, "EMERGENCY clear for $sender rejected: older than the active beacon")
+                        return
+                    }
+                    emergencyRaisedBy.remove(sender)
                     peerEmergencies.value = peerEmergencies.value - sender
                     try { onEmergencyAudit?.invoke("peer_cleared", "sender=$sender") } catch (_: Throwable) {}
                     Log.w(TAG, "EMERGENCY CLEARED by $sender")
@@ -382,6 +456,7 @@ class PttCoordinator(
                         Log.w(TAG, "Local floor released for authenticated emergency from $sender")
                         onPttReleased()
                     }
+                    emergencyRaisedBy.putIfAbsent(sender, peerId)
                     peerEmergencies.value = peerEmergencies.value + (sender to e)
                     try {
                         onEmergencyAudit?.invoke(
@@ -1057,11 +1132,13 @@ class PttCoordinator(
                 // already-tracked relay peers (relay:<epoch>) — previously only
                 // BLE addresses were registered, so cellular RTT always stayed
                 // unknown and the diagnostics panel showed "--".
-                val hbTargets = LinkedHashSet<String>().apply {
-                    addAll(bleSignaling?.blePeerAddresses.orEmpty())
-                    addAll(liveness.peerIds())
-                }
-                for (peerId in hbTargets) {
+                // Only peers that have authenticated to us. Seeding raw BLE
+                // addresses here created a second, phantom identity per peer
+                // (heartbeats arrive as "auth:<id>", never as the address):
+                // it could never be heard from, so it sat STALE forever, held
+                // the stale banner on, doubled the roster and re-fired WAKE
+                // on every cooldown.
+                for (peerId in liveness.peerIds()) {
                     liveness.onHeartbeatSent(peerId, selfEpoch, seq, nowMs)
                 }
                 bleSignaling?.broadcastControl(frame)
@@ -1174,6 +1251,8 @@ class PttCoordinator(
         }
         val authenticatedBytes = verified?.innerFrame ?: bytes
         val authenticatedPeerId = verified?.let { "auth:${it.senderId}" } ?: peerId
+        val viaBle = !peerId.startsWith("relay")
+        if (verified != null && viaBle) bleRouteByPeerId[authenticatedPeerId] = peerId
         val frame = ControlFrame.decode(authenticatedBytes) ?: return
 
         when (frame.opcode) {
@@ -1199,7 +1278,7 @@ class PttCoordinator(
             }
 
             // New TLV opcodes
-            ControlFrame.OP_HEARTBEAT -> handleHeartbeat(authenticatedPeerId, frame.payload)
+            ControlFrame.OP_HEARTBEAT -> handleHeartbeat(authenticatedPeerId, frame.payload, viaBle)
             ControlFrame.OP_RECV_ACK -> handleRecvAck(authenticatedPeerId, frame.payload)
             ControlFrame.OP_CAPABILITIES -> handleCapabilities(authenticatedPeerId, frame.payload)
             ControlFrame.OP_PTT_STOP_V2 -> handlePttStopV2(authenticatedPeerId, frame.payload)
@@ -1242,7 +1321,7 @@ class PttCoordinator(
         }
     }
 
-    private fun handleHeartbeat(peerId: String, payload: ByteArray) {
+    private fun handleHeartbeat(peerId: String, payload: ByteArray, viaBle: Boolean = false) {
         if (payload.size < 23) {
             Log.w(TAG, "HB from $peerId: payload too short (${payload.size})")
             return
@@ -1270,16 +1349,20 @@ class PttCoordinator(
             scope.launch { sendCapabilitiesToPeer(peerId) }
         }
 
-        // Echo the heartbeat back (same seq) so the sender can measure RTT to us
+        // Echo the heartbeat back (same seq) so the sender can measure RTT to us.
+        // An echo is marked by rttMs >= 1 (originals always carry 0) and is
+        // never echoed again; only frames that arrived over BLE are echoed, so
+        // a heartbeat heard on both BLE and the relay yields one echo, not two.
+        if (!viaBle || hb.rttMs != 0) return
         val echo = ControlFrame.encodeHeartbeat(
             epoch  = selfEpoch,
             seq    = hb.seq,      // echo same seq for RTT matching
             tsMs   = nowMs,
             state  = currentPresenceState(),
-            rttMs  = rtt.coerceAtLeast(0),
+            rttMs  = rtt.coerceIn(1, 0xFFFF), // u16 on the wire; never 0
             caps   = SassyTalkNative.localCapabilities(),
         )
-        bleSignaling?.sendControl(peerId, echo)
+        sendBleControl(peerId, echo)
     }
 
     /**
@@ -1307,7 +1390,7 @@ class PttCoordinator(
             seq   = hbSeq.getAndIncrement(),
             tsMs  = nowMs,
             state = currentPresenceState(),
-            rttMs = liveness.rttMs(peerId).coerceAtLeast(0),
+            rttMs = 0, // 0 marks an original heartbeat; >= 1 is reserved for echoes
             caps  = SassyTalkNative.localCapabilities(),
         )
         bleSignaling?.broadcastControl(hb)
@@ -1425,7 +1508,7 @@ class PttCoordinator(
         stagedAsInitiator = false
         startHybridConfirmWatchdog()
         val frame = ControlFrame.encodeHybridFrame(ControlFrame.OP_HYBRID_RESP, channel, respMsg)
-        bleSignaling?.sendControl(peerId, frame)
+        sendBleControl(peerId, frame)
         cellularClient?.sendBinary(frame)
         Log.i(TAG, "hybrid handshake: responded to $peerId ch=$channel — session staged pending confirm")
     }
@@ -1448,7 +1531,7 @@ class PttCoordinator(
             stagedHybridChannel = channel
             stagedAsInitiator = true
             val confirm = ControlFrame.encodeHybridFrame(ControlFrame.OP_HYBRID_CONFIRM, channel, token)
-            bleSignaling?.sendControl(peerId, confirm)
+            sendBleControl(peerId, confirm)
             cellularClient?.sendBinary(confirm)
             startHybridConfirmWatchdog()
             startHybridConfirmRetries(peerId, channel, token)
@@ -1473,7 +1556,7 @@ class PttCoordinator(
         val ackToken = token ?: stagedHybridToken
         if (ackToken != null) {
             val ack = ControlFrame.encodeHybridFrame(ControlFrame.OP_HYBRID_CONFIRM_ACK, channel, ackToken)
-            bleSignaling?.sendControl(peerId, ack)
+            sendBleControl(peerId, ack)
             cellularClient?.sendBinary(ack)
         }
         if (SassyTalkNative.hybridHandshakeConfirm()) {
@@ -1513,7 +1596,7 @@ class PttCoordinator(
                 delay(HybridRekeyPolicy.CONFIRM_RETRY_MS)
                 if (stagedHybridToken == null || !stagedAsInitiator) return@launch
                 val confirm = ControlFrame.encodeHybridFrame(ControlFrame.OP_HYBRID_CONFIRM, channel, token)
-                bleSignaling?.sendControl(peerId, confirm)
+                sendBleControl(peerId, confirm)
                 cellularClient?.sendBinary(confirm)
                 Log.i(TAG, "hybrid handshake: retrying CONFIRM to $peerId")
             }
@@ -1566,7 +1649,7 @@ class PttCoordinator(
         }
         val initMsg = Base64.decode(initB64, Base64.NO_WRAP)
         val frame = ControlFrame.encodeHybridFrame(ControlFrame.OP_HYBRID_INIT, channel, initMsg)
-        bleSignaling?.sendControl(peerId, frame)
+        sendBleControl(peerId, frame)
         cellularClient?.sendBinary(frame)
         Log.i(TAG, "hybrid handshake: INIT sent to $peerId ch=$channel")
         return true
@@ -1607,7 +1690,7 @@ class PttCoordinator(
                         break
                     }
                     val frame = ControlFrame.encodeRecvAck(st.epoch, st.seq, System.currentTimeMillis())
-                    bleSignaling?.sendControl(peerId, frame)
+                    sendBleControl(peerId, frame)
                     cellularClient?.sendBinary(frame)
                     Log.d(TAG, "RECV_ACK sent epoch=${st.epoch} seq=${st.seq} to $peerId")
                     delay(RECV_ACK_INTERVAL_MS)
@@ -1694,7 +1777,7 @@ class PttCoordinator(
                     if (nowMs - lastSentMs >= IP_RECV_ACK_INTERVAL_MS) {
                         val frame = ControlFrame.encodeRecvAck(st.epoch, st.seq, nowMs)
                         cellularClient?.sendBinary(frame)
-                        bleSignaling?.sendControl(peerId, frame)
+                        sendBleControl(peerId, frame)
                         holdFloor(peerId, FloorArbitration.STALE_HOLD_MS)
                         lastSentMs = nowMs
                     }
@@ -1724,7 +1807,7 @@ class PttCoordinator(
         scope.launch {
             delay(FloorArbitration.DRAIN_HOLD_MS)
             val ack = ControlFrame.encodeEotAck(epoch, endSeq)
-            bleSignaling?.sendControl(peerId, ack)
+            sendBleControl(peerId, ack)
             cellularClient?.sendBinary(ack)
             Log.d(TAG, "EOT_ACK sent to $peerId epoch=$epoch upToSeq=$endSeq")
         }
@@ -1852,12 +1935,13 @@ class PttCoordinator(
         // the relay's blind fan-out delivers to all attached peers (including
         // the one that just restarted), which is what we need on an epoch
         // flip recovery.
-        if (peerId.startsWith("relay")) {
+        // Authenticated ids ("auth:<installId>") say nothing about transport:
+        // use the BLE link when this peer has one, otherwise the relay.
+        if (sendBleControl(peerId, frame)) {
+            Log.d(TAG, "Sent Capabilities to BLE peer $peerId")
+        } else {
             cellularClient?.sendBinary(frame)
             Log.d(TAG, "Sent Capabilities to cellular peer $peerId")
-        } else {
-            bleSignaling?.sendControl(peerId, frame)
-            Log.d(TAG, "Sent Capabilities to BLE peer $peerId")
         }
     }
 

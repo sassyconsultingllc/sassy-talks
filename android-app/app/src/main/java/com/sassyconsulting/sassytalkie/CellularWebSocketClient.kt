@@ -81,6 +81,13 @@ class CellularWebSocketClient {
         // Send a keepalive comfortably under that when nothing else is (see
         // sendKeepAlive) so a relay-only device doesn't flap-reconnect endlessly.
         private const val KEEPALIVE_INTERVAL_MS = 4_000L
+        private const val AUTH_CALL_TIMEOUT_SEC = 15L
+        // Auth plus WebSocket upgrade must finish inside this, or the attempt
+        // is abandoned and retried.
+        private const val CONNECT_DEADLINE_MS = 25_000L
+        // A socket must stay up this long before the backoff resets, so one
+        // that opens and is closed at once does not retry every 3 s forever.
+        private const val STABLE_OPEN_MS = 30_000L
 
         /**
          * OkHttpClient is expensive (dispatcher + connection pool + thread pools)
@@ -95,6 +102,20 @@ class CellularWebSocketClient {
 
     private val client: OkHttpClient =
         RelayTlsPins.apply(sharedClient.newBuilder()).build()
+
+    /**
+     * Same pool and pins, but with real deadlines, for the /auth round trip.
+     * The socket client reads forever by design; using it for a plain GET
+     * meant a stalled network left the call (and isConnecting) hanging.
+     */
+    private val authClient: OkHttpClient = client.newBuilder()
+        .callTimeout(AUTH_CALL_TIMEOUT_SEC, TimeUnit.SECONDS)
+        .readTimeout(AUTH_CALL_TIMEOUT_SEC, TimeUnit.SECONDS)
+        .pingInterval(0, TimeUnit.SECONDS)
+        .build()
+
+    @Volatile private var connectWatchdog: ScheduledFuture<*>? = null
+    @Volatile private var stabilityReset: ScheduledFuture<*>? = null
 
     private var webSocket: WebSocket? = null
     private val isConnected = AtomicBoolean(false)
@@ -191,6 +212,7 @@ class CellularWebSocketClient {
             return true
         }
         val ownerGeneration = generation.next()
+        armConnectWatchdog(ownerGeneration)
         // Respect build-time flag to disable cellular relay (opt-in at build)
         try {
             if (!BuildConfig.ENABLE_CELLULAR_RELAY) {
@@ -263,9 +285,17 @@ class CellularWebSocketClient {
                 this@CellularWebSocketClient.webSocket = webSocket
                 isConnecting.set(false)
                 isConnected.set(true)
+                connectWatchdog?.cancel(false)
                 hasCompletedHandshake = true
                 lastAliveMs = System.currentTimeMillis()
-                reconnectAttempts.set(0)
+                stabilityReset?.cancel(false)
+                stabilityReset = try {
+                    reconnectScheduler.schedule({
+                        if (generation.owns(ownerGeneration) && isConnected.get()) {
+                            reconnectAttempts.set(0)
+                        }
+                    }, STABLE_OPEN_MS, TimeUnit.MILLISECONDS)
+                } catch (_: Throwable) { null }
                 SassyTalkNative.cellularOnConnected()
                 startOutboundPump()
                 startKeepAlive()
@@ -370,11 +400,32 @@ class CellularWebSocketClient {
         closed.set(true)
         generation.invalidate()
         isConnecting.set(false)
+        connectWatchdog?.cancel(false)
+        stabilityReset?.cancel(false)
         cancelPendingReconnect()
         stopOutboundPump()
         webSocket?.close(1000, "user disconnect")
         webSocket = null
         onDisconnected("user disconnect")
+    }
+
+    /**
+     * The network under the socket changed (Wi-Fi lost, handover). OkHttp
+     * only notices on a write error or a missed pong, 15-30 s later, and
+     * frames sent meanwhile vanish. Drop the socket and dial again now.
+     */
+    fun reconnectNow(reason: String) {
+        if (closed.get()) return
+        Log.i(TAG, "Immediate relay reconnect: $reason")
+        generation.invalidate()
+        connectWatchdog?.cancel(false)
+        stabilityReset?.cancel(false)
+        cancelPendingReconnect()
+        try { webSocket?.cancel() } catch (_: Throwable) {}
+        webSocket = null
+        onDisconnected("network change: $reason")
+        reconnectAttempts.set(0)
+        connect()
     }
 
     /** Terminal close: stop reconnect and release scheduler threads. */
@@ -403,11 +454,15 @@ class CellularWebSocketClient {
         // Don't give up after the fast retries — fall back to a fixed long
         // interval so a prolonged outage still recovers on its own once
         // connectivity returns (a successful connect resets the counter).
-        val delayMs = if (attempt <= MAX_RECONNECT_ATTEMPTS) {
+        val baseDelayMs = if (attempt <= MAX_RECONNECT_ATTEMPTS) {
             minOf(3_000L * (1L shl (attempt - 1).coerceAtMost(4)), 60_000L)
         } else {
             RECONNECT_FLOOR_MS
         }
+        // Up to 25% jitter so every phone does not retry in lockstep after a
+        // relay restart.
+        val delayMs = baseDelayMs +
+            java.util.concurrent.ThreadLocalRandom.current().nextLong(baseDelayMs / 4 + 1)
         val scheduledGeneration = generation.current()
         cancelPendingReconnect()
         pendingReconnect = reconnectScheduler.schedule({
@@ -418,6 +473,28 @@ class CellularWebSocketClient {
                 }
             }
         }, delayMs, TimeUnit.MILLISECONDS)
+    }
+
+    /**
+     * Abandon a connect attempt that has neither opened nor failed by the
+     * deadline. Without this a stalled /auth or upgrade left isConnecting
+     * latched, and every later connect() (including the FCM wake path)
+     * returned early as "already connecting".
+     */
+    private fun armConnectWatchdog(ownerGeneration: Int) {
+        connectWatchdog?.cancel(false)
+        connectWatchdog = try {
+            reconnectScheduler.schedule({
+                if (generation.owns(ownerGeneration) && isConnecting.get() && !isConnected.get() && !closed.get()) {
+                    Log.w(TAG, "Relay connect exceeded ${CONNECT_DEADLINE_MS}ms — abandoning attempt")
+                    generation.invalidate()
+                    try { webSocket?.cancel() } catch (_: Throwable) {}
+                    webSocket = null
+                    isConnecting.set(false)
+                    scheduleReconnect("connect deadline")
+                }
+            }, CONNECT_DEADLINE_MS, TimeUnit.MILLISECONDS)
+        } catch (_: Throwable) { null }
     }
 
     private fun cancelPendingReconnect() {
@@ -681,7 +758,7 @@ class CellularWebSocketClient {
             .build()
 
         val req = Request.Builder().url(authUrl).get().build()
-        client.newCall(req).enqueue(object : Callback {
+        authClient.newCall(req).enqueue(object : Callback {
             override fun onFailure(call: Call, e: java.io.IOException) {
                 onResult(null, e)
             }

@@ -32,6 +32,13 @@ internal class AuthenticatedControlCodec(
     private val epoch: Long,
     private val clockMs: () -> Long = System::currentTimeMillis,
     private val random: SecureRandom = SecureRandom(),
+    // Owned by the caller when it must outlive this codec. The sequence is
+    // bound to (sender, epoch), not to the key or room, so a codec rebuilt
+    // under the same epoch MUST continue the same counter: restarting at 1
+    // makes every peer's replay window reject the sender until the counter
+    // climbs back past its old high-water mark (SOS and floor frames included).
+    private val txSequence: AtomicLong = AtomicLong(0),
+    private val replay: ControlReplayWindow = ControlReplayWindow(),
 ) {
     init {
         require(key.size == 32) { "control key must be 32 bytes" }
@@ -43,8 +50,6 @@ internal class AuthenticatedControlCodec(
     private val roomBinding = MessageDigest.getInstance("SHA-256")
         .digest(roomId.toByteArray(Charsets.UTF_8))
         .copyOf(ROOM_BINDING_BYTES)
-    private val txSequence = AtomicLong(0)
-    private val replay = ReplayWindow()
 
     fun seal(innerFrame: ByteArray): ByteArray {
         val decoded = ControlFrame.decode(innerFrame)
@@ -131,42 +136,9 @@ internal class AuthenticatedControlCodec(
         return VerifiedControl(sender, senderEpoch, sequence, issuedAtMs, inner)
     }
 
+    /** Zeroizes the key. Replay state belongs to whoever supplied it. */
     fun destroy() {
         key.fill(0)
-        replay.clear()
-    }
-
-    private class ReplayWindow {
-        private data class State(var highest: Long, var bitmap: Long)
-        private val states = object : LinkedHashMap<String, State>(16, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, State>?): Boolean =
-                size > MAX_REPLAY_SENDERS
-        }
-
-        @Synchronized
-        fun accept(sender: String, epoch: Long, sequence: Long): Boolean {
-            if (epoch == 0L || sequence <= 0L) return false
-            val key = "$sender\u0000$epoch"
-            val state = states[key]
-            if (state == null) {
-                states[key] = State(sequence, 1L)
-                return true
-            }
-            if (sequence > state.highest) {
-                val shift = sequence - state.highest
-                state.bitmap = if (shift >= REPLAY_BITS) 1L else (state.bitmap shl shift.toInt()) or 1L
-                state.highest = sequence
-                return true
-            }
-            val behind = state.highest - sequence
-            if (behind >= REPLAY_BITS) return false
-            val bit = 1L shl behind.toInt()
-            if (state.bitmap and bit != 0L) return false
-            state.bitmap = state.bitmap or bit
-            return true
-        }
-
-        @Synchronized fun clear() = states.clear()
     }
 
     companion object {
@@ -180,11 +152,53 @@ internal class AuthenticatedControlCodec(
         private const val ROOM_BINDING_BYTES = 16
         private const val MAX_SENDER_BYTES = 64
         private const val MAX_INNER_BYTES = 8 * 1024
-        private const val MAX_REPLAY_SENDERS = 256
-        private const val REPLAY_BITS = 64L
         private const val MAX_AGE_MS = 2 * 60 * 1000L
         private const val MAX_FUTURE_SKEW_MS = 30 * 1000L
         private const val MIN_BODY_BYTES = 4 + 1 + ROOM_BINDING_BYTES + 1 + 1 + 8 + 8 + 8 + 2
+    }
+}
+
+/**
+ * Sliding 64-frame anti-replay window per (sender, epoch). Kept outside the
+ * codec so it survives a key/room change: a sender's sequence is monotonic for
+ * its whole process epoch, so forgetting the high-water mark on rebuild would
+ * reopen the window to frames captured before the rebuild.
+ */
+internal class ControlReplayWindow {
+    private data class State(var highest: Long, var bitmap: Long)
+    private val states = object : LinkedHashMap<String, State>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, State>?): Boolean =
+            size > MAX_REPLAY_SENDERS
+    }
+
+    @Synchronized
+    fun accept(sender: String, epoch: Long, sequence: Long): Boolean {
+        if (epoch == 0L || sequence <= 0L) return false
+        val key = "$sender\u0000$epoch"
+        val state = states[key]
+        if (state == null) {
+            states[key] = State(sequence, 1L)
+            return true
+        }
+        if (sequence > state.highest) {
+            val shift = sequence - state.highest
+            state.bitmap = if (shift >= REPLAY_BITS) 1L else (state.bitmap shl shift.toInt()) or 1L
+            state.highest = sequence
+            return true
+        }
+        val behind = state.highest - sequence
+        if (behind >= REPLAY_BITS) return false
+        val bit = 1L shl behind.toInt()
+        if (state.bitmap and bit != 0L) return false
+        state.bitmap = state.bitmap or bit
+        return true
+    }
+
+    @Synchronized fun clear() = states.clear()
+
+    private companion object {
+        const val MAX_REPLAY_SENDERS = 256
+        const val REPLAY_BITS = 64L
     }
 }
 
@@ -210,6 +224,12 @@ internal object AuthenticatedControlPlane {
 
     private var context: Context? = null
     private var codec: AuthenticatedControlCodec? = null
+
+    // Process-lifetime state. Never reset on a codec rebuild or clear(): the
+    // sequence must only ever move forward for a given sender epoch, and the
+    // epoch itself only changes with the process.
+    private val txSequence = AtomicLong(0)
+    private val replay = ControlReplayWindow()
 
     @Synchronized
     fun seal(frame: ByteArray): ByteArray? = currentCodec()?.runCatching { seal(frame) }?.getOrNull()
@@ -239,7 +259,10 @@ internal object AuthenticatedControlPlane {
         val next = Context(roomId, senderId, fingerprint, epoch)
         if (next != context || codec == null) {
             codec?.destroy()
-            codec = AuthenticatedControlCodec(key.copyOf(), roomId, senderId, epoch)
+            codec = AuthenticatedControlCodec(
+                key.copyOf(), roomId, senderId, epoch,
+                txSequence = txSequence, replay = replay,
+            )
             context = next
         }
         key.fill(0)

@@ -65,6 +65,7 @@ class BluetoothTransport(private val context: Context) {
 
         // Dead peer detection timeout (ms)
         private const val DEAD_PEER_TIMEOUT_MS = 10_000L
+        private const val KEEPALIVE_INTERVAL_MS = 3_000L
     }
 
     // ── State ──
@@ -196,11 +197,27 @@ class BluetoothTransport(private val context: Context) {
 
     /** Connect RFCOMM to a device (auto-connect from BLE peer discovery) */
     fun connectDevice(device: BluetoothDevice) {
+        // One dial per device at a time. Every BLE scan result and the 3 s
+        // retry loop land here; unguarded, a dozen threads each ran three
+        // blocking connects to the same address and starved each other.
+        if (connectedPeers.containsKey(device.address)) return
+        val retryAt = rfcommFailures[device.address]?.second ?: 0L
+        if (android.os.SystemClock.elapsedRealtime() < retryAt) return
+        if (!dialing.add(device.address)) return
         Thread {
             Thread.currentThread().name = "bt-connect-${device.address.takeLast(5)}"
-            connectTo(device)
+            try {
+                connectTo(device)
+            } finally {
+                dialing.remove(device.address)
+            }
         }.start()
     }
+
+    private val dialing: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    /** address -> (consecutive failed dials, elapsedRealtime before which we do not redial). */
+    private val rfcommFailures = java.util.concurrent.ConcurrentHashMap<String, Pair<Int, Long>>()
 
     /**
      * Connect to a remote device using RFCOMM triple fallback.
@@ -216,39 +233,51 @@ class BluetoothTransport(private val context: Context) {
         markConnecting()
         Log.i(TAG, "Connecting to ${device.name} ($addr)...")
 
-        // === Fallback 1: Standard RFCOMM ===
-        try {
-            val socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
-            socket.connect()
-            onPeerConnected(device, socket)
-            Log.i(TAG, "RFCOMM connected (standard) to ${device.name}")
-            return true
-        } catch (e: IOException) {
-            Log.w(TAG, "Standard RFCOMM failed for ${device.name}: ${e.message}")
-        }
+        // The app encrypts every frame end to end with the QR-paired room key,
+        // so the link does not need Bluetooth-level pairing. Dial the INSECURE
+        // (unauthenticated) socket first: it is the only kind that can connect
+        // two phones that have never been paired, and it never raises the
+        // system pairing dialog. The authenticated socket is tried only for a
+        // device that is already bonded.
+        val bonded = try { device.bondState == BluetoothDevice.BOND_BONDED } catch (_: Exception) { false }
 
-        // === Fallback 2: Insecure RFCOMM ===
+        var attempt: BluetoothSocket? = null
         try {
             val socket = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
+            attempt = socket
             socket.connect()
             onPeerConnected(device, socket)
+            rfcommFailures.remove(addr)
             Log.i(TAG, "RFCOMM connected (insecure) to ${device.name}")
             return true
         } catch (e: IOException) {
             Log.w(TAG, "Insecure RFCOMM failed for ${device.name}: ${e.message}")
+            try { attempt?.close() } catch (_: IOException) {}
         }
 
-        // === Fallback 3: Reflection port 1 ===
-        try {
-            val method = device.javaClass.getMethod("createRfcommSocket", Int::class.java)
-            val socket = method.invoke(device, 1) as BluetoothSocket
-            socket.connect()
-            onPeerConnected(device, socket)
-            Log.i(TAG, "RFCOMM connected (reflection port 1) to ${device.name}")
-            return true
-        } catch (e: Exception) {
-            Log.e(TAG, "All RFCOMM methods failed for ${device.name}: ${e.message}")
+        if (bonded) {
+            attempt = null
+            try {
+                val socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
+                attempt = socket
+                socket.connect()
+                onPeerConnected(device, socket)
+                rfcommFailures.remove(addr)
+                Log.i(TAG, "RFCOMM connected (bonded) to ${device.name}")
+                return true
+            } catch (e: IOException) {
+                Log.w(TAG, "Bonded RFCOMM failed for ${device.name}: ${e.message}")
+                try { attempt?.close() } catch (_: IOException) {}
+            }
         }
+
+        // Each failed dial is a multi-second classic page that monopolises the
+        // radio the BLE control link shares. Back off per address instead of
+        // re-paging on every scan result and every 3 s retry tick.
+        val failures = (rfcommFailures[addr]?.first ?: 0) + 1
+        val waitMs = (5_000L shl (failures - 1).coerceAtMost(4)).coerceAtMost(60_000L)
+        rfcommFailures[addr] = failures to (android.os.SystemClock.elapsedRealtime() + waitMs)
+        Log.w(TAG, "RFCOMM unreachable for $addr (attempt $failures) — next dial in ${waitMs / 1000}s")
 
         refreshState()
         return false
@@ -272,8 +301,10 @@ class BluetoothTransport(private val context: Context) {
                     // and an adapter that was off at startup but is on now.
                     if (serverSocket == null) {
                         serverSocket = try {
-                            btAdapter?.listenUsingRfcommWithServiceRecord(SERVICE_NAME, SPP_UUID)
-                                ?: btAdapter?.listenUsingInsecureRfcommWithServiceRecord(SERVICE_NAME, SPP_UUID)
+                            // Insecure listener: accepts both unpaired and
+                            // bonded peers, never prompts. Confidentiality is
+                            // the app's own AES-GCM layer, not the link's.
+                            btAdapter?.listenUsingInsecureRfcommWithServiceRecord(SERVICE_NAME, SPP_UUID)
                         } catch (e: IOException) {
                             Log.e(TAG, "Failed to create server socket: ${e.message}")
                             null
@@ -518,7 +549,9 @@ class BluetoothTransport(private val context: Context) {
                 peer.output.write(syncMsg)
                 peer.output.flush()
             }
-            Log.d(TAG, "Channel sync sent: ch=$channel to ${peer.device.name}")
+            // A completed write proves the link is up, including to older
+            // peers that do not send keepalives of their own.
+            peer.lastActivity = System.currentTimeMillis()
         } catch (e: IOException) {
             Log.w(TAG, "Channel sync failed: ${e.message}")
         }
@@ -545,8 +578,11 @@ class BluetoothTransport(private val context: Context) {
                         .getInt()
 
                     if (frameLen <= 0 || frameLen > MAX_FRAME_SIZE) {
-                        Log.w(TAG, "RX: invalid frame length $frameLen from ${peer.device.name}, skipping")
-                        continue
+                        // The stream has no resync marker: skipping only the
+                        // header would read this frame's payload as the next
+                        // header and garble every frame after it. Drop the
+                        // link and let the dial logic re-establish it.
+                        throw IOException("invalid frame length $frameLen")
                     }
 
                     // Read frame payload
@@ -659,7 +695,16 @@ class BluetoothTransport(private val context: Context) {
         Thread {
             Thread.currentThread().name = "bt-dead-peer"
             while (running.get() && connectedPeers.isNotEmpty()) {
-                Thread.sleep(5_000)
+                Thread.sleep(KEEPALIVE_INTERVAL_MS)
+
+                // Keepalive: an idle link carries no audio, so without this
+                // two silent peers looked dead after 10 s, the socket was
+                // closed and re-dialed, and a PTT press inside the gap was
+                // refused as "still linking". The channel-sync frame is
+                // ignored by the receiver beyond refreshing its liveness.
+                for (peer in connectedPeers.values) {
+                    sendChannelSync(peer)
+                }
 
                 val now = System.currentTimeMillis()
                 val deadPeers = connectedPeers.filter { (_, peer) ->

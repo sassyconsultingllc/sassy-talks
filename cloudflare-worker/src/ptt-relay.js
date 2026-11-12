@@ -142,6 +142,15 @@ export function selectSubprotocol(header) {
 const MAX_MESSAGES_PER_SEC = 120;
 const SOFT_RATE_CLOSE_MULT = 3; // hard-close only at 360 msg/s sustained
 const RATE_WINDOW_MS = 1_000;
+// Token bucket, not a fixed window. A phone on a weak cellular uplink does not
+// send 50 evenly spaced frames a second: TCP stalls for a second or three and
+// then delivers the whole backlog at once. A fixed 120/s window threw away
+// everything past the 120th frame of each such flush, the decoder reset on the
+// resulting gap, and that sender sounded garbled to the whole room while LAN
+// peers were fine. The bucket lets a sender spend up to RATE_BURST_TOKENS in
+// one flush (~10 s of saved-up audio) while the sustained rate — the thing
+// that bounds DO billing — stays at MAX_MESSAGES_PER_SEC.
+const RATE_BURST_TOKENS = 600;
 // Consecutive peer.send failures before we force-close that peer. A single
 // backpressured send used to kill the receiver mid-talk (fan-out catch →
 // close), which looked like high loss on the sender's diagnostics.
@@ -347,6 +356,8 @@ export class PttRoom extends DurableObject {
       // were hibernating), so we don't bother persisting these fields.
       windowStartMs: Date.now(),
       msgCount: 0,
+      rateTokens: RATE_BURST_TOKENS,
+      rateRefillMs: Date.now(),
     };
 
     // Persist session info so it survives hibernation
@@ -412,6 +423,8 @@ export class PttRoom extends DurableObject {
         // Reset rate-limit window on wake — by definition we've been idle.
         attachment.windowStartMs = Date.now();
         attachment.msgCount = 0;
+        attachment.rateTokens = RATE_BURST_TOKENS;
+        attachment.rateRefillMs = Date.now();
         this.sessions.set(ws, attachment);
       }
     }
@@ -435,17 +448,27 @@ export class PttRoom extends DurableObject {
         rlSession.windowStartMs = now;
         rlSession.msgCount = 0;
       }
-      rlSession.msgCount++;
-      if (rlSession.msgCount > MAX_MESSAGES_PER_SEC * SOFT_RATE_CLOSE_MULT) {
-        this.markClosing(ws);
-        try { ws.close(1008, "Rate limit exceeded"); } catch {}
-        this.sessions.delete(ws);
-        return;
-      }
-      if (rlSession.msgCount > MAX_MESSAGES_PER_SEC) {
+      const elapsedMs = Math.max(0, now - (rlSession.rateRefillMs ?? now));
+      rlSession.rateRefillMs = now;
+      rlSession.rateTokens = Math.min(
+        RATE_BURST_TOKENS,
+        (rlSession.rateTokens ?? RATE_BURST_TOKENS) + (elapsedMs * MAX_MESSAGES_PER_SEC) / 1000,
+      );
+      if (rlSession.rateTokens < 1) {
+        // Bucket empty: this sender has outrun the sustained rate for long
+        // enough to spend its whole burst allowance. msgCount now counts
+        // only over-limit frames in the current window.
+        rlSession.msgCount++;
+        if (rlSession.msgCount > MAX_MESSAGES_PER_SEC * (SOFT_RATE_CLOSE_MULT - 1)) {
+          this.markClosing(ws);
+          try { ws.close(1008, "Rate limit exceeded"); } catch {}
+          this.sessions.delete(ws);
+          return;
+        }
         this.droppedRateLimited++;
         return; // soft-drop this frame; keep the socket
       }
+      rlSession.rateTokens -= 1;
     }
 
     if (typeof message !== "string") {

@@ -84,7 +84,11 @@ impl WifiTransport {
                 return Err(e);
             }
         };
-        if let Err(e) = audio_sock.set_read_timeout(Some(Duration::from_millis(10))) {
+        // The RX thread polls this socket while holding the transport mutex
+        // that TX send and PTT start also need. A 10 ms timeout here added up
+        // to 10 ms of delay and jitter to every outgoing frame on an idle
+        // channel; 1 ms keeps the poll cheap without making sends non-blocking.
+        if let Err(e) = audio_sock.set_read_timeout(Some(Duration::from_millis(1))) {
             self.state = WifiState::Error;
             return Err(format!("Failed to set read timeout: {}", e));
         }

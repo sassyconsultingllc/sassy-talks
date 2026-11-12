@@ -294,6 +294,13 @@ class BleSignalingService(
                 listener?.onPeerDiscovered(device)
             }
         }
+
+        override fun onScanFailed(errorCode: Int) {
+            // Without this the flag stayed true and discovery was silently dead
+            // (2 = app registration failed, 6 = scanning too frequently).
+            scanning.set(false)
+            Log.e(TAG, "BLE scan FAILED: error $errorCode — no peers will be discovered until restarted")
+        }
     }
 
     // —— Send Commands to Peers ——
@@ -316,28 +323,33 @@ class BleSignalingService(
      * Broadcast an arbitrary TLV control frame to all connected BLE peers.
      * Used by the heartbeat loop in PttCoordinator.
      */
-    fun broadcastControl(bytes: ByteArray) {
-        val protected = protectControl(bytes) ?: return
+    /** @return how many peers' GATT stacks accepted the write (0 = nobody got it). */
+    fun broadcastControl(bytes: ByteArray): Int {
+        val protected = protectControl(bytes) ?: return 0
         val count = peerGattClients.size
         Log.d(TAG, "\u2192 broadcastControl ${protected.size}B to $count BLE peers")
+        var accepted = 0
         for ((address, gatt) in peerGattClients) {
-            writeBytes(gatt, protected, address)
+            if (writeBytes(gatt, protected, address)) accepted++
         }
+        return accepted
     }
 
     /**
      * Send an arbitrary TLV control frame to a single peer.
      * Used for heartbeat echo and targeted Capabilities delivery.
      */
-    fun sendControl(peerId: String, bytes: ByteArray) {
-        val protected = protectControl(bytes) ?: return
-        val gatt = peerGattClients[peerId]
-        if (gatt != null) {
-            writeBytes(gatt, protected, peerId)
-        } else {
+    fun sendControl(peerId: String, bytes: ByteArray): Boolean {
+        val gatt = peerGattClients[peerId] ?: run {
             Log.w(TAG, "No GATT client for $peerId, cannot sendControl")
+            return false
         }
+        val protected = protectControl(bytes) ?: return false
+        return writeBytes(gatt, protected, peerId)
     }
+
+    /** True when [address] is a BLE peer we can write a control frame to. */
+    fun hasControlLink(address: String): Boolean = peerGattClients.containsKey(address)
 
     private fun protectControl(bytes: ByteArray): ByteArray? {
         if (bytes.firstOrNull() == ControlFrame.OP_AUTHENTICATED) return bytes
@@ -348,16 +360,17 @@ class BleSignalingService(
         return protected
     }
 
-    private fun writeBytes(gatt: BluetoothGatt, bytes: ByteArray, address: String) {
+    private fun writeBytes(gatt: BluetoothGatt, bytes: ByteArray, address: String): Boolean {
         val service = gatt.getService(SERVICE_UUID)
         val char = service?.getCharacteristic(PTT_CHAR_UUID)
-        if (char != null) {
-            char.value = bytes
-            val success = gatt.writeCharacteristic(char)
-            Log.d(TAG, "\u2192 writeBytes ${bytes.size}B to $address (success=$success)")
-        } else {
+        if (char == null) {
             Log.w(TAG, "PTT char not found for $address in writeBytes")
+            return false
         }
+        char.value = bytes
+        val success = gatt.writeCharacteristic(char)
+        Log.d(TAG, "\u2192 writeBytes ${bytes.size}B to $address (success=$success)")
+        return success
     }
 
     private fun broadcastCommand(cmd: Byte, label: String) {
@@ -396,24 +409,37 @@ class BleSignalingService(
         if (!connectingPeers.add(device.address)) return
 
         Log.i(TAG, "Connecting GATT client to ${device.name ?: device.address}")
-        device.connectGatt(context, false, object : BluetoothGattCallback() {
+        val callback = object : BluetoothGattCallback() {
 
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     peerGattClients[device.address] = gatt
                     connectedPeers[device.address] = device
                     connectingPeers.remove(device.address)
-                    gatt.requestMtu(517)
+                    // Sealed control frames are ~130 bytes; the default 23-byte
+                    // MTU cannot carry one. If the request cannot even be
+                    // queued, onMtuChanged never fires, so discover now rather
+                    // than leave the link connected but unusable.
+                    if (!gatt.requestMtu(517)) {
+                        Log.w(TAG, "requestMtu rejected for ${device.address} — discovering at default MTU")
+                        gatt.discoverServices()
+                    }
 
                     Log.i(TAG, "GATT client connected to ${device.name ?: device.address}")
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    peerGattClients.remove(device.address)
+                    val wasLinked = peerGattClients.remove(device.address) != null
                     connectedPeers.remove(device.address)
                     connectingPeers.remove(device.address)
                     gatt.close()
 
                     listener?.onPeerLost(device.address)
-                    Log.i(TAG, "GATT client disconnected from ${device.address}")
+                    if (wasLinked) {
+                        Log.i(TAG, "GATT client disconnected from ${device.address} (status=$status)")
+                    } else {
+                        // Never reached CONNECTED (status 133 / 62 / 8 are the
+                        // usual ones). The running scan re-discovers and retries.
+                        Log.w(TAG, "GATT connect to ${device.address} FAILED (status=$status)")
+                    }
                 }
             }
 
@@ -462,7 +488,16 @@ class BleSignalingService(
                     }
                 }
             }
-        })
+        }
+        // TRANSPORT_LE is mandatory here. The default (TRANSPORT_AUTO) lets the
+        // stack choose BR/EDR for any address it believes is dual-mode — which
+        // is every phone — and a classic page to an LE advertising address
+        // never completes: the connect dies with status 133 and no link forms.
+        val gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
+        if (gatt == null) {
+            connectingPeers.remove(device.address)
+            Log.w(TAG, "connectGatt returned null for ${device.address}")
+        }
     }
 
     // —— Lifecycle ——
