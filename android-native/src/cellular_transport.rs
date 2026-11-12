@@ -347,9 +347,10 @@ impl CellularTransport {
 
     /// Called when Kotlin WebSocket connects successfully
     pub fn on_connected(&mut self) {
+        // The room id is the relay capability; never write it to logcat.
         info!(
-            "CellularTransport: WebSocket connected to room '{}'",
-            self.room_id
+            "CellularTransport: WebSocket connected ({}-char room id)",
+            self.room_id.len()
         );
         self.state = CellularState::Connected;
         self.inbound.clear();
