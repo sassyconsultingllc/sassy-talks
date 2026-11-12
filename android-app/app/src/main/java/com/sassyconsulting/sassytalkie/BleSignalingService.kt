@@ -39,6 +39,11 @@ class BleSignalingService(
         val SERVICE_UUID: UUID = UUID.fromString("b1a2e5d4-d5ab-7890-bede-fa12345678f0")
         val PTT_CHAR_UUID: UUID = UUID.fromString("b1a2e5d4-d5ab-7890-bede-fa12345678f1")
         val CHANNEL_CHAR_UUID: UUID = UUID.fromString("b1a2e5d4-d5ab-7890-bede-fa12345678f2")
+        /** Read-only: this device's [L2capOffer] (audio channel PSM + tie-break nonce). */
+        val L2CAP_CHAR_UUID: UUID = UUID.fromString("b1a2e5d4-d5ab-7890-bede-fa12345678f3")
+
+        private const val OFFER_READ_RETRY_MS = 400L
+        private const val OFFER_READ_MAX_ATTEMPTS = 10
 
         const val CMD_PTT_START: Byte = 0x01
         const val CMD_PTT_STOP: Byte = 0x02
@@ -63,6 +68,16 @@ class BleSignalingService(
      * The existing [Listener] methods are still invoked for backward compatibility.
      */
     var controlFrameCallback: ((peerId: String, bytes: ByteArray) -> Unit)? = null
+
+    /** Supplies the offer we publish on [L2CAP_CHAR_UUID]; null = nothing to offer. */
+    @Volatile internal var localL2capOffer: (() -> L2capOffer?)? = null
+    /** A peer's offer was read: (device, psm, peerNonce). */
+    @Volatile var l2capOfferCallback: ((BluetoothDevice, Int, Long) -> Unit)? = null
+    /** The peer publishes no usable offer (older build, or not listening). */
+    @Volatile var l2capUnavailableCallback: ((BluetoothDevice) -> Unit)? = null
+
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    @Volatile private var highPriority = false
 
     private val advertising = AtomicBoolean(false)
     private val scanning = AtomicBoolean(false)
@@ -100,9 +115,16 @@ class BleSignalingService(
             BluetoothGattCharacteristic.PERMISSION_READ or BluetoothGattCharacteristic.PERMISSION_WRITE
         )
 
+        val l2capChar = BluetoothGattCharacteristic(
+            L2CAP_CHAR_UUID,
+            BluetoothGattCharacteristic.PROPERTY_READ,
+            BluetoothGattCharacteristic.PERMISSION_READ
+        )
+
         val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
         service.addCharacteristic(pttChar)
         service.addCharacteristic(channelChar)
+        service.addCharacteristic(l2capChar)
 
         gattServer = manager.openGattServer(context, gattServerCallback)
         gattServer?.addService(service)
@@ -167,6 +189,26 @@ class BleSignalingService(
             if (responseNeeded) {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
             }
+        }
+
+        override fun onCharacteristicReadRequest(
+            device: BluetoothDevice, requestId: Int, offset: Int,
+            characteristic: BluetoothGattCharacteristic
+        ) {
+            if (characteristic.uuid != L2CAP_CHAR_UUID) {
+                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_READ_NOT_PERMITTED, 0, null)
+                return
+            }
+            // psm 0 tells the reader we are not listening, so it falls back.
+            val value = (localL2capOffer?.invoke() ?: L2capOffer(0, 0L)).encode()
+            if (offset > value.size) {
+                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null)
+                return
+            }
+            gattServer?.sendResponse(
+                device, requestId, BluetoothGatt.GATT_SUCCESS, offset,
+                value.copyOfRange(offset, value.size)
+            )
         }
 
         override fun onDescriptorWriteRequest(
@@ -420,6 +462,15 @@ class BleSignalingService(
                     // MTU cannot carry one. If the request cannot even be
                     // queued, onMtuChanged never fires, so discover now rather
                     // than leave the link connected but unusable.
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                        // 2M PHY doubles airtime efficiency for the audio channel;
+                        // the controller keeps 1M if the peer cannot do it.
+                        gatt.setPreferredPhy(
+                            BluetoothDevice.PHY_LE_2M_MASK, BluetoothDevice.PHY_LE_2M_MASK,
+                            BluetoothDevice.PHY_OPTION_NO_PREFERRED
+                        )
+                    }
+                    if (highPriority) gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                     if (!gatt.requestMtu(517)) {
                         Log.w(TAG, "requestMtu rejected for ${device.address} — discovering at default MTU")
                         gatt.discoverServices()
@@ -462,11 +513,53 @@ class BleSignalingService(
                             val desc = pttChar.getDescriptor(CCCD_UUID)
                             if (desc != null) {
                                 desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                                gatt.writeDescriptor(desc)
+                                // GATT runs one operation at a time: the offer
+                                // read is issued from onDescriptorWrite.
+                                if (gatt.writeDescriptor(desc)) return
                             }
                         }
+                        readL2capOffer(gatt, 0)
                     }
                 }
+            }
+
+            override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+                if (descriptor.uuid == CCCD_UUID) readL2capOffer(gatt, 0)
+            }
+
+            @Deprecated("Deprecated in API 33; the framework still routes here")
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int
+            ) {
+                if (characteristic.uuid != L2CAP_CHAR_UUID) return
+                val offer = if (status == BluetoothGatt.GATT_SUCCESS) L2capOffer.decode(characteristic.value) else null
+                if (offer != null && offer.dialable) {
+                    l2capOfferCallback?.invoke(device, offer.psm, offer.nonce)
+                } else {
+                    Log.i(TAG, "No usable L2CAP offer from ${device.address} (status=$status)")
+                    l2capUnavailableCallback?.invoke(device)
+                }
+            }
+
+            /**
+             * Ask the peer which L2CAP channel carries its audio. A control
+             * write (heartbeat) may be in flight, in which case the stack
+             * refuses the read; retry briefly rather than lose the audio link.
+             */
+            private fun readL2capOffer(gatt: BluetoothGatt, attempt: Int) {
+                if (peerGattClients[device.address] !== gatt) return // link went away
+                val char = gatt.getService(SERVICE_UUID)?.getCharacteristic(L2CAP_CHAR_UUID)
+                if (char == null) {
+                    l2capUnavailableCallback?.invoke(device) // peer runs an older build
+                    return
+                }
+                if (gatt.readCharacteristic(char)) return
+                if (attempt >= OFFER_READ_MAX_ATTEMPTS) {
+                    Log.w(TAG, "L2CAP offer read never accepted for ${device.address}")
+                    l2capUnavailableCallback?.invoke(device)
+                    return
+                }
+                handler.postDelayed({ readL2capOffer(gatt, attempt + 1) }, OFFER_READ_RETRY_MS)
             }
 
             override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
@@ -500,6 +593,21 @@ class BleSignalingService(
         }
     }
 
+    /**
+     * Short connection interval while audio is flowing, relaxed otherwise.
+     * At the default interval a BLE link cannot carry 50 audio frames a
+     * second; held high permanently it would cost idle battery for nothing.
+     */
+    fun setHighPriority(high: Boolean) {
+        if (highPriority == high) return
+        highPriority = high
+        val priority = if (high) BluetoothGatt.CONNECTION_PRIORITY_HIGH else BluetoothGatt.CONNECTION_PRIORITY_BALANCED
+        for ((address, gatt) in peerGattClients) {
+            val ok = try { gatt.requestConnectionPriority(priority) } catch (_: Exception) { false }
+            Log.d(TAG, "connection priority ${if (high) "HIGH" else "BALANCED"} for $address (ok=$ok)")
+        }
+    }
+
     // —— Lifecycle ——
 
     val blePeerCount: Int get() = connectedPeers.size
@@ -508,6 +616,7 @@ class BleSignalingService(
     val blePeerAddresses: Set<String> get() = connectedPeers.keys.toSet()
 
     fun shutdown() {
+        handler.removeCallbacksAndMessages(null)
         stopAdvertising()
         stopScanning()
 

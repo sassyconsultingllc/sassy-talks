@@ -66,6 +66,10 @@ class BluetoothTransport(private val context: Context) {
         // Dead peer detection timeout (ms)
         private const val DEAD_PEER_TIMEOUT_MS = 10_000L
         private const val KEEPALIVE_INTERVAL_MS = 3_000L
+
+        // How long the non-dialing side waits for the peer's inbound L2CAP
+        // channel before dialing itself.
+        private const val L2CAP_PASSIVE_WAIT_MS = 6_000L
     }
 
     // ── State ──
@@ -154,6 +158,62 @@ class BluetoothTransport(private val context: Context) {
     // Server socket for incoming connections
     private var serverSocket: BluetoothServerSocket? = null
 
+    // ── BLE L2CAP channel (Android 10+) ──
+    //
+    // Classic RFCOMM can only reach a phone whose real hardware address we
+    // know, and Android hides that until the two phones are paired. A BLE
+    // scan hands us the peer's rotating private address instead, which a
+    // classic dial can never reach. An LE connection-oriented channel rides
+    // the BLE link that already exists, needs no pairing and no prompt, and
+    // gives the same BluetoothSocket byte stream, so everything above the
+    // socket (framing, keepalive, TX pump, RX thread) is unchanged.
+
+    private var l2capServer: BluetoothServerSocket? = null
+    private val l2capAcceptActive = AtomicBoolean(false)
+
+    /** PSM peers must dial to reach us, or 0 while not listening. */
+    @Volatile var l2capPsm: Int = 0
+        private set
+
+    /** Random per process; only used to decide which side dials. */
+    val linkNonce: Long = java.security.SecureRandom().nextLong()
+
+    private class PeerOffer(val psm: Int, val weDial: Boolean, val atMs: Long)
+
+    /** address -> the L2CAP offer read from that peer over GATT. */
+    private val l2capOffers = ConcurrentHashMap<String, PeerOffer>()
+    /** Peers that publish no L2CAP offer (older app builds): classic RFCOMM only. */
+    private val l2capUnsupported: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    private val l2capSupported: Boolean
+        get() = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q
+
+    /** The peer told us (over GATT) which L2CAP channel it listens on. */
+    fun onL2capOffer(device: BluetoothDevice, psm: Int, peerNonce: Long) {
+        if (!l2capSupported) return
+        val weDial = com.sassyconsulting.sassytalkie.L2capOffer.localDials(linkNonce, peerNonce)
+        l2capOffers[device.address] = PeerOffer(psm, weDial, android.os.SystemClock.elapsedRealtime())
+        l2capUnsupported.remove(device.address)
+        Log.i(TAG, "L2CAP offer from ${device.address}: psm=$psm weDial=$weDial")
+        connectDevice(device)
+    }
+
+    /** The peer has no L2CAP offer to give: fall back to classic RFCOMM. */
+    fun onL2capUnavailable(device: BluetoothDevice) {
+        l2capOffers.remove(device.address)
+        if (l2capUnsupported.add(device.address)) {
+            Log.i(TAG, "No L2CAP offer from ${device.address} — classic RFCOMM only")
+        }
+        connectDevice(device)
+    }
+
+    /** Forget per-link state when the BLE link to [address] goes away. */
+    fun onBleLinkLost(address: String) {
+        l2capOffers.remove(address)
+        l2capUnsupported.remove(address)
+        rfcommFailures.remove(address)
+    }
+
     // ── Public API ──
 
     val isConnected: Boolean get() = connectedPeers.isNotEmpty()
@@ -203,15 +263,144 @@ class BluetoothTransport(private val context: Context) {
         if (connectedPeers.containsKey(device.address)) return
         val retryAt = rfcommFailures[device.address]?.second ?: 0L
         if (android.os.SystemClock.elapsedRealtime() < retryAt) return
+        // Decide before spawning anything: this is called for every BLE peer
+        // every few seconds, and most calls have nothing to do.
+        val plan = planDial(device) ?: return
         if (!dialing.add(device.address)) return
         Thread {
             Thread.currentThread().name = "bt-connect-${device.address.takeLast(5)}"
             try {
-                connectTo(device)
+                when (plan) {
+                    is DialPlan.L2cap -> {
+                        val bonded = try { device.bondState == BluetoothDevice.BOND_BONDED } catch (_: Exception) { false }
+                        // Repeated L2CAP failure with a bonded peer: classic can still work.
+                        if (!connectL2cap(device, plan.psm) && bonded &&
+                            (rfcommFailures[device.address]?.first ?: 0) >= 3
+                        ) connectTo(device)
+                    }
+                    DialPlan.Rfcomm -> connectTo(device)
+                }
             } finally {
                 dialing.remove(device.address)
             }
         }.start()
+    }
+
+    private sealed class DialPlan {
+        class L2cap(val psm: Int) : DialPlan()
+        object Rfcomm : DialPlan()
+    }
+
+    /** Which link to open to [device] right now, or null to wait. */
+    private fun planDial(device: BluetoothDevice): DialPlan? {
+        val addr = device.address
+        if (!l2capSupported) return DialPlan.Rfcomm
+        val offer = l2capOffers[addr]
+        if (offer != null) {
+            if (offer.weDial) return DialPlan.L2cap(offer.psm)
+            // The peer is the designated dialer. Dial ourselves only if its
+            // channel has not arrived AND we have no audio link at all. The
+            // second condition matters because a phone can appear under two
+            // BLE addresses (one it advertises on, one it connects from): its
+            // inbound channel is then filed under the other address, and
+            // dialing here would open a second channel to the same phone.
+            val waitedMs = android.os.SystemClock.elapsedRealtime() - offer.atMs
+            return if (waitedMs >= L2CAP_PASSIVE_WAIT_MS && connectedPeers.isEmpty()) {
+                DialPlan.L2cap(offer.psm)
+            } else {
+                null
+            }
+        }
+        val bonded = try { device.bondState == BluetoothDevice.BOND_BONDED } catch (_: Exception) { false }
+        if (bonded || addr in l2capUnsupported) return DialPlan.Rfcomm
+        // Unpaired, and no offer read yet: a classic page to a BLE address
+        // cannot succeed and only jams the radio. Wait for the GATT read.
+        return null
+    }
+
+    @android.annotation.TargetApi(android.os.Build.VERSION_CODES.Q)
+    private fun connectL2cap(device: BluetoothDevice, psm: Int): Boolean {
+        val addr = device.address
+        if (connectedPeers.containsKey(addr)) return true
+        markConnecting()
+        var attempt: BluetoothSocket? = null
+        try {
+            // "Insecure" = no Bluetooth-level pairing. Every audio frame is
+            // already AES-GCM sealed with the room key before it gets here.
+            val socket = device.createInsecureL2capChannel(psm)
+            attempt = socket
+            socket.connect()
+            onPeerConnected(device, socket)
+            rfcommFailures.remove(addr)
+            Log.i(TAG, "L2CAP connected to $addr (psm=$psm, maxTx=${socket.maxTransmitPacketSize})")
+            return true
+        } catch (e: Exception) {
+            Log.w(TAG, "L2CAP connect to $addr psm=$psm failed: ${e.message}")
+            try { attempt?.close() } catch (_: IOException) {}
+        }
+        val failures = (rfcommFailures[addr]?.first ?: 0) + 1
+        val waitMs = (2_000L shl (failures - 1).coerceAtMost(4)).coerceAtMost(30_000L)
+        rfcommFailures[addr] = failures to (android.os.SystemClock.elapsedRealtime() + waitMs)
+        refreshState()
+        return false
+    }
+
+    /** Listen for inbound L2CAP channels. No-op below Android 10. */
+    private fun startL2capAcceptThread() {
+        if (!l2capSupported) return
+        if (l2capAcceptActive.getAndSet(true)) return
+        Thread {
+            Thread.currentThread().name = "bt-l2cap-accept"
+            try {
+                while (running.get()) {
+                    if (l2capServer == null) {
+                        l2capServer = try {
+                            openL2capServer()
+                        } catch (e: Exception) {
+                            Log.e(TAG, "L2CAP listen failed: ${e.message}")
+                            null
+                        }
+                        if (l2capServer == null) {
+                            l2capPsm = 0
+                            Thread.sleep(5_000)
+                            continue
+                        }
+                    }
+                    val startNs = System.nanoTime()
+                    try {
+                        val socket = l2capServer?.accept(30_000) ?: continue
+                        val device = socket.remoteDevice
+                        Log.i(TAG, "Accepted L2CAP channel from ${device.address}")
+                        onPeerConnected(device, socket)
+                    } catch (e: IOException) {
+                        if (!running.get()) break
+                        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
+                        if (elapsedMs < 5_000) {
+                            // Returned far sooner than the timeout: the server
+                            // socket is dead. Re-listen (the PSM will change;
+                            // peers re-read it on their next GATT connect).
+                            Log.w(TAG, "L2CAP accept error (${elapsedMs}ms): ${e.message} — re-listening")
+                            try { l2capServer?.close() } catch (_: IOException) {}
+                            l2capServer = null
+                            l2capPsm = 0
+                            Thread.sleep(1_000)
+                        }
+                    }
+                }
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } finally {
+                l2capAcceptActive.set(false)
+            }
+        }.start()
+    }
+
+    @android.annotation.TargetApi(android.os.Build.VERSION_CODES.Q)
+    private fun openL2capServer(): BluetoothServerSocket? {
+        val server = btAdapter?.listenUsingInsecureL2capChannel() ?: return null
+        l2capPsm = server.psm
+        Log.i(TAG, "L2CAP listening on psm=${server.psm}")
+        return server
     }
 
     private val dialing: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
@@ -288,6 +477,7 @@ class BluetoothTransport(private val context: Context) {
      */
     fun startAcceptThread() {
         running.set(true)
+        startL2capAcceptThread()
         if (acceptLoopActive.getAndSet(true)) return
 
         Thread {
@@ -472,6 +662,11 @@ class BluetoothTransport(private val context: Context) {
 
         try { serverSocket?.close() } catch (_: IOException) {}
         serverSocket = null
+        try { l2capServer?.close() } catch (_: IOException) {}
+        l2capServer = null
+        l2capPsm = 0
+        l2capOffers.clear()
+        l2capUnsupported.clear()
 
         val addrs = connectedPeers.keys.toList()
         addrs.forEach { removePeer(it) }
@@ -505,7 +700,7 @@ class BluetoothTransport(private val context: Context) {
         // double-playing every received frame.
         val existing = connectedPeers.putIfAbsent(addr, peer)
         if (existing != null) {
-            Log.i(TAG, "Duplicate RFCOMM link to ${device.name ?: addr} — closing late socket")
+            Log.i(TAG, "Duplicate audio link to ${device.name ?: addr} — closing late socket")
             try { socket.close() } catch (_: IOException) {}
             return
         }

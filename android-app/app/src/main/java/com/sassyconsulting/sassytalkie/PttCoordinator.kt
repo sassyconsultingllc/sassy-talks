@@ -131,6 +131,8 @@ class PttCoordinator(
         private const val REACHING_PEER_TIMEOUT_MS = 2_500L
         /** Bound RFCOMM dial retries for BLE peers without a data socket. */
         private const val RFCOMM_LINK_RETRY_MS = 3_000L
+        /** Keep the BLE link on its short interval this long after audio stops. */
+        private const val BT_PRIORITY_HOLD_MS = 10_000L
         /** Hard safety ceiling for every TX source, including toggle accessories. */
         const val DEFAULT_MAX_TX_MS = 60_000L
 
@@ -547,6 +549,11 @@ class PttCoordinator(
             it.listener = null
             it.controlFrameCallback = null
         }
+        bleSignaling?.takeIf { it !== ble }?.let {
+            it.localL2capOffer = null
+            it.l2capOfferCallback = null
+            it.l2capUnavailableCallback = null
+        }
         btTransport?.takeIf { it !== bt }?.let {
             it.audioFrameV2Callback = null
             it.audioFrameCallback = null
@@ -556,6 +563,11 @@ class PttCoordinator(
         btTransport = bt
         ble?.listener = this
         ble?.controlFrameCallback = { peerId, bytes -> onControlFrame(peerId, bytes) }
+        // Bluetooth audio channel negotiation: we publish our L2CAP channel on
+        // the BLE link, and dial (or await) the peer's once we have read theirs.
+        ble?.localL2capOffer = { bt?.let { L2capOffer(it.l2capPsm, it.linkNonce) } }
+        ble?.l2capOfferCallback = { device, psm, nonce -> bt?.onL2capOffer(device, psm, nonce) }
+        ble?.l2capUnavailableCallback = { device -> bt?.onL2capUnavailable(device) }
         bt?.audioFrameV2Callback = { peerId, decoded -> onAudioFrameV2(peerId, decoded) }
         bt?.audioFrameCallback = { peerId, epoch, seq -> onAudioFrameReceived(peerId, epoch, seq) }
         bt?.setTxEpoch(selfEpoch)
@@ -632,6 +644,7 @@ class PttCoordinator(
         val ipUp = try { SassyTalkNative.isConnected() } catch (_: Throwable) { false }
 
         Log.i(TAG, "PTT PRESSED — BLE peers: $blePeers, RFCOMM peers: $rfcommPeers, ipUp=$ipUp")
+        noteBluetoothAudioActive()
 
         // Kick RFCOMM if BLE sees peers but sockets are not up yet.
         if (rfcommPeers == 0 && blePeers > 0) {
@@ -1000,7 +1013,17 @@ class PttCoordinator(
     }
 
     /** Set peerSpeaking = true and arm the UI LED timeout. Not the TX floor. */
+    /** Wall-clock of the last local TX or peer RX; drives the BLE link priority. */
+    @Volatile private var lastBtAudioActiveMs = 0L
+
+    /** Audio is starting or flowing: put the BLE link on its short interval now. */
+    private fun noteBluetoothAudioActive() {
+        lastBtAudioActiveMs = System.currentTimeMillis()
+        try { bleSignaling?.setHighPriority(true) } catch (_: Throwable) {}
+    }
+
     private fun setPeerSpeaking(speaking: Boolean) {
+        if (speaking) noteBluetoothAudioActive()
         peerSpeaking.value = speaking
         peerSpeakingTimeoutJob?.cancel()
         if (speaking) {
@@ -1068,6 +1091,7 @@ class PttCoordinator(
         // liveness entry so the peer stays on the sticky roster and can be
         // woken over relay/FCM.
         Log.i(TAG, "BT peer link lost: $deviceAddress — keeping session roster entry")
+        btTransport?.onBleLinkLost(deviceAddress)
         peerCaps.remove(deviceAddress)
         // Tear down this peer's RECV_ACK loop so it doesn't pump frames to a dead peer.
         stopRecvAckJob(deviceAddress)
@@ -1144,6 +1168,14 @@ class PttCoordinator(
                 bleSignaling?.broadcastControl(frame)
                 cellularClient?.sendBinary(frame)
                 if (BuildConfig.DEBUG) Log.d(TAG, "HB seq=$seq broadcast to ${bleSignaling?.blePeerCount ?: 0} peers (relay=${cellularClient != null})")
+
+                // Relax the BLE connection interval once the channel has been
+                // quiet for a while; noteBluetoothAudioActive() tightens it again.
+                if (transmitting.get() || peerSpeaking.value) {
+                    lastBtAudioActiveMs = nowMs
+                } else if (nowMs - lastBtAudioActiveMs > BT_PRIORITY_HOLD_MS) {
+                    try { bleSignaling?.setHighPriority(false) } catch (_: Throwable) {}
+                }
 
                 delay(HEARTBEAT_INTERVAL_MS)
             }
