@@ -147,6 +147,9 @@ fun MainScreen(
         .collectAsState()
     val selfEmergencyActive by (walkieService?.pttCoordinator?.selfEmergencyActive ?: falseFallback)
         .collectAsState()
+    val trueFallback = remember { kotlinx.coroutines.flow.MutableStateFlow(true) }
+    val selfEmergencyDelivered by (walkieService?.pttCoordinator?.selfEmergencyDelivered ?: trueFallback)
+        .collectAsState()
 
     // Free-trial accounting: a session only counts once a peer is actually
     // present. Creating a room nobody joins proves nothing to the user, so it
@@ -398,6 +401,7 @@ fun MainScreen(
 
         if (selfEmergencyActive) {
             SelfEmergencyBanner(
+                delivered = selfEmergencyDelivered,
                 onClear = { walkieService?.pttCoordinator?.clearEmergency() }
             )
             Spacer(modifier = Modifier.height(6.dp))
@@ -999,7 +1003,7 @@ fun MainScreen(
                     val ok = walkieService?.pttCoordinator?.raiseEmergency() ?: false
                     if (!ok) {
                         scope.launch {
-                            snackbarHost.showSnackbar("SOS failed — no transport available")
+                            snackbarHost.showSnackbar("SOS not sent yet — no connection. Retrying every second.")
                         }
                     }
                 }) {
@@ -1167,7 +1171,7 @@ private fun PeerEmergencyCard(em: com.sassyconsulting.sassytalkie.PttCoordinator
 
 /** Our own beacon is live. Persistent, with the only way to stand down. */
 @Composable
-private fun SelfEmergencyBanner(onClear: () -> Unit) {
+private fun SelfEmergencyBanner(delivered: Boolean, onClear: () -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = EmergencyRedDim),
@@ -1185,7 +1189,7 @@ private fun SelfEmergencyBanner(onClear: () -> Unit) {
             )
             Spacer(modifier = Modifier.width(8.dp))
             Text(
-                text = "Broadcasting SOS",
+                text = if (delivered) "Broadcasting SOS" else "SOS NOT SENT — no connection, retrying",
                 color = Color.White,
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Bold,

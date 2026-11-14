@@ -142,10 +142,24 @@ export function selectSubprotocol(header) {
 const MAX_MESSAGES_PER_SEC = 120;
 const SOFT_RATE_CLOSE_MULT = 3; // hard-close only at 360 msg/s sustained
 const RATE_WINDOW_MS = 1_000;
+// Token bucket, not a fixed window. A phone on a weak cellular uplink does not
+// send 50 evenly spaced frames a second: TCP stalls for a second or three and
+// then delivers the whole backlog at once. A fixed 120/s window threw away
+// everything past the 120th frame of each such flush, the decoder reset on the
+// resulting gap, and that sender sounded garbled to the whole room while LAN
+// peers were fine. The bucket lets a sender spend up to RATE_BURST_TOKENS in
+// one flush (~10 s of saved-up audio) while the sustained rate — the thing
+// that bounds DO billing — stays at MAX_MESSAGES_PER_SEC.
+const RATE_BURST_TOKENS = 600;
 // Consecutive peer.send failures before we force-close that peer. A single
 // backpressured send used to kill the receiver mid-talk (fan-out catch →
 // close), which looked like high loss on the sender's diagnostics.
 const SEND_FAIL_CLOSE_THRESHOLD = 3;
+// Largest frame a client may send. Audio frames are a few hundred bytes and
+// hybrid-PQC rekey frames a few KB; anything near this is abuse. Without a
+// cap one member could fan out multi-megabyte frames to the whole room and
+// push the Durable Object past its memory limit.
+const MAX_INBOUND_FRAME_BYTES = 64 * 1024;
 
 // ── Store-and-forward (async voice / catch-up) ────────────────────────────
 // A bounded, DO-local in-memory ring buffer of the most recent broadcast
@@ -342,6 +356,8 @@ export class PttRoom extends DurableObject {
       // were hibernating), so we don't bother persisting these fields.
       windowStartMs: Date.now(),
       msgCount: 0,
+      rateTokens: RATE_BURST_TOKENS,
+      rateRefillMs: Date.now(),
     };
 
     // Persist session info so it survives hibernation
@@ -407,8 +423,19 @@ export class PttRoom extends DurableObject {
         // Reset rate-limit window on wake — by definition we've been idle.
         attachment.windowStartMs = Date.now();
         attachment.msgCount = 0;
+        attachment.rateTokens = RATE_BURST_TOKENS;
+        attachment.rateRefillMs = Date.now();
         this.sessions.set(ws, attachment);
       }
+    }
+
+    // Size cap before anything copies, parses or fans the frame out.
+    const inboundSize = typeof message === "string" ? message.length : message.byteLength;
+    if (inboundSize > MAX_INBOUND_FRAME_BYTES) {
+      this.markClosing(ws);
+      try { ws.close(1009, "Frame too large"); } catch { /* already closed */ }
+      this.sessions.delete(ws);
+      return;
     }
 
     // Per-socket rate limit. Soft-drop excess frames first; only hard-close
@@ -421,16 +448,27 @@ export class PttRoom extends DurableObject {
         rlSession.windowStartMs = now;
         rlSession.msgCount = 0;
       }
-      rlSession.msgCount++;
-      if (rlSession.msgCount > MAX_MESSAGES_PER_SEC * SOFT_RATE_CLOSE_MULT) {
-        try { ws.close(1008, "Rate limit exceeded"); } catch {}
-        this.sessions.delete(ws);
-        return;
-      }
-      if (rlSession.msgCount > MAX_MESSAGES_PER_SEC) {
+      const elapsedMs = Math.max(0, now - (rlSession.rateRefillMs ?? now));
+      rlSession.rateRefillMs = now;
+      rlSession.rateTokens = Math.min(
+        RATE_BURST_TOKENS,
+        (rlSession.rateTokens ?? RATE_BURST_TOKENS) + (elapsedMs * MAX_MESSAGES_PER_SEC) / 1000,
+      );
+      if (rlSession.rateTokens < 1) {
+        // Bucket empty: this sender has outrun the sustained rate for long
+        // enough to spend its whole burst allowance. msgCount now counts
+        // only over-limit frames in the current window.
+        rlSession.msgCount++;
+        if (rlSession.msgCount > MAX_MESSAGES_PER_SEC * (SOFT_RATE_CLOSE_MULT - 1)) {
+          this.markClosing(ws);
+          try { ws.close(1008, "Rate limit exceeded"); } catch {}
+          this.sessions.delete(ws);
+          return;
+        }
         this.droppedRateLimited++;
         return; // soft-drop this frame; keep the socket
       }
+      rlSession.rateTokens -= 1;
     }
 
     if (typeof message !== "string") {
@@ -595,6 +633,7 @@ export class PttRoom extends DurableObject {
       this.sendFailCounts.set(peer, fails);
       this.droppedFanout++;
       if (fails >= SEND_FAIL_CLOSE_THRESHOLD) {
+        this.markClosing(peer);
         try { peer.close(1011, "Send failed"); } catch { /* already closed */ }
         this.sessions.delete(peer);
         this.sendFailCounts.delete(peer);
@@ -694,8 +733,20 @@ export class PttRoom extends DurableObject {
   async webSocketError(ws, error) {
     const session = this.sessions.get(ws) || {};
     console.error(`WebSocket error for ${session.id || "unknown"}: ${error}`);
+    this.markClosing(ws);
     this.sessions.delete(ws);
     try { ws.close(1011, "Error"); } catch { /* ignore */ }
+  }
+
+  /**
+   * Flag a socket this object is closing, so the wake-push path stops
+   * treating its peer as attached while the close handshake is pending.
+   */
+  markClosing(ws) {
+    try {
+      const att = this.sessions.get(ws) || ws.deserializeAttachment();
+      if (att) ws.serializeAttachment({ ...att, closing: true });
+    } catch { /* socket already gone */ }
   }
 
   /**
@@ -723,10 +774,17 @@ export class PttRoom extends DurableObject {
     if (this.fcmRoomPushCount >= FCM_ROOM_PUSH_BUDGET) return; // budget exhausted this window
 
     // Build the set of currently-attached peerIds.
+    // A socket we closed can linger in getWebSockets() until the peer
+    // completes the close handshake, which a dead phone never does. Counting
+    // it as attached suppressed the wake push for exactly the peer that
+    // needed one.
     const attached = new Set();
     for (const ws of activeSockets) {
       const s = this.sessions.get(ws) || ws.deserializeAttachment() || null;
-      if (s && s.peer) attached.add(s.peer);
+      if (!s || !s.peer) continue;
+      if (s.offlineNotified || s.closing) continue;
+      if (typeof ws.readyState === "number" && ws.readyState !== 1) continue;
+      attached.add(s.peer);
     }
 
     // Get the room's presence list (cached briefly to keep KV traffic sane

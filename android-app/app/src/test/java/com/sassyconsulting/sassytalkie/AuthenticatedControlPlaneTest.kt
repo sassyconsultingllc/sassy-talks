@@ -61,6 +61,40 @@ class AuthenticatedControlPlaneTest {
         assertNull(receiver.open(sender.seal(ControlFrame.encodeWake(11, senderNow))))
     }
 
+    @Test
+    fun `rebuilt codec under the same epoch keeps its sequence and is still accepted`() {
+        // Channel switch / PSK refresh rebuilds the sender's codec. The peer's
+        // window still remembers the old high-water mark for (sender, epoch).
+        val txSequence = java.util.concurrent.atomic.AtomicLong(0)
+        val receiver = codec(sender = "device-b")
+        val before = AuthenticatedControlCodec(
+            key.copyOf(), "room-1", "device-a", 11, { NOW }, txSequence = txSequence,
+        )
+        repeat(200) {
+            assertTrue(receiver.open(before.seal(ControlFrame.encodeWake(11, NOW))) != null)
+        }
+        before.destroy()
+
+        val after = AuthenticatedControlCodec(
+            key.copyOf(), "room-1", "device-a", 11, { NOW }, txSequence = txSequence,
+        )
+        val verified = receiver.open(after.seal(ControlFrame.encodeWake(11, NOW)))
+        assertEquals(201L, verified!!.sequence)
+    }
+
+    @Test
+    fun `replay window survives a receiver codec rebuild`() {
+        val replay = ControlReplayWindow()
+        val sender = codec(sender = "device-a")
+        val captured = sender.seal(ControlFrame.encodeWake(11, NOW))
+        val first = AuthenticatedControlCodec(key.copyOf(), "room-1", "device-b", 22, { NOW }, replay = replay)
+        assertTrue(first.open(captured) != null)
+        first.destroy()
+
+        val rebuilt = AuthenticatedControlCodec(key.copyOf(), "room-1", "device-b", 22, { NOW }, replay = replay)
+        assertNull(rebuilt.open(captured))
+    }
+
     @Test(expected = IllegalArgumentException::class)
     fun `legacy control cannot be wrapped as privileged v2`() {
         codec(sender = "device-a").seal(ControlFrame.encodeLegacy(ControlFrame.OP_PTT_START))

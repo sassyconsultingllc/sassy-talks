@@ -1427,6 +1427,50 @@ impl AudioCache {
             }
         }
 
+        // Whole-clip mode keeps audio in active_buffers / playback_queue /
+        // now_playing rather than the live accumulator. Move it to history
+        // too, so a clip that was arriving, queued or playing when the link
+        // dropped can still be replayed from the timeline.
+        if self.whole_clip_mode {
+            let mut salvaged: Vec<Utterance> = Vec::new();
+            if let Some(utt) = self.now_playing.take() {
+                salvaged.push(utt);
+            }
+            salvaged.extend(self.playback_queue.drain(..));
+            let ids: Vec<String> = self.active_buffers.keys().cloned().collect();
+            for id in ids {
+                let (name, is_fav, is_muted) = self
+                    .user_info
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| (id.clone(), false, false));
+                if is_muted {
+                    continue;
+                }
+                if let Some(mut buf) = self.active_buffers.remove(&id) {
+                    let mut utt = buf.drain_to_utterance(&name, is_fav);
+                    if utt.frames.len() < MIN_CLIP_FRAMES {
+                        continue; // presence beacon, not speech
+                    }
+                    normalize_clip(&mut utt.frames);
+                    salvaged.push(utt);
+                }
+            }
+            for utt in salvaged {
+                if utt.frames.is_empty() {
+                    continue;
+                }
+                let commit = (
+                    utt.id,
+                    utt.sender_id.clone(),
+                    utt.sender_name.clone(),
+                    utt.duration_ms(),
+                );
+                self.push_history(utt);
+                self.newly_committed_ids.push(commit);
+            }
+        }
+
         self.active_buffers.clear();
         self.live_accumulator.clear();
         self.playback_queue.clear();
@@ -2460,5 +2504,36 @@ mod normalize_tests {
         let g = normalize_clip(&mut c);
         assert!((c[0].samples[10] as f32 - a0 as f32 * g).abs() <= 1.0);
         assert!((c[30].samples[10] as f32 - b0 as f32 * g).abs() <= 1.0);
+    }
+}
+
+#[cfg(test)]
+mod clear_active_whole_clip_tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_clip_survives_disconnect_in_history() {
+        let mut cache = AudioCache::new();
+        cache.set_whole_clip_mode(true);
+        cache.update_user_info("alice", "Alice", false, false);
+        for seq in 0..20u32 {
+            let out = cache.ingest_logical_frame("alice", 1, seq, 1_000 + seq as u64 * 20, vec![100i16; 960]);
+            assert!(out.is_none(), "whole-clip mode never plays live");
+        }
+        let before = cache.history.len();
+        cache.clear_active();
+        assert_eq!(cache.history.len(), before + 1, "clip in flight must reach history");
+        assert_eq!(cache.history.back().unwrap().frames.len(), 20);
+        assert!(cache.active_buffers.is_empty());
+    }
+
+    #[test]
+    fn lone_beacon_is_not_saved_as_a_clip() {
+        let mut cache = AudioCache::new();
+        cache.set_whole_clip_mode(true);
+        cache.ingest_logical_frame("bob", 7, 0, 5_000, vec![0i16; 960]);
+        let before = cache.history.len();
+        cache.clear_active();
+        assert_eq!(cache.history.len(), before);
     }
 }

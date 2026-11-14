@@ -420,7 +420,14 @@ impl EmergencyState {
     /// stale. No-op (returns `None`) when inactive.
     pub fn tick(&mut self, now_ms: u64) -> Option<Vec<u8>> {
         let active = self.active.as_mut()?;
-        if now_ms.saturating_sub(active.last_beacon_ms) < self.interval_ms {
+        if now_ms < active.last_beacon_ms {
+            // The wall clock stepped backwards (NTP, manual change). Re-anchor
+            // so the next beacon is one interval away instead of waiting for
+            // the clock to catch up, which could silence an SOS for minutes.
+            active.last_beacon_ms = now_ms;
+            return None;
+        }
+        if now_ms - active.last_beacon_ms < self.interval_ms {
             return None;
         }
         active.last_beacon_ms = now_ms;

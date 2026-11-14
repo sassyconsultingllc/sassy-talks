@@ -556,6 +556,10 @@ class AutoConnectManager(private val context: Context) {
                 if (relayUp) {
                     Log.i(TAG, "WiFi lost — staying on relay")
                     applyConnected("cellular", true)
+                    // The relay socket was almost certainly opened over the
+                    // Wi-Fi that just went away; re-dial on the new network
+                    // instead of waiting for it to time out.
+                    cellularClient?.reconnectNow("wifi-lost")
                 } else {
                     Log.w(TAG, "WiFi lost and relay down — Bluetooth chain")
                     setActiveTransport("none")
@@ -674,6 +678,17 @@ class AutoConnectManager(private val context: Context) {
 
     fun onRelayReady() {
         _relayReady.value = true
+        // Register for wake pushes on every relay open, not only the first
+        // one that happened to finish inside the startup wait. A device with
+        // no presence row cannot be woken when its socket drops.
+        try {
+            val sid = SassyTalkNative.getSessionId()
+            if (!sid.isNullOrBlank()) {
+                com.sassyconsulting.sassytalkie.PresenceClient.uploadCurrentToken(context, sid)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Presence upload on relay ready failed: ${t.message}")
+        }
         relayDownSinceMs = 0L
         relayLossJob?.cancel()
         relayLossJob = null

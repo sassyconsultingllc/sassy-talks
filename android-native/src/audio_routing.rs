@@ -103,6 +103,18 @@ fn apply_route() -> Result<(), String> {
     let sdk = sdk_int(&mut env).unwrap_or(0);
     set_mode_in_communication(&mut env, am_ref.as_obj())?;
 
+    // Record the saved state as soon as the mode has changed. If a later
+    // routing call fails, release() can still restore the phone's mode.
+    if first_engage {
+        let mut guard = ROUTER.lock().unwrap();
+        *guard = Some(RouterState {
+            am: am_ref.clone(),
+            saved_mode,
+            saved_speaker_on: saved_speaker,
+            active: true,
+        });
+    }
+
     let types = collect_output_types(&mut env, am_ref.as_obj()).unwrap_or_default();
     let target = audio_route_policy::resolve(force_speaker, &types);
     let current = current_output_type(&mut env, am_ref.as_obj(), sdk);
@@ -127,15 +139,6 @@ fn apply_route() -> Result<(), String> {
         }
     }
 
-    if first_engage {
-        let mut guard = ROUTER.lock().unwrap();
-        *guard = Some(RouterState {
-            am: am_ref,
-            saved_mode,
-            saved_speaker_on: saved_speaker,
-            active: true,
-        });
-    }
     Ok(())
 }
 

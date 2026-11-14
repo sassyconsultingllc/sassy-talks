@@ -106,7 +106,10 @@ export async function sendWakePush(env, token, roomId) {
     if (!errCode) errCode = body?.error?.status || "";
   } catch { /* non-JSON error body */ }
 
-  const stale = res.status === 404 || errCode === "UNREGISTERED" || errCode === "INVALID_ARGUMENT";
+  // Only UNREGISTERED means the token is dead. INVALID_ARGUMENT also covers
+  // a malformed request, and treating it as stale let one bad payload field
+  // wipe every wake registration in the room.
+  const stale = res.status === 404 || errCode === "UNREGISTERED";
   return { ok: false, status: res.status, error: errMsg || errCode || `HTTP ${res.status}`, stale };
 }
 

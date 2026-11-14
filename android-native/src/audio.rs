@@ -391,6 +391,12 @@ impl AudioEngine {
         }
     }
 
+    /// Recorder handle for callers that block in `read()`; they must not
+    /// hold the engine mutex across that call.
+    pub fn recorder_handle(&self) -> Option<Arc<AndroidAudioRecord>> {
+        self.recorder.lock().unwrap().as_ref().map(Arc::clone)
+    }
+
     /// Read recorded audio data
     pub fn read_audio(&self, buffer: &mut [i16]) -> Result<usize, String> {
         // Clone-out-then-call: read() blocks waiting for samples; holding the

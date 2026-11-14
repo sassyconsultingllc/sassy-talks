@@ -230,7 +230,10 @@ async function redeemPromo(request, env) {
   // Promo codes are low-entropy and this endpoint is unauthenticated, so cap
   // guessing per source IP. Only failed lookups (below) count toward the limit,
   // so a legit device's redeem/refresh of a VALID code is never throttled.
-  if ((await promoGuessCount(request, env, 0)) >= PROMO_GUESS_LIMIT) {
+  // Count the attempt before the lookup, atomically. Reading then writing
+  // after the lookup let parallel requests all see zero and guess freely.
+  const attempt = await promoAttemptBegin(request, env);
+  if (attempt.count > PROMO_GUESS_LIMIT) {
     return json({ ok: false, error: "Too many attempts; try again later" }, 429);
   }
 
@@ -242,9 +245,12 @@ async function redeemPromo(request, env) {
   ).bind(codeHash).first();
 
   if (!promo) {
-    await promoGuessCount(request, env, 1);
+    if (!attempt.atomic) await promoGuessCount(request, env, 1);
     return json({ ok: false, error: "Unknown promo code" }, 404);
   }
+  // A real code: give the attempt back so valid redeems and refreshes are
+  // never throttled.
+  await promoAttemptRefund(env, attempt);
   if (promo.status !== "active") {
     return json({ ok: false, error: `Promo code ${promo.status}` }, 403);
   }
@@ -439,6 +445,44 @@ function generatePromoCode() {
  * Never throws and returns 0 when KV is unavailable, so it can only ADD
  * protection, never block a legitimate redemption.
  */
+/**
+ * Atomic per-IP attempt counter in D1 (`promo_attempts`, see
+ * schema/licenses.sql). Falls back to the KV counter when the table is not
+ * there yet, so deploying the worker before the migration loses nothing.
+ */
+async function promoAttemptBegin(request, env) {
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const win = Math.floor(Date.now() / 1000 / PROMO_GUESS_WINDOW_SEC);
+  try {
+    const ipHash = await hmacSha256Hex(`promo-ip.${ip}`, env.LICENSE_SALT);
+    const row = await env.LICENSES.prepare(
+      "INSERT INTO promo_attempts (ip_hash, win, n) VALUES (?, ?, 1) " +
+        "ON CONFLICT(ip_hash, win) DO UPDATE SET n = n + 1 RETURNING n",
+    ).bind(ipHash, win).first();
+    const count = Number(row && row.n);
+    if (!Number.isFinite(count) || count < 1) throw new Error("no counter row");
+    if (count === 1) {
+      // First attempt of a window: drop this table's expired rows.
+      try {
+        await env.LICENSES.prepare("DELETE FROM promo_attempts WHERE win < ?").bind(win - 1).run();
+      } catch { /* cleanup is best effort */ }
+    }
+    return { atomic: true, count, ipHash, win };
+  } catch {
+    const n = await promoGuessCount(request, env, 0);
+    return { atomic: false, count: n + 1 };
+  }
+}
+
+async function promoAttemptRefund(env, attempt) {
+  if (!attempt.atomic) return;
+  try {
+    await env.LICENSES.prepare(
+      "UPDATE promo_attempts SET n = n - 1 WHERE ip_hash = ? AND win = ? AND n > 0",
+    ).bind(attempt.ipHash, attempt.win).run();
+  } catch { /* best effort */ }
+}
+
 async function promoGuessCount(request, env, delta) {
   const kv = env.SHARES;
   if (!kv) return 0;

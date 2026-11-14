@@ -266,7 +266,8 @@ impl CellularTransport {
 
     /// Set the room ID (derived from QR session_id)
     pub fn set_room_id(&mut self, room_id: String) {
-        info!("CellularTransport: room_id set to '{}'", room_id);
+        // The room id is the relay capability; never write it to logcat.
+        info!("CellularTransport: room_id set ({} chars)", room_id.len());
         self.room_id = room_id;
     }
 
@@ -346,9 +347,10 @@ impl CellularTransport {
 
     /// Called when Kotlin WebSocket connects successfully
     pub fn on_connected(&mut self) {
+        // The room id is the relay capability; never write it to logcat.
         info!(
-            "CellularTransport: WebSocket connected to room '{}'",
-            self.room_id
+            "CellularTransport: WebSocket connected ({}-char room id)",
+            self.room_id.len()
         );
         self.state = CellularState::Connected;
         self.inbound.clear();

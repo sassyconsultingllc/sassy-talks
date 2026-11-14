@@ -267,7 +267,13 @@ impl AndroidAudioRecord {
                 .i()
                 .map_err(|e| format!("Failed to convert result: {}", e))?;
 
-            if bytes_read <= 0 {
+            // Negative values are AudioRecord error codes (-3 invalid
+            // operation, -6 dead object). Report them so the TX thread can
+            // drop the PTT latch instead of silently sending nothing.
+            if bytes_read < 0 {
+                return Err(format!("AudioRecord.read error {}", bytes_read));
+            }
+            if bytes_read == 0 {
                 return Ok(0);
             }
 
@@ -565,6 +571,11 @@ impl AndroidAudioTrack {
                 .map_err(|e| format!("Failed to write: {}", e))?
                 .i()
                 .map_err(|e| format!("Failed to convert result: {}", e))?;
+            // Negative values are AudioTrack error codes; cast to usize they
+            // looked like a huge successful write and hid a dead track.
+            if bytes_written < 0 {
+                return Err(format!("AudioTrack.write error {}", bytes_written));
+            }
             Ok(bytes_written as usize)
         })();
 
@@ -1790,7 +1801,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     if !sid.is_empty() {
         if let Some(ref sm) = guard.state_machine {
             sm.set_cellular_room(sid.clone());
-            info!("JNI: Cellular room synced to generated session_id {}", sid);
+            info!("JNI: Cellular room synced to generated session_id ({} chars)", sid.len());
         }
     }
 
@@ -2192,6 +2203,14 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     guard.session_manager.clear_session();
+    // Ending a session must also drop the live transport keys. Without this
+    // the Wi-Fi path kept encrypting and sending with the ended session's key
+    // and PTT still passed its gate until the process exited.
+    if let Some(sm) = guard.state_machine.as_ref() {
+        if let Ok(mut tm) = sm.get_transport().lock() {
+            tm.clear_session_keys();
+        }
+    }
 }
 
 /// JNI: Get per-channel info as JSON array
@@ -3240,7 +3259,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
         Ok(s) => s.into(),
         Err(_) => return,
     };
-    info!("JNI: Cellular room set to '{}'", room);
+    info!("JNI: Cellular room set ({} chars)", room.len());
 
     let state = get_jni_state();
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());

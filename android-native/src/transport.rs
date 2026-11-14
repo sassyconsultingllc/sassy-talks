@@ -12,6 +12,9 @@
 /// Audio is fanned out to every live IP plane so mixed-protocol groups
 /// (one peer on relay, one on WiFi, one on BT+relay) can still hear each
 /// other. `active` is the preferred UI/PTT slot, not an XOR send gate.
+/// Rate-limits the AEAD-failure log line (see decrypt path).
+static DECRYPT_FAIL_LOG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 use log::{error, info, warn};
 
 use crate::cellular_transport::{CellularState, CellularTransport, PacketQueue};
@@ -348,7 +351,12 @@ impl TransportManager {
                     );
                 } else {
                     crate::diag::note_decrypt_fail(&e);
-                    error!("Decryption failed (dropping packet): {}", e);
+                    // A peer on another key streams at 50 fps; one line per
+                    // frame flooded logcat from the RX thread under this lock.
+                    let n = DECRYPT_FAIL_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n == 1 || n % 100 == 0 {
+                        error!("Decryption failed (dropping packet): {} ({} failures, rate-limited)", e, n);
+                    }
                 }
                 Ok(0)
             }
@@ -618,6 +626,15 @@ impl TransportManager {
         self.device_name = name.to_string();
     }
 
+    /// Drop the live session key and any staged hybrid RX key. Called when
+    /// the user ends a session: nothing may be sent or accepted under the
+    /// old key afterwards, even if a bearer is still up.
+    pub fn clear_session_keys(&mut self) {
+        self.crypto = None;
+        self.pending_rx = None;
+        info!("TransportManager: session keys cleared");
+    }
+
     /// Disconnect all transports
     pub fn disconnect(&mut self) -> Result<(), String> {
         info!("TransportManager: disconnecting all");
@@ -626,6 +643,9 @@ impl TransportManager {
         self.wifi_direct.reset();
         self.cellular.shutdown();
         self.crypto = None;
+        // A staged key left behind would be promoted to live by the next
+        // matching frame, re-enabling TX on a session the user closed.
+        self.pending_rx = None;
         self.bluetooth_connected = false;
         self.bluetooth_tx_allowed = false;
         self.bluetooth_outbound.clear();
