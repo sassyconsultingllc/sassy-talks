@@ -49,9 +49,8 @@ All notable changes to SassyTalkie. Format loosely follows
 
 The November audit of the PTT path (#38) and a closing pass over every
 surface. The relay changes are live: the #38 ones since 2026-11-14, the rest
-since 2026-11-17 (worker version b6a4fac8). The promo-attempt counter also
-needs the `promo_attempts` table from `schema/licenses.sql`; until then it
-uses the KV fallback.
+since 2026-11-17 (worker version b6a4fac8), and the `promo_attempts` table
+from `schema/licenses.sql` was added to the production database the same day.
 
 ### Fixed
 - **Sessions forgotten on restart (Android):** at startup the app checks
