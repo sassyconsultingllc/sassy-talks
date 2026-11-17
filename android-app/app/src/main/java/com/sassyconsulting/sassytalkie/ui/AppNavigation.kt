@@ -4,7 +4,6 @@
 package com.sassyconsulting.sassytalkie.ui
 
 import android.content.Context
-import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -83,8 +82,9 @@ fun AppNavigation(
     var entitled by remember { mutableStateOf(false) }
     var profileSetState by remember { mutableStateOf(false) }
 
-    // AutoConnectManager lives here (singleton for the session) — NOT in MainScreen
-    val autoConnect = remember { AutoConnectManager(context) }
+    // One AutoConnectManager per process, shared with WalkieService so the
+    // service can keep the radio connected while no screen is open.
+    val autoConnect = remember { AutoConnectManager.shared(context) }
 
     // ── Phase 1: Wait for permissions ──
     if (!permissionsGranted) {
@@ -133,78 +133,21 @@ fun AppNavigation(
     }
 
     // ── Phase 2: Initialize native library (only after permissions granted) ──
+    // The start-up itself is shared with WalkieService (RadioBootstrap), which
+    // may already have run it to bring the radio back after the process was
+    // killed. This only decides where the UI starts.
     LaunchedEffect(permissionsGranted) {
         if (permissionsGranted && !nativeReady) {
-            val success = withContext(Dispatchers.IO) {
-                SassyTalkNative.appContext = context.applicationContext
-                val initOk = if (!SassyTalkNative.isInitialized()) {
-                    SassyTalkNative.init()
-                } else {
-                    true
+            val boot = com.sassyconsulting.sassytalkie.RadioBootstrap.ensure(context)
+            if (boot.nativeReady) {
+                profileSetState = boot.profileSet
+                currentScreen = when {
+                    !boot.profileSet -> Screen.Profile
+                    // A live session goes straight to the radio.
+                    boot.sessionActive -> Screen.Main
+                    else -> currentScreen
                 }
-                // Hand a Context down to the native layer so audio routing
-                // (MODE_IN_COMMUNICATION + loudspeaker override) can obtain
-                // AudioManager. Safe to call even if already initialized.
-                if (initOk) {
-                    try { SassyTalkNative.initContext(context.applicationContext) } catch (_: Throwable) {}
-                }
-                initOk
-            }
-            if (success) {
-                // Post-update reset, BEFORE restoring anything. An in-place
-                // update keeps all prior state while the binary underneath it
-                // changed — stale native caches, counters describing a dead
-                // process, a relay socket bound to the old room. This is the
-                // cleanup the update path never did, which is why
-                // "reinstall it" kept working as a fix.
-                //
-                // Runs here rather than only in AppUpdateReceiver because a
-                // force-stopped app never receives MY_PACKAGE_REPLACED, and
-                // OEM battery managers force-stop aggressively — the devices
-                // most likely to need this are the ones least likely to get
-                // the broadcast. Costs one int comparison when it is a no-op.
-                withContext(Dispatchers.IO) {
-                    com.sassyconsulting.sassytalkie.UpdateReset.runIfUpdated(context)
-                }
-
-                // Restore persisted session (survives app restart)
-                val sessionRestored = withContext(Dispatchers.IO) {
-                    val restored = SassyTalkNative.restoreSession()
-                    SassyTalkNative.restoreCohortHistory()
-                    restored
-                }
-
-                // Determine starting screen: profile setup on first launch
-                val prefs = context.getSharedPreferences("sassy_profile", Context.MODE_PRIVATE)
-                val profileSet = prefs.getBoolean(KEY_PROFILE_SET, false)
-                profileSetState = profileSet
-                val savedName = getSavedProfileName(context)
-
-                // Apply saved profile name to native library. The install id
-                // MUST go in first: the native sender identity is derived from
-                // name + install id, and identical names alone (two defaults,
-                // same model) made devices drop each other's audio as
-                // self-echo and never show in the roster.
-                withContext(Dispatchers.IO) {
-                    SassyTalkNative.setInstallId(
-                        com.sassyconsulting.sassytalkie.InstallId.get(context)
-                    )
-                    if (profileSet) {
-                        SassyTalkNative.setDeviceName(savedName)
-                    } else {
-                        SassyTalkNative.setDeviceName(Build.MODEL)
-                        currentScreen = Screen.Profile
-                    }
-                }
-
-                // If session was restored from disk, skip auth and go straight to main
-                if (sessionRestored && profileSet) {
-                    currentScreen = Screen.Main
-                }
-
-                // Entitlement gate overrides all of the above routing while
-                // locked. EncryptedSharedPreferences read — cheap, still on
-                // the IO-adjacent init path.
+                // Entitlement gate overrides the routing above while locked.
                 entitled = withContext(Dispatchers.IO) {
                     // Trial users are "entitled" for routing purposes: the paywall
                     // waits until 5 sessions have actually had a peer in them.
@@ -214,35 +157,6 @@ fun AppNavigation(
                     currentScreen = Screen.Gate
                 }
                 nativeReady = true
-
-                // Initialize the activity bridge for incoming-audio detection + notifications.
-                // Activity is session-scoped only — do NOT rehydrate disk history (favorites
-                // and speech rows must not linger across days / process restarts).
-                TranscriptionBridge.initialize(context)
-                TranscriptionBridge.discardPersistedTimeline()
-                TranscriptionBridge.clearEntries()
-                TranscriptionBridge.setEnabled(true)
-
-                // Restore persisted mic settings (gain + squelch). Defaults
-                // are unity/disabled so first-run behavior is unchanged.
-                val micPrefs = context.getSharedPreferences("sassy_settings", android.content.Context.MODE_PRIVATE)
-                SassyTalkNative.setMicGain(micPrefs.getFloat("mic_gain", 1.0f))
-                SassyTalkNative.setSquelchDbfs(micPrefs.getInt("squelch_dbfs", 0))
-                // Restore group-mix preference. Default false preserves the
-                // classic walkie-talkie behavior for users who never opt in.
-                SassyTalkNative.setMixModeEnabled(micPrefs.getBoolean("enable_mix_mode", false))
-                // Re-assert the noise-suppression preference (native defaults off).
-                SassyTalkNative.setNoiseSuppressionEnabled(micPrefs.getBoolean("noise_suppression", false))
-                // Re-assert sealed-sender. The sealed CONTEXT (key + peer id) is
-                // (re)populated by restoreSession()/importSessionFromQR above;
-                // this just re-arms the blinding toggle the user last chose.
-                SassyTalkNative.setSealedSenderEnabled(micPrefs.getBoolean("sealed_sender", false))
-                // v2.7.5: restore RX gain, speakerphone routing, jitter
-                // buffer preset so the user's prior choices stick across
-                // process death without requiring a Settings visit.
-                SassyTalkNative.setRxGain(micPrefs.getFloat("rx_gain", 1.0f))
-                SassyTalkNative.setSpeakerphonePreference(micPrefs.getBoolean("speakerphone_on", true))
-                SassyTalkNative.setJitterPrebufferFrames(micPrefs.getInt("jitter_prebuffer_frames", 5))
             } else {
                 initFailed = true
             }

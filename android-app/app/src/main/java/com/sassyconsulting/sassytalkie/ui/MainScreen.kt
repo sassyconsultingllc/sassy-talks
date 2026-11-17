@@ -296,11 +296,10 @@ fun MainScreen(
         // Must run BEFORE attachWalkieService so the relay client gets wired
         // to the freshly-created coordinator.
         withContext(Dispatchers.IO) { service.initBleTransport() }
-        autoConnect.attachWalkieService(service)
-        if (connectState != ConnectState.CONNECTED) {
-            autoConnect.reset()
-            autoConnect.autoConnect(service)
-        }
+        // ensureConnected, not reset + autoConnect: WalkieService may already
+        // have brought the radio back on its own (process killed, then
+        // restarted by the system). Reconnecting here would drop that link.
+        autoConnect.ensureConnected(service)
         withContext(Dispatchers.IO) {
             SassyTalkNative.restoreCohortHistory()
             SassyTalkNative.setCacheMode(SassyTalkNative.CACHE_MODE_QUEUE)

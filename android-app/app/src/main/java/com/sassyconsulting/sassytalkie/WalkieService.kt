@@ -42,6 +42,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.collectLatest
 
 /**
@@ -149,6 +150,8 @@ class WalkieService : Service() {
     var pttCoordinator: PttCoordinator? = null
         private set
     private var bleInitialized = false
+    /** Set in onDestroy; late resumeRadio/initBleTransport calls must not start anything. */
+    @Volatile private var destroyed = false
 
     // ── Service lifecycle ──
 
@@ -224,7 +227,12 @@ class WalkieService : Service() {
             val room = intent.getStringExtra(EXTRA_ROOM)
             Log.i(TAG, "WAKE intent received room=${room?.take(8)}")
             serviceScope.launch { kickCellularReconnect() }
-            return START_NOT_STICKY
+            // Stay sticky. The wake only reaches a service that is already
+            // running in the foreground (see FcmWakePolicy), and the return
+            // value of the latest start decides whether Android restarts the
+            // service after killing the process. NOT_STICKY here meant one
+            // wake push switched that restart, and so resumeRadio, off.
+            return START_STICKY
         }
 
         try {
@@ -263,25 +271,73 @@ class WalkieService : Service() {
             return START_NOT_STICKY
         }
 
+        // A null intent means the system restarted this sticky service after
+        // killing the process. Nothing else will bring the radio back: the
+        // transports used to be started only by the open UI, so the phone sat
+        // in standby, unreachable, until the user opened the app.
+        if (intent == null) {
+            Log.i(TAG, "Restarted by the system — resuming the radio without the UI")
+            serviceScope.launch { resumeRadio("system-restart") }
+        }
+
         return START_STICKY
+    }
+
+    /**
+     * Bring the radio up from the service alone: the same start-up and
+     * connection the radio screen would run. Only when an app launch would go
+     * straight to the radio (profile set, session saved, entitled) and the
+     * microphone permission is held. Safe alongside the UI: start-up and
+     * connecting are both serialized, and an existing connection is kept.
+     */
+    private suspend fun resumeRadio(reason: String) {
+        val micGranted = androidx.core.content.ContextCompat.checkSelfPermission(
+            this, android.Manifest.permission.RECORD_AUDIO,
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        val entitled = com.sassyconsulting.sassytalkie.license.TrialGate.mayUseRadio(this)
+        if (!micGranted || !entitled) {
+            Log.i(TAG, "resumeRadio($reason) skipped: mic=$micGranted entitled=$entitled")
+            return
+        }
+        val boot = RadioBootstrap.ensure(applicationContext)
+        if (!RadioBootstrap.mayResumeWithoutUi(micGranted, entitled, boot)) {
+            Log.i(
+                TAG,
+                "resumeRadio($reason) skipped: native=${boot.nativeReady} " +
+                    "profile=${boot.profileSet} session=${boot.sessionActive}",
+            )
+            return
+        }
+        withContext(Dispatchers.IO) { initBleTransport() }
+        val autoConnect = com.sassyconsulting.sassytalkie.ui.AutoConnectManager.shared(applicationContext)
+        // Re-checked once the connect lock is ours: the UI may have ended the
+        // session or locked the radio while this waited behind its connect.
+        val connected = autoConnect.ensureConnected(this) {
+            !destroyed &&
+                !SassyTalkNative.getSessionId().isNullOrBlank() &&
+                com.sassyconsulting.sassytalkie.license.TrialGate.mayUseRadio(this)
+        }
+        if (connected) {
+            try { SassyTalkNative.setCacheMode(SassyTalkNative.CACHE_MODE_QUEUE) } catch (_: Throwable) {}
+        }
+        Log.i(TAG, "resumeRadio($reason): connected=$connected")
     }
 
     /**
      * Force the cellular relay client to reconnect if it's disconnected.
      * Safe to call from any thread — guards against double-connect.
      *
-     * On a cold-start triggered BY an FCM wake push (process killed, FCM
-     * delivery spawns WalkieService), PttCoordinator + CellularWebSocketClient
-     * haven't been wired yet — they're set up by AppNavigation after
-     * MainActivity launches. Polling for up to 15s gives the normal startup
-     * a chance to bring them up so the wake actually re-attaches the relay.
+     * When the wake arrives in a process where nothing has started the radio
+     * (no relay client after a short wait for a UI that is starting up), the
+     * service brings the radio up itself through [resumeRadio].
      */
     private suspend fun kickCellularReconnect() {
         if (!com.sassyconsulting.sassytalkie.license.TrialGate.mayUseRadio(this)) {
             Log.i(TAG, "kickCellularReconnect: not entitled — skipping relay connect")
             return
         }
-        val deadline = System.currentTimeMillis() + 15_000L
+        // A UI that is starting up wires the relay client within a moment.
+        val deadline = System.currentTimeMillis() + 3_000L
         while (System.currentTimeMillis() < deadline) {
             val coord = pttCoordinator
             val client = coord?.cellularClient
@@ -298,7 +354,9 @@ class WalkieService : Service() {
             }
             kotlinx.coroutines.delay(500)
         }
-        Log.w(TAG, "kickCellularReconnect: gave up waiting for PttCoordinator after 15s")
+        // No relay client: nothing has started the radio in this process.
+        // Do it here rather than wait for a UI that may never open.
+        resumeRadio("wake")
     }
 
     /**
@@ -364,6 +422,10 @@ class WalkieService : Service() {
     override fun onDestroy() {
         Log.i(TAG, "Service destroyed")
         isRunning = false
+        destroyed = true
+        // The connection manager outlives this service (it is process-wide);
+        // drop its reference to us before our coordinator goes away.
+        com.sassyconsulting.sassytalkie.ui.AutoConnectManager.shared(applicationContext).detach(this)
         pttCoordinator?.forceStop("service-destroy")
         stopTranslationNotificationBridge()
         stopCohortSnapshotter()
@@ -497,7 +559,12 @@ class WalkieService : Service() {
      *   callers MUST treat false as "IP-only mode", not an error.
      */
     @android.annotation.SuppressLint("MissingPermission")
+    // Synchronized with shutdownBleTransport: the UI (two places) and
+    // resumeRadio can all call this at once, and the check-then-set below
+    // would otherwise start a second GATT server and RFCOMM listener.
+    @Synchronized
     fun initBleTransport(): Boolean {
+        if (destroyed) return false
         if (!com.sassyconsulting.sassytalkie.license.TrialGate.mayUseRadio(this)) {
             Log.i(TAG, "initBleTransport: not entitled — refusing to start BLE/RFCOMM")
             return false
@@ -554,6 +621,7 @@ class WalkieService : Service() {
         }
     }
 
+    @Synchronized
     private fun shutdownBleTransport() {
         pttCoordinator?.forceStop("bluetooth-teardown")
         pttCoordinator?.attachBluetooth(null, null)

@@ -11,6 +11,40 @@ All notable changes to SassyTalkie. Format loosely follows
 
 ## [Unreleased]
 
+## [3.2.14] (90) - 2026-11-17
+
+### Fixed
+- **Radio back after Android kills the app:** the foreground service came
+  back on its own, but the radio stayed in standby until the app was opened,
+  because only the radio screen started the transports. The service now runs
+  the same start-up (native init, session restore, identity, saved settings)
+  and connects by itself, so the phone is reachable again without anyone
+  touching it. It does this only when opening the app would go straight to
+  the radio: a saved session, profile set, entitled, microphone permission
+  granted.
+- **Wake push with no relay client:** a wake that arrives while nothing has
+  started the radio no longer waits 15 s for a screen that may never open;
+  the service connects itself.
+- **A wake push turned the restart off:** the wake path returned
+  `START_NOT_STICKY`, so after one wake Android would not restart the service
+  if it later killed the process. It stays sticky now.
+- **Desktop and iPhone talkers on Android:** since 3.2 Android read a v1
+  frame's timestamp (milliseconds, 20 apart) as a frame counter, so every
+  frame from a desktop or iPhone looked like a 19-frame loss: it waited out the
+  reorder window and the decoder was reset each time. v1 frames are now
+  decoded in order as they arrive; duplicates from a second transport are
+  still dropped. Found with a headless desktop peer while testing this
+  release.
+- **Leaving the app:** the relay socket is closed when the app is closed for
+  good. Before, it stayed open with no heartbeat until the relay dropped it
+  about 8 s later.
+
+### Changed
+- One connection manager per process, shared by the screen and the service.
+  Connection attempts are serialized, an attempt overtaken by a disconnect or
+  session change never reports itself connected, and opening the radio screen
+  keeps an existing connection instead of reconnecting.
+
 ## [3.2.13] (89) - 2026-11-17
 
 The November audit of the PTT path (#38) and a closing pass over every
