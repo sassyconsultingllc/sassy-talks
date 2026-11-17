@@ -230,6 +230,18 @@ export function buildReplayFrame(audioFrame, peerId = "") {
   return out;
 }
 
+/**
+ * Close code to answer a client's Close frame with. ws.close() throws on the
+ * reserved codes a handler can be handed (1005 no status, 1006 abnormal, 1015
+ * TLS failure) and on anything outside 1000-4999, so those are answered with a
+ * normal 1000.
+ */
+export function replyCloseCode(code) {
+  if (!Number.isInteger(code) || code < 1000 || code > 4999) return 1000;
+  if (code === 1004 || code === 1005 || code === 1006 || code === 1015) return 1000;
+  return code;
+}
+
 // decodeURIComponent throws URIError on malformed percent-sequences (e.g.
 // "%GG"). Query params are attacker-influenced (device/peer come from the
 // client), so a bad value would otherwise 500 the DO fetch handler.
@@ -696,9 +708,13 @@ export class PttRoom extends DurableObject {
   async webSocketClose(ws, code, reason, wasClean) {
     const session = this.sessions.get(ws) || ws.deserializeAttachment() || {};
     this.sessions.delete(ws);
-    // Note: the runtime already initiated the close (that's why this handler
-    // fired). The previous explicit `ws.close()` was a no-op at best — the
-    // socket is by-definition closing here.
+    // Answer the client's Close frame. On this worker's compatibility date the
+    // runtime does not do it for us (that came with web_socket_auto_reply_to_close,
+    // 2026-04-07). Without the reply the handshake never completes: the client
+    // waits out its close timeout and reports 1006, and the half-closed socket
+    // stays in getWebSockets(), where it still counts against
+    // MAX_PEERS_PER_ROOM and is still handed every frame of the room.
+    try { ws.close(replyCloseCode(code), "closing"); } catch { /* already closed */ }
 
     // A peer just dropped — it may reconnect with ?catchup. Open a buffering
     // window so the store-and-forward ring actually retains what it missed.

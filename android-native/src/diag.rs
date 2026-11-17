@@ -222,7 +222,7 @@ pub fn snapshot_json() -> String {
     format!(
         concat!(
             r#"{{"capture":{{"frames":{},"last_dbfs":{:.1}}},"#,
-            r#""codec":{{"frames_encoded":{},"encoded_bytes":{},"avg_frame_bytes":{}}},"#,
+            r#""codec":{{"frames_encoded":{},"encoded_bytes":{},"avg_frame_bytes":{},"bitrate_bps":{}}},"#,
             r#""crypto_rx":{{"ok":{},"fail":{},"no_session":{},"replay":{},"attempted":{},"ok_pct":{:.1}}},"#,
             r#""tx":{{"queued":{},"succeeded":{},"failed":{}}},"#,
             r#""activity":{{"last_tx_success_age_ms":{},"last_tx_age_ms":{},"last_rx_ok_age_ms":{}}}}}"#
@@ -239,6 +239,7 @@ pub fn snapshot_json() -> String {
                 ENCODED_BYTES.load(Ordering::Relaxed) / f
             }
         },
+        crate::audio_pipeline::get_tx_bitrate_bps(),
         ok,
         fail,
         no_sess,
@@ -325,6 +326,7 @@ mod tests {
         assert!(s.contains(r#""frames_encoded":2"#), "{s}");
         assert!(s.contains(r#""encoded_bytes":300"#), "{s}");
         assert!(s.contains(r#""avg_frame_bytes":150"#), "{s}");
+        assert!(s.contains(r#""bitrate_bps":"#), "{s}");
     }
 
     #[test]

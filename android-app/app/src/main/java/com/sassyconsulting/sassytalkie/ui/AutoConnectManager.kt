@@ -24,6 +24,7 @@ import com.sassyconsulting.sassytalkie.ManagedConfig
 import com.sassyconsulting.sassytalkie.RelayConnectionState
 import com.sassyconsulting.sassytalkie.RelayTlsPins
 import com.sassyconsulting.sassytalkie.SassyTalkNative
+import com.sassyconsulting.sassytalkie.TxBitratePolicy
 import com.sassyconsulting.sassytalkie.WalkieService
 import com.sassyconsulting.sassytalkie.license.Entitlements
 
@@ -62,6 +63,8 @@ class AutoConnectManager(private val context: Context) {
         private const val DEGRADED_RETRY_MS = 12_000L
         /** Ignore brief WiFi flaps before showing Reconnecting / FAILED. */
         private const val WIFI_LOSS_GRACE_MS = 1_800L
+        /** After Wi-Fi validates, wait this long for it to become the default network. */
+        private const val WIFI_VALIDATED_SETTLE_MS = 1_500L
         /** Stay on relay this long after the first WS drop before considering BT. */
         private const val RELAY_STICKY_MS = 20_000L
     }
@@ -198,6 +201,15 @@ class AutoConnectManager(private val context: Context) {
             wifiAllowed = wifiEnabledPref(),
             relayAllowed = relayEnabledPref(),
             bluetoothAllowed = bluetoothEnabledPref(),
+        )
+        // Every network and transport change lands here, so this is also where
+        // the transmit bitrate follows the uplink (lower on mobile data).
+        SassyTalkNative.setTxBitrate(
+            TxBitratePolicy.forUplink(
+                relayActive = relayOk,
+                osHasCellular = avail.osHasCellular,
+                osHasWifi = avail.osHasWifi,
+            )
         )
         val reportedActive = when {
             relayOk && wifiOk -> "both"
@@ -447,9 +459,7 @@ class AutoConnectManager(private val context: Context) {
                     }
                     Log.w(TAG, "Relay down ${RELAY_STICKY_MS}ms — trying Bluetooth fallback")
                     setActiveTransport("none")
-                    if (reflectBluetoothFallback()) {
-                        startDegradedRetry()
-                    } else {
+                    if (!bluetoothFallbackOrRelay()) {
                         _state.value = ConnectState.FAILED
                         _statusText.value = "No local link — tap to retry"
                         startDegradedRetry()
@@ -458,6 +468,24 @@ class AutoConnectManager(private val context: Context) {
                 else -> refreshTransportAdvisory()
             }
         }
+    }
+
+    /**
+     * Bluetooth fallback that yields to the relay. The search can take 14 s,
+     * and the relay often reconnects meanwhile: onRelayReady then marks the
+     * session as on the relay, and a fallback that finished afterwards used to
+     * switch it back to Bluetooth (or to "No local link"). The relay is the
+     * preferred hub, so it wins. Returns true when either link is up.
+     */
+    private suspend fun bluetoothFallbackOrRelay(): Boolean {
+        val bluetoothUp = reflectBluetoothFallback()
+        if (cellularClient?.isConnected() == true) {
+            applyConnected("cellular", true)
+            stopDegradedRetry()
+            return true
+        }
+        if (bluetoothUp) startDegradedRetry()
+        return bluetoothUp
     }
 
     private suspend fun reflectBluetoothFallback(): Boolean {
@@ -548,51 +576,53 @@ class AutoConnectManager(private val context: Context) {
     }
 
     /** WiFi still down after grace — keep relay if up; don't flap a working hub. */
-    private suspend fun handleConfirmedWifiLoss() {
+    private suspend fun handleConfirmedWifiLoss(lostAtMs: Long) {
         when (activeTransport) {
             "both" -> {
-                val relayUp = cellularClient?.isConnected() == true
                 walkieServiceRef?.releaseMulticastLock()
-                if (relayUp) {
+                if (cellularClient?.isConnected() == true) {
                     Log.i(TAG, "WiFi lost — staying on relay")
                     applyConnected("cellular", true)
-                    // The relay socket was almost certainly opened over the
-                    // Wi-Fi that just went away; re-dial on the new network
-                    // instead of waiting for it to time out.
-                    cellularClient?.reconnectNow("wifi-lost")
+                    // A socket opened before the loss rode the Wi-Fi that just
+                    // went away; re-dial it on the new network instead of
+                    // waiting for it to time out. One that onNetworkAvailable
+                    // already reopened on mobile data is kept.
+                    cellularClient?.redialAfterNetworkChange(lostAtMs, "wifi-lost")
                 } else {
-                    Log.w(TAG, "WiFi lost and relay down — Bluetooth chain")
-                    setActiveTransport("none")
-                    if (reflectBluetoothFallback()) {
-                        startDegradedRetry()
-                    } else {
-                        _state.value = ConnectState.FAILED
-                        _statusText.value = "No local link — tap to retry"
-                        startDegradedRetry()
-                    }
+                    // The relay socket usually dies with the Wi-Fi it rode on
+                    // and comes back on mobile data within a second or two.
+                    // Going straight to the Bluetooth chain here showed
+                    // "No local link" while the relay was already reconnecting.
+                    recoverAfterWifiLoss("WiFi lost and relay down", lostAtMs)
                 }
             }
-            "wifi" -> {
-                Log.w(TAG, "WiFi path lost — preferring relay then Bluetooth")
-                _statusText.value = "Checking radio link…"
-                setActiveTransport("none")
-                walkieServiceRef?.releaseMulticastLock()
-
-                val relayOk = relayEnabledPref() && connectCellularSilent(walkieServiceRef)
-                if (relayOk) {
-                    applyConnected("cellular", true)
-                } else if (reflectBluetoothFallback()) {
-                    startDegradedRetry()
-                } else {
-                    Log.e(TAG, "All transports down after signal loss")
-                    _state.value = ConnectState.FAILED
-                    _statusText.value = "No local link — tap to retry"
-                    startDegradedRetry()
-                }
-            }
+            "wifi" -> recoverAfterWifiLoss("WiFi path lost", lostAtMs)
             "cellular" -> refreshTransportAdvisory()
             "bluetooth", "none" -> refreshTransportAdvisory()
             else -> refreshTransportAdvisory()
+        }
+    }
+
+    /** Wi-Fi is gone and the relay is not up: relay first, then Bluetooth. */
+    private suspend fun recoverAfterWifiLoss(reason: String, lostAtMs: Long) {
+        Log.w(TAG, "$reason — preferring relay then Bluetooth")
+        _statusText.value = "Checking radio link…"
+        setActiveTransport("none")
+        walkieServiceRef?.releaseMulticastLock()
+        // A retry scheduled while Wi-Fi was failing can be most of a minute
+        // away; the network just changed, so dial on the new one now.
+        cellularClient?.redialAfterNetworkChange(lostAtMs, "wifi-lost")
+
+        val relayOk = relayEnabledPref() && connectCellularSilent(walkieServiceRef)
+        when {
+            relayOk -> applyConnected("cellular", true)
+            bluetoothFallbackOrRelay() -> Unit
+            else -> {
+                Log.e(TAG, "All transports down after signal loss")
+                _state.value = ConnectState.FAILED
+                _statusText.value = "No local link — tap to retry"
+                startDegradedRetry()
+            }
         }
     }
 
@@ -602,6 +632,8 @@ class AutoConnectManager(private val context: Context) {
 
         val callback = object : ConnectivityManager.NetworkCallback() {
             private val wifiNetworks = java.util.Collections.synchronizedSet(mutableSetOf<Network>())
+            /** Wi-Fi networks already seen validated, so each one triggers one LAN upgrade. */
+            private val validatedWifi = java.util.Collections.synchronizedSet(mutableSetOf<Network>())
 
             private fun noteNetwork(network: Network) {
                 val caps = try { cm.getNetworkCapabilities(network) } catch (_: Exception) { null }
@@ -612,12 +644,21 @@ class AutoConnectManager(private val context: Context) {
 
             override fun onLost(network: Network) {
                 val wasWifi = wifiNetworks.remove(network)
-                if (!wasWifi || hasWifi()) {
-                    Log.i(TAG, "Non-WiFi network lost (wasWifi=$wasWifi, wifiStillUp=${hasWifi()}) — no failover")
+                validatedWifi.remove(network)
+                // "Is Wi-Fi still up" comes from the Wi-Fi networks this
+                // callback is tracking, not from hasWifi(). When onLost fires
+                // the system can still name the network that just went away as
+                // the active one, which read as "Wi-Fi still up": the failover
+                // below was skipped, the session stayed labelled WiFi + Relay
+                // on mobile data, and the relay was never re-dialed.
+                val otherWifiUp = wifiNetworks.isNotEmpty()
+                if (!wasWifi || otherWifiUp) {
+                    Log.i(TAG, "Network lost (wasWifi=$wasWifi, otherWifiUp=$otherWifiUp) — no failover")
                     refreshTransportAdvisory()
                     return
                 }
                 Log.w(TAG, "WiFi network lost — activeTransport=$activeTransport (grace ${WIFI_LOSS_GRACE_MS}ms)")
+                val lostAtMs = System.currentTimeMillis()
 
                 // Debounce: Android often fires onLost during AP roam / brief
                 // radio blips. Wait before tearing MulticastLock or flashing
@@ -629,13 +670,14 @@ class AutoConnectManager(private val context: Context) {
                         refreshTransportAdvisory()
                         return@launch
                     }
-                    handleConfirmedWifiLoss()
+                    handleConfirmedWifiLoss(lostAtMs)
                 }
             }
 
             override fun onAvailable(network: Network) {
                 noteNetwork(network)
                 Log.d(TAG, "Network available — activeTransport=$activeTransport")
+                cellularClient?.onNetworkAvailable()
                 if (activeTransport == "wifi" || activeTransport == "both") {
                     refreshTransportAdvisory()
                 } else {
@@ -644,8 +686,31 @@ class AutoConnectManager(private val context: Context) {
             }
 
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                // A VPN reports its underlying transport, which changes when it
+                // moves from Wi-Fi to mobile data; drop it from the set then.
                 if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
                     wifiNetworks.add(network)
+                    // Wi-Fi that came back after a loss: onAvailable fired
+                    // before it was validated and became the default network,
+                    // so the LAN path was not restored then. Do it once now.
+                    if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) &&
+                        validatedWifi.add(network) &&
+                        activeTransport != "wifi" && activeTransport != "both" &&
+                        wifiEnabledPref()
+                    ) {
+                        scope.launch {
+                            // Let the system make it the default network first;
+                            // upgradeToBestIp checks the active network.
+                            kotlinx.coroutines.delay(WIFI_VALIDATED_SETTLE_MS)
+                            if (activeTransport != "wifi" && activeTransport != "both") {
+                                Log.i(TAG, "WiFi validated — restoring the LAN path")
+                                upgradeToBestIp()
+                            }
+                        }
+                    }
+                } else {
+                    wifiNetworks.remove(network)
+                    validatedWifi.remove(network)
                 }
                 refreshTransportAdvisory()
             }

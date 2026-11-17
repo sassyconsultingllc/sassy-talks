@@ -127,7 +127,8 @@ class SassyTalkFcmService : FirebaseMessagingService() {
         }
         val room = data["room"] ?: ""
         val wakeTs = data["ts"] ?: data["sentAt"]
-        Log.i(TAG, "WAKE push received room=$room ts=$wakeTs")
+        // Room ids are relay capabilities: log only a prefix.
+        Log.i(TAG, "WAKE push received room=${room.take(8)} ts=$wakeTs")
 
         // Persist so a cold-started service can act on it.
         wakePrefs()?.edit()
@@ -148,7 +149,7 @@ class SassyTalkFcmService : FirebaseMessagingService() {
                 }
                 try {
                     applicationContext.startService(serviceIntent)
-                    Log.i(TAG, "WAKE → WalkieService ACTION_WAKE room=$room (warm)")
+                    Log.i(TAG, "WAKE → WalkieService ACTION_WAKE room=${room.take(8)} (warm)")
                 } catch (t: Throwable) {
                     Log.d(TAG, "warm-path startService skipped: ${t.message}")
                     postWakeNotification(room)
@@ -159,7 +160,7 @@ class SassyTalkFcmService : FirebaseMessagingService() {
                 // from the background either (API 29+). A high-priority
                 // notification is the allowed bootstrap; the user tap opens
                 // MainActivity which then starts the radio FGS legally.
-                Log.i(TAG, "WAKE cold → visible notification room=$room")
+                Log.i(TAG, "WAKE cold → visible notification room=${room.take(8)}")
                 postWakeNotification(room)
             }
         }

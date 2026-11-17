@@ -151,6 +151,9 @@ pub struct StateMachine {
     // Pending classical X25519 key exchange, between init & complete.
     pending_key_exchange: Arc<Mutex<Option<crate::crypto::KeyExchange>>>,
     control: Arc<Mutex<Option<sassytalkie_core::control_auth::ControlAuthCodec>>>,
+    /// Control sequence + replay window for this process. `session_epoch` never
+    /// changes, so every codec `set_psk` builds must continue the same counter.
+    control_state: Arc<sassytalkie_core::control_auth::ControlAuthState>,
     audit: Arc<Mutex<sassytalkie_core::audit::AuditChain>>,
     enrollment_token: Arc<Mutex<Option<String>>>,
 
@@ -220,6 +223,7 @@ impl StateMachine {
             staged_initiator: Arc::new(Mutex::new(None)),
             pending_key_exchange: Arc::new(Mutex::new(None)),
             control: Arc::new(Mutex::new(None)),
+            control_state: sassytalkie_core::control_auth::ControlAuthState::new(),
             audit: Arc::new(Mutex::new(sassytalkie_core::audit::AuditChain::default())),
             enrollment_token: Arc::new(Mutex::new(None)),
             room_id: Arc::new(Mutex::new(None)),
@@ -279,13 +283,18 @@ impl StateMachine {
             .unwrap()
             .clone()
             .unwrap_or_else(|| "unpaired".into());
-        *self.control.lock().unwrap() = sassytalkie_core::control_auth::ControlAuthCodec::new(
-            *key,
-            &room,
-            &self.sender_id,
-            self.session_epoch,
-        )
-        .ok();
+        // with_state, not new: this runs again on every re-pair and after a
+        // wipe, always under the same session_epoch. A fresh counter there made
+        // peers reject this phone's heartbeat, floor and SOS frames as replays.
+        *self.control.lock().unwrap() =
+            sassytalkie_core::control_auth::ControlAuthCodec::with_state(
+                *key,
+                &room,
+                &self.sender_id,
+                self.session_epoch,
+                self.control_state.clone(),
+            )
+            .ok();
         info!("Crypto: PSK session installed");
     }
 
@@ -532,11 +541,13 @@ impl StateMachine {
             Some(p) => p,
             None => return false,
         };
-        let (frame_channel, _sub, sender, _name, _ts, compressed) =
-            match sassytalkie_core::wire::unpack_wire_frame(&plain) {
-                Ok(parts) => parts,
-                Err(_) => return false,
-            };
+        let frame = match sassytalkie_core::wire::unpack_wire_frame_detailed(&plain) {
+            Ok(frame) => frame,
+            Err(_) => return false,
+        };
+        let takes_floor = floor_policy::audio_frame_takes_floor(frame.sequence);
+        let (frame_channel, sender, compressed) =
+            (frame.channel, frame.sender_id, frame.compressed);
         // The relay echoes frames to everyone in the room including us — skip our
         // own loopback (matches desktop cellular `sender == peer_id`).
         if sender == self.sender_id {
@@ -549,7 +560,11 @@ impl StateMachine {
         if self.is_transmitting.load(Ordering::SeqCst) {
             return false;
         }
-        self.floor.hold(&sender, floor_policy::STALE_HOLD_MS, now);
+        // An Android presence beacon is a lone silent frame; it is not speech
+        // and must not make the channel look busy.
+        if takes_floor {
+            self.floor.hold(&sender, floor_policy::STALE_HOLD_MS, now);
+        }
         let samples = {
             let mut decoders = self.relay_decoders.lock().unwrap();
             if !decoders.contains_key(&sender) && decoders.len() >= MAX_RELAY_DECODERS {
@@ -1189,9 +1204,14 @@ impl StateMachine {
                     Some(p) => p,
                     None => continue,
                 };
-                let (frame_channel, _subch, sender, _name, _ts, compressed) =
-                    match sassytalkie_core::wire::unpack_wire_frame(&plain) {
-                        Ok(parts) => parts,
+                let (frame_channel, sender, compressed, takes_floor) =
+                    match sassytalkie_core::wire::unpack_wire_frame_detailed(&plain) {
+                        Ok(f) => (
+                            f.channel,
+                            f.sender_id,
+                            f.compressed,
+                            floor_policy::audio_frame_takes_floor(f.sequence),
+                        ),
                         Err(e) => {
                             warn!("Failed to parse wire frame: {}", e);
                             continue;
@@ -1206,8 +1226,11 @@ impl StateMachine {
                     && !is_transmitting.load(Ordering::SeqCst)
                 {
                     // Inbound audio re-asserts the floor even if the 400 ms LED
-                    // already blinked off (changelog 3.2).
-                    floor.hold(&sender, floor_policy::STALE_HOLD_MS, now);
+                    // already blinked off (changelog 3.2). A presence beacon
+                    // does not: it is one silent frame, not speech.
+                    if takes_floor {
+                        floor.hold(&sender, floor_policy::STALE_HOLD_MS, now);
+                    }
 
                     if !decoders.contains_key(&sender) && decoders.len() >= MAX_RELAY_DECODERS {
                         decoders.clear();
@@ -1430,6 +1453,34 @@ mod tests {
         out
     }
 
+    /// Regression: `set_psk` runs again on a re-pair and after a wipe, always
+    /// under the same process epoch. It used to restart the control sequence,
+    /// so peers dropped this phone's heartbeat, floor and SOS frames as
+    /// replays until the counter passed its old high-water mark.
+    #[test]
+    fn control_sequence_survives_a_key_reinstall() {
+        let sm = paired();
+        let now = sassytalkie_core::wire::now_ms();
+        let peer =
+            sassytalkie_core::control_auth::ControlAuthCodec::new(KEY, "unpaired", "peer", 77)
+                .unwrap();
+
+        let mut last = 0;
+        for _ in 0..80 {
+            last = peer
+                .open(&sm.relay_heartbeat_frame(), now)
+                .expect("heartbeat before the reinstall")
+                .sequence;
+        }
+
+        sm.wipe_session();
+        sm.set_psk(&KEY);
+        let after = peer
+            .open(&sm.relay_heartbeat_frame(), now)
+            .expect("first heartbeat after the reinstall must not look like a replay");
+        assert!(after.sequence > last);
+    }
+
     #[test]
     fn sender_id_fits_the_wire_so_loopback_check_holds() {
         let id = sender_id_for_install("6F1C2A5E-0D3B-4C7A-9E21-ABCDEF012345");
@@ -1469,6 +1520,30 @@ mod tests {
         // The stored state used to be set to Receiving here and never cleared,
         // so the UI said "Receiving" for the rest of the session.
         assert_ne!(*sm.state.lock().unwrap(), AppState::Receiving);
+    }
+
+    /// Regression: an idle Android phone's presence beacon (one silent v2 frame,
+    /// sequence 0, every ~10 s) held the floor, so presses were refused with
+    /// "Channel busy" while nobody was talking.
+    #[test]
+    fn android_presence_beacon_does_not_hold_the_floor() {
+        let sm = paired();
+        let mut enc = OpusEncoder::new().unwrap();
+        let opus = enc.encode(&vec![0i16; crate::audio::FRAME_SIZE]).unwrap();
+        let now = sassytalkie_core::wire::now_ms();
+        let beacon = sassytalkie_core::wire::pack_wire_frame_v2(
+            1,
+            sassytalkie_core::wire::SUBCH_MAIN,
+            "android-peer",
+            "Pixel",
+            42,
+            0,
+            now,
+            &opus,
+        );
+        let sealed = CryptoSession::from_psk(&KEY).encrypt(&beacon).unwrap();
+        sm.process_relay_frame(&sealed);
+        assert!(!sm.floor().is_held(crate::control::now_ms()));
     }
 
     #[test]

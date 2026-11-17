@@ -804,7 +804,7 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
     // Connection guard: check if any transport has connected peers
-        let (bt_connected, transport_active) = if let Some(ref sm) = guard.state_machine {
+    let (bt_connected, transport_active) = if let Some(ref sm) = guard.state_machine {
         let tm = sm.get_transport().lock().unwrap_or_else(|e| e.into_inner());
         let active = tm.active_transport();
         let has_ip = tm.has_live_ip_transport();
@@ -907,6 +907,16 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     gain_x100: jni::sys::jint,
 ) {
     crate::audio_pipeline::set_mic_gain_x100(gain_x100);
+}
+
+/// JNI: Set the transmit Opus bitrate in bps (clamped to the codec range).
+#[no_mangle]
+pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nativeSetTxBitrate(
+    _env: JNIEnv,
+    _class: JClass,
+    bps: jni::sys::jint,
+) {
+    crate::audio_pipeline::set_tx_bitrate_bps(bps);
 }
 
 /// JNI: Get the current mic input gain × 100.
@@ -1447,6 +1457,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     }
 }
 
+/// Counts Bluetooth AEAD failures so their log line can be rate-limited.
+static BT_DECRYPT_FAIL_LOG_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// JNI: Decode a BT-received audio frame and play it.
 ///
 /// Kotlin passes raw bytes received from RFCOMM → unpack wire frame → ADPCM decode → play.
@@ -1493,7 +1507,17 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
             match tm.decrypt_raw(&raw_bytes) {
                 Ok(dec) => dec,
                 Err(e) => {
-                    warn!("BT RX: decrypt failed ({}), dropping packet", e);
+                    // A peer on another key sends 50 frames a second; log the
+                    // first failure and then every hundredth, as the IP path does.
+                    let n = BT_DECRYPT_FAIL_LOG_COUNT
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    if n == 1 || n % 100 == 0 {
+                        warn!(
+                            "BT RX: decrypt failed ({}), dropping packet ({} failures, rate-limited)",
+                            e, n
+                        );
+                    }
                     return JNI_FALSE;
                 }
             }
@@ -1801,7 +1825,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     if !sid.is_empty() {
         if let Some(ref sm) = guard.state_machine {
             sm.set_cellular_room(sid.clone());
-            info!("JNI: Cellular room synced to generated session_id ({} chars)", sid.len());
+            info!(
+                "JNI: Cellular room synced to generated session_id ({} chars)",
+                sid.len()
+            );
         }
     }
 
@@ -2096,7 +2123,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     } else {
         drop(guard);
         let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        guard.active_user_registry().lock().unwrap_or_else(|e| e.into_inner()).set_muted(&id, muted == JNI_TRUE);
+        guard
+            .active_user_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_muted(&id, muted == JNI_TRUE);
     }
 }
 
@@ -2128,7 +2159,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     } else {
         drop(guard);
         let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        guard.active_user_registry().lock().unwrap_or_else(|e| e.into_inner()).set_favorite(&id, favorite == JNI_TRUE);
+        guard
+            .active_user_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_favorite(&id, favorite == JNI_TRUE);
     }
 }
 
@@ -2158,7 +2193,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
     } else {
         drop(guard);
         let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        guard.active_user_registry().lock().unwrap_or_else(|e| e.into_inner()).remove_user(&id);
+        guard
+            .active_user_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove_user(&id);
     }
 }
 
@@ -2673,7 +2712,10 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
             let resp_b64 =
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, resp.to_bytes());
             drop(guard);
-            info!("JNI: hybrid handshake responded (channel {}) — session staged pending confirm", channel);
+            info!(
+                "JNI: hybrid handshake responded (channel {}) — session staged pending confirm",
+                channel
+            );
             env.new_string(&resp_b64)
                 .map(|s| s.into())
                 .unwrap_or_else(|_| JObject::null())
@@ -3208,7 +3250,11 @@ pub extern "system" fn Java_com_sassyconsulting_sassytalkie_SassyTalkNative_nati
             .unwrap_or_else(|e| e.into_inner());
 
         // Parse user registry JSON to sync mute/favorite status into cache
-        let users_json = guard.active_user_registry().lock().unwrap_or_else(|e| e.into_inner()).to_json();
+        let users_json = guard
+            .active_user_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .to_json();
         if let Ok(users) = serde_json::from_str::<Vec<serde_json::Value>>(&users_json) {
             for u in users {
                 if let (Some(id), Some(name), Some(muted), Some(fav)) = (

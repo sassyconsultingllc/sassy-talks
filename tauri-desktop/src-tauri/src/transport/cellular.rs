@@ -596,18 +596,22 @@ impl CellularTransport {
                 },
             }
         };
-        match wire::unpack_wire_frame(&plain) {
-            Ok((_ch, _sub, sender, _name, ts, opus)) => {
-                if sender == self.config.peer_id {
+        match wire::unpack_wire_frame_detailed(&plain) {
+            Ok(frame) => {
+                if frame.sender_id == self.config.peer_id {
                     return true;
                 }
-                self.floor
-                    .hold(&sender, floor_policy::STALE_HOLD_MS, unix_now_ms());
+                // An idle Android phone's presence beacon is audio too, but it
+                // must not make the channel look busy.
+                if floor_policy::audio_frame_takes_floor(frame.sequence) {
+                    self.floor
+                        .hold(&frame.sender_id, floor_policy::STALE_HOLD_MS, unix_now_ms());
+                }
                 self.packets_received.fetch_add(1, Ordering::Relaxed);
                 let _ = self.inbound_tx.try_send(super::AudioFrame {
-                    sender,
-                    timestamp: ts,
-                    opus,
+                    sender: frame.sender_id,
+                    timestamp: frame.timestamp,
+                    opus: frame.compressed,
                 });
             }
             Err(e) => {
@@ -959,6 +963,31 @@ mod tests {
             t.floor().is_held(unix_now_ms()),
             "lost PTT_START must not mean a free channel"
         );
+    }
+
+    /// Regression: an idle Android phone sends a one-frame silent presence
+    /// beacon every ~10 s. Holding the floor on it refused about one desktop
+    /// press in six with "Channel busy" while nobody was talking.
+    #[tokio::test]
+    async fn android_presence_beacon_does_not_lock_the_floor() {
+        let key = generate_psk();
+        let t = test_transport(key);
+        let _rx = t.take_audio_receiver().unwrap();
+        let mut phone = CryptoSession::from_psk(&key);
+        let beacon =
+            wire::pack_wire_frame_v2(1, wire::SUBCH_MAIN, "phone", "Phone", 9, 0, 1_000, b"opus");
+        t.handle_inbound(phone.encrypt(&beacon).unwrap());
+        assert!(!t.floor().is_held(unix_now_ms()));
+        assert!(
+            t.floor_request(false).is_ok(),
+            "a beacon must not make the channel busy"
+        );
+        t.floor_release();
+
+        let speech =
+            wire::pack_wire_frame_v2(1, wire::SUBCH_MAIN, "phone", "Phone", 9, 1, 1_020, b"opus");
+        t.handle_inbound(phone.encrypt(&speech).unwrap());
+        assert!(t.floor().is_held(unix_now_ms()));
     }
 
     #[tokio::test]

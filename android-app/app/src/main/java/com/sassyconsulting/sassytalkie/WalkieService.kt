@@ -222,7 +222,7 @@ class WalkieService : Service() {
         // onStart path; this branch just runs the reconnect work.
         if (intent?.action == ACTION_WAKE) {
             val room = intent.getStringExtra(EXTRA_ROOM)
-            Log.i(TAG, "WAKE intent received room=$room")
+            Log.i(TAG, "WAKE intent received room=${room?.take(8)}")
             serviceScope.launch { kickCellularReconnect() }
             return START_NOT_STICKY
         }
@@ -734,8 +734,14 @@ class WalkieService : Service() {
         // exported broadcast receiver — that would be a standing surface
         // leaking the room id to any app on the device, for a debugging
         // convenience. This path is already gated on diagnostics being
-        // enabled, so it costs nothing in a normal release install.
-        if (++diagLogTick % 2 == 0) Log.i("SassyDiag", json)
+        // enabled, so it costs nothing in a normal release install. The line
+        // carries only the first 8 characters of the room id.
+        if (++diagLogTick % 2 == 0) {
+            Log.i(
+                "SassyDiag",
+                com.sassyconsulting.sassytalkie.debug.DiagnosticsCollector.redactRoomForLog(json),
+            )
+        }
 
         try {
             val root = org.json.JSONObject(json)

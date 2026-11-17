@@ -16,9 +16,9 @@ use log::{error, info, warn};
 /// by TransportManager (AES-256-GCM) before data reaches this module.
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use zeroize::Zeroize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use zeroize::Zeroize;
 
 use sassytalkie_core::sealed;
 

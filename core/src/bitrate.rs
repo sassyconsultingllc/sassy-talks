@@ -18,6 +18,12 @@
 //! Enforcement wiring (per-peer reject counter → evict) is left to the consumer
 //! RX path; a peer's negotiated bitrate comes from the session handshake and
 //! defaults to [`DEFAULT_BITRATE_BPS`] for peers that don't advertise one.
+//!
+//! **Not wired into any RX path, and must not be as it stands.** The 24 kbps
+//! figure above is historical: clients now encode at 64 kbps, and Android drops
+//! to 24 kbps while its relay uplink is mobile data. A guard built with
+//! [`DEFAULT_BITRATE_BPS`] and the default tolerance would reject every
+//! full-rate frame. A consumer has to accept the whole 24-64 kbps range.
 
 /// The bitrate every stock client uses today (see `OpusEncoder.applyPttDefaults`).
 pub const DEFAULT_BITRATE_BPS: u32 = 24_000;
@@ -150,19 +156,34 @@ mod tests {
 
     #[test]
     fn nominal_frame_is_accepted() {
-        assert!(frame_within_bounds(60, 20, DEFAULT_BITRATE_BPS, DEFAULT_TOLERANCE_PCT));
+        assert!(frame_within_bounds(
+            60,
+            20,
+            DEFAULT_BITRATE_BPS,
+            DEFAULT_TOLERANCE_PCT
+        ));
     }
 
     #[test]
     fn silence_beacon_is_exempt() {
         // A 3-byte CN frame estimates to a tiny bitrate but must not be dropped.
-        assert!(frame_within_bounds(3, 20, DEFAULT_BITRATE_BPS, DEFAULT_TOLERANCE_PCT));
+        assert!(frame_within_bounds(
+            3,
+            20,
+            DEFAULT_BITRATE_BPS,
+            DEFAULT_TOLERANCE_PCT
+        ));
     }
 
     #[test]
     fn wildly_high_bitrate_is_rejected() {
         // 400 bytes/20ms = 160 kbps, far outside 24k ±50%.
-        assert!(!frame_within_bounds(400, 20, DEFAULT_BITRATE_BPS, DEFAULT_TOLERANCE_PCT));
+        assert!(!frame_within_bounds(
+            400,
+            20,
+            DEFAULT_BITRATE_BPS,
+            DEFAULT_TOLERANCE_PCT
+        ));
     }
 
     #[test]

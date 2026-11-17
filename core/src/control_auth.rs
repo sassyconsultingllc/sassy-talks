@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -51,22 +52,55 @@ pub enum ControlAuthError {
     Crypto,
 }
 
+/// Send sequence counter and receive replay window.
+///
+/// A codec is rebuilt whenever the key or room changes, but the sequence is
+/// bound to `(sender, epoch)`, which outlives it. An owner whose epoch is fixed
+/// for the process must keep one `ControlAuthState` and pass it to every codec
+/// it builds (see [`ControlAuthCodec::with_state`]). Restarting the counter
+/// under the same epoch makes every peer's replay window reject the sender
+/// until it climbs back past its old high-water mark, and that covers floor
+/// and SOS frames. Android does the same in `AuthenticatedControlPlane`.
+#[derive(Default)]
+pub struct ControlAuthState {
+    tx_sequence: AtomicU64,
+    replay: Mutex<ReplayWindow>,
+}
+
+impl ControlAuthState {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+}
+
 /// AES-GCM authenticated wrapper for v2 control frames.
 pub struct ControlAuthCodec {
     cipher: Aes256Gcm,
     room_binding: [u8; ROOM_BINDING_BYTES],
     sender_id: String,
     epoch: u64,
-    tx_sequence: AtomicU64,
-    replay: std::sync::Mutex<ReplayWindow>,
+    state: Arc<ControlAuthState>,
 }
 
 impl ControlAuthCodec {
+    /// A codec with its own sequence counter and replay window. Only correct
+    /// when `epoch` is new for this codec; otherwise use [`Self::with_state`].
     pub fn new(
         key: [u8; 32],
         room_id: &str,
         sender_id: &str,
         epoch: u64,
+    ) -> Result<Self, ControlAuthError> {
+        Self::with_state(key, room_id, sender_id, epoch, ControlAuthState::new())
+    }
+
+    /// A codec that continues the sequence and replay window in `state`.
+    pub fn with_state(
+        key: [u8; 32],
+        room_id: &str,
+        sender_id: &str,
+        epoch: u64,
+        state: Arc<ControlAuthState>,
     ) -> Result<Self, ControlAuthError> {
         let sender_bytes = sender_id.as_bytes();
         if sender_bytes.is_empty() || sender_bytes.len() > MAX_SENDER_BYTES {
@@ -80,8 +114,7 @@ impl ControlAuthCodec {
             room_binding,
             sender_id: sender_id.to_string(),
             epoch,
-            tx_sequence: AtomicU64::new(0),
-            replay: std::sync::Mutex::new(ReplayWindow::default()),
+            state,
         })
     }
 
@@ -106,6 +139,7 @@ impl ControlAuthCodec {
             return Err(ControlAuthError::TooLarge);
         }
         let seq = self
+            .state
             .tx_sequence
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
@@ -230,7 +264,7 @@ impl ControlAuthCodec {
             return None;
         }
         {
-            let mut replay = self.replay.lock().ok()?;
+            let mut replay = self.state.replay.lock().ok()?;
             if !replay.accept(&sender, sender_epoch, sequence) {
                 return None;
             }
@@ -520,6 +554,55 @@ mod tests {
         assert!(receiver.open(&second, now).is_some());
         assert!(receiver.open(&first, now).is_some());
         assert!(receiver.open(&first, now).is_none());
+    }
+
+    /// Regression: re-installing the session key (re-pair, wipe then rejoin)
+    /// under a process-fixed epoch restarted the sequence at 1, so every peer
+    /// that had already heard this sender dropped its heartbeat, floor and SOS
+    /// frames as replays. Fixed in the Android client in 3.2.13's audit; iOS
+    /// shared this codec and still had it.
+    #[test]
+    fn codec_rebuilt_under_the_same_epoch_keeps_counting() {
+        let now = 1_700_000_000_000u64;
+        let hb = encode_tlv(OP_HEARTBEAT, &[0; 23]);
+        let receiver = ControlAuthCodec::new(key(), "room-1", "device-b", 22).unwrap();
+
+        let state = ControlAuthState::new();
+        let first =
+            ControlAuthCodec::with_state(key(), "room-1", "device-a", 11, state.clone()).unwrap();
+        for _ in 0..100 {
+            assert!(receiver.open(&first.seal(&hb, now).unwrap(), now).is_some());
+        }
+
+        let rebuilt = ControlAuthCodec::with_state(key(), "room-1", "device-a", 11, state).unwrap();
+        let verified = receiver
+            .open(&rebuilt.seal(&hb, now).unwrap(), now)
+            .expect("first frame after a rebuild must be accepted");
+        assert_eq!(verified.sequence, 101);
+
+        // What the bug looked like: a fresh counter under the same epoch.
+        let restarted = ControlAuthCodec::new(key(), "room-1", "device-a", 11).unwrap();
+        assert!(receiver
+            .open(&restarted.seal(&hb, now).unwrap(), now)
+            .is_none());
+    }
+
+    /// The receive window is shared too, so a rebuild does not reopen it to
+    /// frames captured before the rebuild.
+    #[test]
+    fn rebuilt_codec_still_rejects_frames_seen_before_the_rebuild() {
+        let now = 1_700_000_000_000u64;
+        let sender = ControlAuthCodec::new(key(), "room-1", "device-a", 11).unwrap();
+        let captured = sender
+            .seal(&encode_tlv(OP_HEARTBEAT, &[0; 23]), now)
+            .unwrap();
+
+        let state = ControlAuthState::new();
+        let before =
+            ControlAuthCodec::with_state(key(), "room-1", "device-b", 22, state.clone()).unwrap();
+        assert!(before.open(&captured, now).is_some());
+        let after = ControlAuthCodec::with_state(key(), "room-1", "device-b", 22, state).unwrap();
+        assert!(after.open(&captured, now).is_none());
     }
 
     #[test]
