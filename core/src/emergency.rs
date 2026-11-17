@@ -112,7 +112,10 @@ impl FixedCoord {
 
     /// Back to floating-point degrees.
     pub fn to_degrees(self) -> (f64, f64) {
-        (self.lat_e7 as f64 / COORD_SCALE, self.lon_e7 as f64 / COORD_SCALE)
+        (
+            self.lat_e7 as f64 / COORD_SCALE,
+            self.lon_e7 as f64 / COORD_SCALE,
+        )
     }
 }
 
@@ -708,8 +711,14 @@ mod tests {
         // Collide-check against the FULL registry, not a hand-copied subset —
         // the hand-copied subset is exactly what let 0x1B/0x1C through.
         for op in [OP_EMERGENCY, OP_MANDOWN, OP_EMERGENCY_CLEAR] {
-            let hits = protocol::ALL_OPCODES.iter().filter(|(_, v)| *v == op).count();
-            assert_eq!(hits, 1, "op {op:#x} must appear exactly once in ALL_OPCODES");
+            let hits = protocol::ALL_OPCODES
+                .iter()
+                .filter(|(_, v)| *v == op)
+                .count();
+            assert_eq!(
+                hits, 1,
+                "op {op:#x} must appear exactly once in ALL_OPCODES"
+            );
         }
         assert_ne!(OP_EMERGENCY, OP_MANDOWN);
         assert_ne!(OP_EMERGENCY, OP_EMERGENCY_CLEAR);
@@ -931,7 +940,7 @@ mod tests {
     fn motion_resets_countdown_before_trip() {
         let mut d = det();
         d.update(0, false, 80.0); // settling
-        // Movement detected → back to normal.
+                                  // Movement detected → back to normal.
         assert_eq!(d.update(500, true, 80.0), ManDownPhase::Normal);
         // Re-falling starts the countdown fresh.
         assert_eq!(d.update(600, false, 80.0), ManDownPhase::Settling);
@@ -941,7 +950,7 @@ mod tests {
     fn returning_upright_resets_countdown() {
         let mut d = det();
         d.update(0, false, 80.0); // settling (tilted, still)
-        // Stood back up (low tilt) even while still → normal.
+                                  // Stood back up (low tilt) even while still → normal.
         assert_eq!(d.update(500, false, 10.0), ManDownPhase::Normal);
     }
 

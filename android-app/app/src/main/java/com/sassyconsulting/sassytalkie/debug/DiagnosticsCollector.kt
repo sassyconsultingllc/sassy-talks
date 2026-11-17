@@ -16,6 +16,16 @@ import org.json.JSONObject
  */
 object DiagnosticsCollector {
 
+    private val ROOM_FIELD = Regex("\"room\":\"([^\"]*)\"")
+
+    /**
+     * A diagnostics snapshot as it may be written to logcat. The room id is
+     * the relay capability, so only its first 8 characters are kept: enough to
+     * check that two devices are in the same room, not enough to join it.
+     */
+    fun redactRoomForLog(json: String): String =
+        ROOM_FIELD.replace(json) { "\"room\":\"${it.groupValues[1].take(8)}\"" }
+
     data class CellularStats(
         val state: String = "",
         val room: String = "",

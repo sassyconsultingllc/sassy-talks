@@ -11,6 +11,130 @@ All notable changes to SassyTalkie. Format loosely follows
 
 ## [Unreleased]
 
+## [3.2.13] (89) - 2026-11-17
+
+The November audit of the PTT path (#38) and a closing pass over every
+surface. Relay entries take effect on the next relay deploy; the promo-attempt
+counter also needs the `promo_attempts` table from `schema/licenses.sql`.
+
+### Fixed
+- **Sessions forgotten on restart (Android):** at startup the app checks
+  whether its session store is a plaintext file left by an old build and
+  deletes it if so. The check read only the first 256 characters, but
+  entries are stored in hash order, so on many installs an encrypted session
+  came first, the store was taken for plaintext, and every saved session and
+  the cohort history were deleted on each cold start. The whole file is now
+  read, and an encrypted store is never wiped. Present since at least 3.1.13.
+- **Control frames after a channel switch or key refresh (Android):** the
+  sealed-control sequence restarted at 1 when the codec was rebuilt under the
+  same process epoch, so every peer's replay window rejected the sender's SOS,
+  heartbeat and floor frames. The sequence and replay window now live for the
+  process.
+- **Control frames after re-pairing (iPhone):** the shared Rust codec had the
+  same restart, on every key install. `ControlAuthState` carries the sequence
+  and replay window across rebuilds.
+- **Phantom peers:** liveness was seeded with raw BLE addresses, which never
+  heartbeat, so each Bluetooth peer left a permanently stale twin that doubled
+  the roster and re-sent WAKE on every cooldown. Liveness and targeted control
+  frames are keyed on the authenticated install id.
+- **SOS that reached nobody:** the banner said "Broadcasting SOS" with no
+  transport up. It now says the beacon has not been sent, and retries every
+  second until one takes it. Only the device that raised an emergency can
+  clear it.
+- **Stuck "transmitting":** a microphone that cannot start, or stops
+  delivering, drops the PTT latch and counts a failed transmission. Negative
+  `AudioRecord.read` and `AudioTrack.write` results are treated as errors.
+- **End Session:** the live and staged transport keys are cleared, so nothing
+  is sent or accepted under the ended session's key.
+- **Audio mode:** the phone's audio mode is restored even when a routing call
+  fails after the mode change.
+- **Whole-clip mode:** a clip arriving, queued or playing at disconnect is
+  kept in history.
+- **Emergency beacon:** it re-anchors when the wall clock steps backwards
+  instead of waiting for the clock to catch up.
+- **Names:** device names and audit details are truncated on a character
+  boundary.
+- **Bluetooth:** GATT connects over LE, services are discovered when the MTU
+  request is refused, a failed scan is reported, the insecure RFCOMM socket is
+  dialed first (no pairing prompt), failed dials back off, a bad frame length
+  drops the link instead of garbling every later frame, and idle links are
+  kept alive.
+- **Relay reconnect (Android):** a stalled connect is abandoned after 25 s,
+  retries are jittered, the socket is re-dialed at once when Wi-Fi is lost,
+  and the wake-push registration is refreshed on every relay open.
+- **Wi-Fi to mobile data (Android):** losing Wi-Fi could go unnoticed,
+  because the check asked the system for the active network while it still
+  named the Wi-Fi that had just gone. The session stayed labelled "WiFi +
+  Relay" on mobile data. Loss is now judged from the networks the app tracks,
+  and recovery tries the relay before Bluetooth, so the screen no longer says
+  "No local link" while the relay is reconnecting. When Wi-Fi returns, the
+  local Wi-Fi path is restored once the network is validated.
+- **Relay after an outage (Android):** a retry scheduled during an outage
+  could be most of a minute away, which held the relay, and an SOS waiting on
+  it, down long after the phone was back online. The relay is dialed as soon
+  as a network becomes available. Frames that could not be sent because the
+  socket was down are no longer counted as send drops.
+- **Relay client after teardown (Android):** an automatic retry that raced
+  "disconnect" could bring the closed client back as a second socket in the
+  room, and a callback arriving after shutdown could crash the app. Retries
+  can no longer revive a closed client.
+- **Relay preferred over Bluetooth (Android):** when the relay reconnected
+  during the Bluetooth search that follows a lost link, the finished search
+  switched the session back to Bluetooth or to "No local link".
+- **"Channel busy" with nobody talking (desktop, iPhone):** an idle Android
+  phone sends a one-frame silent presence beacon every ~10 s, and these
+  clients took the floor for 1.5 s on any audio frame, so about one press in
+  six was refused. Beacons no longer take the floor.
+- **Relay close handshake:** the relay never answered a client's Close frame,
+  so the client timed out with 1006 and the half-closed socket stayed in the
+  room, counted against its 16-peer limit and still sent every frame.
+- **Relay wake pushes:** sockets the relay is closing no longer count as
+  attached, so a dead peer gets its push. An FCM `INVALID_ARGUMENT` no longer
+  deletes the presence row, and APNs device tokens are URL-encoded.
+- **Relay limits:** inbound frames are capped at 64 KiB, and promo attempts
+  are counted atomically in D1 before the lookup.
+- **Relay `/ws` with a legacy token:** a `peer` value that is not a valid
+  header value returned a 500 instead of opening the socket.
+- **Logs:** the room id is no longer written to logcat in full: wake pushes,
+  relay setup, session create/import/clear and the diagnostics line keep at
+  most its first 8 characters. The AEAD-failure lines (IP and Bluetooth) are
+  rate-limited.
+
+### Added
+- **Bluetooth audio between unpaired phones (Android 10+):** audio runs over a
+  BLE L2CAP channel. Each phone publishes its channel on a new read-only GATT
+  characteristic and the lower tie-break nonce dials, so there is no pairing
+  and no system prompt. Peers without the characteristic, and Android 7 to 9,
+  keep classic RFCOMM.
+- **Lower bitrate on mobile data (Android):** transmit drops from 64 kbps to
+  24 kbps while relay audio is leaving over mobile data, and returns to
+  64 kbps on Wi-Fi. Receivers need no change. The current rate is in the
+  native diagnostics (`codec.bitrate_bps`).
+- **Relay burst allowance:** the per-socket limit is a token bucket (120
+  messages a second sustained, 600 burst) instead of a fixed one-second
+  window, which dropped the backlog a phone flushes after a cellular stall.
+
+### Changed
+- **CI:** the Rust files the audit touched are rustfmt-clean, which the
+  `Rust format, clippy, and native tests` job requires. That job failed on
+  `main` after the #17 and #38 merges.
+
+### Tested
+- Unit tests pass: core 223, Android native 67, iPhone 17, desktop 71,
+  relay 55, Android JVM 356 (both flavors).
+- Upgrade from the 3.2.10 release to this release build on an Android 15
+  emulator: session kept, relay connects, PTT, SOS raise / stand-down, SOS
+  with no connection, Wi-Fi to mobile data and back (bitrate follows).
+- Two peers through the production relay: the app and a headless desktop-core
+  peer exchanged sealed audio both ways; floor start/stop, EOT_ACK and the
+  roster worked.
+
+### Not verified
+- The BLE L2CAP audio link between two unpaired phones needs two physical
+  phones; the emulator has no Bluetooth radio.
+- The 24 kbps rate and the relay burst allowance have not been measured on a
+  weak cell.
+
 ## [3.2.12] (88) - 2026-11-09
 
 Merges the July swarm-audit branch (#17) and the desktop npm bumps (#36).

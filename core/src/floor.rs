@@ -40,6 +40,22 @@ pub const STALE_HOLD_MS: u64 = 1_500;
 /// Mirrors Android `PttCoordinator.DEFAULT_MAX_TX_MS`.
 pub const DEFAULT_MAX_TX_MS: u64 = 60_000;
 
+/// Does an inbound audio frame occupy the floor?
+///
+/// Every frame does except an Android presence beacon: a single silent v2
+/// frame with wire sequence 0, sent when its TX thread starts and every ~10 s
+/// while idle. Holding the floor on it made the channel look busy for
+/// [`STALE_HOLD_MS`] every ten seconds whenever an idle phone was in the room,
+/// so roughly one press in six was refused with "Channel busy". The first
+/// frame of a real transmission is also sequence 0, but its authenticated
+/// `PTT_START_V2` already holds the floor and sequence 1 follows 20 ms later.
+/// v1 frames carry no sequence; `wire::unpack_wire_frame_detailed` reports
+/// their timestamp there, which is never 0, so they always take the floor.
+#[inline]
+pub fn audio_frame_takes_floor(sequence: u32) -> bool {
+    sequence != 0
+}
+
 /// Should a local PTT press be refused because the channel is busy?
 ///
 /// A local emergency overrides a held floor — a distress call is never blocked
@@ -239,6 +255,18 @@ impl Default for FloorState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presence_beacon_does_not_take_the_floor() {
+        use crate::wire::{pack_wire_frame, pack_wire_frame_v2, unpack_wire_frame_detailed};
+        let beacon = pack_wire_frame_v2(1, 0, "phone", "Phone", 77, 0, 1_700_000_000_000, &[1]);
+        let speech = pack_wire_frame_v2(1, 0, "phone", "Phone", 77, 1, 1_700_000_000_020, &[1]);
+        let legacy = pack_wire_frame(1, 0, "desk", "Desk", 1_700_000_000_000, &[1]);
+        let seq = |f: &[u8]| unpack_wire_frame_detailed(f).unwrap().sequence;
+        assert!(!audio_frame_takes_floor(seq(&beacon)));
+        assert!(audio_frame_takes_floor(seq(&speech)));
+        assert!(audio_frame_takes_floor(seq(&legacy)));
+    }
 
     #[test]
     fn local_emergency_overrides_busy_channel() {

@@ -84,17 +84,23 @@ object SassyTalkNative {
         if (legacyPurged) return
         legacyPurged = true
         try {
-            // If the file exists and isn't an EncryptedSharedPreferences blob,
-            // it means an older build wrote plaintext keys here. Wipe it.
+            // An older build may have written session keys here in the clear.
+            // Read the whole file: see SessionPrefsHygiene for why a prefix
+            // check deleted real, encrypted sessions.
             val f = java.io.File(ctx.applicationInfo.dataDir, "shared_prefs/$SESSION_PREFS.xml")
             if (f.exists()) {
-                val sample = f.readText(Charsets.UTF_8).take(256)
-                val looksEncrypted = sample.contains("__androidx_security_crypto_encrypted_prefs_")
-                if (!looksEncrypted) {
-                    Log.w(TAG, "Wiping legacy plaintext session prefs at ${f.path}")
-                    ctx.getSharedPreferences(SESSION_PREFS, android.content.Context.MODE_PRIVATE)
-                        .edit().clear().commit()
-                    f.delete()
+                val prefs = ctx.getSharedPreferences(SESSION_PREFS, android.content.Context.MODE_PRIVATE)
+                when (val verdict = SessionPrefsHygiene.inspect(f.readText(Charsets.UTF_8))) {
+                    SessionPrefsHygiene.Verdict.Keep -> Unit
+                    SessionPrefsHygiene.Verdict.WipeFile -> {
+                        Log.w(TAG, "Wiping legacy plaintext session prefs at ${f.path}")
+                        prefs.edit().clear().commit()
+                        f.delete()
+                    }
+                    is SessionPrefsHygiene.Verdict.RemoveEntries -> {
+                        Log.w(TAG, "Removing ${verdict.names.size} plaintext session entries left by an old build")
+                        prefs.edit().apply { verdict.names.forEach(::remove) }.commit()
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -843,6 +849,17 @@ object SassyTalkNative {
         }
     }
 
+    /**
+     * Set the transmit Opus bitrate in bps (see [TxBitratePolicy]). Applies
+     * from the next encoded frame; safe to call mid-transmission.
+     */
+    fun setTxBitrate(bps: Int) {
+        if (!initialized) return
+        try { nativeSetTxBitrate(bps) } catch (e: Throwable) {
+            Log.e(TAG, "setTxBitrate failed: ${e.message}")
+        }
+    }
+
     /** Current mic input gain (1.0 = unity). */
     fun getMicGain(): Float {
         if (!initialized) return 1.0f
@@ -1138,7 +1155,8 @@ object SassyTalkNative {
         if (initialized && roomId.isNotBlank()) {
             try {
                 nativeCellularSetRoom(roomId)
-                Log.i(TAG, "Cellular room set: $roomId")
+                // The room id is the relay capability; never log it whole.
+                Log.i(TAG, "Cellular room set (${roomId.length} chars)")
             } catch (e: Exception) {
                 Log.e(TAG, "cellularSetRoom failed: ${e.message}")
             }
@@ -1479,6 +1497,7 @@ object SassyTalkNative {
     // Mic gain & squelch
     @JvmStatic private external fun nativeSetMicGainX100(gainX100: Int)
     @JvmStatic private external fun nativeGetMicGainX100(): Int
+    @JvmStatic private external fun nativeSetTxBitrate(bps: Int)
     @JvmStatic private external fun nativeSetSquelchDbfs(dbfs: Int)
     @JvmStatic private external fun nativeGetSquelchDbfs(): Int
 

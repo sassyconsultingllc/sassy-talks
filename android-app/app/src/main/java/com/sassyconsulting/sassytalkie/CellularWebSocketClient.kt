@@ -130,6 +130,9 @@ class CellularWebSocketClient {
      * only the gap we actually missed is replayed — see [RelayCatchup].
      */
     @Volatile private var lastAliveMs = 0L
+    /** When the current dial began, and when its socket opened (wall clock). */
+    @Volatile private var attemptStartedAtMs = 0L
+    @Volatile private var openedAtMs = 0L
     /** Invalidates auth callbacks, sockets, pumps, and reconnect tasks together. */
     private val generation = GenerationOwner()
     // Set by disconnect(), cleared by an explicit connect(). While true, every
@@ -207,10 +210,27 @@ class CellularWebSocketClient {
         if (closed.getAndSet(false)) {
             reconnectAttempts.set(0)
         }
+        return dial()
+    }
+
+    /**
+     * Open the socket unless the client is closed. Every internal path (retry,
+     * network change, reconnectNow) uses this, never [connect]: connect()
+     * clears `closed`, so a retry that raced disconnect() or shutdown() used
+     * to bring the torn-down client back as a second socket in the room.
+     */
+    private fun dial(): Boolean {
+        if (closed.get()) return false
         if (isConnected.get() || !isConnecting.compareAndSet(false, true)) {
             Log.d(TAG, "Already connected/connecting")
             return true
         }
+        if (closed.get()) {
+            // disconnect() landed between the check above and the CAS.
+            isConnecting.set(false)
+            return false
+        }
+        attemptStartedAtMs = System.currentTimeMillis()
         val ownerGeneration = generation.next()
         armConnectWatchdog(ownerGeneration)
         // Respect build-time flag to disable cellular relay (opt-in at build)
@@ -288,6 +308,7 @@ class CellularWebSocketClient {
                 connectWatchdog?.cancel(false)
                 hasCompletedHandshake = true
                 lastAliveMs = System.currentTimeMillis()
+                openedAtMs = lastAliveMs
                 stabilityReset?.cancel(false)
                 stabilityReset = try {
                     reconnectScheduler.schedule({
@@ -425,7 +446,45 @@ class CellularWebSocketClient {
         webSocket = null
         onDisconnected("network change: $reason")
         reconnectAttempts.set(0)
-        connect()
+        dial()
+    }
+
+    /**
+     * The network changed at [changedAtMs]. Re-dial unless the open socket, or
+     * the attempt in flight, began after the change and so already runs on the
+     * new network: tearing that one down only adds a second outage.
+     */
+    fun redialAfterNetworkChange(changedAtMs: Long, reason: String) {
+        if (closed.get()) return
+        val startedAt = when {
+            isConnected.get() -> openedAtMs
+            isConnecting.get() -> attemptStartedAtMs
+            else -> 0L
+        }
+        if (startedAt >= changedAtMs) {
+            Log.d(TAG, "Relay socket already postdates the network change ($reason) — keeping it")
+            return
+        }
+        reconnectNow(reason)
+    }
+
+    /**
+     * A network just became available. A retry scheduled during the outage can
+     * be most of a minute away, which kept the relay (and a pending SOS) down
+     * long after the phone was back online. Dial now instead. An attempt that
+     * is already in flight is left alone, but the backoff is cleared so that if
+     * it fails (it may have started before the network was usable) the next
+     * try is seconds away.
+     */
+    fun onNetworkAvailable() {
+        if (closed.get() || isConnected.get()) return
+        reconnectAttempts.set(0)
+        if (isConnecting.get()) return
+        if (pendingReconnect?.isDone == false) {
+            Log.i(TAG, "Network available — dialing the relay now instead of waiting out the backoff")
+            cancelPendingReconnect()
+            dial()
+        }
     }
 
     /** Terminal close: stop reconnect and release scheduler threads. */
@@ -465,14 +524,20 @@ class CellularWebSocketClient {
             java.util.concurrent.ThreadLocalRandom.current().nextLong(baseDelayMs / 4 + 1)
         val scheduledGeneration = generation.current()
         cancelPendingReconnect()
-        pendingReconnect = reconnectScheduler.schedule({
-            if (generation.owns(scheduledGeneration) && !isConnected.get() && !closed.get()) {
-                Log.i(TAG, "Reconnecting ($cause, attempt $attempt, delay ${delayMs}ms)…")
-                try { connect() } catch (e: Exception) {
-                    Log.w(TAG, "Reconnect attempt $attempt threw: ${e.message}")
+        // shutdown() stops this executor; a late failure callback must not
+        // throw out of OkHttp's dispatcher thread.
+        pendingReconnect = try {
+            reconnectScheduler.schedule({
+                if (generation.owns(scheduledGeneration) && !isConnected.get() && !closed.get()) {
+                    Log.i(TAG, "Reconnecting ($cause, attempt $attempt, delay ${delayMs}ms)…")
+                    try { dial() } catch (e: Exception) {
+                        Log.w(TAG, "Reconnect attempt $attempt threw: ${e.message}")
+                    }
                 }
-            }
-        }, delayMs, TimeUnit.MILLISECONDS)
+            }, delayMs, TimeUnit.MILLISECONDS)
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            null
+        }
     }
 
     /**
@@ -541,6 +606,10 @@ class CellularWebSocketClient {
      * "relay packet loss" in diagnostics.
      */
     private fun sendWithRetry(ws: WebSocket, packet: ByteArray): Boolean {
+        // Socket down: nothing was attempted, so this is not a backpressure
+        // drop. Counting it inflated the send-drop figure and logged a warning
+        // for every heartbeat for as long as the phone was offline.
+        if (!isConnected.get()) return false
         val payload = packet.toByteString()
         var attempt = 0
         while (attempt < SEND_RETRY_MAX && isConnected.get()) {
@@ -677,14 +746,20 @@ class CellularWebSocketClient {
 
     private fun startKeepAlive() {
         stopKeepAlive()
-        keepAliveTask = keepAliveScheduler.scheduleWithFixedDelay(
-            {
-                try { sendKeepAlive() } catch (e: Exception) {
-                    Log.w(TAG, "keepalive send failed: ${e.message}")
-                }
-            },
-            KEEPALIVE_INTERVAL_MS, KEEPALIVE_INTERVAL_MS, TimeUnit.MILLISECONDS,
-        )
+        // shutdown() stops this executor. An onOpen that lands afterwards must
+        // not throw out of the OkHttp callback, which would take the process down.
+        keepAliveTask = try {
+            keepAliveScheduler.scheduleWithFixedDelay(
+                {
+                    try { sendKeepAlive() } catch (e: Exception) {
+                        Log.w(TAG, "keepalive send failed: ${e.message}")
+                    }
+                },
+                KEEPALIVE_INTERVAL_MS, KEEPALIVE_INTERVAL_MS, TimeUnit.MILLISECONDS,
+            )
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            null
+        }
     }
 
     private fun stopKeepAlive() {

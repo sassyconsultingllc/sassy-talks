@@ -727,7 +727,11 @@ impl AudioCache {
             timestamp,
             // Whole-clip mode never uses `samples` again, so move it rather
             // than copy 960 samples per frame.
-            samples: if self.whole_clip_mode { std::mem::take(&mut samples) } else { samples.clone() },
+            samples: if self.whole_clip_mode {
+                std::mem::take(&mut samples)
+            } else {
+                samples.clone()
+            },
             received_at: Instant::now(),
         };
 
@@ -896,7 +900,11 @@ impl AudioCache {
     /// Called periodically by the RX/playback thread to check for completed utterances
     /// and move them to the playback queue
     pub fn tick(&mut self) {
-        let gap_ms = if self.whole_clip_mode { CLIP_END_GAP_MS } else { SPEECH_GAP_MS };
+        let gap_ms = if self.whole_clip_mode {
+            CLIP_END_GAP_MS
+        } else {
+            SPEECH_GAP_MS
+        };
         // Age out stale entries in each speaker's recent-push deque so
         // is_actively_speaking() can return false for speakers who haven't
         // produced anything within ACTIVE_SPEAKER_WINDOW_MS — even if no
@@ -971,7 +979,11 @@ impl AudioCache {
                 if self.whole_clip_mode {
                     let gain = normalize_clip(&mut utterance.frames);
                     if gain > 1.0 {
-                        info!("AudioCache: clip from {} raised {:.1} dB", name, 20.0 * gain.log10());
+                        info!(
+                            "AudioCache: clip from {} raised {:.1} dB",
+                            name,
+                            20.0 * gain.log10()
+                        );
                     }
                 }
 
@@ -1387,7 +1399,11 @@ impl AudioCache {
         self.history.clear();
         self.now_playing = None;
         self.play_cursor = 0;
-        self.mode = if self.whole_clip_mode { CacheMode::Queue } else { CacheMode::Live };
+        self.mode = if self.whole_clip_mode {
+            CacheMode::Queue
+        } else {
+            CacheMode::Live
+        };
         info!("AudioCache: cleared all caches (incl. history)");
     }
 
@@ -1484,7 +1500,11 @@ impl AudioCache {
         self.live_adaptive_extra = 0;
         self.now_playing = None;
         self.play_cursor = 0;
-        self.mode = if self.whole_clip_mode { CacheMode::Queue } else { CacheMode::Live };
+        self.mode = if self.whole_clip_mode {
+            CacheMode::Queue
+        } else {
+            CacheMode::Live
+        };
         info!(
             "AudioCache: cleared active buffers (history kept: {} entries)",
             self.history.len()
@@ -1575,7 +1595,10 @@ impl AudioCache {
             self.mix_pending.clear();
             self.mode = CacheMode::Queue;
         }
-        info!("AudioCache: whole-clip mode {}", if on { "on" } else { "off" });
+        info!(
+            "AudioCache: whole-clip mode {}",
+            if on { "on" } else { "off" }
+        );
     }
 
     pub fn is_whole_clip_mode(&self) -> bool {
@@ -2254,7 +2277,10 @@ mod tests {
         cache.ingest_frame("bob", 2000, bob);
         std::thread::sleep(Duration::from_millis(LIVE_JITTER_DRAIN_AGE_MS + 20));
         while let Some((sid, samples)) = cache.next_playback_frame() {
-            assert_ne!(sid, "bob", "second peer must not interleave into live playout");
+            assert_ne!(
+                sid, "bob",
+                "second peer must not interleave into live playout"
+            );
             assert_eq!(samples, alice);
         }
     }
@@ -2312,7 +2338,9 @@ mod long_transmission_tests {
         let mut out = Vec::new();
         for i in 0..total {
             for (sid, mark) in [("alice", 1i16), ("bob", 2i16)] {
-                if let Some(s) = cache.ingest_logical_frame(sid, 9, i, 1_000 + i as u64 * 20, vec![mark; 960]) {
+                if let Some(s) =
+                    cache.ingest_logical_frame(sid, 9, i, 1_000 + i as u64 * 20, vec![mark; 960])
+                {
                     out.push((sid.to_string(), s[0]));
                 }
             }
@@ -2335,7 +2363,8 @@ mod long_transmission_tests {
         let mut cache = AudioCache::new();
         let total = 750u32;
         for i in 0..total {
-            let _ = cache.ingest_logical_frame("talker", 9, i, 1_000 + i as u64 * 20, vec![1i16; 960]);
+            let _ =
+                cache.ingest_logical_frame("talker", 9, i, 1_000 + i as u64 * 20, vec![1i16; 960]);
             cache.tick();
         }
         std::thread::sleep(Duration::from_millis(SPEECH_GAP_MS + 50));
@@ -2365,9 +2394,14 @@ mod whole_clip_tests {
         cache.set_whole_clip_mode(true);
         let total = 3_000u32; // 60 s
         for i in 0..total {
-            assert!(cache.ingest_logical_frame("talker", 4, i, 1_000 + i as u64 * 20, frame(i)).is_none());
+            assert!(cache
+                .ingest_logical_frame("talker", 4, i, 1_000 + i as u64 * 20, frame(i))
+                .is_none());
             cache.tick();
-            assert!(cache.next_playback_frame().is_none(), "played before the clip ended");
+            assert!(
+                cache.next_playback_frame().is_none(),
+                "played before the clip ended"
+            );
         }
         std::thread::sleep(Duration::from_millis(CLIP_END_GAP_MS + 50));
         cache.tick();
@@ -2392,7 +2426,10 @@ mod whole_clip_tests {
             if i == 50 {
                 std::thread::sleep(Duration::from_millis(SPEECH_GAP_MS + 100));
                 cache.tick();
-                assert!(cache.next_playback_frame().is_none(), "stall ended the clip");
+                assert!(
+                    cache.next_playback_frame().is_none(),
+                    "stall ended the clip"
+                );
             }
         }
         std::thread::sleep(Duration::from_millis(CLIP_END_GAP_MS + 50));
@@ -2430,7 +2467,11 @@ mod whole_clip_tests {
             });
         }
         let total: usize = cache.history.iter().map(|u| u.frames.len()).sum();
-        assert!(total <= HISTORY_MAX_FRAMES, "history holds {} frames", total);
+        assert!(
+            total <= HISTORY_MAX_FRAMES,
+            "history holds {} frames",
+            total
+        );
         assert_eq!(cache.history.back().unwrap().id, 3, "newest entry evicted");
     }
 }
@@ -2470,9 +2511,12 @@ mod normalize_tests {
     }
 
     fn rms(frames: &[CachedFrame]) -> f32 {
-        let (s, n) = frames.iter().flat_map(|f| f.samples.iter()).fold((0f64, 0usize), |(s, n), &x| {
-            (s + (x as f64) * (x as f64), n + 1)
-        });
+        let (s, n) = frames
+            .iter()
+            .flat_map(|f| f.samples.iter())
+            .fold((0f64, 0usize), |(s, n), &x| {
+                (s + (x as f64) * (x as f64), n + 1)
+            });
         ((s / n as f64).sqrt() / 32768.0) as f32
     }
 
@@ -2481,7 +2525,12 @@ mod normalize_tests {
         let mut c = clip(600, 50); // about -38 dBFS RMS
         let g = normalize_clip(&mut c);
         assert!(g > 10.0 && g <= CLIP_MAX_GAIN, "gain {}", g);
-        let peak = c.iter().flat_map(|f| f.samples.iter()).map(|&s| (s as i32).abs()).max().unwrap();
+        let peak = c
+            .iter()
+            .flat_map(|f| f.samples.iter())
+            .map(|&s| (s as i32).abs())
+            .max()
+            .unwrap();
         assert!(peak as f32 <= CLIP_PEAK_CEILING * 32768.0 + 1.0);
         assert!(rms(&c) > 0.1);
     }
@@ -2517,12 +2566,22 @@ mod clear_active_whole_clip_tests {
         cache.set_whole_clip_mode(true);
         cache.update_user_info("alice", "Alice", false, false);
         for seq in 0..20u32 {
-            let out = cache.ingest_logical_frame("alice", 1, seq, 1_000 + seq as u64 * 20, vec![100i16; 960]);
+            let out = cache.ingest_logical_frame(
+                "alice",
+                1,
+                seq,
+                1_000 + seq as u64 * 20,
+                vec![100i16; 960],
+            );
             assert!(out.is_none(), "whole-clip mode never plays live");
         }
         let before = cache.history.len();
         cache.clear_active();
-        assert_eq!(cache.history.len(), before + 1, "clip in flight must reach history");
+        assert_eq!(
+            cache.history.len(),
+            before + 1,
+            "clip in flight must reach history"
+        );
         assert_eq!(cache.history.back().unwrap().frames.len(), 20);
         assert!(cache.active_buffers.is_empty());
     }

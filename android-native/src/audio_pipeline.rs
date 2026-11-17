@@ -85,6 +85,24 @@ static MIC_GAIN_X100: AtomicI32 = AtomicI32::new(100);
 /// frame whose RMS is below -40 dBFS". Useful for noisy environments.
 static SQUELCH_DBFS: AtomicI32 = AtomicI32::new(0);
 
+/// Target Opus bitrate for transmit, in bps. Kotlin lowers it while the
+/// uplink is mobile data (see `codec::CELLULAR_BITRATE`). The TX thread owns
+/// the encoder and applies a change between frames, so there is no shared
+/// encoder state to race on.
+static TX_BITRATE_BPS: AtomicI32 = AtomicI32::new(crate::codec::VOICE_BITRATE);
+
+/// Set the transmit bitrate. Clamped to the codec's accepted range.
+pub fn set_tx_bitrate_bps(bps: i32) {
+    let clamped = bps.clamp(crate::codec::MIN_BITRATE, crate::codec::MAX_BITRATE);
+    if TX_BITRATE_BPS.swap(clamped, Ordering::Relaxed) != clamped {
+        info!("TX bitrate set to {} bps", clamped);
+    }
+}
+
+pub fn get_tx_bitrate_bps() -> i32 {
+    TX_BITRATE_BPS.load(Ordering::Relaxed)
+}
+
 /// Set mic input gain. Input is `gain × 100` (so 100 = 1.0×). Clamped to [25, 400].
 pub fn set_mic_gain_x100(g: i32) {
     let clamped = g.clamp(25, 400);
@@ -417,7 +435,10 @@ pub fn spawn_tx_thread(
                     if tx_dead_frames >= TX_DEAD_FRAMES_MAX {
                         // The mic stopped delivering. Stop pretending to
                         // transmit; the release branch stops the recorder.
-                        warn!("TX: mic delivered no audio for {} frames; dropping PTT", tx_dead_frames);
+                        warn!(
+                            "TX: mic delivered no audio for {} frames; dropping PTT",
+                            tx_dead_frames
+                        );
                         tx_dead_frames = 0;
                         ptt_pressed.store(false, Ordering::SeqCst);
                         crate::diag::note_tx_failure();
@@ -486,7 +507,9 @@ pub fn spawn_tx_thread(
                     crate::diag::note_capture(dbfs);
                 }
 
-                // Encode with Opus
+                // Encode with Opus. Pick up a bitrate change (Wi-Fi <-> mobile
+                // data handover) here, between frames; a no-op when unchanged.
+                encoder.set_bitrate(TX_BITRATE_BPS.load(Ordering::Relaxed));
                 let compressed = encoder.encode(&pcm_buffer[..CODEC_FRAME_SIZE]);
                 crate::diag::note_encode(compressed.len());
 
@@ -1318,7 +1341,9 @@ mod playout_refill_tests {
         // Two overlapping talkers force Queue mode.
         for i in 0..300u32 {
             for (sid, mark) in [("alice", 1i16), ("bob", 2i16)] {
-                if let Some(s) = cache.ingest_logical_frame(sid, 3, i, 1_000 + i as u64 * 20, vec![mark; 960]) {
+                if let Some(s) =
+                    cache.ingest_logical_frame(sid, 3, i, 1_000 + i as u64 * 20, vec![mark; 960])
+                {
                     rx.enqueue_playout(s);
                 }
             }

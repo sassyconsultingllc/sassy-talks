@@ -9,7 +9,6 @@
 ///
 /// libopus is compiled from the audiopus_sys-bundled sources in build.rs;
 /// the FFI declarations live in opus_ffi.rs.
-
 use crate::opus_ffi as ffi;
 
 /// Codec sample rate in Hz.
@@ -28,7 +27,18 @@ pub const COMPRESSED_FRAME_SIZE: usize = 512;
 /// and networks carry it easily, and voice, whistling and background sound
 /// survive without the thin, smeared sound of 24-32 kbps VoIP mode. Must stay
 /// in step with ios-native and tauri-desktop codec.rs.
-const VOICE_BITRATE: i32 = 64000;
+pub const VOICE_BITRATE: i32 = 64000;
+
+/// Bitrate used while the phone's uplink is mobile data. A 64 kbps stream is
+/// ~9 kB/s on the wire once AEAD and WebSocket/TLS framing are added, which a
+/// weak cellular uplink cannot sustain: frames queue, go stale and are dropped,
+/// and the listener hears gaps. 24 kbps fullband Opus is clear speech at about
+/// 40% of the bytes. Decoders need no signalling; Opus is self-describing.
+pub const CELLULAR_BITRATE: i32 = 24000;
+
+/// Accepted range for a runtime bitrate change.
+pub const MIN_BITRATE: i32 = 12000;
+pub const MAX_BITRATE: i32 = VOICE_BITRATE;
 
 /// Opus complexity 0-10. 10 is best quality; encoding one 20 ms frame is
 /// still well under 1 ms on any phone this app supports.
@@ -43,8 +53,11 @@ fn check_opus_error(code: i32, context: &str) {
     if code < ffi::OPUS_OK {
         let msg = unsafe {
             let ptr = ffi::opus_strerror(code);
-            if ptr.is_null() { "unknown error".to_string() }
-            else { std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+            if ptr.is_null() {
+                "unknown error".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            }
         };
         log::warn!("Opus {} error {}: {}", context, code, msg);
     }
@@ -57,6 +70,8 @@ fn check_opus_error(code: i32, context: &str) {
 /// Encodes 960-sample PCM frames into variable-length Opus packets.
 pub struct VoiceEncoder {
     enc: *mut ffi::OpusEncoder,
+    /// Current target bitrate; survives [`VoiceEncoder::reset`].
+    bitrate: i32,
 }
 
 // Safety: OpusEncoder is not thread-safe; we always access it under a Mutex in the pipeline.
@@ -67,39 +82,82 @@ impl VoiceEncoder {
     pub fn new() -> Self {
         let mut err = 0i32;
         let enc = unsafe {
-            ffi::opus_encoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, OPUS_APPLICATION, &mut err)
+            ffi::opus_encoder_create(
+                CODEC_SAMPLE_RATE,
+                CODEC_CHANNELS,
+                OPUS_APPLICATION,
+                &mut err,
+            )
         };
         if enc.is_null() || err != ffi::OPUS_OK {
             panic!("opus_encoder_create failed: {}", err);
         }
         // Bitrate: see VOICE_BITRATE
-        let ret = unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_BITRATE_REQUEST, VOICE_BITRATE) };
+        let ret =
+            unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_BITRATE_REQUEST, VOICE_BITRATE) };
         check_opus_error(ret, "encoder set_bitrate");
         // Complexity: see VOICE_COMPLEXITY
-        let ret = unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_COMPLEXITY_REQUEST, VOICE_COMPLEXITY) };
+        let ret = unsafe {
+            ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_COMPLEXITY_REQUEST, VOICE_COMPLEXITY)
+        };
         check_opus_error(ret, "encoder set_complexity");
         // Enable in-band FEC so the decoder can recover lost packets
         let ret = unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_INBAND_FEC_REQUEST, 1i32) };
         check_opus_error(ret, "encoder set_inband_fec");
         // Tell encoder to expect ~10% packet loss (tunes FEC overhead)
-        let ret = unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10i32) };
+        let ret =
+            unsafe { ffi::opus_encoder_ctl(enc, ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10i32) };
         check_opus_error(ret, "encoder set_packet_loss_perc");
-        Self { enc }
+        Self {
+            enc,
+            bitrate: VOICE_BITRATE,
+        }
+    }
+
+    /// Change the target bitrate. Takes effect on the next encoded frame and
+    /// is safe between any two frames. Out-of-range values are clamped.
+    pub fn set_bitrate(&mut self, bps: i32) {
+        let bps = bps.clamp(MIN_BITRATE, MAX_BITRATE);
+        if bps == self.bitrate {
+            return;
+        }
+        let ret = unsafe { ffi::opus_encoder_ctl(self.enc, ffi::OPUS_SET_BITRATE_REQUEST, bps) };
+        check_opus_error(ret, "encoder set_bitrate");
+        if ret >= ffi::OPUS_OK {
+            self.bitrate = bps;
+        }
+    }
+
+    pub fn bitrate(&self) -> i32 {
+        self.bitrate
     }
 
     /// Reset encoder by reinitialising (called on PTT release to start clean).
     pub fn reset(&mut self) {
         let mut err = 0i32;
         let new_enc = unsafe {
-            ffi::opus_encoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, OPUS_APPLICATION, &mut err)
+            ffi::opus_encoder_create(
+                CODEC_SAMPLE_RATE,
+                CODEC_CHANNELS,
+                OPUS_APPLICATION,
+                &mut err,
+            )
         };
         if !new_enc.is_null() && err == ffi::OPUS_OK {
             unsafe { ffi::opus_encoder_destroy(self.enc) };
             self.enc = new_enc;
-            unsafe { ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_BITRATE_REQUEST, VOICE_BITRATE); }
-            unsafe { ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_COMPLEXITY_REQUEST, VOICE_COMPLEXITY); }
-            unsafe { ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_INBAND_FEC_REQUEST, 1i32); }
-            unsafe { ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10i32); }
+            unsafe {
+                ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_BITRATE_REQUEST, self.bitrate);
+            }
+            unsafe {
+                ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_COMPLEXITY_REQUEST, VOICE_COMPLEXITY);
+            }
+            unsafe {
+                ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_INBAND_FEC_REQUEST, 1i32);
+            }
+            unsafe {
+                ffi::opus_encoder_ctl(new_enc, ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10i32);
+            }
         }
     }
 
@@ -130,7 +188,9 @@ impl VoiceEncoder {
 }
 
 impl Default for VoiceEncoder {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Drop for VoiceEncoder {
@@ -156,9 +216,7 @@ impl VoiceDecoder {
     /// Create a new decoder.
     pub fn new() -> Self {
         let mut err = 0i32;
-        let dec = unsafe {
-            ffi::opus_decoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, &mut err)
-        };
+        let dec = unsafe { ffi::opus_decoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, &mut err) };
         if dec.is_null() || err != ffi::OPUS_OK {
             panic!("opus_decoder_create failed: {}", err);
         }
@@ -168,7 +226,8 @@ impl VoiceDecoder {
     /// Reset decoder state.
     pub fn reset(&mut self) {
         let mut err = 0i32;
-        let new_dec = unsafe { ffi::opus_decoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, &mut err) };
+        let new_dec =
+            unsafe { ffi::opus_decoder_create(CODEC_SAMPLE_RATE, CODEC_CHANNELS, &mut err) };
         if !new_dec.is_null() && err == ffi::OPUS_OK {
             unsafe { ffi::opus_decoder_destroy(self.dec) };
             self.dec = new_dec;
@@ -201,7 +260,11 @@ impl VoiceDecoder {
             )
         };
         if n <= 0 {
-            log::error!("Opus decode FAILED (code={}, {} input bytes) — returning silence", n, compressed.len());
+            log::error!(
+                "Opus decode FAILED (code={}, {} input bytes) — returning silence",
+                n,
+                compressed.len()
+            );
             check_opus_error(n, "decode");
             return vec![0i16; CODEC_FRAME_SIZE];
         }
@@ -235,7 +298,11 @@ impl VoiceDecoder {
             )
         };
         if n <= 0 {
-            log::warn!("Opus decode_fec: code={} from {}-byte packet — falling back to PLC", n, next_packet.len());
+            log::warn!(
+                "Opus decode_fec: code={} from {}-byte packet — falling back to PLC",
+                n,
+                next_packet.len()
+            );
             return self.decode_plc();
         }
         buf.truncate(n as usize);
@@ -268,7 +335,9 @@ impl VoiceDecoder {
 }
 
 impl Default for VoiceDecoder {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Drop for VoiceDecoder {
@@ -288,5 +357,67 @@ mod tests {
         assert_eq!(CODEC_SAMPLE_RATE, 48000);
         assert_eq!(CODEC_CHANNELS, 1);
         assert_eq!(CODEC_FRAME_SIZE, 960);
+    }
+
+    /// Deterministic wideband noise. A plain tone is so cheap to code that
+    /// VBR spends far less than its target at any setting.
+    fn noise_frame(seed: &mut u32) -> Vec<i16> {
+        (0..CODEC_FRAME_SIZE)
+            .map(|_| {
+                *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((*seed >> 16) as i16) / 4
+            })
+            .collect()
+    }
+
+    fn mean_packet_bytes(enc: &mut VoiceEncoder, frames: usize) -> usize {
+        let mut seed = 0x5a5a_1234;
+        let total: usize = (0..frames)
+            .map(|_| enc.encode(&noise_frame(&mut seed)).len())
+            .sum();
+        total / frames
+    }
+
+    #[test]
+    fn cellular_bitrate_shrinks_packets_and_still_decodes() {
+        let mut enc = VoiceEncoder::new();
+        assert_eq!(enc.bitrate(), VOICE_BITRATE);
+        let full = mean_packet_bytes(&mut enc, 50);
+
+        enc.set_bitrate(CELLULAR_BITRATE);
+        assert_eq!(enc.bitrate(), CELLULAR_BITRATE);
+        let low = mean_packet_bytes(&mut enc, 50);
+        assert!(
+            low * 2 < full,
+            "24 kbps frames should be well under half of 64 kbps ones: {low} vs {full}"
+        );
+
+        // A receiver is told nothing about the change and needs nothing.
+        let mut seed = 7;
+        let packet = enc.encode(&noise_frame(&mut seed));
+        let pcm = VoiceDecoder::new().decode(&packet);
+        assert_eq!(pcm.len(), CODEC_FRAME_SIZE);
+    }
+
+    #[test]
+    fn bitrate_is_clamped_to_the_codec_range() {
+        let mut enc = VoiceEncoder::new();
+        enc.set_bitrate(1);
+        assert_eq!(enc.bitrate(), MIN_BITRATE);
+        enc.set_bitrate(1_000_000);
+        assert_eq!(enc.bitrate(), MAX_BITRATE);
+    }
+
+    /// The encoder is rebuilt on every PTT release. A press on mobile data
+    /// must not come back at full rate after the first release.
+    #[test]
+    fn bitrate_survives_the_reset_on_ptt_release() {
+        let mut enc = VoiceEncoder::new();
+        let full = mean_packet_bytes(&mut enc, 50);
+        enc.set_bitrate(CELLULAR_BITRATE);
+        enc.reset();
+        assert_eq!(enc.bitrate(), CELLULAR_BITRATE);
+        let low = mean_packet_bytes(&mut enc, 50);
+        assert!(low * 2 < full, "reset lost the bitrate: {low} vs {full}");
     }
 }

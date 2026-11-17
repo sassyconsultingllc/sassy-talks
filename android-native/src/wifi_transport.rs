@@ -1,15 +1,14 @@
 // Copyright (c) 2026 Shane Smith / Sassy Consulting LLC. All rights reserved.
 // Proprietary source. This notice is Copyright Management Information (17 U.S.C. 1202); removal or alteration prohibited.
 // CodeMark: SCLLC1-sassytalkie-BZWRKRV2CRZP
+use log::info;
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 /// WiFi Multicast Transport Module
 ///
 /// UDP multicast transport for audio data when both peers are on WiFi.
 /// Uses socket2 for multicast group management on Android.
-
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant};
-use log::info;
-use socket2::{Domain, Protocol, Socket, Type, SockAddr};
 
 /// Timeout after which a peer is considered gone if no discovery message has
 /// been seen. Set conservatively to 30s — discovery announces are sent far
@@ -109,7 +108,10 @@ impl WifiTransport {
         self.discovery_socket = Some(disc_sock);
 
         self.state = WifiState::Discovering;
-        info!("WiFi transport: initialized on {}:{}", MULTICAST_GROUP, MULTICAST_PORT);
+        info!(
+            "WiFi transport: initialized on {}:{}",
+            MULTICAST_GROUP, MULTICAST_PORT
+        );
         Ok(())
     }
 
@@ -118,27 +120,33 @@ impl WifiTransport {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
             .map_err(|e| format!("Failed to create socket: {}", e))?;
 
-        socket.set_reuse_address(true)
+        socket
+            .set_reuse_address(true)
             .map_err(|e| format!("Failed to set reuse: {}", e))?;
 
         // Bind to any interface on the port
         let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
-        socket.bind(&SockAddr::from(addr))
+        socket
+            .bind(&SockAddr::from(addr))
             .map_err(|e| format!("Failed to bind to port {}: {}", port, e))?;
 
         // Join multicast group on all interfaces
-        socket.join_multicast_v4(&MULTICAST_GROUP, &Ipv4Addr::UNSPECIFIED)
+        socket
+            .join_multicast_v4(&MULTICAST_GROUP, &Ipv4Addr::UNSPECIFIED)
             .map_err(|e| format!("Failed to join multicast: {}", e))?;
 
         // Enable multicast loopback for testing on same device
-        socket.set_multicast_loop_v4(false)
+        socket
+            .set_multicast_loop_v4(false)
             .map_err(|e| format!("Failed to set multicast loop: {}", e))?;
 
         // Set TTL for local network
-        socket.set_multicast_ttl_v4(1)
+        socket
+            .set_multicast_ttl_v4(1)
             .map_err(|e| format!("Failed to set multicast TTL: {}", e))?;
 
-        socket.set_nonblocking(false)
+        socket
+            .set_nonblocking(false)
             .map_err(|e| format!("Failed to set blocking: {}", e))?;
 
         Ok(socket.into())
@@ -146,21 +154,30 @@ impl WifiTransport {
 
     /// Send audio data via multicast
     pub fn send_audio(&self, data: &[u8]) -> Result<usize, String> {
-        let socket = self.audio_socket.as_ref()
+        let socket = self
+            .audio_socket
+            .as_ref()
             .ok_or("Audio socket not initialized")?;
 
         if data.len() > MAX_PACKET_SIZE {
-            return Err(format!("Packet too large: {} > {}", data.len(), MAX_PACKET_SIZE));
+            return Err(format!(
+                "Packet too large: {} > {}",
+                data.len(),
+                MAX_PACKET_SIZE
+            ));
         }
 
         let dest = SocketAddrV4::new(MULTICAST_GROUP, MULTICAST_PORT);
-        socket.send_to(data, dest)
+        socket
+            .send_to(data, dest)
             .map_err(|e| format!("Failed to send: {}", e))
     }
 
     /// Receive audio data from multicast
     pub fn receive_audio(&self, buffer: &mut [u8]) -> Result<usize, String> {
-        let socket = self.audio_socket.as_ref()
+        let socket = self
+            .audio_socket
+            .as_ref()
             .ok_or("Audio socket not initialized")?;
 
         match socket.recv_from(buffer) {
@@ -179,7 +196,9 @@ impl WifiTransport {
 
     /// Send discovery announcement
     pub fn announce(&self, channel: u8) -> Result<(), String> {
-        let socket = self.discovery_socket.as_ref()
+        let socket = self
+            .discovery_socket
+            .as_ref()
             .ok_or("Discovery socket not initialized")?;
 
         // Packet format: [type:1][channel:1][name_len:1][name:N]
@@ -191,7 +210,8 @@ impl WifiTransport {
         packet.extend_from_slice(name_bytes);
 
         let dest = SocketAddrV4::new(MULTICAST_GROUP, DISCOVERY_PORT);
-        socket.send_to(&packet, dest)
+        socket
+            .send_to(&packet, dest)
             .map_err(|e| format!("Failed to announce: {}", e))?;
 
         Ok(())
@@ -211,13 +231,17 @@ impl WifiTransport {
         loop {
             match socket.recv_from(&mut buffer) {
                 Ok((size, addr)) => {
-                    if size < 3 { continue; }
+                    if size < 3 {
+                        continue;
+                    }
 
                     let msg_type = buffer[0];
                     let channel = buffer[1];
                     let name_len = buffer[2] as usize;
 
-                    if size < 3 + name_len { continue; }
+                    if size < 3 + name_len {
+                        continue;
+                    }
 
                     let name = String::from_utf8_lossy(&buffer[3..3 + name_len]).to_string();
 
@@ -230,7 +254,9 @@ impl WifiTransport {
 
                             // If we've already seen this peer, refresh its last_seen
                             // timestamp; otherwise record a new entry.
-                            if let Some(existing) = self.peers.iter_mut().find(|p| p.address == peer_ip) {
+                            if let Some(existing) =
+                                self.peers.iter_mut().find(|p| p.address == peer_ip)
+                            {
                                 existing.last_seen = now;
                                 existing.channel = channel;
                             } else {
@@ -240,7 +266,10 @@ impl WifiTransport {
                                     channel,
                                     last_seen: now,
                                 };
-                                info!("WiFi: discovered peer {} at {}", peer.device_name, peer.address);
+                                info!(
+                                    "WiFi: discovered peer {} at {}",
+                                    peer.device_name, peer.address
+                                );
                                 new_peers.push(peer.clone());
                                 self.peers.push(peer);
                             }
@@ -258,7 +287,8 @@ impl WifiTransport {
 
         // Prune peers that haven't been heard from in PEER_STALE_MS.
         let now = Instant::now();
-        self.peers.retain(|p| now.duration_since(p.last_seen).as_millis() < PEER_STALE_MS);
+        self.peers
+            .retain(|p| now.duration_since(p.last_seen).as_millis() < PEER_STALE_MS);
 
         new_peers
     }

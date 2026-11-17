@@ -100,7 +100,12 @@ impl AuditChain {
     }
 }
 
-pub fn export_package(chain: &AuditChain, app_id: &str, app_version: &str, install_id: &str) -> String {
+pub fn export_package(
+    chain: &AuditChain,
+    app_id: &str,
+    app_version: &str,
+    install_id: &str,
+) -> String {
     let events: Vec<serde_json::Value> = chain
         .events()
         .iter()
@@ -154,7 +159,9 @@ pub fn export_package(chain: &AuditChain, app_id: &str, app_version: &str, insta
 }
 
 pub fn event_hash(previous: &str, ts_unix_ms: u64, event: &str, detail: &str) -> String {
-    hex_lower(&Sha256::digest(format!("{previous}|{ts_unix_ms}|{event}|{detail}").as_bytes()))
+    hex_lower(&Sha256::digest(
+        format!("{previous}|{ts_unix_ms}|{event}|{detail}").as_bytes(),
+    ))
 }
 
 pub fn verify_events(events: &[AuditEvent]) -> bool {
@@ -211,7 +218,9 @@ fn looks_like_secret(token: &str) -> bool {
     if t.len() >= 32 && t.chars().all(|c| c.is_ascii_hexdigit()) {
         return true;
     }
-    if t.len() >= 24 && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    if t.len() >= 24
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
         && (t.contains('+') || t.contains('/') || t.ends_with('='))
     {
         return true;
@@ -293,7 +302,10 @@ mod tests {
         let s = unix_ms_to_utc(0);
         assert!(s.ends_with('Z'));
         assert_eq!(s, "1970-01-01T00:00:00.000Z");
-        assert_eq!(unix_ms_to_utc(1_700_000_000_000), "2023-11-14T22:13:20.000Z");
+        assert_eq!(
+            unix_ms_to_utc(1_700_000_000_000),
+            "2023-11-14T22:13:20.000Z"
+        );
     }
 
     #[test]

@@ -225,7 +225,15 @@ export default {
       // these internal headers so the DO can classify the authenticated socket.
       const headers = new Headers(request.headers);
       headers.set("X-Sassy-Verified-Auth-Class", identity.authClass);
-      headers.set("X-Sassy-Verified-Peer", identity.peer || claimedPeer);
+      // A v2 token carries a validated peer. On a legacy token the peer is
+      // whatever the client put in the query string, and Headers.set throws on
+      // anything outside Latin-1, which turned a bad `peer` into a 500. Forward
+      // it only when it is a well-formed id; otherwise the room falls back to
+      // its own bounded parse of the query parameter.
+      headers.set(
+        "X-Sassy-Verified-Peer",
+        identity.peer || (isValidPeerId(claimedPeer) ? claimedPeer : ""),
+      );
       headers.set("X-Sassy-Token-Version", String(identity.version));
       return room.fetch(new Request(request, { headers }));
     }
