@@ -597,6 +597,18 @@ impl PlayoutPacer {
 /// Per-sender pre-decode reorder buffer. Opus is stateful — decoding in network
 /// arrival order when frames arrive out-of-order (common on cellular relay)
 /// produces garbled PCM that the post-decode jitter buffer cannot fix.
+/// Stream epoch the wire unpacker reports for a v1 frame (desktop, iPhone).
+/// v1 carries no epoch or counter, so the unpacker puts the sender's
+/// millisecond timestamp in `sequence`. That key is still right for dropping
+/// the copy a desktop sends over both the relay and Wi-Fi, but consecutive
+/// frames are ~20 apart: treated as a frame counter, every frame looked like a
+/// 19-frame loss, waited out the reorder window and reset the decoder. Android
+/// senders always use a non-zero epoch (see `next_stream_epoch`).
+const LEGACY_V1_EPOCH: u64 = 0;
+/// For v1 the "sequence" is milliseconds, so only a rollback this large means
+/// the sender restarted; anything smaller is a late or duplicate frame.
+const LEGACY_V1_RESTART_MS: u32 = 5_000;
+
 struct SenderDecodeState {
     decoder: VoiceDecoder,
     stream_epoch: Option<u64>,
@@ -633,7 +645,12 @@ impl SenderDecodeState {
             if sequence <= last {
                 // A substantial rollback is a sender restart that reused an
                 // epoch. Reset safely; a small rollback is a duplicate/reorder.
-                if last.saturating_sub(sequence) > 32 {
+                let restart = if stream_epoch == LEGACY_V1_EPOCH {
+                    LEGACY_V1_RESTART_MS
+                } else {
+                    32
+                };
+                if last.saturating_sub(sequence) > restart {
                     self.reset_for_epoch(stream_epoch);
                 } else {
                     return vec![];
@@ -662,6 +679,16 @@ impl SenderDecodeState {
         reorder_wait_ms: u64,
     ) -> Vec<(u64, u32, u64, Vec<i16>)> {
         let mut out = Vec::new();
+        if self.stream_epoch == Some(LEGACY_V1_EPOCH) {
+            // v1: no counter to measure a gap with. Decode in timestamp order
+            // as frames arrive, with no reorder wait and no PLC/reset.
+            while let Some((seq, (timestamp, compressed))) = self.pending.pop_first() {
+                let pcm = self.decoder.decode(&compressed);
+                self.last_decoded_seq = Some(seq);
+                out.push((LEGACY_V1_EPOCH, seq, timestamp, pcm));
+            }
+            return out;
+        }
         loop {
             let expected_seq = match self.last_decoded_seq {
                 Some(last) => last.saturating_add(1),
@@ -1323,6 +1350,72 @@ mod tests {
         data[3] = 200; // name_len > MAX_DEVICE_NAME_LEN
         let result = unpack_wire_frame(&data);
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod legacy_v1_rx_tests {
+    use super::*;
+    use crate::codec::VoiceEncoder;
+
+    fn opus_frame(enc: &mut VoiceEncoder) -> Vec<u8> {
+        enc.encode(&vec![0i16; CODEC_FRAME_SIZE])
+    }
+
+    /// Regression (since 3.2): desktop and iPhone send v1 frames, whose
+    /// "sequence" is the sender's ms timestamp, 20 apart. Each frame used to
+    /// wait out the reorder window and then reset the decoder as a 19-frame
+    /// gap. Every frame must decode the moment it arrives.
+    #[test]
+    fn v1_frames_twenty_ms_apart_decode_as_they_arrive() {
+        let mut enc = VoiceEncoder::new();
+        let mut st = SenderDecodeState::new();
+        let t0 = 1_700_000_000_000u64;
+        for i in 0..10u64 {
+            let ts = t0 + i * 20;
+            let out = st.ingest(LEGACY_V1_EPOCH, ts as u32, ts, opus_frame(&mut enc), 3, 60);
+            assert_eq!(out.len(), 1, "frame {i} must decode immediately");
+            assert_eq!(out[0].1, ts as u32);
+            assert_eq!(out[0].3.len(), CODEC_FRAME_SIZE);
+        }
+    }
+
+    /// The copy of the same frame arriving over the other transport is dropped.
+    #[test]
+    fn v1_duplicate_from_the_second_transport_is_dropped() {
+        let mut enc = VoiceEncoder::new();
+        let mut st = SenderDecodeState::new();
+        let ts = 1_700_000_000_000u64;
+        let frame = opus_frame(&mut enc);
+        assert_eq!(st.ingest(0, ts as u32, ts, frame.clone(), 3, 60).len(), 1);
+        assert!(st.ingest(0, ts as u32, ts, frame, 3, 60).is_empty());
+        // A frame a little late (older than the last decoded) is dropped too,
+        // not treated as a sender restart.
+        let later = ts + 40;
+        assert_eq!(
+            st.ingest(0, later as u32, later, opus_frame(&mut enc), 3, 60)
+                .len(),
+            1
+        );
+        let stale = ts + 20;
+        assert!(st
+            .ingest(0, stale as u32, stale, opus_frame(&mut enc), 3, 60)
+            .is_empty());
+    }
+
+    /// v2 (Android) streams keep the gap repair.
+    #[test]
+    fn v2_gap_still_waits_for_reorder() {
+        let mut enc = VoiceEncoder::new();
+        let mut st = SenderDecodeState::new();
+        assert_eq!(
+            st.ingest(77, 1, 1_000, opus_frame(&mut enc), 3, 60).len(),
+            1
+        );
+        // Sequence 2 missing: 3 waits for the reorder window.
+        assert!(st
+            .ingest(77, 3, 1_040, opus_frame(&mut enc), 3, 60)
+            .is_empty());
     }
 }
 

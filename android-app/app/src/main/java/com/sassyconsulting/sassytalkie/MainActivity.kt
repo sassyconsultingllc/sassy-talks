@@ -400,7 +400,12 @@ class MainActivity : ComponentActivity() {
         // Config changes also destroy/recreate the Activity; shutting down on
         // every such change caused audio/BT glitches and needless service restarts.
         if (isFinishing && !isChangingConfigurations) {
+            // The connection manager is process-wide now (shared with the
+            // service), so leaving must tear its relay client down explicitly
+            // before the native side it calls into goes away.
+            com.sassyconsulting.sassytalkie.ui.AutoConnectManager.shared(this).shutdown()
             SassyTalkNative.shutdown()
+            RadioBootstrap.reset()
             stopService(Intent(this, WalkieService::class.java))
         }
     }

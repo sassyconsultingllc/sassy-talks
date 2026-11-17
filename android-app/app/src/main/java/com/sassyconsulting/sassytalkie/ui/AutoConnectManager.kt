@@ -17,6 +17,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import com.sassyconsulting.sassytalkie.BtAudioPath
 import com.sassyconsulting.sassytalkie.CellularWebSocketClient
@@ -47,10 +48,22 @@ enum class ConnectState {
  * Mixed-protocol groups hear each other because native TX fans out to
  * every live IP plane and the BT RFCOMM pump runs in parallel.
  */
-class AutoConnectManager(private val context: Context) {
+class AutoConnectManager private constructor(private val context: Context) {
 
     companion object {
         private const val TAG = "AutoConnect"
+
+        @Volatile private var instance: AutoConnectManager? = null
+
+        /**
+         * The process-wide manager. The UI and WalkieService share it, so the
+         * service can bring the radio back after the process is killed and the
+         * UI, when it opens, sees that connection instead of starting another.
+         */
+        fun shared(context: Context): AutoConnectManager =
+            instance ?: synchronized(this) {
+                instance ?: AutoConnectManager(context.applicationContext).also { instance = it }
+            }
         /** Auth + WS open is async; 5s used to tear down a still-connecting client. */
         private const val CELLULAR_TIMEOUT_MS = 15_000L
         const val PREFS_TRANSPORT = "sassy_settings"
@@ -98,7 +111,7 @@ class AutoConnectManager(private val context: Context) {
      * Wait until RFCOMM is up (or timeout). BLE sightings alone never count as
      * Bluetooth-connected for transport selection.
      */
-    private suspend fun waitForRfcommReady(walkieService: WalkieService?): Int {
+    private suspend fun waitForRfcommReady(walkieService: WalkieService?, generation: Int? = null): Int {
         kickRfcommLinks(walkieService)
         var rfcomm = rfcommPeerCount(walkieService)
         if (rfcomm > 0) return rfcomm
@@ -107,7 +120,7 @@ class AutoConnectManager(private val context: Context) {
             _statusText.value = BtAudioPath.linkingStatus(ble, 0) ?: "Linking Bluetooth…"
         }
         val deadline = System.currentTimeMillis() + BT_RFCOMM_LINK_TIMEOUT_MS
-        while (System.currentTimeMillis() < deadline) {
+        while (System.currentTimeMillis() < deadline && !overtaken(generation)) {
             kickRfcommLinks(walkieService)
             rfcomm = rfcommPeerCount(walkieService)
             if (rfcomm > 0) return rfcomm
@@ -244,6 +257,20 @@ class AutoConnectManager(private val context: Context) {
         walkieServiceRef?.updateNotification(notif)
     }
 
+    /**
+     * The service is being destroyed: forget it, and unwire the relay client
+     * from its coordinator. A later service re-attaches through
+     * [attachWalkieService] / [ensureConnected].
+     */
+    fun detach(walkieService: WalkieService) {
+        if (walkieServiceRef !== walkieService) return
+        walkieServiceRef = null
+        val coord = walkieService.pttCoordinator
+        if (coord != null && cellularClient?.pttCoordinator === coord) {
+            cellularClient?.pttCoordinator = null
+        }
+    }
+
     /** Wire an existing cellular client to the coordinator after late service bind. */
     fun attachWalkieService(walkieService: WalkieService) {
         walkieServiceRef = walkieService
@@ -255,8 +282,58 @@ class AutoConnectManager(private val context: Context) {
         }
     }
 
-    suspend fun autoConnect(walkieService: WalkieService?): Boolean {
+    /**
+     * Serializes connection attempts. The UI and WalkieService can both start
+     * one (screen opened while the service resumes the radio); two at once
+     * would build two relay clients.
+     */
+    private val connectMutex = kotlinx.coroutines.sync.Mutex()
+
+    /**
+     * Bumped by [reset] and [disconnect]. A connect that started before the
+     * bump was overtaken (session changed, user reconnected) and must not
+     * report CONNECTED: [ensureConnected] would then trust it and never
+     * connect the new room. Before the connection manager was shared with the
+     * service, only the screen started connects, so this could not happen.
+     */
+    @Volatile private var connectGeneration = 0
+
+    /** Connect from scratch with the current settings. */
+    suspend fun autoConnect(walkieService: WalkieService?): Boolean =
+        connectMutex.withLock { autoConnectLocked(walkieService) }
+
+    /**
+     * Connect only if not already connected. Used where a connection may
+     * already exist: the radio screen opening, and the service resuming the
+     * radio on its own.
+     */
+    suspend fun ensureConnected(
+        walkieService: WalkieService?,
+        stillWanted: () -> Boolean = { true },
+    ): Boolean {
+        // Taken before waiting for the lock: a disconnect or reset while we
+        // wait (End Session, invite, reconnect) means this request is stale.
+        val requestedAt = connectGeneration
+        return connectMutex.withLock {
+            if (walkieService != null) attachWalkieService(walkieService)
+            when {
+                _state.value == ConnectState.CONNECTED -> true
+                requestedAt != connectGeneration -> false
+                !stillWanted() -> false
+                else -> {
+                    resetState()
+                    autoConnectLocked(walkieService)
+                }
+            }
+        }
+    }
+
+    private fun overtaken(generation: Int?): Boolean =
+        generation != null && generation != connectGeneration
+
+    private suspend fun autoConnectLocked(walkieService: WalkieService?): Boolean {
         walkieServiceRef = walkieService
+        val generation = connectGeneration
         if (!com.sassyconsulting.sassytalkie.license.TrialGate.mayUseRadio(context)) {
             Log.i(TAG, "autoConnect: not entitled — refusing to start transports")
             _state.value = ConnectState.FAILED
@@ -278,14 +355,14 @@ class AutoConnectManager(private val context: Context) {
             val relayOk = if (relayAllowed) {
                 _state.value = ConnectState.TRYING_CELLULAR
                 _statusText.value = "Connecting Cloudflare Relay..."
-                connectCellularSilent(walkieService)
+                connectCellularSilent(walkieService, generation)
             } else {
                 Log.d(TAG, "Cloudflare relay disabled by user pref — skipping")
                 false
             }
 
             // 2) WiFi multicast as an extra plane (does not replace relay).
-            if (wifiAllowed && hasWifi()) {
+            if (wifiAllowed && hasWifi() && !overtaken(generation)) {
                 _state.value = ConnectState.TRYING_WIFI
                 _statusText.value = if (relayOk) "Relay up — adding WiFi..." else "Trying WiFi..."
                 Log.d(TAG, "WiFi detected, trying multicast (relayOk=$relayOk)")
@@ -307,12 +384,12 @@ class AutoConnectManager(private val context: Context) {
             if (!wifiOk && !relayOk && btAllowed && rfcommPeers == 0) {
                 _statusText.value = "Searching for Bluetooth peers..."
                 val discoverDeadline = System.currentTimeMillis() + BT_PEER_DISCOVERY_TIMEOUT_MS
-                while (System.currentTimeMillis() < discoverDeadline) {
+                while (System.currentTimeMillis() < discoverDeadline && !overtaken(generation)) {
                     if (blePeerCount(walkieService) > 0 || rfcommPeerCount(walkieService) > 0) break
                     kotlinx.coroutines.delay(500)
                 }
                 if (rfcommPeerCount(walkieService) == 0 && blePeerCount(walkieService) > 0) {
-                    rfcommPeers = waitForRfcommReady(walkieService)
+                    rfcommPeers = waitForRfcommReady(walkieService, generation)
                 } else {
                     rfcommPeers = rfcommPeerCount(walkieService)
                 }
@@ -332,6 +409,15 @@ class AutoConnectManager(private val context: Context) {
                 else -> "none"
             }
 
+            if (generation != connectGeneration) {
+                // Overtaken by disconnect()/reset() while connecting. Leave the
+                // state to whoever bumped the generation.
+                Log.i(TAG, "autoConnect overtaken by a disconnect or reset — not reporting $transport")
+                // Give back the multicast lock this attempt took; whoever
+                // overtook it connects again (or the session has ended).
+                if (wifiOk) walkieService?.releaseMulticastLock()
+                return@withContext false
+            }
             if (transport != "none") {
                 applyConnected(transport, relayOk)
                 if (transport == "bluetooth") {
@@ -354,7 +440,7 @@ class AutoConnectManager(private val context: Context) {
         return connected
     }
 
-    private suspend fun connectCellularSilent(walkieService: WalkieService?): Boolean {
+    private suspend fun connectCellularSilent(walkieService: WalkieService?, generation: Int? = null): Boolean {
         if (cellularClient?.isConnected() == true) {
             refreshTransportAdvisory()
             return true
@@ -363,7 +449,7 @@ class AutoConnectManager(private val context: Context) {
         val existing = cellularClient
         if (existing != null && existing.isAttempting()) {
             Log.d(TAG, "Relay still attempting — waiting instead of tearing down")
-            return waitForRelay(existing)
+            return waitForRelay(existing, generation)
         }
 
         tearDownCellularClient()
@@ -388,12 +474,14 @@ class AutoConnectManager(private val context: Context) {
         cellularClient = client
         client.connect()
 
-        return waitForRelay(client)
+        return waitForRelay(client, generation)
     }
 
-    private suspend fun waitForRelay(client: CellularWebSocketClient): Boolean {
+    private suspend fun waitForRelay(client: CellularWebSocketClient, generation: Int? = null): Boolean {
         val iterations = (CELLULAR_TIMEOUT_MS / 100).toInt()
         for (i in 0 until iterations) {
+            // Overtaken by a disconnect/reset: stop holding the connect lock.
+            if (overtaken(generation)) return false
             if (client.isConnected()) {
                 Log.d(TAG, "Relay connected")
                 val sid = SassyTalkNative.getSessionId()
@@ -770,6 +858,12 @@ class AutoConnectManager(private val context: Context) {
     }
 
     fun reset() {
+        connectGeneration++
+        resetState()
+    }
+
+    /** Clear the shown state without overtaking an attempt in progress. */
+    private fun resetState() {
         _state.value = ConnectState.IDLE
         _statusText.value = ""
         _relayReady.value = false
@@ -780,6 +874,7 @@ class AutoConnectManager(private val context: Context) {
     }
 
     fun disconnect() {
+        connectGeneration++
         unregisterNetworkCallback()
         stopDegradedRetry()
         relayLossJob?.cancel()
@@ -795,6 +890,7 @@ class AutoConnectManager(private val context: Context) {
 
     fun shutdown() {
         disconnect()
+        walkieServiceRef = null
         scope.cancel()
         scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     }
