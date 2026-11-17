@@ -48,8 +48,10 @@ All notable changes to SassyTalkie. Format loosely follows
 ## [3.2.13] (89) - 2026-11-17
 
 The November audit of the PTT path (#38) and a closing pass over every
-surface. Relay entries take effect on the next relay deploy; the promo-attempt
-counter also needs the `promo_attempts` table from `schema/licenses.sql`.
+surface. The relay changes are live: the #38 ones since 2026-11-14, the rest
+since 2026-11-17 (worker version b6a4fac8). The promo-attempt counter also
+needs the `promo_attempts` table from `schema/licenses.sql`; until then it
+uses the KV fallback.
 
 ### Fixed
 - **Sessions forgotten on restart (Android):** at startup the app checks
@@ -127,8 +129,11 @@ counter also needs the `promo_attempts` table from `schema/licenses.sql`.
   deletes the presence row, and APNs device tokens are URL-encoded.
 - **Relay limits:** inbound frames are capped at 64 KiB, and promo attempts
   are counted atomically in D1 before the lookup.
-- **Relay `/ws` with a legacy token:** a `peer` value that is not a valid
-  header value returned a 500 instead of opening the socket.
+- **Relay `/ws` with a legacy token:** the query `peer` is forwarded to the
+  room only when it is a valid peer id; otherwise the room falls back to its
+  own bounded parse. (Node's test runtime rejected a non-Latin-1 value with
+  an error; Cloudflare's runtime accepted it, so production never returned
+  a 500.)
 - **Logs:** the room id is no longer written to logcat in full: wake pushes,
   relay setup, session create/import/clear and the diagnostics line keep at
   most its first 8 characters. The AEAD-failure lines (IP and Bluetooth) are
