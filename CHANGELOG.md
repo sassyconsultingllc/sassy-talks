@@ -11,6 +11,31 @@ All notable changes to SassyTalkie. Format loosely follows
 
 ## [Unreleased]
 
+## [3.2.15] (91) - 2026-11-21
+
+### Fixed
+- **Radio restart refused in the background:** when Android restarted the
+  service after killing the app, some builds refuse a background
+  foreground start that includes the microphone type. The service then
+  stopped and was never restarted. It now retries without the microphone
+  type, so the phone stays reachable; a press it can't capture for is
+  dropped by the existing mic watchdog.
+- **Crash loop on a headless resume:** an error during the background
+  resume (encrypted prefs, native init) was uncaught and crashed the
+  process, which the sticky restart then repeated. It is now caught and
+  logged.
+- **Headless connect that failed stayed failed:** a radio resumed before
+  the network was up had no screen to retry from. The network callback is
+  now registered after a failed connect too, so it connects once a network
+  appears.
+- The Wi-Fi multicast lock is acquired and released under its own lock,
+  and a destroyed service no longer posts a notification.
+
+### Build
+- A local `bundlePlayRelease` with no release credentials now fails
+  instead of silently signing the AAB with the debug key. The guard
+  matched `bundlerelease` and missed flavored task names.
+
 ## [3.2.14] (90) - 2026-11-17
 
 ### Fixed

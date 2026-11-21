@@ -27,8 +27,8 @@ android {
         minSdk = 24
         // Play requires targetSdk 36 for app updates from 31 August 2026.
         targetSdk = 36
-        versionCode = 90
-        versionName = "3.2.14"
+        versionCode = 91
+        versionName = "3.2.15"
         
         // Feature flag: enable or disable cellular (relay) transport at build time
         buildConfigField("boolean", "ENABLE_CELLULAR_RELAY", "true")
@@ -133,8 +133,11 @@ android {
             // Only enforce credential checks if a release-producing task was actually requested.
             // Otherwise `clean`, `assembleDebug`, IDE syncs, etc. would fail configuration.
             val requestedTasks = gradle.startParameter.taskNames.joinToString(" ").lowercase()
-            val isReleaseRequested = listOf("assemblerelease", "bundlerelease", "installrelease", "packagerelease")
-                .any { requestedTasks.contains(it) }
+            // Flavored tasks put the flavor in the middle (bundlePlayRelease),
+            // so match the verb and "release" with anything between. A plain
+            // substring check missed them and silently debug-signed the AAB.
+            val isReleaseRequested = Regex("""(assemble|bundle|install|package)\w*release""")
+                .containsMatchIn(requestedTasks)
             signingConfig = when {
                 hasReleaseCreds -> signingConfigs.getByName("release")
                 allowDebugSigned -> {

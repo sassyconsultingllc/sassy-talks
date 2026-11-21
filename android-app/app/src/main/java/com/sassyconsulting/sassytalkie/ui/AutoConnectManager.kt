@@ -433,7 +433,11 @@ class AutoConnectManager private constructor(private val context: Context) {
             transport != "none"
         }
 
-        if (connected) {
+        // Also after a failure that wasn't overtaken: a radio the service
+        // resumed after a restart, before the network was up, has no screen to
+        // tap "retry" on. The callback upgrades to the best IP path once a
+        // network appears. disconnect() unregisters it.
+        if (connected || generation == connectGeneration) {
             registerNetworkCallback()
         }
 
