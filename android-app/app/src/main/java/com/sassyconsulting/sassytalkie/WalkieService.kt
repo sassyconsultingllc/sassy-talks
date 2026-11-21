@@ -244,14 +244,31 @@ class WalkieService : Service() {
             // AudioRecord alive in the background. The Rust pipeline historically
             // captured under mediaPlayback, which API 34 deprecates for mic input.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                ServiceCompat.startForeground(
-                    this,
-                    NOTIFICATION_ID,
-                    buildNotification("Radio standby", showPttAction = false),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-                )
+                try {
+                    ServiceCompat.startForeground(
+                        this,
+                        NOTIFICATION_ID,
+                        buildNotification("Radio standby", showPttAction = false),
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                    )
+                } catch (e: Exception) {
+                    // A system restart (null intent) happens in the background,
+                    // where some builds refuse the microphone type. Without the
+                    // fallback the service stopped and was never restarted, so
+                    // the phone stayed unreachable. Receiving needs no mic; the
+                    // mic watchdog already drops a press it can't capture for.
+                    if (intent != null) throw e
+                    Log.w(TAG, "startForeground with microphone refused on restart (${e.message}); retrying without it")
+                    ServiceCompat.startForeground(
+                        this,
+                        NOTIFICATION_ID,
+                        buildNotification("Radio standby", showPttAction = false),
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                    )
+                }
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 ServiceCompat.startForeground(
                     this,
@@ -291,6 +308,19 @@ class WalkieService : Service() {
      * connecting are both serialized, and an existing connection is kept.
      */
     private suspend fun resumeRadio(reason: String) {
+        // serviceScope has no exception handler, and this sticky service runs
+        // it after a system restart: an uncaught throw here (encrypted prefs,
+        // native init) would crash the process and loop with no UI to stop it.
+        try {
+            resumeRadioUnguarded(reason)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            Log.e(TAG, "resumeRadio($reason) failed: ${t.message}", t)
+        }
+    }
+
+    private suspend fun resumeRadioUnguarded(reason: String) {
         val micGranted = androidx.core.content.ContextCompat.checkSelfPermission(
             this, android.Manifest.permission.RECORD_AUDIO,
         ) == android.content.pm.PackageManager.PERMISSION_GRANTED
@@ -864,7 +894,11 @@ class WalkieService : Service() {
      * Without this, the WiFi driver silently drops all multicast/broadcast UDP
      * packets on most Android devices.
      */
-    fun acquireMulticastLock() {
+    // Own monitor, not @Synchronized: the service's monitor is held by
+    // initBleTransport/shutdownBleTransport, which can take a while.
+    private val multicastGuard = Any()
+
+    fun acquireMulticastLock(): Unit = synchronized(multicastGuard) {
         if (multicastLock?.isHeld == true) return
 
         val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -882,7 +916,7 @@ class WalkieService : Service() {
      * Release the MulticastLock. Call when disconnecting or when the user
      * leaves the walkie-talkie screen.
      */
-    fun releaseMulticastLock() {
+    fun releaseMulticastLock(): Unit = synchronized(multicastGuard) {
         multicastLock?.let {
             if (it.isHeld) {
                 it.release()
@@ -1241,6 +1275,9 @@ class WalkieService : Service() {
     }
 
     fun updateNotification(status: String) {
+        // A late call from the connection manager on a destroyed service would
+        // post a notification nothing ever removes.
+        if (destroyed) return
         lastNotificationStatus = status
         val lockScreenPtt = try {
             ManagedConfig.lockScreenPttActionsAllowed(this)
